@@ -1,0 +1,10 @@
+# Default build target for the whole workspace: the phone-class ISA (ARM64),
+# bare-metal (no OS underneath — we ARE the OS).
+[build]
+target = "aarch64-unknown-none"
+
+# `cargo run -p mansa-kernel` boots the kernel image in QEMU's `virt` machine.
+# Requires qemu-system-aarch64 on PATH. -nographic routes the PL011 UART to
+# your terminal, so the kernel's banner prints right here.
+[target.aarch64-unknown-none]
+runner = "qemu-system-aarch64 -M virt -cpu cortex-a72 -smp 1 -m 256M -nographic -kernel"

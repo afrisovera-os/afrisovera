@@ -1,0 +1,18 @@
+# build output
+/target
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# QEMU run artefacts
+/serial.log
+/*.png
+/*.ppm
+*.pcap
+
+# test-runner results and logs (one machine's run, not source)
+/.rat-*.tsv
+/.rat-logs/
+/.rat-logs-*/
+/.rat-pc-logs/
+/rat.out
