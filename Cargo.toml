@@ -1,0 +1,23 @@
+# AfriSovera OS — Cargo workspace root (virtual manifest).
+# Everything above the kernel line is / will be a userspace process; each becomes
+# its own crate under userland/. Phase 0 starts with just the kernel.
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "tools/afriidl",
+    "userland/rustapp",
+    "userland/niavm",
+]
+# `cargo build` at the root builds only the kernel (for the bare-metal target).
+# The host tool `afriidl` is built explicitly with `--target <host-triple>`.
+default-members = ["kernel"]
+
+# Bare-metal: no unwinder. Abort on panic in every profile.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"   # size-first: the design center is a $40 / 1–2 GB phone.

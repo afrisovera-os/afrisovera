@@ -1,0 +1,10 @@
+[package]
+name = "niavm"
+version = "0.0.1"
+edition = "2021"
+description = "A Nia mini WASM interpreter, compiled as an EL0 userland app (the interpreter runs at EL0; host calls are syscalls)."
+license = "Apache-2.0"
+
+[[bin]]
+name = "niavm"
+path = "src/main.rs"

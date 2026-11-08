@@ -1,0 +1,45 @@
+name: Bug report
+description: Something does not work as described
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce
+      description: Exact commands (for example `bash scripts/smoke-test.sh`), and the shell commands typed into AfriSh.
+    validations:
+      required: true
+  - type: dropdown
+    id: target
+    attributes:
+      label: Which kernel
+      options:
+        - ARM (QEMU virt)
+        - ARM (Raspberry Pi build)
+        - PC (x86-64, UEFI)
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Output of `git rev-parse --short HEAD`
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Host OS, `qemu-system-aarch64 --version` / `qemu-system-x86_64 --version`, `rustc --version`.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Serial log or test output
+      description: Paste the relevant part. Remove anything private first.
+      render: text

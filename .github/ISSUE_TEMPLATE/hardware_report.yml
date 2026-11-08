@@ -1,0 +1,22 @@
+name: Hardware report
+description: Tell us how AfriSovera (or `wifi` / `lsusb` / `lssd` output) behaves on a real machine
+labels: [hardware]
+body:
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      description: Make and model (PC, laptop, Raspberry Pi, phone).
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      render: text

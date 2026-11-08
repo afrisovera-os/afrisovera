@@ -1,0 +1,35 @@
+[package]
+name = "mansa-kernel"
+version = "0.0.1"
+edition = "2021"
+description = "Mansa — AfriSovera's capability-based microkernel (Phase 0: boot + UART)."
+license = "Apache-2.0"
+
+[[bin]]
+name = "mansa-kernel"
+path = "src/main.rs"
+
+# The PC kernel (x86-64, a UEFI application): PC track step 1, docs/05. A second
+# binary of the SAME crate so it shares source files with the ARM kernel; gated on
+# the `pc` feature so the default ARM build never tries to build it.
+#   cargo build -p mansa-kernel --bin mansa-pc --features pc --target x86_64-unknown-uefi
+[[bin]]
+name = "mansa-pc"
+path = "src/pc/main.rs"
+required-features = ["pc"]
+
+[features]
+# Target board. Default = QEMU `virt` (fully featured). `board-raspi` selects the
+# Raspberry Pi 3 (BCM2837 / QEMU raspi3b) bring-up; `board-rpi4` selects the
+# Raspberry Pi 4 (BCM2711) peripheral map — addresses only, no boot path yet;
+# `board-pine64` selects the PINE64 / Allwinner A64 map, which additionally needs a
+# DesignWare 8250 UART driver before it could ever print. See docs/15 and
+# kernel/src/board.rs.
+default = ["board-virt"]
+board-virt = []
+board-raspi = []
+board-rpi4 = []
+board-pine64 = []
+pc = []
+
+[dependencies]

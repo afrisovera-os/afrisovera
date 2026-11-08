@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 760" role="img" aria-label="AfriSovera OS logo">
+  <defs>
+    <radialGradient id="field" cx="0.5" cy="0.34" r="0.9">
+      <stop offset="0" stop-color="#191307"/>
+      <stop offset="0.55" stop-color="#0A0703"/>
+      <stop offset="1" stop-color="#000000"/>
+    </radialGradient>
+    <!-- gold body: deep foot -> rich mid -> bright -> pale crown -->
+    <linearGradient id="body" x1="0" y1="1" x2="0.15" y2="0">
+      <stop offset="0" stop-color="#6B4712"/>
+      <stop offset="0.32" stop-color="#B47F24"/>
+      <stop offset="0.62" stop-color="#EAB945"/>
+      <stop offset="0.85" stop-color="#F8D673"/>
+      <stop offset="1" stop-color="#FFF0BE"/>
+    </linearGradient>
+    <linearGradient id="bodyR" x1="1" y1="1" x2="0.85" y2="0">
+      <stop offset="0" stop-color="#5E3E10"/>
+      <stop offset="0.32" stop-color="#9C6E1F"/>
+      <stop offset="0.62" stop-color="#D6A63C"/>
+      <stop offset="0.85" stop-color="#EBC65F"/>
+      <stop offset="1" stop-color="#FBE7A8"/>
+    </linearGradient>
+    <!-- specular sheen sweeping across the sails -->
+    <linearGradient id="sheen" x1="0" y1="0" x2="1" y2="0.7">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0"/>
+      <stop offset="0.42" stop-color="#FFFFFF" stop-opacity="0.42"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0.62"/>
+      <stop offset="0.58" stop-color="#FFFFFF" stop-opacity="0.2"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="needle" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFF6DA"/>
+      <stop offset="0.5" stop-color="#F1C963"/>
+      <stop offset="1" stop-color="#8A5E16"/>
+    </linearGradient>
+    <linearGradient id="plinth" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4E340D"/>
+      <stop offset="0.5" stop-color="#F4D680"/>
+      <stop offset="1" stop-color="#4E340D"/>
+    </linearGradient>
+    <linearGradient id="word" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFF0BE"/>
+      <stop offset="0.5" stop-color="#EDBF54"/>
+      <stop offset="1" stop-color="#9E7220"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="18" result="b"/>
+      <feColorMatrix in="b" type="matrix"
+        values="0 0 0 0 0.95  0 0 0 0 0.72  0 0 0 0 0.25  0 0 0 0.55 0"/>
+    </filter>
+    <clipPath id="clipL"><path d="M150 560 C230 420 340 250 396 120 L396 560 Z"/></clipPath>
+    <clipPath id="clipR"><path d="M650 560 C570 420 460 250 404 120 L404 560 Z"/></clipPath>
+  </defs>
+
+  <rect x="0" y="0" width="900" height="760" fill="url(#field)"/>
+
+  <g transform="translate(50 -8)">
+    <!-- soft aura behind the monument -->
+    <g filter="url(#glow)" opacity="0.9">
+      <path d="M150 560 C230 420 340 250 400 96 C460 250 570 420 650 560 Z"/>
+    </g>
+
+    <!-- left + right sails -->
+    <path d="M150 560 C230 420 340 250 396 120 L396 560 Z" fill="url(#body)"/>
+    <path d="M650 560 C570 420 460 250 404 120 L404 560 Z" fill="url(#bodyR)"/>
+
+    <!-- geometric etching (chevron lattice), clipped inside each sail -->
+    <g stroke="#6E4C13" stroke-width="2.4" fill="none" opacity="0.55" stroke-linecap="round">
+      <g clip-path="url(#clipL)">
+        <path d="M396 170 L300 210 M396 230 L280 285 M396 300 L262 372 M396 380 L250 470 M396 470 L246 560"/>
+        <path d="M340 230 L340 560 M300 300 L300 560 M262 380 L262 560"/>
+      </g>
+      <g clip-path="url(#clipR)">
+        <path d="M404 170 L500 210 M404 230 L520 285 M404 300 L538 372 M404 380 L550 470 M404 470 L554 560"/>
+        <path d="M460 230 L460 560 M500 300 L500 560 M538 380 L538 560"/>
+      </g>
+    </g>
+
+    <!-- specular sheen over the crown -->
+    <path d="M150 560 C230 420 340 250 396 120 L396 560 Z" fill="url(#sheen)" clip-path="url(#clipL)" opacity="0.8"/>
+    <path d="M650 560 C570 420 460 250 404 120 L404 560 Z" fill="url(#sheen)" clip-path="url(#clipR)" opacity="0.5"/>
+
+    <!-- rising needle spire from the seam -->
+    <path d="M400 60 L406 150 L401 470 L399 470 L394 150 Z" fill="url(#needle)"/>
+    <circle cx="400" cy="60" r="3.4" fill="#FFF7DA"/>
+
+    <!-- bevelled plinth -->
+    <rect x="150" y="560" width="500" height="12" rx="4" fill="url(#plinth)"/>
+    <rect x="150" y="572" width="500" height="4" rx="2" fill="#2A1C08"/>
+    <!-- faint reflection -->
+    <g opacity="0.14" transform="translate(0 1152) scale(1 -1)">
+      <path d="M150 560 C230 420 340 250 396 120 L396 560 Z" fill="url(#body)"/>
+      <path d="M650 560 C570 420 460 250 404 120 L404 560 Z" fill="url(#bodyR)"/>
+    </g>
+  </g>
+
+  <!-- wordmark -->
+  <text x="450" y="672" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif"
+        font-size="86" font-weight="700" letter-spacing="10" fill="url(#word)">AFRISOVERA</text>
+  <text x="450" y="712" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif"
+        font-size="21" font-weight="600" letter-spacing="15" fill="#C89B3D">OPERATING SYSTEM</text>
+  <text x="450" y="742" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif"
+        font-size="15" font-weight="500" letter-spacing="7" fill="#8A7550">OWN YOUR DEVICE &#183; OWN YOUR FUTURE</text>
+</svg>

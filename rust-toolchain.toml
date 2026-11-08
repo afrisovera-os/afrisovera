@@ -1,0 +1,11 @@
+# Pin the toolchain so every contributor and CI builds Mansa identically.
+# Boot-to-UART needs no nightly features — the prebuilt `aarch64-unknown-none`
+# std (core + alloc) is enough. When Phase 0.2+ needs unstable features
+# (e.g. custom target JSON + build-std), switch `channel` to a pinned nightly.
+[toolchain]
+# Pinned to an exact release (1 Nov 2026): "stable" moves, and stable 1.99.1 built a
+# kernel that faulted in smoke/ps/tcp/heap/wasm-ops, while 1.97.1 (the dev box's) is
+# green. Move this deliberately, with a full run-all-tests.sh, never by accident.
+channel = "1.97.1"
+targets = ["aarch64-unknown-none", "x86_64-unknown-uefi"]   # x86_64-unknown-uefi: the PC kernel (mansa-pc)
+components = ["rust-src", "llvm-tools"]

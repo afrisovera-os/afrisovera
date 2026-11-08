@@ -1,0 +1,23 @@
+name: Feature or design proposal
+description: Suggest a new capability or a design change
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What can't be done today, and who needs it?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How it could work. Link the design doc in docs/ it touches, if any.
+    validations:
+      required: true
+  - type: textarea
+    id: tests
+    attributes:
+      label: How it would be tested
+      description: What a test suite would check to prove it works.

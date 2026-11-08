@@ -1,0 +1,167 @@
+# The full test walk: every registered suite, split across parallel GitHub runners.
+# Public repositories get standard GitHub-hosted runners free, so the whole registry (hours of QEMU boots on
+# one machine) runs here as N shards side by side, then one job joins the results into a single roll-up.
+#   - weekly (Sunday 02:00 UTC) on the default branch: ARM and PC kernels;
+#   - "Run workflow" on the Actions tab: pick ARM, PC or both, the number of shards, and optionally a subset.
+name: Full walk
+
+on:
+  schedule:
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: 'Which kernel'
+        type: choice
+        options: [both, arm, pc]
+        default: both
+      shards:
+        description: 'Parallel runners per kernel (1-20)'
+        default: '12'
+      only:
+        description: 'Optional: only these suites (comma list, globs allowed). Empty = the whole registry.'
+        default: ''
+      timeout:
+        description: 'Per-suite timeout, seconds'
+        default: '300'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-walk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan the shards
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        env:
+          ARCH: ${{ github.event.inputs.arch || 'both' }}
+          SHARDS: ${{ github.event.inputs.shards || '12' }}
+          ONLY: ${{ github.event.inputs.only }}
+        shell: python
+        run: |
+          import fnmatch, json, os, re
+          src = open("scripts/run-all-tests.sh", encoding="utf-8").read()
+          suites = re.search(r"^SUITES=\((.*)\)$", src, re.M).group(1).split()
+          arm_only = set()
+          for line in open("scripts/lib/pc-arch/arm-only.txt", encoding="utf-8"):
+              line = line.strip()
+              if line and not line.startswith("#"):
+                  arm_only.add(line.split()[0])
+          only = [p.strip() for p in os.environ.get("ONLY", "").split(",") if p.strip()]
+          if only:
+              suites = [s for s in suites if any(fnmatch.fnmatch(s, p) for p in only)]
+          n = max(1, min(20, int(os.environ.get("SHARDS") or 12)))
+          arch = os.environ["ARCH"]
+          arches = ["arm", "pc"] if arch == "both" else [arch]
+          include = []
+          for a in arches:
+              lst = [s for s in suites if not (a == "pc" and s in arm_only)]
+              k = min(n, max(1, len(lst)))
+              for i in range(k):
+                  part = lst[i::k]  # round-robin, so the slow suites spread across shards
+                  if part:
+                      include.append({"arch": a, "shard": i + 1, "of": k, "suites": ",".join(part)})
+          print(f"{len(suites)} suites; {len(include)} shard(s)")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"include": include}) + "\n")
+
+  # Builds QEMU once into the cache, so the shards do not all build it at the same time.
+  warm:
+    name: Warm the QEMU cache
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+
+  walk:
+    name: ${{ matrix.arch }} shard ${{ matrix.shard }}/${{ matrix.of }}
+    needs: [plan, warm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - name: Walk
+        env:
+          SUITES: ${{ matrix.suites }}
+          ARCH: ${{ matrix.arch }}
+          TMO: ${{ github.event.inputs.timeout || '300' }}
+        run: |
+          find scripts -name '*.sh' -exec chmod +x {} + 2> /dev/null || true
+          chmod +x scripts/lib/pc-arch/qemu-system-aarch64 2> /dev/null || true
+          RUNNER=scripts/run-all-tests.sh
+          [ "$ARCH" = pc ] && RUNNER=scripts/run-all-tests-pc.sh
+          set +e
+          "$RUNNER" --timeout "$TMO" --results results.tsv --logdir logs --only "$SUITES" > walk.out 2>&1
+          rc=$?
+          set -e
+          tail -25 walk.out
+          want=$(tr ',' '\n' <<< "$SUITES" | grep -c .)
+          ran=$(wc -l < results.tsv 2>/dev/null || echo 0)
+          bad=$(awk -F'\t' '$2 != "PASS"' results.tsv 2>/dev/null | wc -l)
+          echo "shard: $ran of $want suite(s) ran, $bad not PASS (runner exit $rc)"
+          [ "$ran" -eq "$want" ] && [ "$bad" -eq 0 ]
+      - name: Upload the shard's results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: walk-${{ matrix.arch }}-${{ matrix.shard }}
+          path: |
+            results.tsv
+            walk.out
+            logs/
+            !logs/**/*.img
+          retention-days: 14
+
+  rollup:
+    name: Roll-up
+    needs: [plan, walk]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: walk-*
+          path: shards
+      - name: Join the shards
+        env:
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+        shell: python
+        run: |
+          import json, os, pathlib
+          matrix = json.loads(os.environ["MATRIX"])["include"]
+          out = ["## Full walk", ""]
+          red = 0
+          for arch in sorted({m["arch"] for m in matrix}):
+              want = [s for m in matrix if m["arch"] == arch for s in m["suites"].split(",")]
+              got = {}
+              for f in pathlib.Path("shards").glob(f"walk-{arch}-*/results.tsv"):
+                  for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                      cols = line.split("\t")
+                      if len(cols) >= 2:
+                          got[cols[0]] = cols[1]
+              passed = [s for s in want if got.get(s) == "PASS"]
+              notpass = [f"{s} {got[s]}" for s in want if s in got and got[s] != "PASS"]
+              missing = [s for s in want if s not in got]
+              red += len(notpass) + len(missing)
+              out.append(f"**{arch}**: {len(passed)}/{len(want)} PASS, {len(notpass)} not PASS, {len(missing)} not run")
+              out += [f"- not PASS: `{x}`" for x in notpass[:100]]
+              out += [f"- not run: `{x}`" for x in missing[:100]]
+              out.append("")
+          text = "\n".join(out)
+          print(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(text + "\n")
+          raise SystemExit(1 if red else 0)

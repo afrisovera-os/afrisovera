@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Verify the `wrap` command greedily word-wraps text to a column width, printing
+# each wrapped line. Deterministic (greedy math checked by hand):
+#   wrap 10 the quick brown fox jumps -> "the quick" / "brown fox" / "jumps"
+#   wrap 5 a b c d e                  -> "a b c" / "d e"
+set -uo pipefail
+
+BIN="target/aarch64-unknown-none/debug/mansa-kernel"
+cargo build -p mansa-kernel
+
+qemu-system-aarch64 -M virt -cpu cortex-a72 -smp 1 -m 256M \
+    -global virtio-mmio.force-legacy=false -device ramfb -display none \
+    -serial tcp:127.0.0.1:4800,server,nowait \
+    -qmp tcp:127.0.0.1:4801,server,nowait -kernel "$BIN" &
+QPID=$!
+. "$(dirname "$0")/lib/afrish-boot.sh"
+afrish_wait_boot
+OUT="${TMPDIR:-/tmp}/wrap.out"
+python3 scripts/shell-demo.py 4800 4801 "${TMPDIR:-/tmp}/wrap.png" "wrap 10 the quick brown fox jumps" "wrap 5 a b c d e" > "$OUT" 2>&1
+kill "$QPID" 2>/dev/null
+wait "$QPID" 2>/dev/null
+
+grep -aE "wrap: " "$OUT" | sed 's/^/  /'
+
+python3 - "$OUT" <<'PY'
+import sys
+s = open(sys.argv[1], "rb").read().decode("latin1")
+want = [
+    "wrap: the quick",
+    "wrap: brown fox",
+    "wrap: jumps",
+    "wrap: a b c",
+    "wrap: d e",
+]
+missing = [w for w in want if w not in s]
+if missing:
+    print(f"WRAP TEST FAILED (missing: {missing})"); sys.exit(1)
+print("WRAP TEST PASSED  (width 10: the quick/brown fox/jumps; width 5: a b c/d e)")
+PY

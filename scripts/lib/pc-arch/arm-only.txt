@@ -1,0 +1,47 @@
+# Suites that test the ARM machine itself, not the OS: a PC has no such hardware, so a PC
+# walk (scripts/run-all-tests-pc.sh) does not run them. Each line: suite  -- the reason.
+# Added 5 Nov 2026 from the PC walk of 2530719's failure messages. A suite leaves this list
+# the day the PC kernel can honestly pass it; it never leaves by editing the suite.
+#
+# ARM system / identity registers (no x86 equivalent to print)
+cpuinfo        -- MIDR: implementer 0x41 ARM, part 0xd08 Cortex-A72, EL 1
+smpinfo        -- MPIDR Aff0 affinity of the primary core
+mmuinfo        -- SCTLR_EL1
+tcrinfo        -- TCR_EL1
+mairinfo       -- MAIR_EL1
+ttbr           -- TTBR0/1_EL1
+vbar           -- VBAR_EL1
+cpacr          -- CPACR_EL1
+cacheinfo      -- CTR_EL0
+clidr          -- CLIDR_EL1
+ccsidr         -- CCSIDR_EL1
+dczinfo        -- DCZID_EL0
+isar           -- ID_AA64ISAR0_EL1
+isar1          -- ID_AA64ISAR1_EL1
+mmfr           -- ID_AA64MMFR0_EL1
+mmfr1          -- ID_AA64MMFR1_EL1
+pfr            -- ID_AA64PFR0_EL1
+dfr            -- ID_AA64DFR0_EL1
+pmcr           -- PMCR_EL0
+# ARM PrimeCell / GIC peripherals (the PC has a 16550 UART, CMOS RTC, APIC, no PL061)
+uartinfo       -- PL011 PrimeCell ID
+uartflags      -- PL011 flag register
+uart8250       -- the virt build must name pl011 as its own console driver
+rtcinfo        -- PL031 PrimeCell ID and RTCDR
+gicinfo        -- GICD_TYPER
+giccinfo       -- GIC CPU interface registers
+gicid          -- GIC identification registers
+gicbase        -- GICv2 bases resolved by gic.rs
+sgi-el0        -- GIC software-generated interrupts from EL0
+gpio           -- PL061 part 0x061
+gpio-out       -- PL061 direction register
+# The ARM boards and their device trees
+smoke          -- the board command must report qemu-virt and a device tree
+pi             -- Raspberry Pi board image
+board-rpi4     -- board: qemu-virt (aarch64)
+board-pine64   -- board: qemu-virt (aarch64)
+board-check    -- qemu-virt (aarch64) vs device tree
+board-resolved -- qemu-virt (aarch64)
+board-machine  -- qemu-virt (aarch64) vs device tree
+frame-bounds   -- virt DRAM at 0x40000000 from the blueprint; PC RAM starts at 0
+heap           -- the arena must sit in the image QEMU's -kernel loads at 0x40000000 (ARM virt)

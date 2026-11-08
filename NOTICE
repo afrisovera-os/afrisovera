@@ -1,0 +1,17 @@
+AfriSovera OS
+Copyright 2026 The AfriSovera OS Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software developed by the AfriSovera OS project
+(https://github.com/afrisovera-os/afrisovera).
+
+The test harness downloads and builds QEMU (https://www.qemu.org/), which is
+licensed separately under the GNU GPL v2; QEMU is not distributed with this
+repository. The UEFI firmware used by the PC tests (EDK II / OVMF) comes from
+the QEMU build and is licensed under the BSD-2-Clause-Patent licence.
+
+"AfriSovera", "Mansa", "Asili", "Nia", "Sankofa", "Daraja", "Tonga" and the
+AfriSovera logo are names and marks of the AfriSovera OS project. The Apache
+License does not grant permission to use them except as needed to describe the
+origin of the work (see section 6 of the licence and TRADEMARK_POLICY.md).

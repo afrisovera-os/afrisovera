@@ -1,0 +1,19 @@
+// AfriSovera IPC protocol — AfriIDL v0 sample.
+//
+// This declares, once, the typed contract for a message passed over a Mansa IPC
+// channel. `afriidl` generates no_std Rust (message structs with fixed
+// little-endian wire serialization + a method-id enum) that both a service and
+// its clients can share — the same idea as Fuchsia FIDL, at v0 scope.
+
+protocol Ipc {
+    // A single IPC message. Fields are packed little-endian in declaration order.
+    message Message {
+        endpoint: u32,   // target endpoint id
+        tag: u32,        // message kind / opcode
+        payload: u64,    // the actual word(s) of data
+    }
+
+    // The operations a holder of an Ipc capability may invoke.
+    method send(msg: Message) -> u64;
+    method recv(endpoint: u32) -> Message;
+}

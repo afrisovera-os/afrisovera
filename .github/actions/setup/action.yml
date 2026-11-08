@@ -1,0 +1,57 @@
+# Shared set-up for every test job: packages, QEMU (built once, then cached), and the pinned Rust toolchain.
+name: Set up the AfriSovera test tools
+description: Install build packages, QEMU from cache (or build it), and the pinned Rust toolchain
+inputs:
+  qemu-version:
+    description: QEMU version to build
+    default: '11.0.0'
+  rust-version:
+    description: Rust toolchain (must match rust-toolchain.toml)
+    default: '1.97.1'
+runs:
+  using: composite
+  steps:
+    - name: Packages
+      shell: bash
+      run: |
+        sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq > /dev/null
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq expect procps ninja-build libglib2.0-dev \
+          libpixman-1-dev libslirp-dev libpng-dev flex bison python3-venv bzip2 > /dev/null
+
+    - name: QEMU from cache
+      id: qemu-cache
+      uses: actions/cache@v4
+      with:
+        path: ~/tools/qemu
+        key: qemu-${{ inputs.qemu-version }}-aarch64-x86_64-${{ runner.os }}-v2
+
+    # QEMU 11 is required: older distribution builds fail some suites (heap). The first run builds it
+    # (about 20 minutes); every later run restores it from the cache.
+    - name: Build QEMU (first run only)
+      if: steps.qemu-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        V: ${{ inputs.qemu-version }}
+      run: |
+        curl -fsSL --retry 3 -o /tmp/qemu.txz "https://download.qemu.org/qemu-$V.tar.xz"
+        tar -xJf /tmp/qemu.txz -C /tmp
+        cd "/tmp/qemu-$V"
+        ./configure --prefix="$HOME/tools/qemu" --target-list=aarch64-softmmu,x86_64-softmmu --enable-slirp \
+          --disable-docs --disable-werror > /tmp/qemu-configure.log 2>&1 || { tail -30 /tmp/qemu-configure.log; exit 3; }
+        make -j"$(nproc)" > /tmp/qemu-build.log 2>&1 || { tail -30 /tmp/qemu-build.log; exit 3; }
+        make install > /dev/null
+
+    - name: QEMU on PATH
+      shell: bash
+      run: |
+        echo "$HOME/tools/qemu/bin" >> "$GITHUB_PATH"
+        "$HOME/tools/qemu/bin/qemu-system-aarch64" --version | sed -n 1p
+
+    - name: Rust
+      shell: bash
+      env:
+        RV: ${{ inputs.rust-version }}
+      run: |
+        rustup toolchain install "$RV" --profile minimal --target aarch64-unknown-none \
+          --target x86_64-unknown-uefi --target x86_64-unknown-none --component rust-src,llvm-tools
+        echo "RUSTUP_TOOLCHAIN=$RV" >> "$GITHUB_ENV"

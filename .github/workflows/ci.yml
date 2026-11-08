@@ -1,0 +1,112 @@
+# Quick checks: every push and pull request.
+#   1. build both kernels (ARM for QEMU virt and Raspberry Pi 3, and the x86-64 UEFI PC kernel);
+#   2. run a small core set of suites on each, plus every scripts/<name>-test.sh the change touched.
+# The whole registry runs in full-walk.yml.
+name: Quick checks
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'docs/**']
+  pull_request:
+    paths-ignore: ['**/*.md', 'docs/**']
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: 'Suites to run, comma-separated (globs allowed, e.g. "tcp,wasm-*"). Empty = core set.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quick-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CORE_ARM: smoke,smp,heap,wasm-ops,tcp,persist,hash
+  CORE_PC: pc-boot,pc-paging,pc-ring3,pc-ipc
+  MAX_SUITES: 25
+
+jobs:
+  build:
+    name: Build both kernels
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --target aarch64-unknown-none \
+            --target x86_64-unknown-uefi --component rust-src,llvm-tools
+          echo "RUSTUP_TOOLCHAIN=1.97.1" >> "$GITHUB_ENV"
+      - name: ARM kernel (QEMU virt)
+        run: cargo build -p mansa-kernel
+      - name: ARM kernel (Raspberry Pi 3)
+        run: cargo build -p mansa-kernel --no-default-features --features board-raspi
+      - name: PC kernel (x86-64 UEFI)
+        run: cargo build -p mansa-kernel --bin mansa-pc --features pc --target x86_64-unknown-uefi
+
+  suites:
+    name: Core suites
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup
+
+      - name: Pick the suites
+        id: pick
+        env:
+          ASKED: ${{ github.event.inputs.suites }}
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ]; then
+            S="${ASKED:-$CORE_ARM,$CORE_PC}"
+          else
+            if [ -n "$BASE" ] && [ "$BASE" != 0000000000000000000000000000000000000000 ] && git cat-file -e "$BASE" 2>/dev/null; then
+              RANGE="$BASE...HEAD"
+            else
+              RANGE="HEAD~1..HEAD"
+            fi
+            changed=$(git diff --name-only "$RANGE" | sed -n 's#^scripts/\(.*\)-test\.sh$#\1#p' \
+              | while read -r s; do [ -f "scripts/$s-test.sh" ] && echo "$s"; done | head -n "$MAX_SUITES" | paste -sd, -)
+            S="$CORE_ARM,$CORE_PC${changed:+,$changed}"
+          fi
+          echo "suites=$S" >> "$GITHUB_OUTPUT"
+          echo "Suites: $S"
+
+      - name: Run the suites
+        env:
+          SUITES: ${{ steps.pick.outputs.suites }}
+        run: |
+          find scripts -name '*.sh' -exec chmod +x {} + 2> /dev/null || true
+          set +e
+          scripts/run-all-tests.sh --timeout 300 --results .rat-results.tsv --logdir .rat-logs --only "$SUITES" \
+            > rat.out 2>&1
+          rc=$?
+          set -e
+          tail -40 rat.out
+          # a subset run: the runner counts every suite it skipped as NOT RUN, so judge only the ones asked for
+          ran=$(wc -l < .rat-results.tsv 2>/dev/null || echo 0)
+          bad=$(awk -F'\t' '$2 != "PASS"' .rat-results.tsv 2>/dev/null | wc -l)
+          echo "subset: $ran suite(s) ran, $bad not PASS (runner exit $rc)"
+          { echo "### $ran suite(s) ran, $bad not PASS"; echo; echo '```'; cat .rat-results.tsv; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          [ "$ran" -gt 0 ] && [ "$bad" -eq 0 ]
+
+      - name: Keep the logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quick-logs
+          path: |
+            rat.out
+            .rat-results.tsv
+            .rat-logs/
+            !.rat-logs/**/*.img
+          retention-days: 14

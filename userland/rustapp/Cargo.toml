@@ -1,0 +1,10 @@
+[package]
+name = "rustapp"
+version = "0.0.1"
+edition = "2021"
+description = "A real compiled-Rust EL0 userland app (proves the userland path beyond asm stubs)."
+license = "Apache-2.0"
+
+[[bin]]
+name = "rustapp"
+path = "src/main.rs"

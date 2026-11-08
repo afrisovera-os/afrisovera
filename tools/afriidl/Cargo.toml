@@ -1,0 +1,10 @@
+[package]
+name = "afriidl"
+version = "0.0.1"
+edition = "2021"
+description = "AfriIDL v0 — AfriSovera's interface definition language compiler (parser + Rust codegen)."
+license = "Apache-2.0"
+
+[[bin]]
+name = "afriidl"
+path = "src/main.rs"

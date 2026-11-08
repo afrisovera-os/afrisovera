@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# PC MODE for the regression registry (PC track step 2, 4 Nov 2026).
+#
+# The ~690 suites in scripts/*-test.sh each launch `qemu-system-aarch64 -M virt ... -kernel
+# <ARM kernel>` and talk to the guest's shell over a TCP serial socket. They must stay
+# unedited (they are the registry's evidence), so PC mode does not touch them: it puts THIS
+# file first on PATH under the same name. It turns the ARM command line into a PC one:
+#   - the PC kernel (mansa-pc.efi, $PC_EFI) booted by UEFI firmware on a q35 PC, from a FAT
+#     disk laid out like a USB stick (EFI/BOOT/BOOTX64.EFI) -- `-kernel` is dropped;
+#   - kept as they are: -m, -smp, -serial, -qmp, -display, -nographic, -no-reboot, -netdev,
+#     -drive, -chardev, -audiodev, -fw_cfg, -name;
+#   - ARM-only machine options dropped: -M/-machine, -cpu, -global virtio-mmio.*, ramfb;
+#   - virtio devices moved from the ARM memory-mapped bus to PCI: virtio-X-device -> virtio-X-pci.
+# Everything the suite then sees (prompt, command output, screenshots over QMP) comes from the
+# PC kernel. Used by scripts/run-all-tests-pc.sh; not meant to be run by hand.
+set -uo pipefail
+
+REAL="${PC_QEMU:-qemu-system-x86_64}"
+EFI="${PC_EFI:-target/x86_64-unknown-uefi/debug/mansa-pc.efi}"
+[ -r "$EFI" ] || { echo "pc-arch shim: $EFI not built (run scripts/run-all-tests-pc.sh)" >&2; exit 1; }
+
+QDIR="$(dirname "$(command -v "$REAL")")"
+OVMF="${PC_OVMF:-}"
+if [ -z "$OVMF" ]; then
+    for f in "$QDIR/../share/qemu/edk2-x86_64-code.fd" "$QDIR/share/edk2-x86_64-code.fd" \
+             /usr/share/qemu/edk2-x86_64-code.fd /usr/share/OVMF/OVMF_CODE.fd \
+             /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/ovmf/OVMF.fd; do
+        if [ -r "$f" ]; then OVMF="$f"; break; fi
+    done
+fi
+[ -n "$OVMF" ] || { echo "pc-arch shim: no x86-64 UEFI firmware found" >&2; exit 1; }
+
+# native Windows QEMU wants Windows paths; elsewhere these are the identity
+winpath() { if command -v cygpath > /dev/null; then cygpath -m "$1"; else printf '%s' "$1"; fi; }
+
+ESP="$(mktemp -d "${TMPDIR:-/tmp}/pc-esp.XXXXXX")"
+mkdir -p "$ESP/EFI/BOOT"
+cp "$EFI" "$ESP/EFI/BOOT/BOOTX64.EFI"
+
+args=(-M q35 -drive "if=pflash,format=raw,readonly=on,file=$(winpath "$OVMF")"
+      -drive "format=raw,file=fat:rw:$(winpath "$ESP")")
+while [ $# -gt 0 ]; do
+    o="$1"
+    case "$o" in
+        -M|-machine|-cpu|-kernel|-append|-initrd|-dtb)
+            shift 2; continue ;;
+        -global)
+            case "${2:-}" in virtio-mmio.*) shift 2; continue ;; esac
+            args+=("$o" "$2"); shift 2; continue ;;
+        -device)
+            d="${2:-}"
+            case "$d" in
+                ramfb*) shift 2; continue ;;
+                virtio-*-device*) d="${d/-device/-pci}" ;;
+            esac
+            args+=("$o" "$d"); shift 2; continue ;;
+        -nographic|-no-reboot|-S|-s|-snapshot)
+            args+=("$o"); shift; continue ;;
+        -*)
+            if [ $# -ge 2 ]; then args+=("$o" "$2"); shift 2; else args+=("$o"); shift; fi
+            continue ;;
+        *)
+            args+=("$o"); shift; continue ;;
+    esac
+done
+
+"$REAL" "${args[@]}" &
+QPID=$!
+# the suite kills THIS process when it is done: pass that on to the real QEMU
+trap 'kill "$QPID" 2>/dev/null; wait "$QPID" 2>/dev/null; rm -rf "$ESP"; exit 0' TERM INT HUP
+wait "$QPID"
+rc=$?
+rm -rf "$ESP"
+exit "$rc"
