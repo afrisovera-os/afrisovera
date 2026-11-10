@@ -49,7 +49,7 @@ pub struct Device {
     pub ok: bool,
 }
 
-const MAX_DEVICES: usize = 16;
+const MAX_DEVICES: usize = if cfg!(target_arch = "x86_64") { 32 } else { 16 }; // a PC has ~27 register sites (review R1-9)
 static mut DEVICES: [Option<Device>; MAX_DEVICES] = [None; MAX_DEVICES];
 static mut COUNT: usize = 0;
 
@@ -60,7 +60,7 @@ pub fn register(name: &'static str, class: Class, mmio: u64, ok: bool) {
         if COUNT < MAX_DEVICES {
             DEVICES[COUNT] = Some(Device { name, class, mmio, ok });
             COUNT += 1;
-        }
+        } else { #[cfg(target_arch = "x86_64")] crate::kprintln!("[asili] registry full ({} devices): {} not recorded", MAX_DEVICES, name); }
     }
 }
 

@@ -6,9 +6,12 @@ serial console.
 
 Steps (in order):  type:<text>   keys on the USB keyboard, then Enter
                    move:<dx>,<dy> relative mouse move (sent in pieces of at most 40)
+                   fast:<dx>,<dy> the same move sent in one piece (a fast flick)
                    abs:<x>,<y>   absolute pointer position, 0..32767 each (a usb-tablet)
                    down / up     left mouse button
+                   wheel:up / wheel:down  roll the mouse wheel one notch (pc-usbwheel)
                    hold:<key>,<ms>  hold one key down that long (key repeat)
+                   keys:<qcode>+<qcode>  press one chord, e.g. keys:alt+tab (desktop shortcuts)
                    plug:<driver>,<id>[,<xhci id>[,<port>]] / unplug:<id>  hot-plug a USB device (QMP device_add/del)
                    wait:<s>      let the guest catch up
 The capture starts at the shell prompt; a screenshot is saved to <png> at the end. Nothing is
@@ -79,6 +82,8 @@ def main():
             for ch in arg + "\n":
                 code = "ret" if ch == "\n" else QCODE.get(ch, ch)
                 keys = [{"type": "qcode", "data": code}]
+                if ch.isalpha() and ch.isupper():  # capitals: shift + the letter (as usb-type.py)
+                    keys = [{"type": "qcode", "data": "shift"}, {"type": "qcode", "data": ch.lower()}]
                 if ch == "_":
                     keys.insert(0, {"type": "qcode", "data": "shift"})
                 qmp("send-key", {"keys": keys, "hold-time": 40})
@@ -93,14 +98,30 @@ def main():
                 rx, ry = rx - sx, ry - sy
                 drain(0.1)
             drain(0.5)
+        elif kind == "fast":
+            # the whole move in ONE event: QEMU's mouse gives it out at most 127 a report, in
+            # back-to-back reports, a fast flick (pc-usbaccel: acceleration)
+            fx, fy = (int(v) for v in arg.split(","))
+            qmp("input-send-event", {"events": [{"type": "rel", "data": {"axis": "x", "value": fx}},
+                                                {"type": "rel", "data": {"axis": "y", "value": fy}}]})
+            drain(1)
         elif kind == "abs":
             ax, ay = (int(v) for v in arg.split(","))
             qmp("input-send-event", {"events": [{"type": "abs", "data": {"axis": "x", "value": ax}},
                                                 {"type": "abs", "data": {"axis": "y", "value": ay}}]})
             drain(0.5)
+        elif kind == "wheel":
+            btn = "wheel-up" if arg == "up" else "wheel-down"
+            for down in (True, False):
+                qmp("input-send-event", {"events": [{"type": "btn", "data": {"down": down, "button": btn}}]})
+                drain(0.1)
+            drain(0.3)
         elif kind in ("down", "up"):
             qmp("input-send-event", {"events": [{"type": "btn", "data": {"down": kind == "down", "button": "left"}}]})
             drain(0.4)
+        elif kind == "keys":  # keys:alt+tab  one chord (QMP qcodes), e.g. keys:meta_l  keys:alt+f4  keys:esc
+            qmp("send-key", {"keys": [{"type": "qcode", "data": k} for k in arg.split("+")], "hold-time": 80})
+            drain(0.8)
         elif kind == "hold":
             key, ms = arg.split(",")
             qmp("send-key", {"keys": [{"type": "qcode", "data": key}], "hold-time": int(ms)})

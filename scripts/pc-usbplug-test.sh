@@ -6,7 +6,9 @@
 # types `lsusb` again (QEMU then sends the keys to the PS/2 keyboard). xhci.rs notes the
 # port-status-change events in the timer interrupt and enumerates / detaches from the
 # shell's idle loop (xhci::service). Graded: the keyboard is enumerated after boot, the
-# command typed on it runs, and the unplug is seen and counted.
+# command typed on it runs, and the unplug is seen and counted. Then two USB mice go in: the
+# second is not used (one mouse is kept) and must be reported ONCE, not reset and tried again
+# by its own port-change events (field item F1: the HP ENVY's webcam/Bluetooth loop, 9 Nov 2026).
 #   scripts/pc-usbplug-test.sh              # grader selftest, then the QEMU boot
 #   scripts/pc-usbplug-test.sh --selftest   # grader selftest only
 set -uo pipefail
@@ -27,6 +29,10 @@ grade() { # grade <serial>
     has '^  keyboard: slot [0-9]+, [0-9]+ reports, [0-9]+ keys typed$' || _f "lsusb did not list the hot-plugged keyboard"
     has '\[xhci\] port [0-9]+: device unplugged$' || _f "the unplug was not seen"
     has '^  hot-plug: 1 plugged in, 1 unplugged since boot$' || _f "lsusb after the unplug does not count it"
+    has '\[xhci\] port [0-9]+: USB mouse [0-9a-f]{4}:[0-9a-f]{4} ' || _f "the first mouse plugged in was not enumerated"
+    local n; n=$(printf '%s\n' "$S" | grep -acE '\[xhci\] port [0-9]+: device [0-9a-f]{4}:[0-9a-f]{4} \(.*\) plugged in, not one this driver uses$')
+    [ "$n" -eq 1 ] || _f "the second (unused) mouse was reported $n times, not once (hot-plug retry loop, F1)"
+    has 'did not answer' && _f "a QEMU device did not answer (descriptor not read)"
     if has 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[xhci\] .*(failed|timed out)'; then
         _f "$(printf '%s\n' "$S" | grep -aE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[xhci\] .*(failed|timed out)' | head -1)"
     fi
@@ -42,7 +48,10 @@ usb: xHCI controller 00:03.0, 8 ports, 1 connected
   keyboard: slot 1, 12 reports, 6 keys typed
 afrisovera> [xhci] port 5: device unplugged
 usb: xHCI controller 00:03.0, 8 ports, 0 connected
-  hot-plug: 1 plugged in, 1 unplugged since boot"
+  hot-plug: 1 plugged in, 1 unplugged since boot
+afrisovera> [xhci] port 6: USB mouse 0627:0001 (high speed), slot 2, interrupt-IN endpoint 1 every 8000 us
+[xhci] port 6: device plugged in and ready
+[xhci] port 7: device 0627:0001 (unknown class) plugged in, not one this driver uses"
 
 selftest() {
     local D pass=0 bad=0
@@ -62,10 +71,14 @@ selftest() {
     arm not-typed red "$(printf '%s\n' "$GREEN" | grep -v '0 unplugged since boot')"
     arm unplug-unseen red "$(printf '%s\n' "$GREEN" | grep -v 'device unplugged')"
     arm unplug-uncounted red "$(printf '%s\n' "$GREEN" | sed 's/1 plugged in, 1 unplugged/1 plugged in, 0 unplugged/')"
+    arm mouse-unseen red "$(printf '%s\n' "$GREEN" | grep -v 'USB mouse')"
+    arm unused-unreported red "$(printf '%s\n' "$GREEN" | grep -v 'not one this driver uses')"
+    arm retry-loop red "$(printf '%s\n%s\n' "$GREEN" "$(printf '%s\n' "$GREEN" | grep 'not one this driver uses')")"
+    arm did-not-answer red "$(printf '%s\n%s\n' "$GREEN" '[xhci] port 7: device did not answer; port reset for one more try')"
     arm empty red ""
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 8 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 12 ]
 }
 
 echo "== PC USB hot-plug =="
@@ -89,10 +102,10 @@ qemu-system-aarch64 -M virt -m 256M -display none -device qemu-xhci,id=xhci \
     -serial "tcp:127.0.0.1:4844,server,nowait" -qmp "tcp:127.0.0.1:4845,server,nowait" &
 QPID=$!
 python3 scripts/lib/usb-steps.py 4844 4845 "$W/serial.log" "$(winpath "$W/shot.png")" \
-    "plug:usb-kbd,k1" "type:lsusb" "unplug:k1" "type:lsusb"
+    "plug:usb-kbd,k1" "type:lsusb" "unplug:k1" "type:lsusb" "plug:usb-mouse,m1" "plug:usb-mouse,m2" "wait:4" "type:lsusb"
 kill "$QPID" 2> /dev/null
 wait "$QPID" 2> /dev/null
-tr -d '\r' < "$W/serial.log" | grep -aE 'no USB keyboard|USB keyboard 0627|plugged|hot-plug|  keyboard: slot' | sed 's/^/  | /'
+tr -d '\r' < "$W/serial.log" | grep -aE 'no USB keyboard|USB keyboard 0627|USB mouse|plugged|hot-plug|  keyboard: slot|did not answer' | sed 's/^/  | /'
 
 echo "  --- grading ---"
 if grade "$W/serial.log"; then

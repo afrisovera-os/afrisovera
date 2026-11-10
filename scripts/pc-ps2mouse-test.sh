@@ -8,7 +8,15 @@
 # screenshot. Graded: the keyboard and the mouse are both found on the i8042, `lsps2` reports
 # the packets, 2 clicks, no button held and the pointer at 420,300 (it starts at the console's
 # middle, 320,240; PS/2 counts up, the screen down, so +60 must go DOWN), and the screenshot
-# shows the pointer there and not at the middle.
+# shows the pointer there and not at the middle. Since 9 Nov 2026 (HP ENVY F6) also: the mouse
+# is set to 100 samples/s and 8 counts/mm, and its bytes arrive by IRQ 12 (at least one
+# interrupt taken), not only from the timer's poll. Since its second part: acceleration is on
+# with the curve 1x to 100 mm/s, 2x at 250, 3x from 400, and the test's slow moves (40 counts
+# a tenth of a second, 50 mm/s) were NOT sped up, so the pointer still lands exactly.
+# Since F7's last part (wheel): the IntelliMouse knock gives id 3 with 4-byte packets, and the
+# wheel rolled up, up, up, down (MOUSE_WHEEL, before the typing) scrolls the console 3, 6, 9
+# then 6 lines back (COM1 notes), and lsps2 counts the 4 notches. The notes come after the
+# prompt, so the typed `lsps2` may stand on a line of its own.
 #   scripts/pc-ps2mouse-test.sh              # grader selftest, then the QEMU boot
 #   scripts/pc-ps2mouse-test.sh --selftest   # grader selftest only
 set -uo pipefail
@@ -63,10 +71,17 @@ grade() { # grade <serial capture> <pixel line>
     has() { printf '%s\n' "$S" | grep -aqE "$1"; }
     has '^\[ps2\] i8042 keyboard controller \(config 0x[0-9a-f]{2} -> 0x[0-9a-f]{2}\), scancode set 1, polled$' ||
         _f "the i8042 keyboard controller was not found"
-    has '^\[ps2\] PS/2 mouse or touchpad \(id 0x0[034]\) on the aux port, 3-byte packets, polled$' ||
+    has '^\[ps2\] PS/2 mouse or touchpad \(id 0x0[034]\) on the aux port, (3-byte packets|4-byte packets with a wheel), polled$' ||
         _f "the PS/2 mouse was not found on the aux port"
+    has '^\[ps2\] PS/2 mouse or touchpad \(id 0x03\) on the aux port, 4-byte packets with a wheel, polled$' ||
+        _f "the IntelliMouse knock did not give a wheel (id 3, 4-byte packets)"
+    local ups
+    ups="$(printf '%s\n' "$S" | grep -aoE '^\[con\] scrollback: [0-9]+ lines up' | awk '{print $3}' | tr '\n' ' ')"
+    [ "$ups" = "3 6 9 6 " ] || _f "the wheel did not scroll the console 3, 6, 9 then 6 lines back: '${ups}'"
+    has '^ps2: wheel on \(4-byte packets\); 4 notch\(es\), 3 console lines each$' ||
+        _f "lsps2 does not count 4 wheel notches: $(printf '%s\n' "$S" | grep -aE '^ps2: (no )?wheel' | tail -1)"
     has '^\[xhci\] port [0-9]+: USB mouse' && _f "a USB mouse was enumerated: this boot must have none"
-    printf '%s\n' "$S" | grep -aqE '^afrisovera> lsps2$' || _f "lsps2 typed on the PS/2 keyboard did not reach the shell"
+    printf '%s\n' "$S" | grep -aqE '^(afrisovera> )?lsps2$' || _f "lsps2 typed on the PS/2 keyboard did not reach the shell"
     has '^ps2: i8042 keyboard, polled; [0-9]+ scancodes read, [0-9]+ keys typed$' || _f "lsps2 did not report the keyboard"
     local m n
     m="$(printf '%s\n' "$S" | grep -aoE '^ps2: mouse/touchpad id 0x[0-9a-f]{2}, polled; [0-9]+ packets, buttons [01]{3}, [0-9]+ clicks$' | tail -1)"
@@ -77,6 +92,14 @@ grade() { # grade <serial capture> <pixel line>
         [ "$n" -ge 5 ] || _f "only $n packets (3 moves and 4 button changes were sent): $m"
         printf '%s\n' "$m" | grep -qE 'buttons 000, 2 clicks$' || _f "expected 2 clicks and no button held: $m"
     fi
+    local q
+    q="$(printf '%s\n' "$S" | grep -aoE '^ps2: rate .*' | tail -1)"
+    printf '%s\n' "$q" | grep -qE '^ps2: rate 100 samples/s, resolution 8 counts/mm; IRQ 12, [1-9][0-9]* interrupts$' ||
+        _f "the mouse is not at 100 samples/s, 8 counts/mm with IRQ 12 interrupts taken: ${q:-no rate line}"
+    q="$(printf '%s\n' "$S" | grep -aoE '^ps2: acceleration .*' | tail -1)"
+    printf '%s\n' "$q" | grep -qE '^ps2: acceleration on: x1\.00 at 50 mm/s, x1\.00 at 100, x1\.50 at 175, x2\.00 at 250, x3\.00 from 400; [0-9]+ packet\(s\) sped up$' ||
+        _f "acceleration is not on with the 1x/1.5x/2x/3x curve: ${q:-no acceleration line}"
+    printf '%s\n' "$q" | grep -qE '; 0 packet\(s\) sped up$' || _f "slow moves were sped up (the pointer cannot land exactly): $q"
     printf '%s\n' "$S" | grep -aqE '^ps2: pointer at 420,300$' ||
         _f "the pointer is not at 420,300: $(printf '%s\n' "$S" | grep -aE '^ps2: (pointer|not moved)' | tail -1)"
     case "$P" in *"tip=000000 "*) ;; *) _f "no black pointer tip at 420,300 on the screen ($P)" ;; esac
@@ -89,12 +112,20 @@ grade() { # grade <serial capture> <pixel line>
 }
 
 GREEN="[ps2] i8042 keyboard controller (config 0x67 -> 0x64), scancode set 1, polled
-[ps2] PS/2 mouse or touchpad (id 0x00) on the aux port, 3-byte packets, polled
+[ps2] PS/2 mouse or touchpad (id 0x03) on the aux port, 4-byte packets with a wheel, polled
 AfriSh ready. Type 'help' for commands.
-afrisovera> lsps2
+afrisovera> 
+[con] scrollback: 3 lines up of 160 kept; top line: [pc] SMP: 1 core online
+[con] scrollback: 6 lines up of 160 kept; top line: [pc] memory map: 101 entries
+[con] scrollback: 9 lines up of 160 kept; top line: [pc] GOP: 1280x800
+[con] scrollback: 6 lines up of 160 kept; top line: [pc] memory map: 101 entries
+lsps2
 ps2: i8042 keyboard, polled; 12 scancodes read, 6 keys typed
-ps2: mouse/touchpad id 0x00, polled; 7 packets, buttons 000, 2 clicks
+ps2: mouse/touchpad id 0x03, polled; 11 packets, buttons 000, 2 clicks
 ps2: pointer at 420,300
+ps2: rate 100 samples/s, resolution 8 counts/mm; IRQ 12, 13 interrupts
+ps2: acceleration on: x1.00 at 50 mm/s, x1.00 at 100, x1.50 at 175, x2.00 at 250, x3.00 from 400; 0 packet(s) sped up
+ps2: wheel on (4-byte packets); 4 notch(es), 3 console lines each
 afrisovera> "
 GPX="tip=000000 fill=ffffff mid=080b12"
 
@@ -111,15 +142,19 @@ selftest() {
     echo "  --- grader selftest (no QEMU) ---"
     arm expected-green green "$GREEN" "$GPX"
     arm crlf green "$(printf '%s\n' "$GREEN" | sed 's/$/\r/')" "$GPX"
-    arm wheel-id green "$(printf '%s\n' "$GREEN" | sed 's/id 0x00/id 0x03/')" "$GPX"
+    arm no-wheel red "$(printf '%s\n' "$GREEN" | sed 's/id 0x03) on the aux port, 4-byte packets with a wheel/id 0x00) on the aux port, 3-byte packets/; s/^ps2: wheel on.*/ps2: no wheel (3-byte packets)/' | grep -v '^\[con\]')" "$GPX"
+    arm wheel-no-scroll red "$(printf '%s\n' "$GREEN" | grep -v '^\[con\]')" "$GPX"
+    arm wheel-backwards red "$(printf '%s\n' "$GREEN" | sed 's/^\[con\] scrollback: 9 lines up/[con] scrollback: 3 lines up/')" "$GPX"
+    arm wheel-page-size red "$(printf '%s\n' "$GREEN" | sed 's/^\[con\] scrollback: 3 lines up/[con] scrollback: 24 lines up/')" "$GPX"
+    arm wheel-uncounted red "$(printf '%s\n' "$GREEN" | sed 's/4 notch(es)/0 notch(es)/')" "$GPX"
     arm no-keyboard red "$(printf '%s\n' "$GREEN" | grep -v '^\[ps2\] i8042')" "$GPX"
     arm no-mouse red "$(printf '%s\n' "$GREEN" | grep -v '^\[ps2\] PS/2 mouse')" "$GPX"
     arm mouse-refused red "$(printf '%s\n' "$GREEN" | sed 's|^\[ps2\] PS/2 mouse.*|[ps2] no PS/2 mouse or touchpad on the aux port|')" "$GPX"
     arm usb-mouse-too red "$(printf '%s\n[xhci] port 2: USB mouse 0627:0001 (full speed), slot 2' "$GREEN")" "$GPX"
-    arm lsps2-not-typed red "$(printf '%s\n' "$GREEN" | grep -v '^afrisovera> lsps2')" "$GPX"
+    arm lsps2-not-typed red "$(printf '%s\n' "$GREEN" | grep -vE '^(afrisovera> )?lsps2$')" "$GPX"
     arm keyboard-line-gone red "$(printf '%s\n' "$GREEN" | grep -v '^ps2: i8042')" "$GPX"
     arm no-mouse-line red "$(printf '%s\n' "$GREEN" | grep -v '^ps2: mouse')" "$GPX"
-    arm too-few-packets red "$(printf '%s\n' "$GREEN" | sed 's/7 packets/2 packets/')" "$GPX"
+    arm too-few-packets red "$(printf '%s\n' "$GREEN" | sed 's/11 packets/2 packets/')" "$GPX"
     arm one-click red "$(printf '%s\n' "$GREEN" | sed 's/2 clicks/1 clicks/')" "$GPX"
     arm button-stuck red "$(printf '%s\n' "$GREEN" | sed 's/buttons 000/buttons 001/')" "$GPX"
     arm did-not-move red "$(printf '%s\n' "$GREEN" | sed 's/^ps2: pointer at 420,300/ps2: not moved yet (the pointer appears at the first touch)/')" "$GPX"
@@ -127,11 +162,19 @@ selftest() {
     arm not-drawn red "$GREEN" "tip=080b12 fill=080b12 mid=080b12"
     arm drawn-at-middle red "$GREEN" "tip=000000 fill=ffffff mid=ffffff"
     arm no-screenshot red "$GREEN" "tip=none fill=none mid=none (not a PNG)"
+    arm polled-only red "$(printf '%s\n' "$GREEN" | sed 's/IRQ 12, 13 interrupts/polled only (no IRQ 12)/')" "$GPX"
+    arm no-interrupt red "$(printf '%s\n' "$GREEN" | sed 's/IRQ 12, 13 interrupts/IRQ 12, 0 interrupts/')" "$GPX"
+    arm accel-off red "$(printf '%s\n' "$GREEN" | sed 's/^ps2: acceleration on.*/ps2: acceleration off (1:1); `accel on` switches it on/')" "$GPX"
+    arm no-accel-line red "$(printf '%s\n' "$GREEN" | grep -v '^ps2: acceleration')" "$GPX"
+    arm slow-sped-up red "$(printf '%s\n' "$GREEN" | sed 's/0 packet(s) sped up/2 packet(s) sped up/')" "$GPX"
+    arm curve-flat red "$(printf '%s\n' "$GREEN" | sed 's/x2\.00 at 250, x3\.00/x1.00 at 250, x1.00/')" "$GPX"
+    arm settings-as-found red "$(printf '%s\n' "$GREEN" | sed 's|rate 100 samples/s, resolution 8 counts/mm|rate as found, resolution as found|')" "$GPX"
+    arm no-rate-line red "$(printf '%s\n' "$GREEN" | grep -v '^ps2: rate')" "$GPX"
     arm panic red "$(printf '%s\n[pc] PANIC: x' "$GREEN")" "$GPX"
     arm empty red "" ""
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 20 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 32 ]
 }
 
 echo "== PC PS/2 mouse / touchpad (PC track step 3) =="
@@ -155,11 +198,11 @@ winpath() { if command -v cygpath > /dev/null; then cygpath -m "$1"; else printf
 qemu-system-aarch64 -M virt -m 256M -display none \
     -serial "tcp:127.0.0.1:4976,server,nowait" -qmp "tcp:127.0.0.1:4977,server,nowait" &
 QPID=$!
-python3 scripts/lib/usb-mouse.py 4976 4977 "$W/serial.log" "$(winpath "$W/screen.png")" 100 60 2 "lsps2"
+MOUSE_WHEEL="up up up down" python3 scripts/lib/usb-mouse.py 4976 4977 "$W/serial.log" "$(winpath "$W/screen.png")" 100 60 2 "lsps2"
 kill "$QPID" 2> /dev/null
 wait "$QPID" 2> /dev/null
 PX="$(pixels "$W/screen.png" 2> /dev/null || echo 'tip=none fill=none mid=none (no screenshot)')"
-tr -d '\r' < "$W/serial.log" | grep -aE '^\[ps2\]|^\[xhci\]|^afrisovera> lsps2|^ps2:' | sed 's/^/  | /'
+tr -d '\r' < "$W/serial.log" | grep -aE '^\[ps2\]|^\[xhci\]|^\[con\]|^afrisovera> lsps2|^ps2:' | sed 's/^/  | /'
 echo "  | pixels: $PX"
 
 echo "  --- grading ---"

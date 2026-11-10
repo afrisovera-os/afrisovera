@@ -21,11 +21,15 @@ T="${TMPDIR:-/tmp}"
 # INSTALLDISK_KIND=emmc (scripts/pc-installdisk-emmc-test.sh): the same on a laptop's built-in eMMC (SDHCI);
 #   QEMU's UEFI firmware has no SD/MMC driver, so boot 3 starts from the stick layout with the eMMC attached
 #   and grades that the driver finds AfriSovera's partition and the file on it (real laptops' firmware boots eMMC)
+# INSTALLDISK_KIND=ide (scripts/pc-installdisk-ide-test.sh): the same on a SATA disk in IDE mode (QEMU's piix3-ide,
+#   primary master = ide0); boot 3 starts from it through the firmware's own IDE driver
 KIND="${INSTALLDISK_KIND:-nvme}"
 BOOT3_LINE='harness: boot 3: only the installed disk attached (no USB stick, no boot disk)'
 BOOT3_RE='^harness: boot 3: only the installed disk attached \(no USB stick, no boot disk\)$'
 if [ "$KIND" = sata ]; then
     CMD=sata2; NAME="sata port 2"; DRV='\[ahci\] port 2:'; DEV=(-device ide-hd,drive=sd,bus=ide.2); PORT=5170; UP=SATA
+elif [ "$KIND" = ide ]; then
+    CMD=ide0; NAME=ide0; DRV='\[ide\] ide0:'; DEV=(-device piix3-ide,id=pide -device ide-hd,drive=sd,bus=pide.0,unit=0); PORT=6170; UP=IDE
 elif [ "$KIND" = emmc ]; then
     CMD=emmc; NAME=emmc; DRV='\[sdhci\] eMMC:'; DEV=(-device sdhci-pci -device emmc,drive=sd); PORT=5270; UP=eMMC
     BOOT3_LINE='harness: boot 3: the installed eMMC attached, started from the stick layout (QEMU firmware has no eMMC driver)'
@@ -58,6 +62,10 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log>
         _f "boot 2: AfriSovera's partition was not formatted and used"
     hasB '^harness: boot 2: GPT ok \(protective MBR, both headers, 2 entries\), FAT32 EFI\\BOOT\\BOOTX64\.EFI is the booted kernel byte for byte$' ||
         _f "boot 2: the harness's own read of the disk image did not find a valid GPT + FAT32 boot file"
+    if [ "$KIND" = ide ]; then # 10 Nov 2026: the big copies go in runs of up to 16 sectors, one cache flush each
+        hasB '^  big copies \(installdisk, bootcopy\): [1-9][0-9]* run\(s\) in one command, [1-9][0-9]* sector\(s\), each read back and flushed once \(on\)$' ||
+            _f "boot 2: installdisk did not write its big copies in runs of several sectors (lside)"
+    fi
     hasC "$BOOT3_RE" || _f "boot 3: the harness did not boot from the installed disk alone"
     hasC '^\[pc\] MANSA-PC BOOT OK$' || _f "boot 3: AfriSovera did not start from the installed disk"
     hasC "^$DRV AfriSovera's partition at sector 616448 \\([0-9]+ MiB\\) holds our files\$" ||
@@ -98,6 +106,16 @@ if [ "$KIND" = sata ]; then # the same samples as the SATA disk on port 2 says t
     B1="$(printf '%s\n' "$B1" | sed "$SATA_SED")"
     B2="$(printf '%s\n' "$B2" | sed "$SATA_SED")"
     B3="$(printf '%s\n' "$B3" | sed "$SATA_SED")"
+elif [ "$KIND" = ide ]; then # the same samples as the IDE-mode disk says them
+    IDE_SED='s/installdisk nvme/installdisk ide0/g; s/installdisk: nvme/installdisk: ide0/g; s/^\[nvme\] AfriSovera/[ide] ide0: AfriSovera/'
+    B1="$(printf '%s
+' "$B1" | sed "$IDE_SED")"
+    B2="$(printf '%s
+' "$B2" | sed "$IDE_SED")"
+    B3="$(printf '%s
+' "$B3" | sed "$IDE_SED")"
+    B2="$(printf '%s
+  big copies (installdisk, bootcopy): 907 run(s) in one command, 14500 sector(s), each read back and flushed once (on)' "$B2")"
 elif [ "$KIND" = emmc ]; then # the same samples as the eMMC says them
     EMMC_SED='s/installdisk nvme/installdisk emmc/g; s/installdisk: nvme/installdisk: emmc/g; s/^\[nvme\] AfriSovera/[sdhci] eMMC: AfriSovera/'
     B1="$(printf '%s\n' "$B1" | sed "$EMMC_SED")"
@@ -130,9 +148,15 @@ selftest() {
     arm failed red "$B1" "$(printf '%s\ninstalldisk: writing the partition table FAILED after 9 sectors' "$B2")" "$B3"
     arm panic red "$B1" "$B2" "$(printf '%s\nKERNEL PANIC' "$B3")"
     arm empty red "" "" ""
+    NARMS=14
+    if [ "$KIND" = ide ]; then
+        NARMS=15
+        arm big-copies-off red "$B1" "$(printf '%s
+' "$B2" | sed 's/flushed once (on)/flushed once (off)/')" "$B3"
+    fi
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 14 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq "$NARMS" ]
 }
 
 echo "== PC install ($UP): a whole disk given to AfriSovera, booted with no USB stick (PC track step 5) =="
@@ -198,7 +222,8 @@ else printf '\nharness: boot 1: the disk image CHANGED\n' >> "$W/boot1.log"; fi
 IC="$(tr -d '\r' < "$W/boot1.log" | grep -aoE "type exactly: installdisk $CMD yes [0-9a-f]{4}\$" | head -1 | awk '{print $NF}')"
 echo "  install code: ${IC:-NONE}"
 echo "  --- boot 2: the code typed, a file written ---"
-boot_shim "$((PORT + 4))" "$W/boot2.log" "installdisk $CMD yes ${IC:-none}|write notes.txt HELLO-INSTALL-6NOV|sync"
+B2X=; [ "$KIND" = ide ] && B2X="|lside"
+boot_shim "$((PORT + 4))" "$W/boot2.log" "installdisk $CMD yes ${IC:-none}$B2X|write notes.txt HELLO-INSTALL-6NOV|sync"
 printf '\n' >> "$W/boot2.log"
 "$PY" - "$IMG" "$PC_EFI" >> "$W/boot2.log" << 'PYEOF'
 import sys, struct, zlib
@@ -272,7 +297,7 @@ kill "$q" 2> /dev/null
 wait "$q" 2> /dev/null
 fi
 cat "$W/boot1.log" "$W/boot2.log" "$W/boot3.log" | tr -d '\r' |
-    grep -aE '^afrisovera> (installdisk|cat)|^installdisk|^\[(nvme|ahci|sdhci)\].*AfriSovera|^\[pc\] (own boot|MANSA)|^HELLO|^harness' | sed 's/^/  | /'
+    grep -aE '^afrisovera> (installdisk|cat)|^installdisk|^\[(nvme|ahci|sdhci|ide)\].*AfriSovera|^\[pc\] (own boot|MANSA)|^HELLO|^harness' | sed 's/^/  | /'
 
 echo "  --- grading ---"
 if grade "$W/boot1.log" "$W/boot2.log" "$W/boot3.log"; then

@@ -28,7 +28,6 @@ use super::{R_DRIVER_FEATURES_SEL, R_MAGIC, R_QUEUE_DESC_HIGH, R_QUEUE_DESC_LOW,
 use super::{R_QUEUE_DEVICE_LOW, R_QUEUE_DRIVER_HIGH, R_QUEUE_DRIVER_LOW, R_QUEUE_NOTIFY, R_QUEUE_NUM};
 use super::{R_QUEUE_NUM_MAX, R_QUEUE_READY, R_QUEUE_SEL, R_STATUS, R_VERSION};
 use super::{DEV_BLK, DEV_NET, DEV_RNG, DEV_SOUND};
-use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 
 const VENDOR_VIRTIO: u16 = 0x1AF4;
@@ -63,38 +62,15 @@ const NO_DEV: Dev = Dev { base: 0, id: 0, common: 0, notify: 0, mult: 0, bdf: (0
 static mut DEVS: [Dev; MAX_DEVS] = [NO_DEV; MAX_DEVS];
 static mut NDEVS: usize = 0;
 
-// --- PCI configuration space through the legacy 0xCF8/0xCFC ports ---
+// --- PCI configuration space through the shared pc/pci.rs (review R1-8) ---
 
-unsafe fn outl(port: u16, v: u32) {
-    asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack, preserves_flags));
-}
-unsafe fn inl(port: u16) -> u32 {
-    let v: u32;
-    asm!("in eax, dx", in("dx") port, out("eax") v, options(nomem, nostack, preserves_flags));
-    v
-}
-fn cfg_addr(b: u8, d: u8, f: u8, off: u8) -> u32 {
-    0x8000_0000 | (b as u32) << 16 | (d as u32) << 11 | (f as u32) << 8 | (off as u32 & 0xFC)
-}
-fn cfg32(b: u8, d: u8, f: u8, off: u8) -> u32 {
-    // SAFETY: the PCI configuration mechanism #1 ports; single-threaded bring-up.
-    unsafe {
-        outl(0xCF8, cfg_addr(b, d, f, off));
-        inl(0xCFC)
-    }
-}
+use crate::pci::{cfg_read32 as cfg32, cfg_write32};
+
 fn cfg8(b: u8, d: u8, f: u8, off: u8) -> u8 {
     (cfg32(b, d, f, off) >> ((off & 3) * 8)) as u8
 }
 fn cfg16(b: u8, d: u8, f: u8, off: u8) -> u16 {
     (cfg32(b, d, f, off) >> ((off & 2) * 8)) as u16
-}
-fn cfg_write32(b: u8, d: u8, f: u8, off: u8, v: u32) {
-    // SAFETY: as cfg32.
-    unsafe {
-        outl(0xCF8, cfg_addr(b, d, f, off));
-        outl(0xCFC, v);
-    }
 }
 
 /// The address BAR `bar` decodes to (memory BARs, 32- or 64-bit), or 0.

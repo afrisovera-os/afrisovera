@@ -48,6 +48,8 @@ pub const RIGHT_RECV: u8 = 2;
 
 const N: usize = 5; // ring-3 slots: five, as the ARM kernel (N_USER), so `ps` shows the same 6-slot table
 const N_CAPS: usize = 4;
+/// Endpoints a capability can name (0..N_EP); each holds one message of its own.
+pub const N_EP: usize = 4;
 const CODE_VA: u64 = mmu::USER_BASE;
 /// Ring-3 layout: code from USER_BASE (up to CODE_PAGES pages), the data page at DATA_VA,
 /// and STACK_PAGES of stack ending at STACK_TOP.
@@ -81,6 +83,7 @@ struct Proc {
     frame: TrapFrame,
     caps: [Cap; N_CAPS],
     pending: u64, // a BlockedSend process's message
+    wait_ep: usize, // the endpoint a BlockedSend/BlockedRecv process waits on
     slices: u64,  // timer interrupts taken while running
 }
 
@@ -88,7 +91,7 @@ const ZERO_FRAME: TrapFrame = TrapFrame {
     r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0, rdi: 0, rsi: 0, rbp: 0,
     rbx: 0, rdx: 0, rcx: 0, rax: 0, vector: 0, error: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
 };
-const FREE: Proc = Proc { state: State::Free, root: 0, frame: ZERO_FRAME, caps: [NO_CAP; N_CAPS], pending: 0, slices: 0 };
+const FREE: Proc = Proc { state: State::Free, root: 0, frame: ZERO_FRAME, caps: [NO_CAP; N_CAPS], pending: 0, wait_ep: 0, slices: 0 };
 
 /// One endpoint's single message slot.
 #[derive(Clone, Copy)]
@@ -126,7 +129,7 @@ fn use_kstack(slot: usize) {
     let base = unsafe { (*core::ptr::addr_of!(KSTACKS))[slot] };
     crate::cpu::set_rsp0(if base == 0 { 0 } else { (base + crate::heap::STACK_SIZE) as u64 });
 }
-static mut ENDPOINT: Endpoint = Endpoint { full: false, value: 0 };
+static mut ENDPOINTS: [Endpoint; N_EP] = [Endpoint { full: false, value: 0 }; N_EP];
 static mut CURRENT: usize = 0;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Timer interrupts that moved the CPU from one process to a different one.
@@ -187,7 +190,10 @@ pub fn spawn(code: &[u8], caps: &[(usize, u8)], preemptible: bool) -> Option<usi
     *p = FREE;
     p.root = root;
     for (h, &(endpoint, rights)) in caps.iter().enumerate().take(N_CAPS) {
-        p.caps[h] = Cap { valid: true, endpoint, rights };
+        // a capability for an endpoint that does not exist is left empty (its use is refused)
+        if endpoint < N_EP {
+            p.caps[h] = Cap { valid: true, endpoint, rights };
+        }
     }
     p.frame = ZERO_FRAME;
     p.frame.rip = CODE_VA;
@@ -390,22 +396,23 @@ pub fn syscall(f: &mut TrapFrame) {
                 crate::kprintln!("[P{}] SEND on handle {} refused: no SEND capability", pid, f.rdi);
                 f.rax = EPERM;
             }
-            Some(_) => {
+            Some(e) => {
                 let v = f.rsi;
-                // a receiver already waiting gets the message directly
-                if let Some(r) = procs().iter().position(|p| p.state == State::BlockedRecv) {
+                // a receiver already waiting on THIS endpoint gets the message directly
+                if let Some(r) = procs().iter().position(|p| p.state == State::BlockedRecv && p.wait_ep == e) {
                     procs()[r].frame.rax = v;
                     procs()[r].state = State::Runnable;
                     f.rax = 0;
                 } else {
                     // SAFETY: single core, trap handler.
-                    let ep = unsafe { &mut *core::ptr::addr_of_mut!(ENDPOINT) };
+                    let ep = unsafe { &mut (*core::ptr::addr_of_mut!(ENDPOINTS))[e] };
                     if !ep.full {
                         *ep = Endpoint { full: true, value: v };
                         f.rax = 0;
                     } else {
                         f.rax = 0; // returned when the message is taken
                         procs()[pid].pending = v;
+                        procs()[pid].wait_ep = e;
                         procs()[pid].state = State::BlockedSend;
                         switch(f);
                     }
@@ -418,18 +425,19 @@ pub fn syscall(f: &mut TrapFrame) {
                 crate::kprintln!("[P{}] RECV on handle {} refused: no RECV capability", pid, f.rdi);
                 f.rax = EPERM;
             }
-            Some(_) => {
+            Some(e) => {
                 // SAFETY: single core, trap handler.
-                let ep = unsafe { &mut *core::ptr::addr_of_mut!(ENDPOINT) };
+                let ep = unsafe { &mut (*core::ptr::addr_of_mut!(ENDPOINTS))[e] };
                 if ep.full {
                     f.rax = ep.value;
                     ep.full = false;
-                    // a blocked sender's message moves into the slot it was waiting for
-                    if let Some(s) = procs().iter().position(|p| p.state == State::BlockedSend) {
+                    // a sender blocked on THIS endpoint: its message moves into the slot it waited for
+                    if let Some(s) = procs().iter().position(|p| p.state == State::BlockedSend && p.wait_ep == e) {
                         *ep = Endpoint { full: true, value: procs()[s].pending };
                         procs()[s].state = State::Runnable;
                     }
                 } else {
+                    procs()[pid].wait_ep = e;
                     procs()[pid].state = State::BlockedRecv;
                     switch(f); // the sender will put the value in our saved rax
                 }
@@ -521,6 +529,45 @@ proc_prog_send:
     xor edi, edi
     int 0x80
 proc_prog_send_end:
+
+// Endpoint check (review R1-10): a receiver that waits on handle 0, prints what arrives
+// (or the refusal's EPERM) and exits; two senders that each send their own value on
+// handle 0. Which endpoint handle 0 names is the capability's business, not the program's.
+.global proc_prog_eprecv
+.global proc_prog_eprecv_end
+proc_prog_eprecv:
+    mov eax, 4              // RECV(0)
+    xor edi, edi
+    int 0x80
+    mov rdi, rax
+    mov eax, 1              // print what arrived
+    int 0x80
+    xor eax, eax
+    xor edi, edi
+    int 0x80
+proc_prog_eprecv_end:
+.global proc_prog_epsenda
+.global proc_prog_epsenda_end
+proc_prog_epsenda:
+    mov eax, 3              // SEND(0, 0xA1)
+    xor edi, edi
+    mov esi, 0xA1
+    int 0x80
+    xor eax, eax
+    xor edi, edi
+    int 0x80
+proc_prog_epsenda_end:
+.global proc_prog_epsendb
+.global proc_prog_epsendb_end
+proc_prog_epsendb:
+    mov eax, 3              // SEND(0, 0xB2)
+    xor edi, edi
+    mov esi, 0xB2
+    int 0x80
+    xor eax, eax
+    xor edi, edi
+    int 0x80
+proc_prog_epsendb_end:
 
 // Worker: spins until the timer has sliced it 3 times, then prints its count and exits.
 // It never yields: only the timer can take the CPU from it.
@@ -691,6 +738,12 @@ extern "C" {
     static proc_prog_recv_end: u8;
     static proc_prog_send: u8;
     static proc_prog_send_end: u8;
+    static proc_prog_eprecv: u8;
+    static proc_prog_eprecv_end: u8;
+    static proc_prog_epsenda: u8;
+    static proc_prog_epsenda_end: u8;
+    static proc_prog_epsendb: u8;
+    static proc_prog_epsendb_end: u8;
     static proc_prog_worker: u8;
     static proc_prog_worker_end: u8;
     static proc_prog_sleep: u8;
@@ -706,6 +759,11 @@ extern "C" {
 pub enum Prog {
     Recv,
     Send,
+    /// RECV on handle 0, print it, exit (the endpoint check)
+    EpRecv,
+    /// SEND 0xA1 / 0xB2 on handle 0, exit (the endpoint check)
+    EpSendA,
+    EpSendB,
     Worker,
     Sleep,
     Edit,
@@ -736,6 +794,9 @@ pub fn code(p: Prog) -> &'static [u8] {
         let (a, b) = match p {
             Prog::Recv => (&proc_prog_recv as *const u8, &proc_prog_recv_end as *const u8),
             Prog::Send => (&proc_prog_send as *const u8, &proc_prog_send_end as *const u8),
+            Prog::EpRecv => (&proc_prog_eprecv as *const u8, &proc_prog_eprecv_end as *const u8),
+            Prog::EpSendA => (&proc_prog_epsenda as *const u8, &proc_prog_epsenda_end as *const u8),
+            Prog::EpSendB => (&proc_prog_epsendb as *const u8, &proc_prog_epsendb_end as *const u8),
             Prog::Worker => (&proc_prog_worker as *const u8, &proc_prog_worker_end as *const u8),
             Prog::Sleep => (&proc_prog_sleep as *const u8, &proc_prog_sleep_end as *const u8),
             Prog::Edit => (&proc_prog_edit as *const u8, &proc_prog_edit_end as *const u8),

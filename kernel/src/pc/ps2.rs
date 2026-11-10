@@ -10,6 +10,28 @@
 //! standard 3-byte packets move the same pointer the USB mouse moves (xhci::pointer_input),
 //! so window dragging and dock clicks work from a touchpad too. The pointer is shown from
 //! its first packet on (a laptop's pad, not on every PC that only has the port).
+//!
+//! IRQ 12 (9 Nov 2026, HP ENVY field report F6: the touchpad was slow and unsteady): a real
+//! i8042 holds ONE byte at a time and the pad waits while it is full, so reading only at
+//! each timer tick (about 20 ms on a laptop) took about one byte per tick: 3-byte packets
+//! at 100 a second fell behind and were lost. The aux port now interrupts (ISA IRQ 12 through
+//! the IOAPIC) and each byte is taken as it lands; the timer tick still drains, as before.
+//! The pad is also set as Linux sets it (100 samples a second, 8 counts per mm, twice its
+//! power-on 4), and a part packet older than 40 ms (500 ms while polled only) is dropped, so
+//! one lost byte cannot shift every packet after it.
+//!
+//! Acceleration (9 Nov 2026, F6 second part): each packet's speed is its counts over the time
+//! since the packet before (at least the pad's own 10 ms, at most 100 ms), in mm/s at the set
+//! resolution. Up to 100 mm/s the pointer moves 1:1 (fine work stays exact); above, the move
+//! is multiplied, 2x at 250 mm/s and 3x from 400 mm/s, with the fractions carried over, so a
+//! fast swipe crosses the screen. The console is drawn scaled onto the GOP (screen.rs), so a
+//! count already covers more pixels on a bigger screen. `accel off` / `accel on` switch it.
+//! Since 9 Nov 2026 the USB mouse's reports go through the same curve (`accelerate`).
+//!
+//! Wheel (9 Nov 2026, F7 last part: scroll the console with the touchpad or mouse): the
+//! IntelliMouse knock at start-up (sample rates 200, 100, 80) turns a wheel mouse, and a
+//! touchpad that offers scrolling in its PS/2 mode, into id 3 with 4-byte packets; the 4th
+//! byte's notches scroll the console three lines each (conback.rs), not on the desktop.
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,16 +45,47 @@ static SCANCODES: AtomicU64 = AtomicU64::new(0);
 static mut SHIFT: bool = false;
 static mut CAPS: bool = false;
 static mut E0: bool = false;
+static mut ALT: bool = false;
+static mut SUPER: bool = false;
+static mut SUPER_COMBO: bool = false;
+
+/// A key that is a desktop shortcut while the desktop is shown (set-1 scancodes): Alt+Tab,
+/// Alt+F4, Super+arrows, Esc.
+unsafe fn desk_key(code: u8, ext: bool) -> Option<u32> {
+    use crate::desk::*;
+    Some(match (code, ext) {
+        (0x0F, false) if ALT => KEY_ALT_TAB,
+        (0x3E, false) if ALT => KEY_ALT_F4,
+        (0x4B, true) if SUPER => KEY_SUPER_LEFT,
+        (0x4D, true) if SUPER => KEY_SUPER_RIGHT,
+        (0x48, true) if SUPER => KEY_SUPER_UP,
+        (0x50, true) if SUPER => KEY_SUPER_DOWN,
+        (0x01, false) if !ALT && !SUPER => KEY_ESC,
+        _ => return None,
+    })
+}
 static MOUSE: AtomicBool = AtomicBool::new(false);
 static MOUSE_USED: AtomicBool = AtomicBool::new(false);
 static mut MOUSE_ID: u8 = 0;
-static mut PKT: [u8; 3] = [0; 3];
+static mut PKT: [u8; 4] = [0; 4];
 static mut PKT_N: usize = 0;
+static mut PKT_LEN: usize = 3; // 4 once the IntelliMouse knock gives a wheel (id 3)
+static mut WHEEL: u64 = 0; // wheel notches seen
 static mut MBUT: u8 = 0;
 static mut PACKETS: u64 = 0;
 static mut MCLICKS: u64 = 0;
 static mut RESYNCS: u64 = 0;
 static mut OVERFLOWS: u64 = 0;
+static mut STALE: u64 = 0;
+static mut LAST_BYTE: u64 = 0; // timer::cycles() of the packet byte before
+static mut RATE: u8 = 0; // samples a second set, 0 = left as the pad started
+static mut RES: u8 = 0; // counts per mm set, 0 = left as the pad started
+static AUX_IRQ: AtomicBool = AtomicBool::new(false);
+static AUX_IRQS: AtomicU64 = AtomicU64::new(0);
+static ACCEL: AtomicBool = AtomicBool::new(true);
+static mut LAST_PKT: u64 = 0; // timer::cycles() when the packet before completed
+static mut REM: (i32, i32) = (0, 0); // sixteenths of a count carried to the next packet
+static mut SPED: u64 = 0; // packets moved more than 1:1
 
 unsafe fn inb(port: u16) -> u8 {
     let v: u8;
@@ -152,27 +205,63 @@ unsafe fn mouse_init() {
     if aux_cmd(0xF2) == Some(0xFA) {
         MOUSE_ID = aux_read().unwrap_or(0);
     }
+    // The IntelliMouse knock (rates 200, 100, 80, then ask the id again): a wheel mouse, or
+    // a touchpad that offers scrolling in its PS/2 mode, answers id 3 and sends 4-byte
+    // packets, the 4th byte the wheel. Anything else stays a plain 3-byte mouse.
+    if MOUSE_ID == 0 && [200u8, 100, 80].iter().all(|&r| aux_cmd(0xF3) == Some(0xFA) && aux_cmd(r) == Some(0xFA)) {
+        if aux_cmd(0xF2) == Some(0xFA) {
+            MOUSE_ID = aux_read().unwrap_or(0);
+            if MOUSE_ID == 3 {
+                PKT_LEN = 4;
+            }
+        }
+    }
+    // Linux's psmouse settings: 100 samples a second, resolution 3 = 8 counts per mm
+    if aux_cmd(0xF3) == Some(0xFA) && aux_cmd(100) == Some(0xFA) {
+        RATE = 100;
+    }
+    if aux_cmd(0xE8) == Some(0xFA) && aux_cmd(3) == Some(0xFA) {
+        RES = 8;
+    }
     if aux_cmd(0xF4) != Some(0xFA) {
         crate::kprintln!("[ps2] the PS/2 mouse did not start streaming");
         return;
     }
     MOUSE.store(true, Ordering::Relaxed);
-    crate::kprintln!("[ps2] PS/2 mouse or touchpad (id {:#04x}) on the aux port, 3-byte packets, polled", { MOUSE_ID });
+    crate::kprintln!(
+        "[ps2] PS/2 mouse or touchpad (id {:#04x}) on the aux port, {}, polled",
+        { MOUSE_ID },
+        if PKT_LEN == 4 { "4-byte packets with a wheel" } else { "3-byte packets" }
+    );
 }
 
-/// One mouse byte; every third (from a byte with bit 3 set) completes a packet.
+/// One mouse byte; every third (fourth with a wheel), from a byte with bit 3 set, completes a packet.
 unsafe fn mouse_byte(b: u8) {
+    let now = crate::timer::cycles();
+    let ms = if AUX_IRQ.load(Ordering::Relaxed) { 40 } else { 500 };
+    if PKT_N > 0 && now.wrapping_sub(LAST_BYTE) > crate::timer::hz() / 1000 * ms {
+        STALE += 1; // the rest of that packet never came: start again from this byte
+        PKT_N = 0;
+    }
+    LAST_BYTE = now;
     if PKT_N == 0 && b & 0x08 == 0 {
         RESYNCS += 1; // not a packet's first byte: wait for one
         return;
     }
     PKT[PKT_N] = b;
     PKT_N += 1;
-    if PKT_N < 3 {
+    if PKT_N < PKT_LEN {
         return;
     }
     PKT_N = 0;
-    let [h, x, y] = PKT;
+    let [h, x, y, z] = PKT;
+    if PKT_LEN == 4 && z != 0 {
+        // the wheel (signed; negative = rolled away from the user): scroll the console back
+        WHEEL += (z as i8).unsigned_abs() as u64;
+        if !crate::desk::shown() {
+            crate::uart::console_wheel(z as i8 as i32);
+        }
+    }
     PACKETS += 1;
     MOUSE_USED.store(true, Ordering::Relaxed);
     let buttons = h & 7;
@@ -185,7 +274,115 @@ unsafe fn mouse_byte(b: u8) {
         dx = x as i32 - ((h as i32 & 0x10) << 4);
         dy = -(y as i32 - ((h as i32 & 0x20) << 3)); // PS/2 counts up; the screen down
     }
-    crate::xhci::pointer_input(buttons, dx, dy);
+    let ms = (now.wrapping_sub(LAST_PKT) / (crate::timer::hz() / 1000).max(1)).clamp(1000 / RATE.max(100) as u64, 100);
+    LAST_PKT = now;
+    if ms == 100 {
+        REM = (0, 0); // after a pause, start fresh
+    }
+    let (ax, ay, sped) = accelerate(dx, dy, ms as u32, if RES == 0 { 4 } else { RES as u32 }, &mut *core::ptr::addr_of_mut!(REM));
+    SPED += sped as u64;
+    crate::xhci::pointer_input(buttons, ax, ay);
+}
+
+/// One move through the acceleration curve (the touchpad's packets and the USB mouse's
+/// reports alike): `ms` since the move before, `per_mm` counts per millimetre, `rem` the
+/// sixteenths carried from the move before. Returns the move to make and whether it was
+/// sped up; 1:1 when acceleration is off or the move is slow.
+pub(crate) fn accelerate(dx: i32, dy: i32, ms: u32, per_mm: u32, rem: &mut (i32, i32)) -> (i32, i32, bool) {
+    if !ACCEL.load(Ordering::Relaxed) || (dx == 0 && dy == 0) {
+        return (dx, dy, false);
+    }
+    let (ax, ay) = (dx.unsigned_abs(), dy.unsigned_abs());
+    let counts = ax.max(ay) + ax.min(ay) / 2; // about the length of the move
+    let g = gain16(counts * 1000 / ms.max(1) / per_mm.max(1)) as i32;
+    let (fx, fy) = (dx * g + rem.0, dy * g + rem.1);
+    let (mx, my) = (fx / 16, fy / 16);
+    *rem = (fx - mx * 16, fy - my * 16);
+    (mx, my, g > 16)
+}
+
+/// The acceleration at a speed in mm/s, in sixteenths: 1x up to 100 mm/s, rising in a
+/// straight line to 3x at 400 mm/s and staying there.
+fn gain16(mm_s: u32) -> u32 {
+    if mm_s <= 100 {
+        16
+    } else if mm_s >= 400 {
+        48
+    } else {
+        16 + (mm_s - 100) * 32 / 300
+    }
+}
+
+/// `accel` / `accel on` / `accel off`: the pointer acceleration of the touchpad and the USB
+/// mouse (one switch, one curve).
+pub fn accel_cmd(arg: &str) {
+    match arg.trim() {
+        "on" => ACCEL.store(true, Ordering::Relaxed),
+        "off" => ACCEL.store(false, Ordering::Relaxed),
+        "" => {}
+        _ => {
+            crate::kprintln!("accel: say on or off (accel alone shows it)");
+            return;
+        }
+    }
+    accel_line();
+    crate::xhci::accel_line();
+}
+
+/// Whether pointer acceleration is on (`accel on`, the default).
+pub(crate) fn accel_on() -> bool {
+    ACCEL.load(Ordering::Relaxed)
+}
+
+fn accel_line() {
+    if !ACCEL.load(Ordering::Relaxed) {
+        crate::kprintln!("ps2: acceleration off (1:1); `accel on` switches it on");
+        return;
+    }
+    let x = |v: u32| {
+        let g = gain16(v);
+        alloc::format!("x{}.{:02}", g / 16, g % 16 * 100 / 16)
+    };
+    // SAFETY: scalar read of the counter.
+    let sped = unsafe { SPED };
+    crate::kprintln!(
+        "ps2: acceleration on: {} at 50 mm/s, {} at 100, {} at 175, {} at 250, {} from 400; {} packet(s) sped up",
+        x(50), x(100), x(175), x(250), x(400), sped
+    );
+}
+
+/// Route IRQ 12 to the aux port and switch its interrupt on in the i8042 (after the IOAPIC
+/// and the local APIC are up). Keys stay polled; nothing changes when there is no mouse.
+pub fn enable_aux_irq() {
+    if !MOUSE.load(Ordering::Relaxed) {
+        return;
+    }
+    crate::cpu::cli();
+    // SAFETY: i8042 port I/O with interrupts off, so the timer's poll cannot interleave.
+    unsafe {
+        if wait_write() {
+            outb(STATUS, 0x20);
+            if wait_read() {
+                let cfg = inb(DATA);
+                if wait_write() {
+                    outb(STATUS, 0x60);
+                    if wait_write() {
+                        crate::cpu::ioapic_route(12, crate::cpu::PS2_VECTOR);
+                        outb(DATA, cfg | 0b10); // aux interrupt on; the keyboard's stays off
+                        AUX_IRQ.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+    poll(); // a byte already waiting raised no edge: take it now
+    crate::cpu::sti();
+}
+
+/// IRQ 12: the aux port has a byte (and the keyboard may too): drain as the tick does.
+pub fn aux_irq() {
+    AUX_IRQS.fetch_add(1, Ordering::Relaxed);
+    poll();
 }
 
 /// Set 1 make code -> (plain, shifted) ASCII.
@@ -211,8 +408,8 @@ fn ascii(sc: u8) -> Option<(u8, u8)> {
     })
 }
 
-/// Called from the local-APIC timer interrupt: every key pressed since the last tick
-/// becomes console input.
+/// Called from the local-APIC timer interrupt and from IRQ 12 (both interrupt gates on the
+/// boot core, so never nested): every key pressed since the last tick becomes console input.
 pub fn poll() {
     if !ON.load(Ordering::Relaxed) {
         return;
@@ -240,10 +437,36 @@ pub fn poll() {
             E0 = false;
             let release = sc & 0x80 != 0;
             let code = sc & 0x7F;
+            if code == 0x38 {
+                ALT = !release; // left Alt, or right Alt (E0 38)
+                continue;
+            }
+            if ext && (code == 0x5B || code == 0x5C) {
+                // a Windows key: alone, it opens the desktop's launcher when released
+                if release {
+                    if crate::desk::shown() && !SUPER_COMBO {
+                        crate::desk::post_key(crate::desk::KEY_SUPER);
+                    }
+                    SUPER_COMBO = false;
+                }
+                SUPER = !release;
+                continue;
+            }
+            if !release && crate::desk::shown() {
+                if SUPER {
+                    SUPER_COMBO = true;
+                }
+                if let Some(k) = desk_key(code, ext) {
+                    crate::desk::post_key(k);
+                    continue;
+                }
+            }
             match code {
                 0x2A | 0x36 => SHIFT = !release,
                 0x3A if !release => CAPS = !CAPS,
-                _ if release || ext && code != 0x1C => {} // releases; arrows and the like
+                0x48 | 0x50 if ext && !release => crate::uart::history_key(code == 0x48), // Up/Down: shell history
+                0x49 | 0x51 if ext && !release && SHIFT => crate::uart::console_page(code == 0x49), // Shift+PgUp/PgDn
+                _ if release || ext && code != 0x1C => {} // releases; Left/Right and the like
                 _ => {
                     if let Some((plain, shifted)) = ascii(code) {
                         let letter = plain.is_ascii_lowercase();
@@ -282,8 +505,28 @@ pub fn list() {
             Some((x, y)) if MOUSE_USED.load(Ordering::Relaxed) => crate::kprintln!("ps2: pointer at {},{}", x, y),
             _ => crate::kprintln!("ps2: not moved yet (the pointer appears at the first touch)"),
         }
-        if RESYNCS + OVERFLOWS > 0 {
-            crate::kprintln!("ps2: {} stray byte(s) skipped, {} overflowing packet(s)", { RESYNCS }, { OVERFLOWS });
+        let set = |v: u8, unit: &'static str| if v == 0 { alloc::format!("as found") } else { alloc::format!("{} {}", v, unit) };
+        crate::kprintln!(
+            "ps2: rate {}, resolution {}; {}",
+            set(RATE, "samples/s"),
+            set(RES, "counts/mm"),
+            if AUX_IRQ.load(Ordering::Relaxed) {
+                alloc::format!("IRQ 12, {} interrupts", AUX_IRQS.load(Ordering::Relaxed))
+            } else {
+                alloc::format!("polled only (no IRQ 12)")
+            }
+        );
+        accel_line();
+        if PKT_LEN == 4 {
+            crate::kprintln!("ps2: wheel on (4-byte packets); {} notch(es), 3 console lines each", { WHEEL });
+        } else {
+            crate::kprintln!("ps2: no wheel (3-byte packets)");
+        }
+        if RESYNCS + OVERFLOWS + STALE > 0 {
+            crate::kprintln!(
+                "ps2: {} stray byte(s) skipped, {} overflowing packet(s), {} part packet(s) dropped",
+                { RESYNCS }, { OVERFLOWS }, { STALE }
+            );
         }
     }
 }

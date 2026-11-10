@@ -10,8 +10,12 @@ steps of at most 40 counts (QEMU gives them to the mouse the guest polls -- the 
 typed on the USB keyboard (`send-key`, Enter after each), a screenshot is saved to
 <png file>, and the whole serial capture is written to <out file>. Nothing is typed on the
 serial line. Used by scripts/pc-usbmouse-test.sh.
+
+With MOUSE_WHEEL set (e.g. "up up up down"), each word rolls the wheel one notch that way
+after the clicks and before the typing (pc-ps2mouse-test.sh: the wheel scrolls the console).
 """
 import json
+import os
 import socket
 import sys
 import time
@@ -88,6 +92,13 @@ def main():
         drain(0.1)
         mouse([{"type": "btn", "data": {"down": False, "button": "left"}}])
         drain(0.1)
+    drain(0.5)
+    for way in os.environ.get("MOUSE_WHEEL", "").split():
+        btn = "wheel-up" if way == "up" else "wheel-down"
+        mouse([{"type": "btn", "data": {"down": True, "button": btn}}])
+        drain(0.1)
+        mouse([{"type": "btn", "data": {"down": False, "button": btn}}])
+        drain(0.3)
     drain(0.5)
     for text in texts:
         for ch in text + "\n":

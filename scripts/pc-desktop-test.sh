@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # PC track step 6 groundwork (5 Nov 2026): the Tonga desktop's dock answers the USB mouse.
 #
-# Boots the PC kernel with a USB keyboard and mouse. scripts/lib/usb-steps.py types `gui` on
-# the keyboard (the shared Tonga desktop, its dock of SHELL FILES STORE ASILI-AI DEVICES),
-# moves the pointer from 320,240 onto the FILES tile (201,430), clicks, and types `lsusb`.
-# A dock click runs that tile's command as if typed: `clear` (back to the console) then
-# `ls`. Graded: the file list printed after the click, and lsusb counting one dock click.
+# Boots the PC kernel with a USB keyboard and mouse. scripts/lib/usb-steps.py types `desk` on
+# the keyboard (since 9 Nov 2026, field item F8: `desk` alone opens it, as `gui` does) (the shared desktop, desk.rs: its dock of launcher, Files, Terminal, Settings,
+# About), moves the pointer from 320,240 onto the Files tile (281,444), clicks, and types
+# `lsusb`. Since 8 Nov 2026 (docs/design/desktop.md) a dock click opens that app's window on
+# the desktop instead of running a command on the text console. Graded: the Files window
+# opened after the click, the desktop still on screen, lsusb counting one dock click, and
+# `desk status` (typed last) showing the desktop on screen with that one click.
 #   scripts/pc-desktop-test.sh              # grader selftest, then the QEMU boot
 #   scripts/pc-desktop-test.sh --selftest   # grader selftest only
 set -uo pipefail
@@ -18,24 +20,28 @@ grade() { # grade <serial>
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     has() { printf '%s\n' "$S" | grep -aqE "$1"; }
-    has '^\[gui\] Tonga desktop rendered' || _f "gui (typed on the USB keyboard) did not draw the desktop"
-    printf '%s\n' "$S" | sed -n '/^\[gui\] Tonga desktop rendered/,$p' | grep -aqE '^afrisovera> clear$' ||
-        _f "the dock click did not take the screen back to the console"
-    printf '%s\n' "$S" | sed -n '/^\[gui\] Tonga desktop rendered/,$p' | grep -aqE '^afrisovera> ls$' ||
-        _f "the FILES tile did not run ls"
-    has '^ +[0-9]+  hello\.wasm$' || _f "ls did not list the files"
+    has '^\[desk\] desktop opened' || _f "desk (typed on the USB keyboard) did not open the desktop"
+    if has '\[desk\] [a-z]+ profile, hidden;'; then _f "desk alone printed the hidden desktop's status instead of opening it"; fi
+    printf '%s\n' "$S" | sed -n '/^\[desk\] desktop opened/,$p' | grep -aqE '\[desk\] open files$' ||
+        _f "the Files tile did not open the Files window"
+    if printf '%s\n' "$S" | sed -n '/^\[desk\] desktop opened/,$p' | grep -aqE '^afrisovera> clear$'; then
+        _f "the dock click left the desktop for the console"
+    fi
     has '^  mouse: 1 dock click\(s\) on the desktop$' || _f "lsusb does not count exactly one dock click"
+    has '\[desk\] pointer profile, on screen; [0-9]+ frame\(s\) drawn; 1 dock click\(s\)' ||
+        _f "desk status does not show the desktop on screen with one dock click"
     if has 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
     return "$fail"
 }
 
-GREEN="afrisovera> gui
-[gui] Tonga desktop rendered; type 'clear' to return to console
-afrisovera> clear
-afrisovera> ls
-   117  hello.wasm
-afrisovera> lsusb
-  mouse: 1 dock click(s) on the desktop"
+GREEN="afrisovera> desk
+[desk] desktop opened; type 'desk status' for its state, 'clear' to return to console
+afrisovera> [desk] open files
+lsusb
+  mouse: 1 dock click(s) on the desktop
+afrisovera> desk status
+[desk] pointer profile, on screen; 3 frame(s) drawn; 1 dock click(s); 1 notice(s); 0 event(s) dropped
+[desk] window files at 36,44 size 372x250 focused"
 
 selftest() {
     local D pass=0 bad=0
@@ -48,16 +54,19 @@ selftest() {
         else bad=$((bad+1)); echo "    arm $1: $got but expected $2  <-- GRADER BUG"; sed 's/^/      /' "$D/log"; fi
     }
     echo "  --- grader selftest (no QEMU) ---"
-    arm real-green-2026-11-05 green "$GREEN"
+    arm green-2026-11-08 green "$GREEN"
     arm crlf green "$(printf '%s\n' "$GREEN" | sed 's/$/\r/')"
-    arm no-desktop red "$(printf '%s\n' "$GREEN" | grep -v '^\[gui\]')"
-    arm click-ignored red "$(printf '%s\n' "$GREEN" | grep -v '^afrisovera> \(clear\|ls\)$' | grep -v hello)"
-    arm wrong-tile red "$(printf '%s\n' "$GREEN" | sed 's/^afrisovera> ls$/afrisovera> store/' | grep -v hello)"
+    arm no-desktop red "$(printf '%s\n' "$GREEN" | grep -v '^\[desk\] desktop opened')"
+    arm status-only-2026-11-08 red "$(printf '%s\n' "$GREEN" | sed 's/^\[desk\] desktop opened.*$/[desk] pointer profile, hidden; 0 frame(s) drawn; 0 dock click(s); 1 notice(s); 0 event(s) dropped/')"
+    arm no-status red "$(printf '%s\n' "$GREEN" | grep -v 'on screen;')"
+    arm click-ignored red "$(printf '%s\n' "$GREEN" | grep -v 'open files')"
+    arm wrong-tile red "$(printf '%s\n' "$GREEN" | sed 's/open files/open terminal/')"
+    arm left-desktop red "$(printf '%s\n' "$GREEN" | sed 's/^lsusb$/afrisovera> clear\nlsusb/')"
     arm no-count red "$(printf '%s\n' "$GREEN" | sed 's/1 dock click/0 dock click/')"
     arm empty red ""
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 7 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 10 ]
 }
 
 echo "== PC desktop dock and the USB mouse =="
@@ -82,10 +91,10 @@ qemu-system-aarch64 -M virt -m 256M -display none \
     -serial "tcp:127.0.0.1:4814,server,nowait" -qmp "tcp:127.0.0.1:4815,server,nowait" &
 QPID=$!
 python3 scripts/lib/usb-steps.py 4814 4815 "$W/serial.log" "$(winpath "$W/shot.png")" \
-    "type:gui" "move:-119,190" down up "wait:3" "type:lsusb"
+    "type:desk" "move:-39,204" down up "wait:3" "type:lsusb" "type:desk status"
 kill "$QPID" 2> /dev/null
 wait "$QPID" 2> /dev/null
-tr -d '\r' < "$W/serial.log" | grep -aE '^\[gui\]|^afrisovera> (gui|clear|ls|lsusb)$|hello\.wasm|dock click' | sed 's/^/  | /'
+tr -d '\r' < "$W/serial.log" | grep -aE '\[desk\]|^afrisovera> (desk|desk status|clear|lsusb)$|dock click' | sed 's/^/  | /'
 
 echo "  --- grading ---"
 if grade "$W/serial.log"; then

@@ -48,11 +48,24 @@ pub fn status_b() -> u8 {
     reg(0x0B)
 }
 
-/// Seconds since 1970-01-01 00:00:00 UTC, read until two reads agree (the chip may tick
-/// between the byte reads). 0 when no RTC answers.
-pub fn epoch() -> u64 {
+/// The clock as the chip holds it, decoded (BCD or binary, 12 or 24 hour), plus the raw
+/// hour, minute, second and century bytes, for `rtcinfo`.
+#[derive(Clone, Copy)]
+pub struct Civil {
+    pub year: i64,
+    pub month: i64,
+    pub day: i64,
+    pub hour: u64,
+    pub minute: u64,
+    pub second: u64,
+    pub raw: [u8; 4],
+}
+
+/// The chip's date and time, read until two reads agree (the chip may tick between the
+/// byte reads). None when no RTC answers.
+pub fn civil() -> Option<Civil> {
     if !present() {
-        return 0;
+        return None;
     }
     let mut a = raw();
     for _ in 0..8 {
@@ -77,8 +90,19 @@ pub fn epoch() -> u64 {
         c @ 19..=21 => c as i64,
         _ => 20,
     };
-    let year = century * 100 + bcd(a.y) as i64;
-    let (mo, d) = (bcd(a.mo).clamp(1, 12) as i64, bcd(a.d).clamp(1, 31) as i64);
+    Some(Civil {
+        year: century * 100 + bcd(a.y) as i64,
+        month: bcd(a.mo).clamp(1, 12) as i64,
+        day: bcd(a.d).clamp(1, 31) as i64,
+        hour,
+        minute: bcd(a.m) as u64,
+        second: bcd(a.s) as u64,
+        raw: [a.h, a.m, a.s, a.c],
+    })
+}
+
+/// Seconds since 1970-01-01 00:00:00 for a civil date and time (0 before 1970).
+pub fn civil_epoch(year: i64, mo: i64, d: i64, hour: u64, minute: u64, second: u64) -> u64 {
     // days_from_civil (Howard Hinnant), the inverse of shell.rs's epoch_to_utc.
     let y = if mo <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -90,5 +114,14 @@ pub fn epoch() -> u64 {
     if days < 0 {
         return 0;
     }
-    days as u64 * 86400 + hour * 3600 + bcd(a.m) as u64 * 60 + bcd(a.s) as u64
+    days as u64 * 86400 + hour * 3600 + minute * 60 + second
+}
+
+/// Seconds since 1970-01-01 00:00:00 UTC (the chip is taken to hold UTC). 0 when no RTC
+/// answers.
+pub fn epoch() -> u64 {
+    match civil() {
+        Some(c) => civil_epoch(c.year, c.month, c.day, c.hour, c.minute, c.second),
+        None => 0,
+    }
 }

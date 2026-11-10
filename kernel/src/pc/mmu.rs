@@ -14,7 +14,7 @@
 
 use crate::frame;
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const PRESENT: u64 = 1 << 0;
 const WRITE: u64 = 1 << 1;
@@ -24,6 +24,40 @@ const PCD: u64 = 1 << 4;
 const HUGE: u64 = 1 << 7; // in a PD entry: a 2 MiB page
 const ADDR: u64 = 0x000F_FFFF_FFFF_F000;
 const PAGE_2M: u64 = 2 << 20;
+/// No-execute (bit 63): an instruction fetch from the page faults. Only valid once EFER.NXE is
+/// set; before that the bit is reserved, so it is only ever written when `nx()` is true.
+const NX: u64 = 1 << 63;
+const EFER: u32 = 0xC000_0080;
+const EFER_NXE: u64 = 1 << 11;
+
+static NX_ON: AtomicBool = AtomicBool::new(false);
+
+/// True when core 0 switched no-execute on (`init`): ring-3 stack and data pages are then
+/// marked NX, so code written there cannot be run.
+pub fn nx() -> bool {
+    NX_ON.load(Ordering::Relaxed)
+}
+
+/// Switch no-execute on for THIS core if the CPU has it (CPUID 8000_0001h EDX bit 20; Intel
+/// calls it XD and a BIOS setting can hide it). Core 0 from `init`, every other core as it
+/// starts, before it walks a table holding an NX bit. Returns whether it is on here.
+pub fn nx_here() -> bool {
+    use core::arch::x86_64::__cpuid;
+    // SAFETY: CPUID exists on every x86-64 CPU; leaf 8000_0001h is asked only if offered.
+    #[allow(unused_unsafe)]
+    let has = unsafe { __cpuid(0x8000_0000).eax >= 0x8000_0001 && __cpuid(0x8000_0001).edx & (1 << 20) != 0 };
+    if has {
+        // SAFETY: EFER exists on every x86-64 CPU and NXE is allowed because the CPU has NX;
+        // setting it changes nothing for tables that hold no NX bit.
+        unsafe {
+            let e = crate::cpu::rdmsr(EFER);
+            if e & EFER_NXE == 0 {
+                crate::cpu::wrmsr(EFER, e | EFER_NXE);
+            }
+        }
+    }
+    has
+}
 
 /// The local APIC (0xFEE00000) and IOAPIC (0xFEC00000) live in this 2 MiB-aligned block.
 const APIC_BLOCK: core::ops::Range<u64> = 0xFEC0_0000..0xFF00_0000;
@@ -115,6 +149,7 @@ pub fn init(top: u64) -> Option<(u64, usize)> {
         return None;
     }
     let before = frame::used_frames();
+    NX_ON.store(nx_here(), Ordering::Relaxed);
     ROOT.store(frame::alloc()? as u64, Ordering::Relaxed);
     let mut pa = 0;
     while pa < top {
@@ -175,7 +210,8 @@ pub fn page_fault(addr: u64, error: u64) -> bool {
 pub const USER_BASE: u64 = 0x0000_0100_0000_0000;
 
 /// Map one 4 KiB frame at `va` for ring 3. Kernel memory stays without the user bit, so a
-/// ring-3 touch anywhere else faults.
+/// ring-3 touch anywhere else faults. A writable page (stack, data) is also no-execute when
+/// `nx()`: ring 3 can write code or run it, never both on the same page.
 pub fn map_user(va: u64, pa: u64, writable: bool) -> bool {
     map_user_in(root(), va, pa, writable)
 }
@@ -184,7 +220,7 @@ pub fn map_user(va: u64, pa: u64, writable: bool) -> bool {
 pub fn map_user_in(root: u64, va: u64, pa: u64, writable: bool) -> bool {
     match entry_in(root, va & !0xFFF, 1, true) {
         Some(e) => {
-            *e = (pa & ADDR) | PRESENT | USER | if writable { WRITE } else { 0 };
+            *e = (pa & ADDR) | PRESENT | USER | if writable { WRITE | if nx() { NX } else { 0 } } else { 0 };
             // SAFETY: drops any stale translation of this one page.
             unsafe { asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags)) };
             true

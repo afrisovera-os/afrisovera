@@ -42,6 +42,9 @@ mod shell;
 mod store;
 mod timer;
 mod tonga;
+mod desk;
+#[path = "pc/font_lower.rs"]
+mod font_lower;
 mod uart;
 mod uart_ns16550;
 mod virtio;
@@ -323,6 +326,12 @@ pub fn cores_online() -> u32 {
     } else {
         1
     }
+}
+
+/// The machine's RAM in MiB (the `crate::ram_mib` the shared desktop and `mem` print). On
+/// the ARM kernel the frame allocator covers the real RAM, so the frame total is it.
+pub fn ram_mib() -> u64 {
+    (crate::frame::total_frames() * 4 / 1024) as u64
 }
 
 /// The secondary core's MPIDR Aff0 (its affinity/core id), or None if no

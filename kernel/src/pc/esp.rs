@@ -633,6 +633,9 @@ fn lfn(name: &str, short: &[u8; 11], out: &mut [[u8; 32]; 4]) -> usize {
     pieces
 }
 
+/// Fat::take's run of cluster sectors (shell context only).
+static mut BIG: [u8; crate::gpt::RUN * 512] = [0; crate::gpt::RUN * 512];
+
 impl Fat {
     /// 512-byte sectors per cluster.
     fn c512(&self) -> u64 {
@@ -697,7 +700,6 @@ impl Fat {
         let cb = self.cluster_bytes() as usize;
         let (mut first, mut prev, mut got) = (0u32, 0u32, 0u64);
         let mut a = [0u8; 512];
-        let mut s = [0u8; 512];
         for k in 0..self.fat512 {
             if k * 128 > last {
                 break;
@@ -717,16 +719,22 @@ impl Fat {
                     continue;
                 }
                 let base = self.at(c as u32);
-                for q in 0..self.c512() {
-                    s.fill(0);
+                // the cluster in runs of up to RUN sectors (one command and one flush each on an IDE-mode disk)
+                let mut q = 0u64;
+                while q < self.c512() {
+                    let k = (self.c512() - q).min(crate::gpt::RUN as u64) as usize;
+                    // SAFETY: shell context only; nothing else uses BIG while a copy runs.
+                    let run = unsafe { &mut (&mut *core::ptr::addr_of_mut!(BIG))[..k * 512] };
+                    run.fill(0);
                     let from = got as usize * cb + q as usize * 512;
                     if from < data.len() {
-                        let to = (from + 512).min(data.len());
-                        s[..to - from].copy_from_slice(&data[from..to]);
+                        let to = (from + k * 512).min(data.len());
+                        run[..to - from].copy_from_slice(&data[from..to]);
                     }
-                    if !self.dk.write(base + q, &s) {
+                    if !self.dk.write_run(base + q, run) {
                         return Err("a write FAILED");
                     }
+                    q += k as u64;
                 }
                 a[o..o + 4].copy_from_slice(&((v & 0xF000_0000) | EOC).to_le_bytes());
                 changed = true;

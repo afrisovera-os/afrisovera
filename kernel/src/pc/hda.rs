@@ -16,34 +16,8 @@
 //! streams 3.3.35 / 4.5, verbs and parameters 7.3.
 
 use crate::mmu;
-use core::arch::asm;
+use crate::pci;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
-
-unsafe fn outl(port: u16, v: u32) {
-    asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack, preserves_flags));
-}
-unsafe fn inl(port: u16) -> u32 {
-    let v: u32;
-    asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, nostack, preserves_flags));
-    v
-}
-fn cfg_addr(b: u8, d: u8, f: u8, off: u8) -> u32 {
-    0x8000_0000 | (b as u32) << 16 | (d as u32) << 11 | (f as u32) << 8 | (off as u32 & 0xFC)
-}
-fn cfg32(b: u8, d: u8, f: u8, off: u8) -> u32 {
-    // SAFETY: the PCI configuration ports; boot context, single core.
-    unsafe {
-        outl(0xCF8, cfg_addr(b, d, f, off));
-        inl(0xCFC)
-    }
-}
-fn cfg_write32(b: u8, d: u8, f: u8, off: u8, v: u32) {
-    // SAFETY: as cfg32.
-    unsafe {
-        outl(0xCF8, cfg_addr(b, d, f, off));
-        outl(0xCFC, v);
-    }
-}
 
 // controller registers (spec 3.3)
 const GCAP: u64 = 0x00; // u16
@@ -96,6 +70,7 @@ const P_CONNLEN: u32 = 0x0E;
 const P_OUTAMP: u32 = 0x12;
 
 const W_OUT: u32 = 0; // audio output (DAC)
+const W_IN: u32 = 1; // audio input (ADC)
 const W_MIXER: u32 = 2;
 const W_SELECTOR: u32 = 3;
 const W_PIN: u32 = 4;
@@ -105,6 +80,8 @@ const FMT_44K1_16_STEREO: u16 = 0x4011;
 const FMT_48K_16_STEREO: u16 = 0x0011;
 const RATE_HZ: u32 = 44100;
 const STREAM_TAG: u32 = 1;
+const ISTREAM_TAG: u32 = 2; // the microphone's input stream
+const REC_MAX: usize = 3 * 48000; // mono samples kept: 3 s at 48 kHz
 const PERIOD: usize = 4096; // bytes = 1024 stereo S16 frames, as virtio-sound's period
 const NPERIODS: usize = 16;
 const RING: usize = PERIOD * NPERIODS;
@@ -130,6 +107,18 @@ static mut RIRB: Rirb = Rirb([0; 256]);
 static mut BDL: Bdl = Bdl([Bde { addr: 0, len: 0, ioc: 0 }; NPERIODS]);
 static mut RINGBUF: Ring = Ring([0; RING]);
 static mut STAGE: [u8; PERIOD] = [0; PERIOD];
+// the microphone: its own buffer list and ring on the first input stream, and the recording
+static mut IBDL: Bdl = Bdl([Bde { addr: 0, len: 0, ioc: 0 }; NPERIODS]);
+static mut IRING: Ring = Ring([0; RING]);
+static mut REC: [i16; REC_MAX] = [0; REC_MAX];
+static mut REC_N: usize = 0;
+static mut REC_RATE: u32 = 0;
+static mut ISD: u64 = 0; // the input stream descriptor's offset
+static mut IFMT: u16 = FMT_44K1_16_STEREO;
+static mut IN_READY: bool = false;
+static mut IWHY: &str = "";
+static mut IPATH: [(u8, u8); 6] = [(0, 0); 6]; // ADC first, the pin last
+static mut IPATH_LEN: usize = 0;
 
 static mut BAR: u64 = 0;
 static mut READY: bool = false;
@@ -157,9 +146,11 @@ struct Widget {
     pincaps: u32,
     cfg: u32,
     nconn: u8,
-    conn: [u8; 8],
+    conn: [u8; MAXC],
 }
-const W0: Widget = Widget { nid: 0, caps: 0, pincaps: 0, cfg: 0, nconn: 0, conn: [0; 8] };
+// a laptop codec's input mux can list 10 or more sources (the built-in mic among the last)
+const MAXC: usize = 16;
+const W0: Widget = Widget { nid: 0, caps: 0, pincaps: 0, cfg: 0, nconn: 0, conn: [0; MAXC] };
 static mut WS: [Widget; MAXW] = [W0; MAXW];
 static mut NW: usize = 0;
 static mut PATH: [(u8, u8); 6] = [(0, 0); 6]; // (node, connection index used to reach the next)
@@ -288,27 +279,15 @@ fn param(nid: u8, p: u32) -> u32 {
 /// and set up the output path and stream. True when sound can be played.
 pub fn init() -> bool {
     let mut found = false;
-    'scan: for b in 0..8u8 {
-        for d in 0..32u8 {
-            for f in 0..8u8 {
-                let id = cfg32(b, d, f, 0);
-                if id & 0xFFFF == 0xFFFF {
-                    if f == 0 {
-                        break;
-                    }
-                    continue;
-                }
-                if cfg32(b, d, f, 8) >> 16 != 0x0403 {
-                    continue;
-                }
-                found = true;
-                // SAFETY: boot, single core; the device is ours from here
-                if unsafe { bring_up(b, d, f, id as u16, (id >> 16) as u16) } {
-                    break 'scan;
-                }
-            }
+    // the first audio device (class 04:03) that brings up; a failed one leaves the walk going
+    pci::find_by(8, |b, d, f, id| {
+        if pci::cfg_read32(b, d, f, 8) >> 16 != 0x0403 {
+            return false;
         }
-    }
+        found = true;
+        // SAFETY: boot, single core; the device is ours from here
+        unsafe { bring_up(b, d, f, id as u16, (id >> 16) as u16) }
+    });
     // SAFETY: boot, single core.
     unsafe {
         if READY {
@@ -318,6 +297,11 @@ pub fn init() -> bool {
                 controller_name(PCI_ID.0, PCI_ID.1), b, d, f, PCI_ID.0, PCI_ID.1, CAD,
                 CODEC_ID >> 16, CODEC_ID & 0xFFFF, PathText
             );
+            if IN_READY {
+                crate::kprintln!("[hda] microphone: {}, input stream 1 ('mic record' to try it)", InPathText);
+            } else {
+                crate::kprintln!("[hda] no microphone input: {}", IWHY);
+            }
         } else if found {
             crate::kprintln!("[hda] HD Audio controller found but not usable: {}", WHY);
         }
@@ -401,19 +385,19 @@ fn pin_rank(w: &Widget) -> Option<u8> {
 }
 
 unsafe fn bring_up(b: u8, d: u8, f: u8, ven: u16, dev: u16) -> bool {
-    let lo = cfg32(b, d, f, 0x10);
+    let lo = pci::cfg_read32(b, d, f, 0x10);
     let mut bar = (lo & !0xF) as u64;
     if lo & 0x6 == 0x4 {
-        bar |= (cfg32(b, d, f, 0x14) as u64) << 32;
+        bar |= (pci::cfg_read32(b, d, f, 0x14) as u64) << 32;
     }
     if bar == 0 || !mmu::map_mmio(bar, 0x4000) {
         WHY = "no usable BAR0";
         return false;
     }
-    cfg_write32(b, d, f, 4, cfg32(b, d, f, 4) | 0x406); // memory + bus mastering, INTx off (polled)
+    pci::enable(b, d, f, 0x406); // memory + bus mastering, INTx off (polled)
     if ven == 0x8086 {
         // Intel: traffic class 0 for the stream DMA (TCSEL, as Linux does), or some boards crackle
-        cfg_write32(b, d, f, 0x44, cfg32(b, d, f, 0x44) & !0x7);
+        pci::cfg_write32(b, d, f, 0x44, pci::cfg_read32(b, d, f, 0x44) & !0x7);
     }
     BAR = bar;
     PCI_AT = (b, d, f);
@@ -504,6 +488,7 @@ unsafe fn bring_up(b: u8, d: u8, f: u8, ven: u16, dev: u16) -> bool {
         return false;
     }
     READY = true;
+    input_setup(gcap & 1 != 0);
     true
 }
 
@@ -549,10 +534,10 @@ unsafe fn walk_codec() -> bool {
             let per = if long { 2 } else { 4 };
             let mut prev = 0u16;
             let mut i = 0;
-            while i < count && (w.nconn as usize) < 8 {
+            while i < count && (w.nconn as usize) < MAXC {
                 let resp = cmd(nid, GET_CONN, i as u32).unwrap_or(0);
                 for j in 0..per {
-                    if i + j >= count || w.nconn as usize >= 8 {
+                    if i + j >= count || w.nconn as usize >= MAXC {
                         break;
                     }
                     let (e, range) = if long {
@@ -564,7 +549,7 @@ unsafe fn walk_codec() -> bool {
                     };
                     if range && prev != 0 && e > prev {
                         let mut x = prev + 1;
-                        while x <= e && (w.nconn as usize) < 8 {
+                        while x <= e && (w.nconn as usize) < MAXC {
                             w.conn[w.nconn as usize] = x as u8;
                             w.nconn += 1;
                             x += 1;
@@ -700,6 +685,306 @@ unsafe fn stream_reset() -> bool {
     w16(SD + SD_FMT, FMT);
     w32(SD + SD_CTL, STREAM_TAG << 20 | 0x1C << 24); // stream tag, old status flags cleared
     true
+}
+
+// ---- the microphone (input): roadmap PC step 3, 10 Nov 2026 ----
+// A laptop's built-in microphone (or a mic jack, or line in) is an input pin of the same codec;
+// an ADC (audio input converter) reaches it through its connection list, often through a mixer
+// or an input selector. The ADC writes into the controller's first INPUT stream, whose
+// descriptors come before the output ones (spec 3.3.35). Recording is polled, as playback is.
+
+/// Lower is better; None = not an input we record from. Built-in microphone, then a mic
+/// jack, then line in.
+fn in_rank(w: &Widget) -> Option<u8> {
+    if w.pincaps & (1 << 5) == 0 || w.pincaps & (1 << 7 | 1 << 24) != 0 || w.cfg >> 30 == 1 {
+        return None; // not input capable, HDMI/DisplayPort, or not connected on this board
+    }
+    match (w.cfg >> 20) & 0xF {
+        0xA if w.cfg >> 30 == 2 => Some(0), // fixed: built in
+        0xA => Some(1),
+        8 => Some(2),
+        _ => None,
+    }
+}
+
+/// Depth-first from an ADC `nid` down to the pin `pin`; fills path[depth..] and returns its length.
+fn to_pin(nid: u8, pin: u8, path: &mut [(u8, u8); 6], depth: usize) -> Option<usize> {
+    if depth >= path.len() {
+        return None;
+    }
+    if nid == pin {
+        path[depth] = (nid, 0);
+        return Some(depth + 1);
+    }
+    let w = widget(nid);
+    if w.nid == 0 {
+        return None;
+    }
+    let t = (w.caps >> 20) & 0xF;
+    if depth > 0 && t != W_MIXER && t != W_SELECTOR {
+        return None;
+    }
+    for k in 0..w.nconn as usize {
+        path[depth] = (nid, k as u8);
+        if let Some(n) = to_pin(w.conn[k], pin, path, depth + 1) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Find the best input pin with an ADC that reaches it, set that path up and prepare the
+/// first input stream. Playback does not depend on it: a failure only leaves IWHY.
+unsafe fn input_setup(dma64: bool) {
+    IN_READY = false;
+    IPATH_LEN = 0;
+    if STREAMS.1 == 0 {
+        IWHY = "the controller has no input stream";
+        return;
+    }
+    if !dma64 && (addr_of!(IBDL) as u64 | addr_of!(IRING) as u64) >> 32 != 0 {
+        IWHY = "input buffers above 4 GiB and the controller has only 32-bit DMA";
+        return;
+    }
+    let mut best: Option<(u8, [(u8, u8); 6], usize)> = None;
+    for i in 0..NW {
+        let p = WS[i];
+        if (p.caps >> 20) & 0xF != W_PIN {
+            continue;
+        }
+        let Some(rank) = in_rank(&p) else { continue };
+        if best.map_or(false, |(r, _, _)| r <= rank) {
+            continue;
+        }
+        for j in 0..NW {
+            let a = WS[j];
+            if (a.caps >> 20) & 0xF != W_IN || a.caps & (1 << 9) != 0 {
+                continue; // not an ADC, or a digital one (S/PDIF in)
+            }
+            let mut path = [(0u8, 0u8); 6];
+            if let Some(len) = to_pin(a.nid, p.nid, &mut path, 0) {
+                best = Some((rank, path, len));
+                break;
+            }
+        }
+    }
+    let Some((_, p, len)) = best else {
+        IWHY = "no microphone or line-in pin with a path to an ADC";
+        return;
+    };
+    IPATH = p;
+    IPATH_LEN = len;
+    for i in 0..IPATH_LEN {
+        let (nid, k) = IPATH[i];
+        let w = widget(nid);
+        let t = (w.caps >> 20) & 0xF;
+        cmd(nid, SET_POWER, 0);
+        if w.nconn > 1 && t != W_MIXER {
+            cmd(nid, SET_SEL, k as u32);
+        }
+        let ampcaps = |p: u32| if w.caps & (1 << 3) != 0 { param(nid, p) } else { param(AFG, p) };
+        if w.caps & (1 << 1) != 0 {
+            // the input amplifier of the connection used (a pin's is its mic boost, index 0)
+            let off = ampcaps(P_INAMP) & 0x7F;
+            cmd(nid, SET_AMP4, 1 << 14 | 3 << 12 | (k as u32) << 8 | off);
+        }
+        if w.caps & (1 << 2) != 0 {
+            let off = ampcaps(P_OUTAMP) & 0x7F;
+            cmd(nid, SET_AMP4, 1 << 15 | 3 << 12 | off);
+        }
+        if t == W_PIN {
+            // input on; an analog microphone gets its 80% bias voltage when the pin offers it
+            let vref = if (w.cfg >> 20) & 0xF == 0xA && w.pincaps & (1 << 12) != 0 { 0x04 } else { 0 };
+            cmd(nid, SET_PINCTL, 0x20 | vref);
+        }
+        if t == W_IN {
+            let pcm = if param(nid, P_PCM) != 0 { param(nid, P_PCM) } else { param(AFG, P_PCM) };
+            IFMT = if pcm & (1 << 5) != 0 || pcm == 0 { FMT_44K1_16_STEREO } else { FMT_48K_16_STEREO };
+            cmd(nid, SET_FMT4, IFMT as u32);
+            cmd(nid, SET_STREAM, ISTREAM_TAG << 4);
+        }
+    }
+    ISD = 0x80; // the first input stream
+    let bdl = &mut (*addr_of_mut!(IBDL)).0;
+    for (i, e) in bdl.iter_mut().enumerate() {
+        *e = Bde { addr: addr_of!(IRING) as u64 + (i * PERIOD) as u64, len: PERIOD as u32, ioc: 0 };
+    }
+    if !istream_reset() {
+        IWHY = "the input stream did not come out of reset";
+        return;
+    }
+    IN_READY = true;
+}
+
+unsafe fn istream_reset() -> bool {
+    w32(ISD + SD_CTL, ISTREAM_TAG << 20);
+    wait_us(10_000, || r32(ISD + SD_CTL) & 2 == 0);
+    w32(ISD + SD_CTL, 1);
+    wait_us(10_000, || r32(ISD + SD_CTL) & 1 != 0);
+    w32(ISD + SD_CTL, 0);
+    if !wait_us(10_000, || r32(ISD + SD_CTL) & 1 == 0) {
+        return false;
+    }
+    let bdl = addr_of!(IBDL) as u64;
+    w32(ISD + SD_BDPL, bdl as u32);
+    w32(ISD + SD_BDPU, (bdl >> 32) as u32);
+    w32(ISD + SD_CBL, RING as u32);
+    w16(ISD + SD_LVI, (NPERIODS - 1) as u16);
+    w16(ISD + SD_FMT, IFMT);
+    w32(ISD + SD_CTL, ISTREAM_TAG << 20 | 0x1C << 24);
+    true
+}
+
+/// The input path as text: "pin 5 (microphone) -> ADC 4" (sound flows from the pin).
+#[allow(non_upper_case_globals)]
+const InPathText: InPathFmt = InPathFmt;
+struct InPathFmt;
+impl core::fmt::Display for InPathFmt {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        // SAFETY: read of boot-time state.
+        unsafe {
+            for i in (0..IPATH_LEN).rev() {
+                let n = IPATH[i].0;
+                let w = widget(n);
+                if i + 1 < IPATH_LEN {
+                    write!(f, " -> ")?;
+                }
+                match (w.caps >> 20) & 0xF {
+                    W_PIN => write!(
+                        f, "pin {} ({}{})", n, if w.cfg >> 30 == 2 { "built-in " } else { "" }, pin_kind(w.cfg)
+                    )?,
+                    W_IN => write!(f, "ADC {}", n)?,
+                    W_MIXER => write!(f, "mixer {}", n)?,
+                    W_SELECTOR => write!(f, "selector {}", n)?,
+                    _ => write!(f, "node {}", n)?,
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn irate() -> u32 {
+    // SAFETY: scalar read.
+    if unsafe { IFMT } == FMT_44K1_16_STEREO { 44100 } else { 48000 }
+}
+
+/// Record `ms` milliseconds (at most 3 s) from the microphone into REC, both channels averaged
+/// to one. Prints the level heard. False when there is no input or the stream stops moving.
+pub fn record(ms: u32) -> bool {
+    // SAFETY: single core, kernel context; the input stream and REC are ours.
+    unsafe {
+        if !IN_READY {
+            return false;
+        }
+        if !istream_reset() {
+            crate::kprintln!("[hda] the input stream did not come out of reset");
+            return false;
+        }
+        core::ptr::write_bytes(addr_of_mut!(IRING) as *mut u8, 0, RING);
+        let rate = irate();
+        let want = ((rate as u64 * ms as u64) / 1000).min(REC_MAX as u64) as usize;
+        REC_N = 0;
+        REC_RATE = rate;
+        w32(ISD + SD_CTL, ISTREAM_TAG << 20 | 2); // RUN
+        let ring = addr_of!(IRING) as *const u8;
+        let (mut taken, mut wraps, mut last) = (0u64, 0u64, 0u64);
+        let (mut peak, mut sum, mut overruns) = (0u32, 0u64, 0u32);
+        let mut moved = crate::timer::cycles();
+        while REC_N < want {
+            let lpib = (r32(ISD + SD_LPIB) as u64).min(RING as u64);
+            if lpib < last {
+                wraps += 1;
+            }
+            if lpib != last {
+                moved = crate::timer::cycles();
+            }
+            last = lpib;
+            let pos = wraps * RING as u64 + lpib;
+            if pos > taken + RING as u64 - PERIOD as u64 {
+                overruns += 1; // fell behind the DMA: skip to what is still in the ring
+                taken = pos - (RING - PERIOD) as u64;
+            }
+            // stay 128 bytes behind LPIB: the last bytes it counts may still be on their way
+            while taken + 4 + 128 <= pos && REC_N < want {
+                let at = (taken % RING as u64) as usize;
+                let l = read_volatile(ring.add(at) as *const i16) as i32;
+                let r = read_volatile(ring.add(at + 2) as *const i16) as i32;
+                let s = ((l + r) / 2) as i16;
+                REC[REC_N] = s;
+                REC_N += 1;
+                let a = (s as i32).unsigned_abs();
+                peak = peak.max(a);
+                sum += a as u64;
+                taken += 4;
+            }
+            if crate::timer::cycles().wrapping_sub(moved) > us(2_000_000) {
+                crate::kprintln!("[hda] the input stream stopped moving at byte {} (LPIB {:#x})", pos, lpib);
+                istream_reset();
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        istream_reset(); // stops it
+        let avg = if REC_N > 0 { sum / REC_N as u64 } else { 0 };
+        crate::kprintln!(
+            "[hda] recorded {} samples (~{} ms) at {} Hz from {}: peak {} of 32767, average {}{}",
+            { REC_N }, REC_N as u64 * 1000 / rate as u64, rate, InPathText, peak, avg,
+            if overruns > 0 { " (some sound lost: the recorder fell behind)" } else { "" }
+        );
+        crate::kprintln!(
+            "[hda] {}",
+            if peak < 64 { "silence: nothing was heard (is the microphone muted or switched off?)" } else { "sound was heard" }
+        );
+        true
+    }
+}
+
+/// `mic`, `mic record [1-3]`, `mic play`: the PC's microphone through HD Audio.
+pub fn mic_cmd(rest: &str) {
+    // SAFETY: reads of boot-time state; record/play are single-core kernel calls.
+    unsafe {
+        if !READY {
+            crate::kprintln!("mic: no HD Audio sound chip in use on this PC");
+            return;
+        }
+        if !IN_READY {
+            crate::kprintln!("mic: no microphone input: {}", IWHY);
+            return;
+        }
+        let mut w = rest.split_whitespace();
+        match (w.next(), w.next(), w.next()) {
+            (None, _, _) => crate::kprintln!(
+                "mic: {} on input stream 1, {} 16-bit; 'mic record' (2 s, or 'mic record 1'..'3') then 'mic play'",
+                InPathText, if IFMT == FMT_44K1_16_STEREO { "44.1 kHz" } else { "48 kHz" }
+            ),
+            (Some("record"), s, None) => {
+                let secs = match s.map(|s| s.parse::<u32>()) {
+                    None => 2,
+                    Some(Ok(n)) if (1..=3).contains(&n) => n,
+                    _ => {
+                        crate::kprintln!("mic: record for 1, 2 or 3 seconds, e.g. mic record 3");
+                        return;
+                    }
+                };
+                crate::kprintln!("[mic] recording {} s: speak now", secs);
+                if record(secs * 1000) {
+                    crate::kprintln!("[mic] done; 'mic play' plays it back");
+                }
+            }
+            (Some("play"), None, None) => {
+                if REC_N == 0 {
+                    crate::kprintln!("mic: nothing recorded yet; 'mic record' first");
+                    return;
+                }
+                crate::kprintln!("[mic] playing back {} samples recorded at {} Hz", { REC_N }, { REC_RATE });
+                if stream_begin() && stream_write(core::slice::from_raw_parts(addr_of!(REC) as *const i16, REC_N)) && stream_end() {
+                    crate::kprintln!("[mic] played back");
+                }
+            }
+            _ => crate::kprintln!("mic: say 'mic', 'mic record [1-3]' or 'mic play'"),
+        }
+    }
 }
 
 pub fn present() -> bool {
@@ -927,6 +1212,15 @@ pub fn list() {
                     match pin_rank(&w) { Some(_) => "", None => " -- not used" }
                 ),
                 W_OUT => crate::kprintln!("  node {} audio output (DAC){}", w.nid, if w.caps & (1 << 9) != 0 { ", digital" } else { "" }),
+                W_PIN if w.pincaps & (1 << 5) != 0 => crate::kprintln!(
+                    "  node {} input pin: {}{} (config {:#010x}){}",
+                    w.nid,
+                    pin_kind(w.cfg),
+                    if w.cfg >> 30 == 1 { ", not connected on this board" } else if w.cfg >> 30 == 2 { ", built in" } else { "" },
+                    w.cfg,
+                    match in_rank(&w) { Some(_) => "", None => ", not used" }
+                ),
+                W_IN => crate::kprintln!("  node {} audio input (ADC){}", w.nid, if w.caps & (1 << 9) != 0 { ", digital" } else { "" }),
                 _ => {}
             }
         }
@@ -935,6 +1229,14 @@ pub fn list() {
                 "lshda: sound goes out through {}, stream {}, {} 16-bit stereo",
                 PathText, STREAM_TAG, if FMT == FMT_44K1_16_STEREO { "44.1 kHz" } else { "48 kHz" }
             );
+            if IN_READY {
+                crate::kprintln!(
+                    "lshda: sound comes in through {}, input stream 1, {} 16-bit stereo",
+                    InPathText, if IFMT == FMT_44K1_16_STEREO { "44.1 kHz" } else { "48 kHz" }
+                );
+            } else {
+                crate::kprintln!("lshda: no microphone input: {}", IWHY);
+            }
         } else {
             crate::kprintln!("lshda: not usable: {}", WHY);
         }

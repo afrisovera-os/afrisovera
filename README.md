@@ -37,12 +37,21 @@ The design documents in [`docs/`](docs) explain each part and the reasons behind
 
 ## Status, told honestly
 
-AfriSovera is **pre-alpha**. It boots and runs in the QEMU emulator on two architectures, and it is
-tested heavily there. It is **not** a phone OS you can install today, and it has not yet been run on
-physical hardware.
+AfriSovera is **pre-alpha**. It is **not** a phone OS you can install today, and it is not ready for
+everyday use on a PC either.
+
+**What works today:**
+
+- **On a real PC**: the x86-64 kernel boots from a USB stick on a real UEFI laptop (first run on
+  8 November 2026, an HP ENVY with Secure Boot off). It reaches the AfriSh shell, takes typing from the
+  built-in keyboard, moves the pointer with the touchpad, opens the graphical desktop, and leaves the
+  laptop's own Windows disk untouched. That run produced a list of field fixes, most now made and tested in
+  QEMU; the rest wait for the next real-hardware test. Only one model of laptop has been tried so far.
+- **On ARM**: QEMU only. The ARM kernel has not yet run on a physical board.
 
 **Working and tested in QEMU** (more than 740 automated test suites, each booting the kernel and checking its
-output):
+output; the PC drivers below are tested on QEMU's emulated hardware, and only some of them have met real
+hardware yet):
 
 - **ARM (AArch64)**: QEMU `virt` and Raspberry Pi 3 (`raspi3b`) builds from one codebase. MMU and paging,
   heap, GIC interrupts, a preemptive scheduler, a second CPU core (PSCI, cross-core interrupts and IPC),
@@ -66,7 +75,8 @@ output):
 
 **Not done yet** (see the [roadmap](docs/05-roadmap.md)):
 
-- running on a real phone, PC or Raspberry Pi (the PC track's next step is booting from a USB stick);
+- running on a real phone or Raspberry Pi; on real PCs, wider testing beyond the first laptop (some USB
+  devices behind Intel USB 3 controllers are not yet recognised at boot);
 - Wi-Fi, a GPU driver, and the Sankofa UI framework;
 - the assistant is rule-based, not a neural model; speech is formant synthesis, not neural TTS;
 - Daraja maps Android permissions but does not yet run Android apps; the web renderer is a small HTML subset;
@@ -74,7 +84,7 @@ output):
 
 ## Screenshots
 
-All taken in QEMU.
+All taken in QEMU (photos from real hardware will follow).
 
 | Desktop (ARM) | AfriStore | PC boot (x86-64, UEFI) |
 |---|---|---|
@@ -133,7 +143,8 @@ the runner records each one in a results file and prints a roll-up.
 
 1. **Phase 0 to 2** (done in QEMU): kernel, userland, graphics, apps, networking, storage.
 2. **PC track** (in progress): steps 1 to 3 are done (x86-64 kernel, the registry passing on it, real PC
-   drivers); next is booting from a USB stick on a real PC, then installing.
+   drivers), and the kernel has booted from a USB stick on a real laptop; next are the field fixes from that
+   run, more machines, then installing.
 3. **Phase 3**: real silicon (Raspberry Pi 4, PINE64, then a phone).
 4. **Phase 4**: AfriCore services (identity, payments, push, sharing) and distribution.
 5. **Phase 5**: hardening, audits and reach.

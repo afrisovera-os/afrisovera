@@ -438,13 +438,20 @@ pub fn list(want: u64) {
         show(&mut |k, o| crate::ahci::raw_read(p, k, o), cap, bs, want);
         i += 1;
     }
+    let mut i = 0;
+    while let Some((k, cap, bs)) = crate::ide::raw_disk(i) {
+        n += 1;
+        crate::kprintln!("lsparts: ide{} (SATA in IDE mode), {} MiB, {}-byte sectors", k, cap / 2048, bs);
+        show(&mut |s, o| crate::ide::raw_read(k, s, o), cap, bs, want);
+        i += 1;
+    }
     if let Some((cap, bs)) = crate::sdhci::raw_info() {
         n += 1;
         crate::kprintln!("lsparts: emmc (built in), {} MiB, {}-byte blocks", cap / 2048, bs);
         show(&mut |k, o| crate::sdhci::raw_read(k, o), cap, bs, want);
     }
     if n == 0 {
-        crate::kprintln!("lsparts: no NVMe, SATA or eMMC disk");
+        crate::kprintln!("lsparts: no NVMe, SATA, IDE-mode or eMMC disk");
     }
     crate::kprintln!("lsparts: read only -- nothing was written");
     if want > 0 {
@@ -471,6 +478,8 @@ pub(crate) enum Disk {
     Sata(u32),
     /// the built-in eMMC of a cheap laptop (sdhci.rs, 8 Nov 2026)
     Emmc,
+    /// a SATA disk in IDE mode, by its drive number in lside (ide.rs, 10 Nov 2026)
+    Ide(u32),
 }
 
 impl Disk {
@@ -479,6 +488,7 @@ impl Disk {
             Disk::Nvme => crate::nvme::raw_read(n, out),
             Disk::Sata(p) => crate::ahci::raw_read(p, n, out),
             Disk::Emmc => crate::sdhci::raw_read(n, out),
+            Disk::Ide(k) => crate::ide::raw_read(k, n, out),
         }
     }
 
@@ -488,6 +498,10 @@ impl Disk {
         match self {
             Disk::Nvme => l[..4].copy_from_slice(b"nvme"),
             Disk::Emmc => l[..4].copy_from_slice(b"emmc"),
+            Disk::Ide(k) => {
+                l[..3].copy_from_slice(b"ide");
+                l[3] = b'0' + (k % 10) as u8;
+            }
             Disk::Sata(p) => {
                 l[..10].copy_from_slice(b"sata port ");
                 let p = p % 100;
@@ -520,6 +534,14 @@ pub(crate) fn disks() -> ([(Disk, u64, u64); BAK_DISKS], usize) {
     while let Some((p, cap, bs)) = crate::ahci::raw_disk(i) {
         if n < BAK_DISKS {
             d[n] = (Disk::Sata(p), cap, bs);
+            n += 1;
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while let Some((k, cap, bs)) = crate::ide::raw_disk(i) {
+        if n < BAK_DISKS {
+            d[n] = (Disk::Ide(k), cap, bs);
             n += 1;
         }
         i += 1;
@@ -771,9 +793,23 @@ impl Disk {
             Disk::Nvme => crate::nvme::table_write(n, buf),
             Disk::Sata(p) => crate::ahci::table_write(p, n, buf),
             Disk::Emmc => crate::sdhci::table_write(n, buf),
+            Disk::Ide(k) => crate::ide::table_write(k, n, buf),
+        }
+    }
+
+    /// `data` (whole 512-byte sectors, at most RUN) from sector `n` on: one command, read back and
+    /// one cache flush on an IDE-mode disk (installdisk, bootcopy); other disks one sector at a time
+    /// as `write`.
+    pub(crate) fn write_run(self, n: u64, data: &[u8]) -> bool {
+        match self {
+            Disk::Ide(k) => crate::ide::table_write_run(k, n, data),
+            _ => data.chunks_exact(512).enumerate().all(|(j, s)| self.write(n + j as u64, s.try_into().unwrap())),
         }
     }
 }
+
+/// Sectors gathered into one `write_run`.
+pub(crate) const RUN: usize = 16;
 
 /// The owner's code for this plan: tied to the primary header's CRC (which covers the whole
 /// entry array), the start and the size, so it only fits the table exactly as it was shown.
@@ -826,7 +862,7 @@ fn reheader(dk: Disk, lba: u64, per: u64, ecrc: u32) -> Option<[u8; 512]> {
 pub fn install(which: &str, want: u64, given: Option<&str>) {
     let (ds, nd) = disks();
     let Some((dk, cap, bs)) = pick(which, &ds[..nd]) else {
-        crate::kprintln!("installpart: no disk \"{}\" here -- say nvme, sataN or emmc (see lsparts); nothing written", which);
+        crate::kprintln!("installpart: no disk \"{}\" here -- say nvme, sataN, ideN or emmc (see lsparts); nothing written", which);
         return;
     };
     let lab = dk.label();
@@ -938,12 +974,15 @@ pub fn install(which: &str, want: u64, given: Option<&str>) {
     crate::kprintln!("installpart: the partition is empty (not formatted yet); the table as it was stays on the USB stick, so tablecheck now says CHANGED");
 }
 
-/// The disk the owner named ("nvme" or "sataN") among those found.
+/// The disk the owner named ("nvme", "sataN", "ideN" or "emmc") among those found.
 fn pick(which: &str, ds: &[(Disk, u64, u64)]) -> Option<(Disk, u64, u64)> {
     let w = match which {
         "nvme" => Some(Disk::Nvme),
         "emmc" => Some(Disk::Emmc),
-        _ => which.strip_prefix("sata").and_then(|n| n.parse::<u32>().ok()).map(Disk::Sata),
+        _ => match which.strip_prefix("ide") {
+            Some(n) => n.parse::<u32>().ok().filter(|&k| k < 10).map(Disk::Ide),
+            None => which.strip_prefix("sata").and_then(|n| n.parse::<u32>().ok()).map(Disk::Sata),
+        },
     }?;
     ds.iter().find(|x| x.0.label() == w.label()).copied()
 }
@@ -1088,6 +1127,7 @@ pub fn restore(which: &str, given: Option<&str>) {
         Disk::Nvme => crate::nvme::release_part(),
         Disk::Sata(p) => crate::ahci::release_part(p),
         Disk::Emmc => crate::sdhci::release_part(),
+        Disk::Ide(k) => crate::ide::release_part(k),
     };
     if released {
         crate::kprintln!("tablerestore: AfriSovera's partition is no longer in the table, so its files are no longer kept on {} (they stay in memory until the PC is switched off)", name);
@@ -1166,6 +1206,11 @@ pub fn ours_emmc() -> Option<(u64, u64)> {
     ours(Disk::Emmc, cap, bs)
 }
 
+/// For ide.rs at boot: AfriSovera's partition on IDE-mode drive `k`, if there is a healthy one.
+pub fn ours_ide(k: u32, cap512: u64) -> Option<(u64, u64)> {
+    ours(Disk::Ide(k), cap512, 512)
+}
+
 /// For ahci.rs at boot: AfriSovera's partition on the disk on SATA port `p`, if there is a healthy one.
 pub fn ours_sata(p: u32, cap512: u64, bs: u64) -> Option<(u64, u64)> {
     ours(Disk::Sata(p), cap512, bs)
@@ -1181,7 +1226,7 @@ pub fn format(which: &str, given: Option<&str>) {
         return;
     }
     let Some((dk, cap, bs)) = pick(which, &ds[..nd]) else {
-        crate::kprintln!("formatpart: no disk \"{}\" here -- say nvme, sataN or emmc (see lsparts); nothing written", which);
+        crate::kprintln!("formatpart: no disk \"{}\" here -- say nvme, sataN, ideN or emmc (see lsparts); nothing written", which);
         return;
     };
     let lab = dk.label();
@@ -1190,6 +1235,7 @@ pub fn format(which: &str, given: Option<&str>) {
     let nv = crate::nvme::present();
     let sa = crate::ahci::part();
     let em = crate::sdhci::internal();
+    let id = crate::ide::part();
     match dk {
         Disk::Nvme if nv => {
             let (a, l) = crate::nvme::part();
@@ -1218,7 +1264,16 @@ pub fn format(which: &str, given: Option<&str>) {
             }
             return;
         }
-        Disk::Sata(_) | Disk::Emmc if nv || sa.is_some() || em || crate::sdhci::present() || crate::virtio_core::blk_present() => {
+        Disk::Ide(k) if id.is_some_and(|x| x.0 == k) => {
+            let (_, a, l) = id.unwrap_or_default();
+            if l > 0 {
+                crate::kprintln!("formatpart: {} already keeps AfriSovera's files in its partition at sector {} ({} MiB) -- nothing written", name, a, l / 2048);
+            } else {
+                crate::kprintln!("formatpart: {} already holds AfriSovera's files on the whole disk (claimdisk) -- nothing written", name);
+            }
+            return;
+        }
+        Disk::Sata(_) | Disk::Emmc | Disk::Ide(_) if nv || sa.is_some() || id.is_some() || em || crate::sdhci::present() || crate::virtio_core::blk_present() => {
             // only one internal disk holds the files; formatting a second would be a disk nobody reads
             crate::kprintln!("formatpart: the shell's files are already kept on another internal disk -- nothing written");
             return;
@@ -1243,7 +1298,7 @@ pub fn format(which: &str, given: Option<&str>) {
     let cmd = match dk {
         Disk::Nvme => "nvme",
         Disk::Emmc => "emmc",
-        Disk::Sata(_) => which,
+        Disk::Sata(_) | Disk::Ide(_) => which,
     };
     match given {
         Some(c) if c.len() == 4 && u32::from_str_radix(c, 16).ok() == Some(want_code) => {}
@@ -1261,6 +1316,7 @@ pub fn format(which: &str, given: Option<&str>) {
         Disk::Nvme => crate::nvme::use_part(a, l),
         Disk::Sata(p) => crate::ahci::use_part(p, a, l),
         Disk::Emmc => crate::sdhci::use_part(a, l),
+        Disk::Ide(k) => crate::ide::use_part(k, a, l),
     };
     if !used || !crate::vfs::sync_to_disk() || !dk.read(a, &mut s) || &s[..8] != b"AFRIVFS1" {
         crate::kprintln!("formatpart: writing or reading back FAILED");
@@ -1302,33 +1358,63 @@ fn random_guid() -> [u8; 16] {
     u
 }
 
-/// Writes whole blocks of `bs` bytes as 512-byte sectors; counts what it wrote.
+/// Writes whole blocks of `bs` bytes as 512-byte sectors, in order; counts what it wrote.
+/// Sectors that follow each other are gathered (up to RUN) and sent with one `write_run` when the
+/// next one does not follow, the run is full, or at `done` (call it before reading `ok` or `n`).
 struct BlockWriter {
     dk: Disk,
     per: u64,
     ok: bool,
     n: u64,
+    at: u64,
+    k: usize,
 }
 
+/// BlockWriter's gathered run (shell context only, one writer at a time).
+static mut GATHER: [u8; RUN * 512] = [0; RUN * 512];
+
 impl BlockWriter {
+    fn new(dk: Disk, per: u64) -> BlockWriter {
+        BlockWriter { dk, per, ok: true, n: 0, at: 0, k: 0 }
+    }
+
     /// Block `blk` (absolute) = `data` (at most one block), zero filled.
     fn block(&mut self, blk: u64, data: &[u8]) {
-        if !self.ok {
-            return;
-        }
-        let mut s = [0u8; 512];
         for j in 0..self.per {
+            if !self.ok {
+                return;
+            }
+            let x = blk * self.per + j;
+            if self.k > 0 && (x != self.at + self.k as u64 || self.k == RUN) {
+                self.done();
+            }
+            if self.k == 0 {
+                self.at = x;
+            }
+            // SAFETY: shell context only; one BlockWriter at a time.
+            let s = unsafe { &mut (&mut *core::ptr::addr_of_mut!(GATHER))[self.k * 512..self.k * 512 + 512] };
             s.fill(0);
             let o = (j * 512) as usize;
             if o < data.len() {
                 let e = (o + 512).min(data.len());
                 s[..e - o].copy_from_slice(&data[o..e]);
             }
-            if !self.dk.write(blk * self.per + j, &s) {
-                self.ok = false;
-                return;
-            }
-            self.n += 1;
+            self.k += 1;
+        }
+    }
+
+    /// Send the gathered run.
+    fn done(&mut self) {
+        let k = core::mem::take(&mut self.k);
+        if k == 0 || !self.ok {
+            return;
+        }
+        // SAFETY: as in block.
+        let run = unsafe { &(&*core::ptr::addr_of!(GATHER))[..k * 512] };
+        if self.dk.write_run(self.at, run) {
+            self.n += k as u64;
+        } else {
+            self.ok = false;
         }
     }
 }
@@ -1470,6 +1556,7 @@ fn write_esp(w: &mut BlockWriter, start: u64, len: u64, bs: u64, file: &[u8]) ->
         let o = (k * bs) as usize;
         w.block(data0 + 3 + k, &file[o..(o + b).min(file.len())]);
     }
+    w.done();
     w.ok
 }
 
@@ -1481,7 +1568,7 @@ pub fn install_disk(which: &str, given: Option<&str>) {
         return;
     }
     let Some((dk, cap, bs)) = pick(which, &ds[..nd]) else {
-        crate::kprintln!("installdisk: no disk \"{}\" here -- say nvme, sataN or emmc (see lsparts); nothing written", which);
+        crate::kprintln!("installdisk: no disk \"{}\" here -- say nvme, sataN, ideN or emmc (see lsparts); nothing written", which);
         return;
     };
     let lab = dk.label();
@@ -1499,6 +1586,8 @@ pub fn install_disk(which: &str, given: Option<&str>) {
         Disk::Sata(_) => nv || sa.is_some() || crate::virtio_core::blk_present(),
         // an SD card or the eMMC itself holding the files: one disk is read for them
         Disk::Emmc => nv || sa.is_some() || crate::sdhci::present() || crate::virtio_core::blk_present(),
+        // an IDE-mode disk comes after SATA in disk.rs, before a USB stick or an SD card
+        Disk::Ide(_) => nv || sa.is_some() || crate::ide::present() || crate::virtio_core::blk_present(),
     };
     if busy {
         crate::kprintln!("installdisk: the shell's files are kept on an internal disk now -- installdisk is for a disk AfriSovera does not use yet; nothing written");
@@ -1542,7 +1631,7 @@ pub fn install_disk(which: &str, given: Option<&str>) {
         }
     }
     crate::kprintln!("installdisk: {}: writing the EFI system partition ({} MiB) ...", name, ESP_MIB);
-    let mut w = BlockWriter { dk, per, ok: true, n: 0 };
+    let mut w = BlockWriter::new(dk, per);
     // the old tables first, so a disk cut off half way is plainly blank, never half-old
     w.block(0, &[]);
     w.block(1, &[]);
@@ -1608,6 +1697,7 @@ pub fn install_disk(which: &str, given: Option<&str>) {
     m[510] = 0x55;
     m[511] = 0xAA;
     w.block(0, &m);
+    w.done();
     if !w.ok {
         crate::kprintln!("installdisk: writing the partition table FAILED after {} sectors", w.n);
         return;
@@ -1661,6 +1751,7 @@ pub fn install_disk(which: &str, given: Option<&str>) {
         Disk::Nvme => crate::nvme::use_part(a, l),
         Disk::Sata(p) => crate::ahci::use_part(p, a, l),
         Disk::Emmc => crate::sdhci::use_part(a, l),
+        Disk::Ide(k) => crate::ide::use_part(k, a, l),
     };
     let mut s = [0u8; 512];
     if !used || !crate::vfs::sync_to_disk() || !dk.read(a, &mut s) || &s[..8] != b"AFRIVFS1" {

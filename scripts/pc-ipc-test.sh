@@ -15,7 +15,11 @@
 #   SCHEDULER -- two workers that never yield, each waiting to be preempted 3 times:
 #   5. both print a slice count >= 3 and exit; the kernel counts >= 2 timer switches
 #      between them (ok) -- only preemption can let both finish.
-#   6. no fault, no deadlock, no EXCEPTION/PANIC/[FAIL]; MANSA-PC BOOT OK.
+#   ENDPOINTS (review R1-10, 8 Nov 2026) -- P0 waits on endpoint 1, P1 on endpoint 2; P2 sends 0xb2
+#   on endpoint 2, P3 0xa1 on endpoint 1; P4 holds a capability past the last endpoint:
+#   6. P0 prints 0xa1 and P1 prints 0xb2 (a SEND that woke any receiver gives them crossed);
+#      P4's RECV is refused; the kernel's summary: 5 exited, 1 refused, 0 faults (ok).
+#   7. no fault, no deadlock, no EXCEPTION/PANIC/[FAIL]; MANSA-PC BOOT OK.
 # Every line is read at column 0 after stripping CR and escape codes (the rxsplit lesson).
 # A grader selftest runs first on canned logs, both directions (the 2.767 pattern).
 # Usage: scripts/pc-ipc-test.sh            selftest, then build + boot
@@ -70,6 +74,22 @@ grade() {
     done < <(printf '%s\n' "$L" | sed -n '/^\[pc\] IPC: /,/^\[pc\] scheduler: /p' | grep -aoE '^\[P[0-9]\] 0x[0-9a-f]+$' | awk '{print $2}')
     [ "$n" -ge 2 ] || _f "only $n worker(s) reported being preempted 3 or more times"
 
+    # the endpoint check runs after the scheduler: its lines are read from its own stretch
+    local E
+    E="$(printf '%s
+' "$L" | sed -n '/^\[pc\] scheduler: /,/^\[pc\] IPC endpoints: /p')"
+    printf '%s
+' "$E" | grep -aqE '^\[P0\] 0xa1$' ||
+        _f "P0 (waiting on endpoint 1) did not get 0xa1 -- endpoints are not separate"
+    printf '%s
+' "$E" | grep -aqE '^\[P1\] 0xb2$' ||
+        _f "P1 (waiting on endpoint 2) did not get 0xb2 -- endpoints are not separate"
+    printf '%s
+' "$E" | grep -aqE '^\[P4\] RECV on handle 0 refused: no RECV capability$' ||
+        _f "P4's capability past the last endpoint was not refused"
+    has '^\[pc\] IPC endpoints: [0-9]+ endpoints, 2 messages on 2 of them, 5 exited, 1 refused \(a capability past the last endpoint\), 0 faults \(ok\)$' ||
+        _f "the kernel's endpoint summary is not '5 exited, 1 refused, 0 faults (ok)'"
+
     if has '^\[P[0-9]\] fault:'; then _f "a process faulted: $(printf '%s\n' "$L" | grep -aE '^\[P[0-9]\] fault:' | head -1)"; fi
     if has '^\[proc\] .*deadlock'; then _f "processes deadlocked"; fi
     if has '^ *\[FAIL\]'; then
@@ -99,6 +119,16 @@ GREEN="[pc] ring 3: program 3 ran a privileged instruction (cli) -> general prot
 [P1] 0x3
 [P1] exit 0
 [pc] scheduler: 2 workers time-sliced by the APIC timer, 6 switches between them, 2 exited (ok)
+[P2] exit 0
+[P3] exit 0
+[P4] RECV on handle 0 refused: no RECV capability
+[P4] 0xffffffffffffffff
+[P4] exit 0
+[P0] 0xa1
+[P0] exit 0
+[P1] 0xb2
+[P1] exit 0
+[pc] IPC endpoints: 4 endpoints, 2 messages on 2 of them, 5 exited, 1 refused (a capability past the last endpoint), 0 faults (ok)
 [pc] MANSA-PC BOOT OK
 [pc] powering off (requested by the test rig through fw_cfg)"
 
@@ -133,10 +163,16 @@ selftest() {
     arm process-fault red < <(printf '%s\n' "$GREEN" | sed 's/^\[P0\] exit 0$/[P0] fault: vector 14 at RIP 0x10000000004 (address 0x0) -- process stopped/')
     arm deadlock red < <(printf '%s\n' "$GREEN" | sed 's/^\[pc\] MANSA-PC BOOT OK$/[proc] 1 process(es) blocked forever on IPC -- deadlock, stopping them\n[pc] MANSA-PC BOOT OK/')
     arm verdict-in-prose red < <(printf '%s\n' "$GREEN" | sed 's/^\[P0\] 0x42$/  [P0] 0x42/')
+    arm endpoints-crossed red < <(printf '%s
+' "$GREEN" | sed 's/^\[P0\] 0xa1$/[P0] 0xb2/; s/^\[P1\] 0xb2$/[P1] 0xa1/')
+    arm past-last-endpoint-allowed red < <(printf '%s
+' "$GREEN" | grep -v '^\[P4\] RECV on handle 0 refused')
+    arm endpoint-summary-wrong red < <(printf '%s
+' "$GREEN" | sed 's/5 exited, 1 refused (a capability/4 exited, 1 refused (a capability/')
     arm empty-log red < /dev/null
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 16 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 19 ]
 }
 
 # ------------------------------------------------------------------- driver --

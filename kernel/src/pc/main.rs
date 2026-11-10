@@ -87,6 +87,9 @@ mod store;
 #[allow(dead_code)]
 #[path = "../tonga.rs"]
 mod tonga;
+
+#[path = "../desk.rs"]
+mod desk;
 #[allow(dead_code)]
 #[path = "../uart_ns16550.rs"]
 mod uart_ns16550;
@@ -133,7 +136,9 @@ mod virtio_core;
 // `crate::virtio` = virtio_core, its disk calls widened to the PC's SATA disks (disk.rs)
 #[path = "disk.rs"]
 mod virtio;
+mod pci;
 mod ahci;
+mod ide;
 mod nvme;
 mod e1000;
 mod rtl8169;
@@ -141,6 +146,8 @@ mod nic;
 mod xhci;
 mod ps2;
 mod screen;
+mod conback;
+mod helpview;
 mod font_lower;
 mod acpi;
 mod gpt;
@@ -150,6 +157,7 @@ mod fwinfo;
 mod wifi;
 mod hda;
 mod sdhci;
+mod report;
 
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
@@ -157,6 +165,15 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// UEFI's runtime-services table, kept from boot: `psci::poweroff`/`reboot` reset through it.
 static RUNTIME_SERVICES: AtomicUsize = AtomicUsize::new(0);
+/// The RAM the firmware's memory map reported as usable, in MiB (field item F11): the
+/// machine's real memory, not the kernel's fixed frame pool. Shown by the desktop and `mem`.
+static RAM_MIB: AtomicUsize = AtomicUsize::new(0);
+
+/// The machine's RAM in MiB (the `crate::ram_mib` the shared desktop and `mem` print). On a
+/// PC this is what the firmware reported; 0 until the memory map has been read.
+pub fn ram_mib() -> u64 {
+    RAM_MIB.load(Ordering::Relaxed) as u64
+}
 
 pub fn runtime_services() -> *const uefi::RuntimeServices {
     RUNTIME_SERVICES.load(Ordering::Relaxed) as *const uefi::RuntimeServices
@@ -244,6 +261,92 @@ impl Screen {
     }
 }
 
+// ---- The boot trail (8 Nov 2026) ------------------------------------------------------
+// The owner's first real-PC try (an HP ENVY laptop, i5-6200U) showed a blank screen and
+// nothing else: a laptop has no COM1, and the screen showed nothing until the shell. So
+// every boot line is also drawn straight onto the firmware's framebuffer from the first
+// moment, below the title, until the shell takes the screen: if a real machine stops
+// part-way, a photo of the screen says where.
+static mut EARLY: Option<Screen> = None;
+static mut EARLY_ROW: usize = 0;
+static mut EARLY_COL: usize = 0;
+static EARLY_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+const EARLY_TOP: usize = 160;
+const EARLY_BG: u32 = 0x10_2018;
+
+fn early_scale(s: &Screen) -> usize {
+    if s.w >= 1600 { 2 } else { 1 }
+}
+
+/// Called from every print (uart.rs Tee) while the boot trail is on.
+pub fn early_write(text: &str) {
+    if EARLY_BUSY.swap(true, Ordering::Acquire) {
+        return; // a fault inside the trail itself: never recurse
+    }
+    // SAFETY: boot runs on one core; prints hold PRINT_LOCK; EARLY is only changed by boot.
+    unsafe {
+        if let Some(s) = (*core::ptr::addr_of!(EARLY)).as_ref() {
+            let sc = early_scale(s);
+            let (cw, ch) = (8 * sc, 10 * sc);
+            let cols = (s.w.saturating_sub(48)) / cw;
+            let rows = (s.h.saturating_sub(EARLY_TOP + 8)) / ch;
+            for b in text.bytes() {
+                if b == b'\n' || EARLY_COL >= cols {
+                    EARLY_COL = 0;
+                    EARLY_ROW += 1;
+                    if EARLY_ROW >= rows {
+                        // full: start again at the top (the newest lines are the ones that matter)
+                        EARLY_ROW = 0;
+                    }
+                    let y = EARLY_TOP + EARLY_ROW * ch;
+                    s.fill(0, y, s.w, ch * 2, EARLY_BG);
+                    if b == b'\n' {
+                        continue;
+                    }
+                }
+                if b == b'\r' {
+                    continue;
+                }
+                let c = if (0x20..0x7F).contains(&b) { b } else { b'?' };
+                let mut one = [0u8; 4];
+                let st = (c as char).encode_utf8(&mut one);
+                s.text(24 + EARLY_COL * cw, EARLY_TOP + EARLY_ROW * ch, st, 0xD0_D8D0, sc);
+                EARLY_COL += 1;
+            }
+        }
+    }
+    EARLY_BUSY.store(false, Ordering::Release);
+}
+
+/// Begin the boot trail on this screen.
+fn early_on(s: &Screen) {
+    // SAFETY: boot, single core, before anything prints through it.
+    unsafe {
+        EARLY = Some(Screen { base: s.base, w: s.w, h: s.h, stride: s.stride, bgr: s.bgr });
+        EARLY_ROW = 0;
+        EARLY_COL = 0;
+    }
+}
+
+/// Carry the boot trail on where it was (after the kernel's own page tables are in).
+fn early_resume(s: &Screen) {
+    // SAFETY: boot, single core.
+    unsafe { EARLY = Some(Screen { base: s.base, w: s.w, h: s.h, stride: s.stride, bgr: s.bgr }) };
+}
+
+/// End the boot trail (the shell takes the screen); `clear` wipes what it drew.
+fn early_off(clear: bool) {
+    while EARLY_BUSY.swap(true, Ordering::Acquire) {
+        core::hint::spin_loop(); // a print (another core's) is drawing: let it finish
+    }
+    // SAFETY: EARLY_BUSY is held, so no print is drawing through EARLY.
+    let s = unsafe { (*core::ptr::addr_of_mut!(EARLY)).take() };
+    if let (true, Some(s)) = (clear, s) {
+        s.fill(0, EARLY_TOP, s.w, s.h - EARLY_TOP.min(s.h), EARLY_BG);
+    }
+    EARLY_BUSY.store(false, Ordering::Release);
+}
+
 fn screen(u: &uefi::Uefi) -> Option<Screen> {
     let gop = u.graphics()?;
     // SAFETY: the firmware's GOP mode and mode-info structures.
@@ -264,9 +367,22 @@ fn screen(u: &uefi::Uefi) -> Option<Screen> {
 #[no_mangle]
 extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> uefi::Status {
     uart::init();
+    let u = uefi::Uefi { image, st };
+    // The screen FIRST, before anything that could stop on a real machine: the title, then
+    // every boot line below it (the boot trail), so a photo of a stuck PC says where.
+    let scr = screen(&u);
+    if let Some(s) = &scr {
+        s.fill(0, 0, s.w, s.h, 0x10_2018);
+        s.fill(0, 0, s.w, 6, 0xE0_A030);
+        s.text(24, 32, "AfriSovera OS", 0xFF_FFFF, 3);
+        s.text(24, 70, "Mansa kernel on a PC (x86-64)", 0xE0_A030, 2);
+        early_on(s);
+    }
     kprintln!();
     kprintln!("[pc] Mansa x86-64 (PC) -- started by UEFI firmware");
-    let u = uefi::Uefi { image, st };
+    if !uart::present() {
+        kprintln!("[pc] no COM1 serial port (a laptop): the screen is the console");
+    }
     // SAFETY: the system table the firmware passed in; the vendor is a NUL-ended UTF-16 string.
     unsafe {
         let mut p = (*st).firmware_vendor;
@@ -287,7 +403,6 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     // ACPI: the cores and I/O APICs of the machine (read while firmware tables are certain)
     // SAFETY: the system table is valid until exit_boot_services.
     unsafe { acpi::init((*st).n_config, (*st).config_table as u64) };
-    let scr = screen(&u);
     // the boot file itself, for installdisk (it cannot be read once the firmware is gone)
     u.keep_own_image();
     // the firmware's boot entries, for bootentries (read only; the firmware is not asked again)
@@ -301,10 +416,6 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
                 "[pc] GOP framebuffer {}x{} (stride {}) at {:#x}, {}",
                 s.w, s.h, s.stride, s.base as usize, if s.bgr { "BGR" } else { "RGB" }
             );
-            s.fill(0, 0, s.w, s.h, 0x10_2018);
-            s.fill(0, 0, s.w, 6, 0xE0_A030);
-            s.text(24, 32, "AfriSovera OS", 0xFF_FFFF, 3);
-            s.text(24, 70, "Mansa kernel on a PC (x86-64)", 0xE0_A030, 2);
         }
         None => kprintln!("[pc] GOP: no drawable framebuffer -- serial console only"),
     }
@@ -330,16 +441,19 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
             // firmware has exited) as the fallback -- real firmware often marks low memory so.
             // Below the 640 KiB video hole, never page 0, never the page we are standing on.
             // (QEMU reports all of low memory as one block from address 0: it counts.)
+            // The page below it is taken too: core 1 starts on a copy of the kernel's top-level
+            // page table there (smp.rs), since its start-up code loads CR3 in 32-bit mode.
             if matches!(d.ty, 3 | 4 | 7) && d.phys_start < 0xA_0000 {
                 let end = (d.phys_start + d.pages * 4096).min(0xA_0000);
                 let mut page = end - 4096;
                 let sp: u64;
                 // SAFETY: reads the stack pointer.
                 unsafe { core::arch::asm!("mov {}, rsp", out(reg) sp) };
-                if page == sp & !0xFFF && page > d.phys_start {
+                let sp = sp & !0xFFF;
+                while page >= d.phys_start + 4096 && (page == sp || page - 4096 == sp) {
                     page -= 4096;
                 }
-                if page != sp & !0xFFF && page >= d.phys_start && page >= 0x1000 {
+                if page >= d.phys_start + 4096 && page >= 0x2000 && page != sp && page - 4096 != sp {
                     let slot = if d.ty == 7 { &smp::LOW_PAGE } else { &smp::LOW_PAGE_BS };
                     slot.fetch_max(page, core::sync::atomic::Ordering::Relaxed);
                 }
@@ -354,6 +468,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
         "[pc] UEFI memory map: {} entries, {} MiB usable after exit, largest free region {} MiB at {:#x}",
         n, usable >> 20, big >> 20, big_at
     );
+    RAM_MIB.store((usable >> 20) as usize, Ordering::Relaxed);
 
     let mut st_exit = u.exit_boot_services(map.key);
     if st_exit != uefi::SUCCESS {
@@ -410,6 +525,10 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
         .max()
         .unwrap_or(0);
     let fw_cr3 = mmu::cr3();
+    // the boot trail draws through the kernel's own tables from here: a framebuffer above
+    // the memory they map 1:1 is mapped first, or the trail stops (never a fault)
+    let early_fb = scr.as_ref().map(|s| (s.base as u64, (s.stride * s.h * 4) as u64));
+    early_off(false);
     match mmu::init(top) {
         Some((bytes, tables)) => kprintln!(
             "[pc] own page tables: CR3 {:#x} (firmware's was {:#x}), {} GiB mapped 1:1 with 2 MiB pages in {} table frames",
@@ -419,6 +538,16 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
             kprintln!("[pc] own page tables: could not be built (frame pool exhausted or RAM too high) -- halted");
             cpu::halt_forever();
         }
+    }
+    if let (Some((b, len)), Some(s)) = (early_fb, &scr) {
+        if mmu::map_mmio(b, len) {
+            early_resume(s);
+        }
+    }
+    if mmu::nx() {
+        kprintln!("[pc] no-execute: on (EFER.NXE): ring-3 stack and data pages cannot be run as code");
+    } else {
+        kprintln!("[pc] no-execute: this CPU does not offer it (CPUID 8000_0001h EDX bit 20), ring-3 pages stay executable");
     }
     // Proof the tables are the kernel's: touch pages nobody mapped. Each touch faults, the
     // #PF handler maps a fresh frame, the write runs again; then read every page back both
@@ -567,7 +696,38 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
         }
     };
 
-    if a && b && c && alias_ok && ring3_ok && ipc_ok && sched_ok {
+    // Endpoints are separate (review R1-10): P0 waits on endpoint 1, P1 on endpoint 2; P2
+    // sends 0xB2 on endpoint 2 and P3 0xA1 on endpoint 1, so a SEND that woke any waiting
+    // receiver would hand P0 the wrong value. P4's only capability names an endpoint past
+    // the last one: it is left empty, so its RECV is refused. Graded by pc-ipc from the
+    // values each prints: P0 0xa1, P1 0xb2.
+    let ep_ok = {
+        let spawned = [
+            proc::spawn(proc::code(proc::Prog::EpRecv), &[(1, proc::RIGHT_RECV)], false),
+            proc::spawn(proc::code(proc::Prog::EpRecv), &[(2, proc::RIGHT_RECV)], false),
+            proc::spawn(proc::code(proc::Prog::EpSendB), &[(2, proc::RIGHT_SEND)], false),
+            proc::spawn(proc::code(proc::Prog::EpSendA), &[(1, proc::RIGHT_SEND)], false),
+            proc::spawn(proc::code(proc::Prog::EpRecv), &[(proc::N_EP + 5, proc::RIGHT_RECV)], false),
+        ];
+        if spawned.iter().all(|p| p.is_some()) {
+            let (r0, f0) = (proc::REFUSALS.load(Ordering::Relaxed), proc::FAULTS.load(Ordering::Relaxed));
+            let exited = proc::run_all();
+            let refused = proc::REFUSALS.load(Ordering::Relaxed) - r0;
+            let faults = proc::FAULTS.load(Ordering::Relaxed) - f0;
+            let ok = exited == 5 && refused == 1 && faults == 0;
+            kprintln!(
+                "[pc] IPC endpoints: {} endpoints, 2 messages on 2 of them, {} exited, {} refused (a capability past the last endpoint), {} faults ({})",
+                proc::N_EP, exited, refused, faults, if ok { "ok" } else { "WRONG" }
+            );
+            ok
+        } else {
+            let _ = proc::run_all(); // frees whatever was spawned
+            kprintln!("[pc] IPC endpoints: could not create the processes");
+            false
+        }
+    };
+
+    if a && b && c && alias_ok && ring3_ok && ipc_ok && sched_ok && ep_ok {
         kprintln!("[pc] MANSA-PC BOOT OK");
         if let Some(s) = &scr {
             s.text(24, 110, "Boot OK: firmware exited, interrupts and timer live,", 0xC0_FFC0, 2);
@@ -607,6 +767,8 @@ fn start_shell() -> ! {
     virtio::init();
     nvme::init();
     ahci::init();
+    // a SATA disk whose firmware is set to IDE (compatibility) mode, or an old IDE disk
+    ide::init();
     // an SD card in the PC's card reader (SDHCI)
     sdhci::init();
     ps2::init();
@@ -620,6 +782,9 @@ fn start_shell() -> ! {
     }
     if ahci::present() {
         asili::register("ahci-sata", asili::Class::Storage, 0, true);
+    }
+    if ide::present() {
+        asili::register("ide-disk", asili::Class::Storage, 0, true);
     }
     if e1000::present() {
         asili::register("intel-e1000", asili::Class::Net, 0, e1000::link_up());
@@ -710,8 +875,17 @@ fn start_shell() -> ! {
     // The local APIC timer keeps running under the shell: it is what wakes the console's
     // idle `hlt` (cpu::wfi) to poll COM1 again.
     cpu::lapic_init(0x2_0000);
+    // the shell takes the screen: drop the boot trail, paint a clean dark frame over the
+    // whole screen (the title and the boot ground that framed the centred window, F9), then
+    // draw the console on top of it
+    early_off(false);
+    screen::clear(0x0A_0E14);
+    screen::mark();
+    screen::present();
     // typed input arrives by COM1's interrupt, as on the ARM kernel (PL011 RX IRQ)
     uart::enable_rx_irq();
+    // the touchpad's bytes by IRQ 12 too: a real i8042 holds one byte at a time (F6)
+    ps2::enable_aux_irq();
     cpu::sti();
     shell::run();
 }

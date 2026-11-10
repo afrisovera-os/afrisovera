@@ -5,8 +5,11 @@
 //! x86 way: the boot core sends it INIT and two STARTUP inter-processor interrupts through
 //! the local APIC, and the woken core starts in 16-bit real mode at a page below 1 MiB.
 //! `ap_tramp` (below) is copied to such a page; it switches to protected mode, turns on PAE
-//! and long mode with the KERNEL'S OWN page tables (CR3 = `mmu::root()`), and jumps to
-//! `ap_main` on a stack of its own. From there the demo is the ARM one, step for step:
+//! and long mode on a copy of the kernel's top-level page table in the page below it (CR3 is
+//! loaded in 32-bit mode, so it must be below 4 GiB, and the kernel's own table may not be:
+//! on the HP ENVY the image, and so the frame pool, was loaded above 4 GiB -- field item F3),
+//! and jumps to `ap_main` on a stack of its own, which moves to the kernel's own table
+//! (CR3 = `mmu::root()`). From there the demo is the ARM one, step for step:
 //!   1. core 1 checks in ("[core 1] online", "SMP: 2 cores online");
 //!   2. core 0 queues 20 jobs, core 1 drains them in parallel (checksum 3080);
 //!   3. core 1 starts its own scheduler: two kernel threads switched by ITS local-APIC timer;
@@ -24,6 +27,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 pub const IPI_VECTOR: u64 = 0x40;
 
 /// A free 4 KiB page below 1 MiB for the start-up code (from the UEFI memory map), or 0.
+/// The page below it is free too: core 1's first top-level page table goes there.
 pub static LOW_PAGE: AtomicU64 = AtomicU64::new(0);
 /// The same from boot-services memory (free after exit), used only when LOW_PAGE found none.
 pub static LOW_PAGE_BS: AtomicU64 = AtomicU64::new(0);
@@ -179,15 +183,13 @@ pub fn bring_up() {
         put32(off(&ap_gdtptr) + 2, page + off(&ap_gdt));
         put32(off(&ap_far32), page + off(&ap_pm32));
         put32(off(&ap_far64), page + off(&ap_lm64));
-        put32(off(&ap_cr3), crate::mmu::root());
+        // the copy's entries are 64-bit: the tables they lead to may be anywhere
+        let low = page - 0x1000;
+        core::ptr::copy_nonoverlapping(crate::mmu::root() as *const u8, low as *mut u8, 4096);
+        put32(off(&ap_cr3), low);
         let top = core::ptr::addr_of!(AP_STACK) as u64 + core::mem::size_of::<Stack>() as u64;
         put64(off(&ap_stack), top - 8); // as if `call` had pushed a return address
         put64(off(&ap_entry), ap_main as usize as u64);
-    }
-    // the start-up code loads CR3 in 32-bit mode: the kernel's PML4 must be below 4 GiB
-    if crate::mmu::root() >> 32 != 0 {
-        crate::kprintln!("[pc] SMP: the kernel's page tables are above 4 GiB ({:#x}); running single-core", crate::mmu::root());
-        return;
     }
     let Some(dest) = crate::acpi::other_core(cpu::lapic_id()) else {
         crate::kprintln!("[pc] SMP: the ACPI MADT lists one core; running single-core");
@@ -265,6 +267,13 @@ pub fn bring_up() {
 /// Core 1 starts here, in 64-bit mode on its own stack, interrupts off.
 extern "sysv64" fn ap_main() -> ! {
     cpu::load_gdt_ap();
+    if crate::mmu::nx() {
+        crate::mmu::nx_here(); // the kernel's tables hold NX bits: reserved on this core until NXE
+    }
+    // from the start-up copy to the kernel's own top-level table (same entries, but later
+    // changes to the kernel's table are seen here too)
+    // SAFETY: both tables map the kernel 1:1 the same way, so execution continues unchanged.
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) crate::mmu::root(), options(nostack)) };
     cpu::lapic_enable_here();
     AP_ID.store(cpu::lapic_id(), Ordering::Relaxed);
     UP.store(true, Ordering::Release);

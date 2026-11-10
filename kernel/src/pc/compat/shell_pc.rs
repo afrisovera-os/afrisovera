@@ -103,6 +103,49 @@ fn cpuinfo() {
     crate::kprintln!();
 }
 
+/// `rtcinfo`, continued: how the CMOS clock is decoded, and the firmware's own clock
+/// (UEFI GetTime) beside it, so a clock that looks wrong on a real PC can be traced to the
+/// chip's mode, the time zone the firmware keeps, or this kernel's read.
+fn rtc_compare() {
+    let sb = crate::cmos::status_b();
+    let Some(c) = crate::cmos::civil() else { return };
+    crate::kprintln!(
+        "rtcinfo: mode {}, {}-hour; raw hour 0x{:02x} minute 0x{:02x} second 0x{:02x}, century 0x{:02x}",
+        if sb & 0x04 == 0 { "BCD" } else { "binary" },
+        if sb & 0x02 == 0 { 12 } else { 24 },
+        c.raw[0], c.raw[1], c.raw[2], c.raw[3]
+    );
+    crate::kprintln!(
+        "rtcinfo: CMOS {:04}-{:02}-{:02} {:02}:{:02}:{:02} (this kernel takes it as UTC)",
+        c.year, c.month, c.day, c.hour, c.minute, c.second
+    );
+    let cmos = crate::cmos::civil_epoch(c.year, c.month, c.day, c.hour, c.minute, c.second) as i64;
+    match crate::uefi::get_time() {
+        Ok(t) => {
+            crate::kprint!(
+                "rtcinfo: firmware {:04}-{:02}-{:02} {:02}:{:02}:{:02}, zone ",
+                t.year, t.month, t.day, t.hour, t.minute, t.second
+            );
+            if t.time_zone == 2047 {
+                crate::kprint!("unspecified (local time)");
+            } else {
+                crate::kprint!("{} min", t.time_zone);
+            }
+            crate::kprintln!(
+                ", daylight 0x{:02x} (saving {})",
+                t.daylight,
+                if t.daylight & 2 != 0 { "in effect" } else { "not in effect" }
+            );
+            let fw = crate::cmos::civil_epoch(
+                t.year as i64, t.month as i64, t.day as i64,
+                t.hour as u64, t.minute as u64, t.second as u64,
+            ) as i64;
+            crate::kprintln!("rtcinfo: CMOS minus firmware: {} s", cmos - fw);
+        }
+        Err(st) => crate::kprintln!("rtcinfo: firmware clock not readable (status 0x{:x})", st),
+    }
+}
+
 fn date() {
     let secs = crate::cmos::epoch();
     // Civil UTC from epoch seconds: the same days->civil algorithm as shell.rs's
@@ -140,6 +183,7 @@ pub fn intercept(line: &str) -> bool {
     match cmd {
         "date" => date(),
         "lsahci" => crate::ahci::list(),
+        "lside" => crate::ide::list(),
         "lsnvme" => crate::nvme::list(),
         "lsparts" => crate::gpt::list(0),
         // the firmware's boot entries as read at power-on (nothing is changed)
@@ -235,26 +279,43 @@ pub fn intercept(line: &str) -> bool {
                 _ => crate::kprintln!("formatpart: say the disk, e.g. formatpart nvme (it shows the partition and the code; nothing is written without the code)"),
             }
         }
+        // this PC's details sent ONCE to the owner's main PC (tools/report-receiver.py); one-way
+        "report" => crate::report::command(_rest),
         "lse1000" => crate::e1000::list(),
         "lsrtl" => crate::rtl8169::list(),
         "lsusb" => crate::xhci::list(),
         "lsps2" => crate::ps2::list(),
+        "accel" => crate::ps2::accel_cmd(_rest),
+        "usbaddr" => crate::xhci::addr_cmd(_rest),
+        // F7 (HP ENVY field report): `help <word>` / `help <page>` show part of the shared list,
+        // plain `help` ends with how to; the shared `help` prints it (helpview.rs filters)
+        "help" => {
+            crate::helpview::start(_rest);
+            return false;
+        }
+        "history" => crate::uart::history_list(),
+        "scrollback" => crate::conback::info(),
         "lshda" => crate::hda::list(),
+        // the PC's own microphone (HD Audio input): record up to 3 s, then play it back
+        "mic" => crate::hda::mic_cmd(_rest),
         "lssd" => crate::sdhci::list(),
         // sound through the PC's own HD Audio chip when there is no virtio-sound device
         // ... or through a USB headset or speaker, preferred when one is plugged in
         "audio" if !crate::virtio_core::sound_present() && crate::xhci::audio_present() => crate::xhci::audio_cmd(_rest),
         "audio" if !crate::virtio_core::sound_present() && crate::hda::present() => crate::hda::audio(_rest),
         "screeninfo" => crate::screen::info(),
+        // F9b (HP ENVY field report): how the 640x480 console fills a bigger screen
+        "screen" => crate::screen::command(_rest),
         "acpiinfo" => crate::acpi::info(),
         "claimdisk" => {
             // a blank internal disk is only ever used when the owner says so
             let ok = match _rest {
                 "nvme" => crate::nvme::claim(),
                 "sata" => crate::ahci::claim(),
+                "ide" => crate::ide::claim(),
                 "sd" | "emmc" => crate::sdhci::claim(),
                 _ => {
-                    crate::kprintln!("claimdisk: say which -- claimdisk nvme, claimdisk sata, claimdisk sd or claimdisk emmc (only a BLANK disk can be claimed)");
+                    crate::kprintln!("claimdisk: say which -- claimdisk nvme, claimdisk sata, claimdisk ide, claimdisk sd or claimdisk emmc (only a BLANK disk can be claimed)");
                     return true;
                 }
             };
@@ -280,6 +341,22 @@ pub fn intercept(line: &str) -> bool {
             crate::screen::set_desktop(true); // its dock answers mouse clicks
             return false; // the shared `gui` draws it
         }
+        // F8 (HP ENVY field report): `desk` alone opens the desktop, as `gui` does; its state
+        // moved to `desk status`. PC only, so the shared shell.rs (and the ARM image) is unchanged.
+        "desk" if _rest.is_empty() => {
+            crate::screen::set_desktop(true); // its dock answers mouse clicks
+            crate::framebuffer::set_console(false);
+            crate::desk::show();
+            crate::kprintln!("[desk] desktop opened; type 'desk status' for its state, 'clear' to return to console");
+        }
+        "desk" if _rest == "status" => crate::desk::command("list"),
+        "desk" => {
+            // `desk open files` etc. also bring the desktop up (shared code); let its dock take clicks too
+            if !crate::desk::shown() && _rest != "list" {
+                crate::screen::set_desktop(true);
+            }
+            return false;
+        }
         "clear" => {
             crate::screen::set_wm_view(false);
             crate::screen::set_desktop(false);
@@ -290,6 +367,7 @@ pub fn intercept(line: &str) -> bool {
             crate::kprintln!("rtcinfo: CMOS RTC (MC146818) @ I/O port 0x70");
             crate::kprintln!("rtcinfo: present {}  status-B 0x{:02x}", crate::cmos::present(), crate::cmos::status_b());
             crate::kprintln!("rtcinfo: epoch seconds = {}", crate::cmos::epoch());
+            rtc_compare();
         }
         "uartinfo" | "uartflags" => {
             // SAFETY: reads of COM1's line-status / interrupt-id / line-control registers.

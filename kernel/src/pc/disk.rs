@@ -1,6 +1,6 @@
 //! `crate::virtio` on the PC: the shared ARM virtio driver (virtio_core, unchanged), with
 //! its five block-device calls widened to the PC's own disks: NVMe (nvme.rs), then SATA
-//! (ahci.rs), then a USB stick or disk (xhci.rs), then an SD card (sdhci.rs) -- a built-in eMMC (sdhci.rs) holding our files comes before a USB stick, as an internal disk. The first usable one, in that order after a virtio disk, holds the VFS.
+//! (ahci.rs), then a SATA disk in IDE mode (ide.rs), then a USB stick or disk (xhci.rs), then an SD card (sdhci.rs) -- a built-in eMMC (sdhci.rs) holding our files comes before a USB stick, as an internal disk. The first usable one, in that order after a virtio disk, holds the VFS.
 //!
 //! The shared VFS and shell reach the disk only through `crate::virtio::{blk_present,
 //! read_sector, write_sector, blk_capacity, blk_selftest}`. Defining those five here
@@ -10,7 +10,7 @@
 pub use crate::virtio_core::*;
 
 pub fn blk_present() -> bool {
-    crate::virtio_core::blk_present() || crate::nvme::present() || crate::ahci::present() || crate::xhci::msc_present() || crate::sdhci::present()
+    crate::virtio_core::blk_present() || crate::nvme::present() || crate::ahci::present() || crate::ide::present() || crate::xhci::msc_present() || crate::sdhci::present()
 }
 
 pub fn blk_capacity() -> u64 {
@@ -20,6 +20,8 @@ pub fn blk_capacity() -> u64 {
         crate::nvme::capacity()
     } else if crate::ahci::present() {
         crate::ahci::capacity()
+    } else if crate::ide::present() {
+        crate::ide::capacity()
     } else if crate::sdhci::internal() {
         crate::sdhci::capacity()
     } else if crate::xhci::msc_present() {
@@ -36,6 +38,8 @@ pub fn read_sector(n: u64, out: &mut [u8; 512]) -> bool {
         crate::nvme::read_sector(n, out)
     } else if crate::ahci::present() {
         crate::ahci::read_sector(n, out)
+    } else if crate::ide::present() {
+        crate::ide::read_sector(n, out)
     } else if crate::sdhci::internal() {
         crate::sdhci::read_sector(n, out)
     } else if crate::xhci::msc_present() {
@@ -52,6 +56,8 @@ pub fn write_sector(n: u64, data: &[u8; 512]) -> bool {
         crate::nvme::write_sector(n, data)
     } else if crate::ahci::present() {
         crate::ahci::write_sector(n, data)
+    } else if crate::ide::present() {
+        crate::ide::write_sector(n, data)
     } else if crate::sdhci::internal() {
         crate::sdhci::write_sector(n, data)
     } else if crate::xhci::msc_present() {
@@ -66,7 +72,7 @@ pub fn blk_selftest() -> bool {
     if crate::virtio_core::blk_present() {
         return crate::virtio_core::blk_selftest();
     }
-    if !crate::nvme::present() && !crate::ahci::present() && !crate::xhci::msc_present() && !crate::sdhci::present() {
+    if !crate::nvme::present() && !crate::ahci::present() && !crate::ide::present() && !crate::xhci::msc_present() && !crate::sdhci::present() {
         return false;
     }
     let (rd, wr, name): (fn(u64, &mut [u8; 512]) -> bool, fn(u64, &[u8; 512]) -> bool, &str) =
@@ -74,6 +80,8 @@ pub fn blk_selftest() -> bool {
             (crate::nvme::read_sector, crate::nvme::write_sector, "nvme")
         } else if crate::ahci::present() {
             (crate::ahci::read_sector, crate::ahci::write_sector, "ahci")
+        } else if crate::ide::present() {
+            (crate::ide::read_sector, crate::ide::write_sector, "ide")
         } else if crate::sdhci::internal() {
             (crate::sdhci::read_sector, crate::sdhci::write_sector, "sdhci")
         } else if crate::xhci::msc_present() {

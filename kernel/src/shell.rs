@@ -66,6 +66,7 @@ fn cpu_getc() -> u8 {
         if let Some(c) = crate::uart::getc() {
             return c;
         }
+        crate::desk::idle(); // the desktop's input events and redraws (desk.rs)
         crate::uart::note_idle_wfi();
         crate::cpu::wfi();
     }
@@ -207,7 +208,7 @@ fn parse_dest(tok: &str) -> Dest<'_> {
     }
 }
 
-fn exec(line: &str) { pc_intercept!(line);
+pub(crate) fn exec(line: &str) { pc_intercept!(line);
     let line = line.trim();
     if line.is_empty() {
         return;
@@ -866,8 +867,15 @@ fn exec(line: &str) { pc_intercept!(line);
             // Switch off console mirroring so shell echo won't scribble on the
             // desktop, then composite the Tonga desktop onto the framebuffer.
             crate::framebuffer::set_console(false);
-            crate::tonga::desktop();
+            crate::desk::show(); // the AfriSovera desktop (desk.rs, docs/design/desktop.md)
             crate::kprintln!("[gui] Tonga desktop rendered; type 'clear' to return to console");
+        }
+        "desk" => {
+            if !crate::desk::shown() && !rest.is_empty() && rest != "list" {
+                crate::framebuffer::set_console(false);
+                crate::desk::show();
+            }
+            crate::desk::command(rest);
         }
         "wm" => {
             // App-owned surfaces: spawn EL0 apps that each create + draw a window
@@ -22398,6 +22406,7 @@ fn exec(line: &str) { pc_intercept!(line);
             crate::kprintln!("{}", rest);
         }
         "clear" => {
+            crate::desk::hide();
             crate::framebuffer::console_reset();
         }
         "caps" => {

@@ -675,6 +675,45 @@ pub fn set_global(name: &[u8], data: &[u8]) -> Status {
     })
 }
 
+// --- `rtcinfo`: the firmware's own clock (GetTime), to compare with the CMOS read ---
+
+const GET_TIME: usize = 0;
+
+/// EFI_TIME. `time_zone` is minutes from UTC, 2047 when unspecified (local time);
+/// `daylight` bit 0: adjust for daylight saving, bit 1: daylight saving is in effect.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct EfiTime {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+    pad1: u8,
+    pub nanosecond: u32,
+    pub time_zone: i16,
+    pub daylight: u8,
+    pad2: u8,
+}
+type GetTimeFn = extern "efiapi" fn(*mut EfiTime, *mut u8) -> Status;
+
+/// The firmware's clock now: Ok(time) / Err(status) (NOT_FOUND: no runtime services).
+pub fn get_time() -> Result<EfiTime, Status> {
+    let rt = crate::runtime_services();
+    if rt.is_null() {
+        return Err(NOT_FOUND);
+    }
+    let mut t = EfiTime::default();
+    // SAFETY: slot GET_TIME per the UEFI spec, called as GetVariable is (see `bootentry`'s
+    // section comment); the capabilities pointer is optional and passed as null.
+    let st = masked(|| unsafe {
+        let gt: GetTimeFn = core::mem::transmute((*rt).f[GET_TIME]);
+        gt(&mut t, core::ptr::null_mut())
+    });
+    if st == SUCCESS { Ok(t) } else { Err(st) }
+}
+
 /// BOOTVARS read again from the firmware after a change (`bootentries` then says so).
 pub fn reread_boot_entries() {
     let rt = crate::runtime_services();

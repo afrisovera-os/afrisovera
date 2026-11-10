@@ -13,35 +13,12 @@
 //! xHCI 1.2: registers 5, rings/TRBs 4.9-4.11 and 6.4, contexts 6.2, enumeration 4.3.
 
 use crate::mmu;
-use core::arch::asm;
+use crate::pci;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 
-unsafe fn outl(port: u16, v: u32) {
-    asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack, preserves_flags));
-}
-unsafe fn inl(port: u16) -> u32 {
-    let v: u32;
-    asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, nostack, preserves_flags));
-    v
-}
-fn cfg_addr(b: u8, d: u8, f: u8, off: u8) -> u32 {
-    0x8000_0000 | (b as u32) << 16 | (d as u32) << 11 | (f as u32) << 8 | (off as u32 & 0xFC)
-}
-fn cfg32(b: u8, d: u8, f: u8, off: u8) -> u32 {
-    // SAFETY: the PCI configuration ports; boot context, single core.
-    unsafe {
-        outl(0xCF8, cfg_addr(b, d, f, off));
-        inl(0xCFC)
-    }
-}
-fn cfg_write32(b: u8, d: u8, f: u8, off: u8, v: u32) {
-    // SAFETY: as cfg32.
-    unsafe {
-        outl(0xCF8, cfg_addr(b, d, f, off));
-        outl(0xCFC, v);
-    }
-}
+// PCI configuration space through the shared pc/pci.rs (review R1-8).
+use pci::{cfg_read32 as cfg32, cfg_write32};
 
 // TRB types
 const T_NORMAL: u32 = 1;
@@ -77,15 +54,17 @@ const NCMD: usize = 32;
 const NEV: usize = 64;
 const NXFER: usize = 32;
 
-#[repr(C, align(64))]
+// F2 (9 Nov 2026): aligned to 1024, at least its size (no ring is bigger), so no ring crosses a
+// 64 KiB block; pages for contexts and arrays, a buffer's own size for buffers (dma_check)
+#[repr(C, align(1024))]
 struct Ring<const N: usize>([Trb; N]);
 #[repr(C, align(64))]
 struct Erst([u64; 2]); // one segment: base, size
-#[repr(C, align(64))]
+#[repr(C, align(4096))]
 struct Dcbaa([u64; 256]);
-#[repr(C, align(64))]
+#[repr(C, align(4096))]
 struct Ctx([u8; 4096]);
-#[repr(C, align(64))]
+#[repr(C, align(512))]
 struct Buf([u8; 512]);
 
 /// Controllers driven at once (7 Nov 2026): every xHCI with a device plugged in at power-on, up to
@@ -220,18 +199,15 @@ static mut TABLET_SLOT: u32 = 0;
 static mut TABLET_PORT: u32 = 0;
 static mut TREPORTS: u64 = 0;
 
-/// A HID report descriptor -> the first absolute X/Y pair (Generic Desktop X 0x30, Y 0x31,
-/// input, variable, not relative) and, in the same report, the buttons (Button page 1..3) or
-/// else a digitizer's tip switch (0x0D:0x42). None for a relative mouse, a keyboard, or
-/// anything without absolute X and Y. Push/pop and long items are skipped.
-fn parse_abs(r: &[u8]) -> Option<Abs> {
+/// Every variable Input field of a HID report descriptor, in order: `on(report id, usage
+/// (page << 16 | id), the field, the Input item's flags, its index in the item, the item's
+/// count)`. A field's bit counts from the report's first byte, the report ID byte included.
+/// None when the descriptor uses more report IDs than are followed. Push/pop and long items
+/// are skipped.
+fn hid_inputs(r: &[u8], mut on: impl FnMut(u8, u32, Field, u32, u32, u32)) -> Option<()> {
     let (mut page, mut lmin, mut lmax, mut lmax_u, mut rsize, mut rcount, mut rid) = (0u32, 0i32, 0i32, 0i32, 0u32, 0u32, 0u8);
     let (mut usages, mut nu, mut umin, mut umax, mut range) = ([0u32; 16], 0usize, 0u32, 0u32, false);
     let (mut offs, mut noffs) = ([(0u8, 0u32); 8], 0usize); // (report id, its next input bit)
-    let mut x: Option<(u8, Field)> = None;
-    let mut y: Option<Field> = None;
-    let (mut btns, mut nb) = ([(0u8, 0u32, 0u32); 4], 0usize); // first buttons per report id
-    let (mut tips, mut nt) = ([(0u8, 0u32); 4], 0usize); // first tip switch per report id
     let mut i = 0;
     while i < r.len() {
         let b = r[i];
@@ -292,21 +268,7 @@ fn parse_abs(r: &[u8]) -> Option<Abs> {
                         } else {
                             0
                         };
-                        let f = Field { bit: base + k * rsize, size: rsize, min: lmin, max };
-                        let absolute = u & 4 == 0 && rsize > 0 && rsize <= 32 && max > lmin;
-                        match usage {
-                            0x0001_0030 if absolute && x.is_none() => x = Some((rid, f)),
-                            0x0001_0031 if absolute && y.is_none() && x.map(|x| x.0) == Some(rid) => y = Some(f),
-                            0x0009_0001 if rsize == 1 && nb < btns.len() && !btns[..nb].iter().any(|e| e.0 == rid) => {
-                                btns[nb] = (rid, f.bit, (rcount - k).min(3));
-                                nb += 1;
-                            }
-                            0x000D_0042 if rsize == 1 && nt < tips.len() && !tips[..nt].iter().any(|e| e.0 == rid) => {
-                                tips[nt] = (rid, f.bit);
-                                nt += 1;
-                            }
-                            _ => {}
-                        }
+                        on(rid, usage, Field { bit: base + k * rsize, size: rsize, min: lmin, max }, u, k, rcount);
                     }
                 }
                 offs[o].1 = base + rsize * rcount;
@@ -317,6 +279,34 @@ fn parse_abs(r: &[u8]) -> Option<Abs> {
         }
         i += 1 + n;
     }
+    Some(())
+}
+
+/// A HID report descriptor -> the first absolute X/Y pair (Generic Desktop X 0x30, Y 0x31,
+/// input, variable, not relative) and, in the same report, the buttons (Button page 1..3) or
+/// else a digitizer's tip switch (0x0D:0x42). None for a relative mouse, a keyboard, or
+/// anything without absolute X and Y.
+fn parse_abs(r: &[u8]) -> Option<Abs> {
+    let mut x: Option<(u8, Field)> = None;
+    let mut y: Option<Field> = None;
+    let (mut btns, mut nb) = ([(0u8, 0u32, 0u32); 4], 0usize); // first buttons per report id
+    let (mut tips, mut nt) = ([(0u8, 0u32); 4], 0usize); // first tip switch per report id
+    hid_inputs(r, |rid, usage, f, flags, k, rcount| {
+        let absolute = flags & 4 == 0 && f.size > 0 && f.size <= 32 && f.max > f.min;
+        match usage {
+            0x0001_0030 if absolute && x.is_none() => x = Some((rid, f)),
+            0x0001_0031 if absolute && y.is_none() && x.map(|x| x.0) == Some(rid) => y = Some(f),
+            0x0009_0001 if f.size == 1 && nb < btns.len() && !btns[..nb].iter().any(|e| e.0 == rid) => {
+                btns[nb] = (rid, f.bit, (rcount - k).min(3));
+                nb += 1;
+            }
+            0x000D_0042 if f.size == 1 && nt < tips.len() && !tips[..nt].iter().any(|e| e.0 == rid) => {
+                tips[nt] = (rid, f.bit);
+                nt += 1;
+            }
+            _ => {}
+        }
+    })?;
     let (id, x) = x?;
     let y = y?;
     let mut a = Abs { id, x, y, btn: 0, nbtn: 0, tip: false };
@@ -326,6 +316,52 @@ fn parse_abs(r: &[u8]) -> Option<Abs> {
         (a.btn, a.nbtn, a.tip) = (bit, 1, true);
     }
     Some(a)
+}
+
+// --- a USB mouse's wheel (9 Nov 2026, F7 for USB): a boot report has no wheel (HID B.2:
+// buttons, X, Y only), so a mouse whose report descriptor has one is kept in the report
+// protocol and its reports are read by the descriptor's layout. ---
+/// A relative mouse's report: its report ID (0 = none), relative X, Y and wheel (Generic
+/// Desktop 0x38), and the buttons (`nbtn` one-bit fields from `btn`).
+#[derive(Clone, Copy)]
+struct Rel {
+    id: u8,
+    x: Field,
+    y: Field,
+    wheel: Field,
+    btn: u32,
+    nbtn: u32,
+}
+static mut MREL: Option<Rel> = None; // Some: the mouse is read in the report protocol
+static mut MREP_LEN: u32 = 8; // bytes asked for per report then (the endpoint's packet size)
+static mut MWHEEL: u64 = 0; // wheel notches seen
+
+/// A HID report descriptor -> the first relative X/Y pair with a wheel in the same report,
+/// and that report's buttons. None for a mouse without a wheel (it stays a boot mouse).
+fn parse_rel(r: &[u8]) -> Option<Rel> {
+    let mut x: Option<(u8, Field)> = None;
+    let (mut y, mut w): (Option<Field>, Option<Field>) = (None, None);
+    let (mut btns, mut nb) = ([(0u8, 0u32, 0u32); 4], 0usize); // first buttons per report id
+    hid_inputs(r, |rid, usage, f, flags, k, rcount| {
+        let rel = flags & 4 != 0 && f.size >= 2 && f.size <= 32 && f.min < 0;
+        let same = x.map(|x| x.0) == Some(rid);
+        match usage {
+            0x0001_0030 if rel && x.is_none() => x = Some((rid, f)),
+            0x0001_0031 if rel && y.is_none() && same => y = Some(f),
+            0x0001_0038 if rel && w.is_none() && same => w = Some(f),
+            0x0009_0001 if f.size == 1 && nb < btns.len() && !btns[..nb].iter().any(|e| e.0 == rid) => {
+                btns[nb] = (rid, f.bit, (rcount - k).min(3));
+                nb += 1;
+            }
+            _ => {}
+        }
+    })?;
+    let (id, x) = x?;
+    let mut m = Rel { id, x, y: y?, wheel: w?, btn: 0, nbtn: 0 };
+    if let Some(&(_, bit, n)) = btns[..nb].iter().find(|e| e.0 == id) {
+        (m.btn, m.nbtn) = (bit, n);
+    }
+    Some(m)
 }
 
 /// `size` bits of report `r` from bit `bit` (little-endian, as HID packs them).
@@ -338,6 +374,13 @@ fn bits(r: &[u8], bit: u32, size: u32) -> u32 {
         }
     }
     v
+}
+
+/// A field's value, sign-extended when its logical minimum is negative.
+fn signed(r: &[u8], f: Field) -> i32 {
+    let v = bits(r, f.bit, f.size) as i64;
+    let v = if f.min < 0 && f.size < 32 && v >> (f.size - 1) & 1 != 0 { v - (1 << f.size) } else { v };
+    v as i32
 }
 
 /// A field's value scaled onto 0..=`span`-1 pixels.
@@ -374,6 +417,35 @@ static mut MSC_BLOCKS: u64 = 0;
 static mut MSC_BS: u32 = 512;
 static mut MSC_USABLE: bool = false;
 static mut MSC_NAME: [u8; 24] = [b' '; 24];
+// Multi-block commands (9 Nov 2026): one READ(10) or WRITE(10) of up to 8 KiB (16 sectors of
+// 512 B) instead of one command per device block. Reads: the blocks of the last such read are
+// kept from MSC_RA_AT (MSC_RA_N valid) and the next reads served from them. Writes: the VFS
+// saves its sectors in order, so a run of device blocks is gathered from MSC_WB_AT (MSC_WB_N
+// of them; since 10 Nov 2026 on 1, 2 and 4 KiB-block disks too, each block read once and its
+// sectors changed in place) and sent when it ends (its last sector, a gap, 8 KiB) or before
+// any read. Each way is checked once against one block at a time before it is trusted.
+const MSC_RA_BYTES: usize = 8192;
+#[repr(C, align(8192))]
+struct Ahead([u8; MSC_RA_BYTES]);
+static mut MSC_RA: Ahead = Ahead([0; MSC_RA_BYTES]);
+static mut MSC_RA_AT: u64 = 0;
+static mut MSC_RA_N: u32 = 0;
+static mut MSC_WB: Ahead = Ahead([0; MSC_RA_BYTES]);
+static mut MSC_WB_AT: u64 = 0;
+static mut MSC_WB_N: u32 = 0;
+/// 0 = not checked, 1 = on, 2 = off; reads and writes apart.
+static mut MSC_MULTI: u8 = 0;
+static mut MSC_MULTIW: u8 = 0;
+/// Disks of more than 2^32 blocks (over 2 TiB with 512-byte blocks): READ(10)/WRITE(10) carry a
+/// 32-bit block address, so every read and write goes as READ(16)/WRITE(16), as Linux does once
+/// READ CAPACITY(10) says 0xFFFFFFFF and READ CAPACITY(16) gives the real size (SBC-3 5.16).
+static mut MSC_LONG: bool = false;
+/// The 16-byte check at the last block: 0 = not run, 1 = passed, 2 = failed.
+static mut MSC_LONGCHK: u8 = 0;
+/// Reads: sectors asked for, served from the read-ahead, multi-block commands, single-block ones.
+static mut MSC_RSTATS: (u64, u64, u64, u64) = (0, 0, 0, 0);
+/// Writes: sectors written, multi-block commands, single-block ones.
+static mut MSC_WSTATS: (u64, u64, u64) = (0, 0, 0);
 /// Where the device being enumerated sits behind hubs: its route string (one 4-bit hub port
 /// per tier) and, for a full/low-speed device behind a high-speed hub, that hub's slot and
 /// port (the transaction translator). (0, 0, 0) for a device on a root port.
@@ -405,7 +477,7 @@ const NRXB: usize = 4; // receive transfers kept queued on the bulk-IN ring
 const NTXB: usize = 8; // transmit buffers, used round robin
 const NRXQ: usize = 16; // received frames waiting for the network stack
 const FRAME: usize = 2048;
-#[repr(C, align(64))]
+#[repr(C, align(2048))]
 struct Frame([u8; FRAME]);
 static mut EPOUT: Ring<NXFER> = Ring([TRB0; NXFER]);
 static mut PEPOUT: Prod = Prod { idx: 0, cycle: 1 };
@@ -443,6 +515,27 @@ const NO_DEV: Dev = Dev { slot: 0, dci: 0, kind: 0, port: 0, ctl: 0, route: 0 };
 static mut DEVS: [Dev; NDEV] = [NO_DEV; NDEV];
 /// Root ports whose connection changed (port-status-change events), for `service`, per controller.
 static mut PENDING: [u32; NCTL] = [0; NCTL];
+/// F2: each controller's power-on wait (`settle`): ms waited, ports with a device, steady.
+static mut SETTLE: [(u32, u32, bool); NCTL] = [(0, 0, false); NCTL];
+/// F2: each controller's reset (`reset`): ms from HCRST to ready, halted before it, Intel host.
+static mut RESET: [(u32, bool, bool); NCTL] = [(0, false, false); NCTL];
+/// Each controller's Supported Protocol capabilities (xHCI 7.2): (major, minor revision in BCD,
+/// first port, port count, protocol speed ID count), as the controller names its root ports.
+static mut PROTO: [[(u8, u8, u8, u8, u8); 6]; NCTL] = [[(0, 0, 0, 0, 0); 6]; NCTL];
+static mut PROTO_N: [usize; NCTL] = [0; NCTL];
+/// Each protocol's own speed ID table (xHCI 7.2.1, the PSI dwords after the capability's first
+/// four), the first 8 of its PSIC: PSIV 3:0, PSIE 5:4 (b/s, Kb/s, Mb/s, Gb/s), PLT 7:6, PFD 8,
+/// LP 15:14 (0 SuperSpeed, 1 SuperSpeedPlus), PSIM 31:16.
+static mut PSI: [[[u32; 8]; 6]; NCTL] = [[[0; 8]; 6]; NCTL];
+/// Devices whose speed was read from a controller's own speed ID table, and `usbaddr psi` (a test
+/// table as Intel hosts publish it put on controller 1, so QEMU can show the table path).
+static mut PSI_USED: u32 = 0;
+static mut PSI_TEST: bool = false;
+/// Root ports (bit n = port n), per controller, whose device was tried and is not used, or did
+/// not answer after one retry: left alone until it is unplugged (field item F1, HP ENVY 8 Nov
+/// 2026: a device that failed addressing was reset and tried again forever, each reset's own
+/// port-change event starting the next try).
+static mut LEFT: [u32; NCTL] = [0; NCTL];
 /// Per hub (by device index): the ports its status-change endpoint reported (bit n = port n),
 /// for `service`; and what its ports need -- (speed, TT hub slot, TT port, number of ports).
 static mut HUBCHG: [u16; NDEV] = [0; NDEV];
@@ -452,6 +545,42 @@ static mut HUB_WATCHED: u32 = 0; // hubs whose status-change endpoint runs (hot-
 static mut BUSY: bool = false;
 static mut PLUGS: u64 = 0;
 static mut UNPLUGS: u64 = 0;
+/// Field item F2 (HP ENVY, Intel Sunrise Point: Address Device and GET_DESCRIPTOR ending with
+/// completion code 4, a USB transaction error). Two ways to give a new device its address:
+/// plain (Address Device sends SET_ADDRESS at once, then the descriptor is read) and, as Linux's
+/// "new scheme" and Windows do, descriptor first (Address Device with BSR sets up the slot
+/// without SET_ADDRESS, the device descriptor is read (64 bytes asked) at the default
+/// address, then a second Address Device gives the address). A root-port device that does not
+/// answer (on a root port or a hub's port) is tried three times, the second try the other way.
+/// `usbaddr bsr|plain` picks the first way (plain unless told).
+static mut BSR_FIRST: bool = false;
+/// The way `enumerate` uses now (set by `attach` for each try; hubs' devices use BSR_FIRST).
+static mut BSR_NOW: bool = false;
+static mut ADDR_PLAIN: u32 = 0; // devices whose descriptor was read, addressed plain
+static mut ADDR_BSR: u32 = 0; // ... descriptor first
+static mut ADDR_RETRIED: u32 = 0; // devices that answered only on a later try
+static mut ADDR_NONE: u32 = 0; // devices that answered on no try
+/// A test switch (`usbaddr fail N`): the next N addressing tries end at the first descriptor
+/// read as if the device had sent nothing back (completion code 4, a USB transaction error),
+/// so the retry ladder can be seen working where every device answers (QEMU).
+static mut FAIL_NEXT: u32 = 0;
+static mut FAILED_ON_PURPOSE: u32 = 0;
+/// F2: after Address Device has sent SET_ADDRESS, the device has 2 ms to take its new address
+/// (USB 2.0 9.2.6.3); a request sent sooner goes to an address nobody answers yet, which a real
+/// xHCI ends with completion code 4. Linux waits 10 ms ("some device hardware wants it"), so do
+/// we. QEMU's devices take the address at once, so this was never seen there.
+const SET_ADDRESS_MS: u64 = 10;
+/// F2: the first descriptor read before the address (BSR) asks for 64 bytes, as Windows and
+/// Linux's new scheme do (some devices misbehave on an 8-byte read); a short answer is fine.
+const FIRST_READ_BSR: u16 = 64;
+static mut ADDR_WAITS: u32 = 0; // SET_ADDRESS recovery waits made
+static mut LAST_MPS0: u32 = 0; // the EP0 packet size the last device's first read gave
+/// The last completion code a command or control request ended with other than success (0:
+/// none since boot, or a time-out), and which addressing step was running.
+static mut LAST_CC: u32 = 0;
+static mut ADDR_STAGE: &str = "";
+/// The error that sent a root-port device to its next try (the last such), for `lsusb`.
+static mut ADDR_ERR: (u32, &str) = (0, "");
 
 /// A free device entry (never used, or freed by an unplug).
 fn free_dev() -> Option<usize> {
@@ -470,11 +599,36 @@ static mut MY: i32 = (crate::framebuffer::HEIGHT / 2) as i32;
 static mut MBUTTONS: u8 = 0;
 static mut MREPORTS: u64 = 0;
 static mut MCLICKS: u64 = 0;
+/// Acceleration of the USB mouse (9 Nov 2026), through ps2::accelerate's curve: when the
+/// report before came, sixteenths carried over, reports sped up. A mouse does not say its
+/// resolution in its boot reports, so 400 dpi (16 counts/mm, the low end of mice sold) is
+/// taken: a faster mouse reads as faster and is sped up a little sooner.
+static mut M_LAST: u64 = 0;
+static mut M_REM: (i32, i32) = (0, 0);
+static mut M_SPED: u64 = 0;
+const MOUSE_PER_MM: u32 = 16;
 /// The Tonga window being dragged by its title bar (left button held), if any.
 static mut DRAG: Option<usize> = None;
 static mut DRAGS: u64 = 0;
-static mut DOCK_CLICKS: u64 = 0;
 static mut LAST_KEYS: [u8; 6] = [0; 6];
+static mut LAST_MODS: u8 = 0;
+static mut SUPER_COMBO: bool = false;
+
+/// A key that is a desktop shortcut while the desktop is shown (HID usages): Alt+Tab,
+/// Alt+F4, Super+arrows, Esc.
+fn desk_key(k: u8, alt: bool, sup: bool) -> Option<u32> {
+    use crate::desk::*;
+    Some(match k {
+        0x2B if alt => KEY_ALT_TAB,
+        0x3D if alt => KEY_ALT_F4,
+        0x4F if sup => KEY_SUPER_RIGHT,
+        0x50 if sup => KEY_SUPER_LEFT,
+        0x51 if sup => KEY_SUPER_DOWN,
+        0x52 if sup => KEY_SUPER_UP,
+        0x29 if !alt && !sup => KEY_ESC,
+        _ => return None,
+    })
+}
 /// Key repeat (a USB boot keyboard leaves it to the host): the key held, its character, and
 /// the TSC time it next repeats at. 500 ms before the first repeat, then about 30 a second.
 static mut HELD: Option<(u8, u8)> = None;
@@ -598,6 +752,7 @@ unsafe fn command(param: u64, control: u32) -> Option<Trb> {
     let ev = wait_event(T_EV_COMMAND)?;
     if ev.status >> 24 != CC_SUCCESS {
         crate::kprintln!("[xhci] command type {} failed (completion code {})", (control >> 10) & 0x3F, ev.status >> 24);
+        LAST_CC = ev.status >> 24;
         return None;
     }
     Some(ev)
@@ -623,10 +778,12 @@ unsafe fn control(d: usize, rtype: u8, req: u8, value: u16, index: u16, len: u16
         Some(ev) if matches!(ev.status >> 24, CC_SUCCESS | CC_SHORT) => true,
         Some(ev) => {
             crate::kprintln!("[xhci] control request {:#04x} failed (completion code {})", req, ev.status >> 24);
+            LAST_CC = ev.status >> 24;
             false
         }
         None => {
             crate::kprintln!("[xhci] control request {:#04x} timed out", req);
+            LAST_CC = 0;
             false
         }
     }
@@ -642,34 +799,23 @@ fn ctx(base: *mut u8, i: usize) -> *mut u32 {
 fn pci_find(class: u32) -> ([(u8, u8, u8, u32); 4], usize) {
     let mut out = [(0, 0, 0, 0); 4];
     let mut n = 0;
-    for b in 0..8u8 {
-        for d in 0..32u8 {
-            for f in 0..8u8 {
-                let id = cfg32(b, d, f, 0);
-                if id & 0xFFFF == 0xFFFF {
-                    if f == 0 {
-                        break;
-                    }
-                    continue;
-                }
-                if cfg32(b, d, f, 8) >> 8 == class && n < 4 {
-                    out[n] = (b, d, f, id);
-                    n += 1;
-                }
-            }
+    pci::find_by(8, |b, d, f, id| {
+        if cfg32(b, d, f, 8) >> 8 == class && n < 4 {
+            out[n] = (b, d, f, id);
+            n += 1;
         }
-    }
+        false // keep walking: every match, in bus order
+    });
     (out, n)
 }
 
 /// BAR0 of the controller at b:d.f, mapped, with memory decoding on; None if it has none.
 fn bar0(b: u8, d: u8, f: u8) -> Option<u64> {
-    let lo = cfg32(b, d, f, 0x10);
-    let bar = (lo & !0xF) as u64 | if lo & 0x6 == 0x4 { (cfg32(b, d, f, 0x14) as u64) << 32 } else { 0 };
+    let bar = pci::bar_mem(b, d, f, 0);
     if bar == 0 || !mmu::map_mmio(bar, 0x10000) {
         return None;
     }
-    cfg_write32(b, d, f, 4, cfg32(b, d, f, 4) | 0x406); // memory decoding + bus mastering, INTx off (polled)
+    pci::enable(b, d, f, 0x406); // memory decoding + bus mastering, INTx off (polled)
     Some(bar)
 }
 
@@ -703,6 +849,146 @@ fn handoff(bar: u64) {
     }
 }
 
+/// Read the controller's Supported Protocol capabilities (xHCI 7.2, extended capability ID 2):
+/// which root ports are USB 2 and which USB 3, and whether the controller defines its own
+/// protocol speed IDs (PSIC). Stored for `kinds_line`.
+unsafe fn protocols(bar: u64, c: usize) {
+    PROTO_N[c] = 0;
+    let hcc1 = r32(bar + 0x10);
+    let mut xecp = ((hcc1 >> 16) & 0xFFFF) as u64 * 4;
+    let mut guard = 0;
+    while xecp != 0 && xecp < 0x10000 && guard < 64 {
+        guard += 1;
+        let v = r32(bar + xecp);
+        if v & 0xFF == 2 && PROTO_N[c] < 6 {
+            let w2 = r32(bar + xecp + 8);
+            PROTO[c][PROTO_N[c]] = ((v >> 24) as u8, (v >> 16) as u8, w2 as u8, (w2 >> 8) as u8, (w2 >> 28) as u8);
+            for k in 0..((w2 >> 28) as usize).min(8) {
+                PSI[c][PROTO_N[c]][k] = r32(bar + xecp + 16 + 4 * k as u64);
+            }
+            PROTO_N[c] += 1;
+        }
+        let next = ((v >> 8) & 0xFF) as u64;
+        if next == 0 {
+            break;
+        }
+        xecp += next * 4;
+    }
+}
+
+/// One line naming controller `c`'s root ports by kind, e.g. "port kinds: USB 2.0 on ports 1-4,
+/// USB 3.0 on ports 5-8", with any ports no capability names. On a real PC this says which
+/// ports a laptop's built-in devices can be on (field item F2), and a USB 3.1/3.2 range means
+/// SuperSpeedPlus devices (speed IDs 5 to 7) can appear there.
+unsafe fn kinds_line(c: usize, prefix: &str) {
+    let ports = if c == CUR { PORTS } else { BANKS[c].ports };
+    crate::kprint!("{}port kinds:", prefix);
+    let mut named = 0u32;
+    for i in 0..PROTO_N[c] {
+        let (maj, min, first, n, psic) = PROTO[c][i];
+        let last = first as u32 + n as u32 - 1;
+        crate::kprint!(
+            "{} USB {}.{} on port{} {}",
+            if i == 0 { "" } else { "," }, maj, min >> 4, if n == 1 { "" } else { "s" }, first
+        );
+        if n > 1 {
+            crate::kprint!("-{}", last);
+        }
+        if psic > 0 {
+            crate::kprint!(" ({} speed IDs of its own:", psic);
+            for k in 0..(psic as usize).min(8) {
+                let e = PSI[c][i][k];
+                crate::kprint!(" {} {}", e & 0xF, speed_name(psi_class(maj, e)));
+            }
+            crate::kprint!(")");
+        }
+        named += n as u32;
+    }
+    if PROTO_N[c] == 0 {
+        crate::kprint!(" not named by the controller");
+    } else if named < ports {
+        crate::kprint!(", {} of {} not named", ports - named, ports);
+    }
+    crate::kprintln!("");
+}
+
+/// One entry of a controller's own speed ID table (PSI dword) as the default speed code the
+/// driver works with (xHCI 7.2.2.1.1): on a USB 2 port by its bit rate (1.5 Mb/s or less low,
+/// 12 Mb/s or less full, else high); on a USB 3 port SuperSpeed (4), or SuperSpeedPlus (5) when
+/// the link protocol says so or the rate is over 5 Gb/s. As Linux's xhci-hub reads PSI.
+fn psi_class(major: u8, e: u32) -> u32 {
+    let mut rate = (e >> 16) as u64;
+    for _ in 0..(e >> 4) & 3 {
+        rate *= 1000;
+    }
+    if major < 3 {
+        if rate <= 1_500_000 { 2 } else if rate <= 12_000_000 { 1 } else { 3 }
+    } else if (e >> 14) & 3 == 1 || rate > 5_000_000_000 {
+        5
+    } else {
+        4
+    }
+}
+
+/// The speed code of root port `port`'s device on controller `c` from the port's speed ID `id`:
+/// when the port's protocol defines its own IDs (PSIC), the matching table entry says what the
+/// ID means; otherwise (or with no match) the ID is a default one and taken as it is.
+unsafe fn port_speed(c: usize, port: u32, id: u32) -> u32 {
+    for i in 0..PROTO_N[c] {
+        let (maj, _, first, n, psic) = PROTO[c][i];
+        if port < first as u32 || port >= first as u32 + n as u32 {
+            continue;
+        }
+        for k in 0..(psic as usize).min(8) {
+            let e = PSI[c][i][k];
+            if e & 0xF == id && id != 0 {
+                PSI_USED += 1;
+                return psi_class(maj, e);
+            }
+        }
+    }
+    id
+}
+
+/// `usbaddr psi`: controller 1 gets a speed ID table as Intel hosts publish it (USB 2: 1 full
+/// 12 Mb/s, 2 low 1500 Kb/s, 3 high 480 Mb/s; USB 3: 4 SuperSpeed 5 Gb/s, 5 SuperSpeedPlus 10
+/// Gb/s), each entry is checked against what it must mean, and devices plugged in after it take
+/// their speed through the table.
+unsafe fn psi_test() {
+    const T2: [(u32, u32); 3] = [(0x000C_0021, 1), (0x05DC_0012, 2), (0x01E0_0023, 3)];
+    const T3: [(u32, u32); 2] = [(0x0005_0134, 4), (0x000A_4135, 5)];
+    let (mut ok, mut n) = (0u32, 0u32);
+    for i in 0..PROTO_N[0] {
+        let t: &[(u32, u32)] = if PROTO[0][i].0 < 3 { &T2 } else { &T3 };
+        for (k, &(e, want)) in t.iter().enumerate() {
+            PSI[0][i][k] = e;
+            ok += (psi_class(PROTO[0][i].0, e) == want) as u32;
+        }
+        PROTO[0][i].4 = t.len() as u8;
+        n += t.len() as u32;
+    }
+    PSI_TEST = true;
+    crate::kprintln!(
+        "usb: test: controller 1 now has its own speed ID table; {} of {} entries read as expected",
+        ok, n
+    );
+    kinds_line(0, "  ");
+}
+
+/// The name of a USB speed as a port reports it (PORTSC Port Speed, xHCI 7.2.2.1.1 default
+/// speed IDs): 1 full, 2 low, 3 high, 4 SuperSpeed (5 Gb/s); 5 to 7 are SuperSpeedPlus (USB 3.1
+/// and 3.2, 10 or 20 Gb/s) on the USB-C ports of newer PCs.
+fn speed_name(speed: u32) -> &'static str {
+    match speed {
+        1 => "full",
+        2 => "low",
+        3 => "high",
+        4 => "super",
+        5..=7 => "super plus",
+        _ => "?",
+    }
+}
+
 /// Intel 7/8/9-series chipsets (2012-2015) have an EHCI (USB 2) controller beside the xHCI, and
 /// each port is wired to one of them by the XUSB2PR/USB3_PSSEN switches; the firmware may leave
 /// them on EHCI, which this kernel does not drive, so a keyboard there would be invisible. As
@@ -728,6 +1014,34 @@ fn intel_switch(b: u8, d: u8, f: u8, say: bool) {
     }
 }
 
+/// Stop and reset the controller whose operational registers start at `op`, as Linux's
+/// xhci_halt + xhci_reset: Run/Stop cleared and up to 20 ms for HCHalted, then HCRST; 1 ms
+/// before the next register read (Linux XHCI_INTEL_HOST: on Intel controllers a read right
+/// after HCRST can, rarely, hang the whole PC; done on every host here, it costs 1 ms), then
+/// HCRST and CNR clear within 10 s. Returns (ms from HCRST to ready, was halted), or None.
+fn reset(op: u64) -> Option<(u32, bool)> {
+    w32(op, r32(op) & !1);
+    let mut halted = r32(op + 0x04) & 1 != 0;
+    for _ in 0..20 {
+        if halted {
+            break;
+        }
+        crate::timer::busywait_ms(1);
+        halted = r32(op + 0x04) & 1 != 0;
+    }
+    w32(op, 1 << 1);
+    crate::timer::busywait_ms(1);
+    let mut t = 1u32;
+    while r32(op) & 1 << 1 != 0 || r32(op + 0x04) & 1 << 11 != 0 {
+        if t >= 10_000 {
+            return None;
+        }
+        crate::timer::busywait_ms(1);
+        t += 1;
+    }
+    Some((t, halted))
+}
+
 /// A look at a controller that is not driven yet: taken from the firmware, ports switched (Intel),
 /// reset, ports powered; returns how many ports have a device connected. Left halted.
 fn probe(b: u8, d: u8, f: u8) -> u32 {
@@ -735,10 +1049,7 @@ fn probe(b: u8, d: u8, f: u8) -> u32 {
     handoff(bar);
     intel_switch(b, d, f, false);
     let op = bar + (r32(bar) & 0xFF) as u64;
-    w32(op, r32(op) & !1);
-    wait(|| r32(op + 0x04) & 1 != 0);
-    w32(op, 1 << 1);
-    if !wait(|| r32(op) & 1 << 1 == 0 && r32(op + 0x04) & 1 << 11 == 0) {
+    if reset(op).is_none() {
         return 0;
     }
     let ports = r32(bar + 0x04) >> 24;
@@ -844,15 +1155,20 @@ fn start(b: u8, d: u8, f: u8) -> bool {
         let max_slots = (hcs1 & 0xFF).min(255);
         PORTS = hcs1 >> 24;
         handoff(bar);
+        protocols(bar, c);
         intel_switch(b, d, f, true);
         // stop, reset, wait for the controller to be ready
-        w32(op(0x00), r32(op(0x00)) & !1);
-        wait(|| r32(op(0x04)) & 1 != 0);
-        w32(op(0x00), 1 << 1);
-        if !wait(|| r32(op(0x00)) & 1 << 1 == 0 && r32(op(0x04)) & 1 << 11 == 0) {
-            crate::kprintln!("[xhci] controller did not come out of reset");
+        let intel = cfg32(b, d, f, 0) & 0xFFFF == 0x8086;
+        let Some((ms, halted)) = reset(op(0x00)) else {
+            crate::kprintln!("[xhci] controller did not come out of reset in 10 s");
             return false;
-        }
+        };
+        RESET[c] = (ms, halted, intel);
+        crate::kprintln!(
+            "[xhci] reset: {}ready {} ms after HCRST (first read after 1 ms, as Linux on Intel hosts{})",
+            if halted { "halted, " } else { "did not halt in 20 ms, reset anyway; " },
+            ms, if intel { "; this is one" } else { "" }
+        );
         w32(op(0x38), max_slots); // CONFIG: slots enabled
         if r32(op(0x08)) & 1 == 0 {
             crate::kprintln!("[xhci] controller does not take 4 KiB pages (PAGESIZE {:#x}); not used", r32(op(0x08)));
@@ -888,6 +1204,11 @@ fn start(b: u8, d: u8, f: u8) -> bool {
             "[xhci] controller {:02x}:{:02x}.{} (xHCI {}.{}), {} ports, {} slots, {}-byte contexts",
             b, d, f, vs >> 8, (vs >> 4) & 0xF, { PORTS }, max_slots, { CSZ }
         );
+        kinds_line(c, "[xhci] ");
+        if c == 0 {
+            dma_line("[xhci] ");
+        }
+        settle(c);
         // ports: a connected USB 2 device needs a reset to be enabled (USB 3 enables itself)
         for p in 1..=PORTS {
             let mut sc = r32(portsc(p));
@@ -910,13 +1231,8 @@ fn start(b: u8, d: u8, f: u8) -> bool {
             let sc = r32(portsc(p));
             w32(portsc(p), (sc & !(1 << 1 | 0x00FE_0000 | 1 << 4 | 1 << 31 | 1 << 16)) | (sc & 0x00FE_0000)); // clear changes
             if let (true, Some(fd)) = (sc & 1 << 1 != 0, free_dev()) {
-                if !hid(fd, p, (sc >> 10) & 0xF) {
-                    note_other();
-                    let (v, pr, dc, ic) = LAST_OTHER;
-                    crate::kprintln!(
-                        "[xhci] port {}: device {:04x}:{:04x} ({}) is not one this driver uses",
-                        p, v, pr, class_name(if dc != 0 { dc } else { ic })
-                    );
+                if !attach(fd, p, sc) {
+                    left_alone(c, p, false);
                 }
             }
         }
@@ -926,10 +1242,57 @@ fn start(b: u8, d: u8, f: u8) -> bool {
     }
 }
 
+/// F2 (HP ENVY): right after the controller is reset and started, a real xHCI has not yet seen
+/// the devices on its ports again (the HP said "0 devices connected" at boot, then found its
+/// webcam, Bluetooth and fingerprint reader as hot-plugs a moment later, and failed to address
+/// them). As Linux's hub driver does (power-on to power-good, then a port must stay connected
+/// for 100 ms before it is used), every port is powered, then the ports are watched until the
+/// set with a device has not changed for 100 ms, at least 150 ms and at most 1 s in all.
+unsafe fn settle(c: usize) {
+    let mut powered = false;
+    for p in 1..=PORTS {
+        let sc = r32(portsc(p));
+        if sc & 1 << 9 == 0 {
+            w32(portsc(p), (sc & !(1 << 1 | 0x00FE_0000 | 1 << 4 | 1 << 31 | 1 << 16)) | 1 << 9);
+            powered = true;
+        }
+    }
+    if powered {
+        crate::timer::busywait_ms(20); // power-on to power-good
+    }
+    let seen = || {
+        let mut m = [0u64; 4];
+        for p in 1..=PORTS.min(255) {
+            if r32(portsc(p)) & 1 != 0 {
+                m[(p / 64) as usize] |= 1 << (p % 64);
+            }
+        }
+        m
+    };
+    let (mut last, mut steady, mut t) = (seen(), 0u32, 0u32);
+    while (steady < 100 || t < 150) && t < 1000 {
+        crate::timer::busywait_ms(10);
+        t += 10;
+        let m = seen();
+        if m == last {
+            steady += 10;
+        } else {
+            (last, steady) = (m, 0);
+        }
+    }
+    let n: u32 = last.iter().map(|w| w.count_ones()).sum();
+    SETTLE[c] = (t, n, steady >= 100);
+    crate::kprintln!(
+        "[xhci] ports {} after {} ms: {} of {} with a device",
+        if steady >= 100 { "steady" } else { "still changing" }, t, n, { PORTS }
+    );
+}
+
 /// Enumerate the device on port `port` (speed code `speed`) as device `d`; true if it is a
 /// boot keyboard or boot mouse (one of each is kept) and its interrupt endpoint is now running.
 /// A device that is neither gets its slot disabled again, so `d` stays free.
 unsafe fn hid(d: usize, port: u32, speed: u32) -> bool {
+    LAST_OTHER = (0, 0, 0, 0); // this try's own descriptor, never the last device's
     let ev = match command(0, T_ENABLE_SLOT << 10) {
         Some(e) => e,
         None => return false,
@@ -958,9 +1321,9 @@ unsafe fn enumerate(d: usize, port: u32, speed: u32) -> bool {
     core::ptr::write_bytes(outb, 0, 4096);
     DCBAA[CUR].0[slot as usize] = outb as u64;
     let mps0: u32 = match speed {
-        3 => 64,  // high speed
-        4 => 512, // super speed
-        _ => 8,   // full / low speed: 8 until the descriptor says otherwise
+        3 => 64,                // high speed
+        s if s >= 4 => 512,     // SuperSpeed, and SuperSpeedPlus (5 to 7: USB 3.1/3.2 ports)
+        _ => 8,                 // full / low speed: 8 until the descriptor says otherwise
     };
     *ctx(inb, 0).add(1) = 0b11; // add slot + EP0
     let sl = ctx(inb, 1);
@@ -973,15 +1336,48 @@ unsafe fn enumerate(d: usize, port: u32, speed: u32) -> bool {
     *e0.add(2) = tr as u32 | 1; // TR dequeue, DCS 1
     *e0.add(3) = (tr >> 32) as u32;
     *e0.add(4) = 8; // average TRB length
-    if command(inb as u64, T_ADDRESS_DEVICE << 10 | slot << 24).is_none() {
+    let bsr = BSR_NOW; // F2: descriptor first (BSR) or plain, see BSR_FIRST
+    ADDR_STAGE = if bsr { "Address Device (BSR, no SET_ADDRESS yet)" } else { "Address Device" };
+    if command(inb as u64, T_ADDRESS_DEVICE << 10 | (bsr as u32) << 9 | slot << 24).is_none() {
         return false;
     }
-    // device descriptor: first 8 bytes for the real EP0 packet size, then all 18
-    if !control(d, 0x80, 6, 0x0100, 0, 8) {
+    if !bsr {
+        crate::timer::busywait_ms(SET_ADDRESS_MS); // let the device take its address (F2)
+        ADDR_WAITS += 1;
+    }
+    // device descriptor: first the real EP0 packet size (8 bytes plain, 64 asked descriptor
+    // first, as Windows does), then all 18
+    ADDR_STAGE = if bsr { "first descriptor read at the default address" } else { "first descriptor read" };
+    if !control(d, 0x80, 6, 0x0100, 0, if bsr { FIRST_READ_BSR } else { 8 }) {
+        return false;
+    }
+    if FAIL_NEXT > 0 {
+        // `usbaddr fail N`: this try is made to fail here, as the HP ENVY's did (F2)
+        FAIL_NEXT -= 1;
+        FAILED_ON_PURPOSE += 1;
+        LAST_CC = 4;
         return false;
     }
     let real = DBUF.0[7] as u32;
-    if speed < 3 && real != mps0 && real >= 8 {
+    LAST_MPS0 = real;
+    let mps = if speed < 3 && real != mps0 && real >= 8 { real } else { mps0 };
+    if bsr {
+        // now the address: the same slot and EP0, EP0 with the real packet size and its
+        // dequeue pointer where the ring is now (the controller reads the context again)
+        let p = &*addr_of!(PEP0[d]);
+        let deq = tr + p.idx as u64 * core::mem::size_of::<Trb>() as u64;
+        *ctx(inb, 0) = 0;
+        *ctx(inb, 0).add(1) = 0b11; // slot + EP0
+        *e0.add(1) = 3 << 1 | 4 << 3 | mps << 16;
+        *e0.add(2) = deq as u32 | p.cycle;
+        *e0.add(3) = (deq >> 32) as u32;
+        ADDR_STAGE = "Address Device after the descriptor read";
+        if command(inb as u64, T_ADDRESS_DEVICE << 10 | slot << 24).is_none() {
+            return false;
+        }
+        crate::timer::busywait_ms(SET_ADDRESS_MS); // let the device take its address (F2)
+        ADDR_WAITS += 1;
+    } else if mps != mps0 {
         *ctx(inb, 0) = 0;
         *ctx(inb, 0).add(1) = 0b10; // evaluate EP0
         *e0.add(1) = 3 << 1 | 4 << 3 | real << 16;
@@ -989,8 +1385,14 @@ unsafe fn enumerate(d: usize, port: u32, speed: u32) -> bool {
             return false;
         }
     }
+    ADDR_STAGE = "device descriptor read";
     if !control(d, 0x80, 6, 0x0100, 0, 18) {
         return false;
+    }
+    if bsr {
+        ADDR_BSR += 1;
+    } else {
+        ADDR_PLAIN += 1;
     }
     let (vid, pid) = (u16::from_le_bytes([DBUF.0[8], DBUF.0[9]]), u16::from_le_bytes([DBUF.0[10], DBUF.0[11]]));
     let num_configs = DBUF.0[17];
@@ -1017,6 +1419,7 @@ unsafe fn enumerate(d: usize, port: u32, speed: u32) -> bool {
     // and the first other HID interface (not a keyboard), in case it is an absolute pointer:
     // (interface, report descriptor length, its interrupt-IN endpoint)
     let (mut in_tab, mut tab): (bool, Option<(u8, u16, Option<(u8, u32, u8)>)>) = (false, None);
+    let mut mouse_rd = 0u16; // the boot mouse's report descriptor length, to look for a wheel
     while i + 2 <= total {
         let len = DBUF.0[i] as usize;
         if len < 2 {
@@ -1038,6 +1441,9 @@ unsafe fn enumerate(d: usize, port: u32, speed: u32) -> bool {
                 if in_tab {
                     tab = Some((DBUF.0[i + 2], 0, None));
                 }
+            }
+            0x21 if in_kbd && kind == KIND_MOUSE && i + 9 <= total && DBUF.0[i + 6] == 0x22 => {
+                mouse_rd = u16::from_le_bytes([DBUF.0[i + 7], DBUF.0[i + 8]]);
             }
             0x21 if in_tab && i + 9 <= total && DBUF.0[i + 6] == 0x22 => {
                 if let Some(t) = tab.as_mut() {
@@ -1081,8 +1487,19 @@ unsafe fn enumerate(d: usize, port: u32, speed: u32) -> bool {
     if !control(d, 0x00, 9, config_value as u16, 0, 0) {
         return false; // SET_CONFIGURATION
     }
+    // a mouse with a wheel in its report descriptor stays in the report protocol (a boot
+    // report has no wheel); any other keyboard or mouse is switched to the boot protocol
+    let mut rel = None;
+    if kind == KIND_MOUSE && mouse_rd > 0 && control(d, 0x81, 6, 0x2200, iface as u16, mouse_rd.min(512)) {
+        rel = parse_rel(&(&*addr_of!(DBUF)).0[..mouse_rd.min(512) as usize]);
+    }
+    if kind == KIND_MOUSE {
+        MREL = rel;
+        MREP_LEN = mps.clamp(8, 512);
+    }
     if kind != KIND_TABLET {
-        control(d, 0x21, 0x0B, 0, iface as u16, 0); // SET_PROTOCOL(boot); a refusal is survivable
+        // SET_PROTOCOL(boot), or (report) for a wheel mouse; a refusal is survivable
+        control(d, 0x21, 0x0B, rel.is_some() as u16, iface as u16, 0);
     }
     control(d, 0x21, 0x0A, 0, iface as u16, 0); // SET_IDLE(0): report only on change
     // configure the interrupt-IN endpoint: DCI = 2*ep + 1
@@ -1125,7 +1542,7 @@ unsafe fn enumerate(d: usize, port: u32, speed: u32) -> bool {
     crate::kprintln!(
         "[xhci] port {}: USB {} {:04x}:{:04x} ({} speed), slot {}, interrupt-IN endpoint {} every {} us",
         port, match kind { KIND_KBD => "keyboard", KIND_TABLET => "tablet", _ => "mouse" }, vid, pid,
-        match speed { 1 => "full", 2 => "low", 3 => "high", 4 => "super", _ => "?" },
+        speed_name(speed),
         slot, epn, (1u32 << interval) * 125
     );
     if kind == KIND_TABLET {
@@ -1135,6 +1552,16 @@ unsafe fn enumerate(d: usize, port: u32, speed: u32) -> bool {
             a.id, a.x.size, a.x.bit, a.x.min, a.x.max, a.y.size, a.y.bit, a.y.min, a.y.max,
             if a.tip { "touch tip = left button" } else if a.nbtn > 0 { "buttons" } else { "no buttons" }
         );
+    }
+    if kind == KIND_MOUSE {
+        if let Some(m) = rel {
+            crate::kprintln!(
+                "[xhci] mouse: wheel, report protocol: report id {}, {} buttons, x {} bits at bit {}, y {} bits at bit {}, wheel {} bits at bit {}",
+                m.id, m.nbtn, m.x.size, m.x.bit, m.y.size, m.y.bit, m.wheel.size, m.wheel.bit
+            );
+        } else {
+            crate::kprintln!("[xhci] mouse: no wheel in its report descriptor, boot protocol");
+        }
     }
     queue_report(d);
     READY = true;
@@ -1149,7 +1576,11 @@ unsafe fn queue_report(d: usize) {
         NXFER,
         &mut (*addr_of_mut!(PEPIN))[d],
         addr_of!(REPORT[d]) as u64,
-        if DEVS[d].kind == KIND_TABLET { TAB_LEN } else { 8 },
+        match DEVS[d].kind {
+            KIND_TABLET => TAB_LEN,
+            KIND_MOUSE if (*addr_of!(MREL)).is_some() => MREP_LEN,
+            _ => 8,
+        },
         T_NORMAL << 10 | 1 << 5 | 1 << 2,
     );
     doorbell(DEVS[d].slot, DEVS[d].dci);
@@ -1272,8 +1703,14 @@ unsafe fn handle(ev: Trb) {
     if DEVS[d].kind == KIND_MOUSE {
         if cc == CC_SUCCESS || cc == CC_SHORT {
             let r = &(*addr_of!(REPORT[d])).0;
-            MREPORTS += 1;
-            mouse_report(r[0], r[1] as i8 as i32, r[2] as i8 as i32);
+            if let Some(m) = MREL {
+                let got = MREP_LEN.saturating_sub(ev.status & 0xFF_FFFF) as usize; // minus the residue
+                mouse_rel_report(m, &r[..got.min(512)]);
+            } else {
+                MREPORTS += 1;
+                let (dx, dy) = mouse_accel(r[1] as i8 as i32, r[2] as i8 as i32);
+                mouse_report(r[0], dx, dy);
+            }
         }
         queue_report(d);
         return;
@@ -1291,8 +1728,32 @@ unsafe fn handle(ev: Trb) {
         let r = (*addr_of!(REPORT[d])).0;
         let shift = r[0] & 0x22 != 0;
         let last = LAST_KEYS;
+        // desktop shortcuts (desk.rs): Super alone toggles the launcher on its release
+        let (alt, sup, desk) = (r[0] & 0x44 != 0, r[0] & 0x88 != 0, crate::desk::shown());
+        if desk && LAST_MODS & 0x88 != 0 && !sup && !SUPER_COMBO {
+            crate::desk::post_key(crate::desk::KEY_SUPER);
+        }
+        if !sup {
+            SUPER_COMBO = false;
+        }
+        LAST_MODS = r[0];
         for &k in &r[2..8] {
             if k > 3 && !last.contains(&k) {
+                if sup {
+                    SUPER_COMBO = true; // Super+key is a shortcut, not a launcher press
+                }
+                if let Some(dk) = desk_key(k, alt, sup).filter(|_| desk) {
+                    crate::desk::post_key(dk);
+                    continue;
+                }
+                if k == 0x52 || k == 0x51 {
+                    crate::uart::history_key(k == 0x52); // Up/Down: shell history (uart.rs)
+                    continue;
+                }
+                if (k == 0x4b || k == 0x4e) && shift {
+                    crate::uart::console_page(k == 0x4b); // Shift+PgUp/PgDn: scrollback (conback.rs)
+                    continue;
+                }
                 if let Some(c) = ascii(k, shift) {
                     crate::uart::inject(c);
                     KEYS += 1;
@@ -1376,7 +1837,7 @@ unsafe fn detach(d: usize, c: usize) {
             KBD_SLOT = 0;
             HELD = None;
         }
-        KIND_MOUSE => MOUSE_SLOT = 0,
+        KIND_MOUSE => (MOUSE_SLOT, MREL) = (0, None),
         KIND_TABLET => TABLET_SLOT = 0,
         KIND_NET => NET_SLOT = 0,
         KIND_AUDIO => AUD_SLOT = 0,
@@ -1387,6 +1848,7 @@ unsafe fn detach(d: usize, c: usize) {
         KIND_MSC => {
             MSC_SLOT = 0;
             MSC_USABLE = false;
+            (MSC_RA_N, MSC_WB_N) = (0, 0); // gathered writes are lost with the device
         }
         KIND_HUB if HUBI[d].3 != 0 => {
             HUBS = HUBS.saturating_sub(1);
@@ -1477,33 +1939,72 @@ unsafe fn hub_status(d: usize, hp: u32) -> Option<(u16, u16)> {
 }
 
 /// Reset hub `d`'s port `hp` (a device is connected there) and enumerate the device as entry
-/// `fd`, with its route string and transaction translator; true if this driver uses it.
+/// `fd`, with its route string and transaction translator; true if this driver uses it. A
+/// device that does not answer gets the root ports' three tries (F2): each after a new port
+/// reset with a longer recovery, the second the other way of addressing.
 unsafe fn hub_port(d: usize, hp: u32, fd: usize) -> bool {
     let (speed, tts, ttp, _) = HUBI[d];
     let (port, slot, saved) = (DEVS[d].port, DEVS[d].slot, PATH);
-    control(d, 0x23, 3, 4, hp as u16, 0); // SET_FEATURE(PORT_RESET)
-    let mut reset_done = false;
-    for _ in 0..50 {
-        crate::timer::busywait_ms(5);
-        if let Some((_, ch)) = hub_status(d, hp) {
-            if ch & 1 << 4 != 0 {
-                reset_done = true;
-                break;
+    let mut ok = false;
+    let mut answered = false;
+    let mut enabled = true;
+    for (n, bsr, ms) in [(1u32, BSR_FIRST, 0u64), (2, !BSR_FIRST, 50), (3, BSR_FIRST, 100)] {
+        if n > 1 {
+            ADDR_ERR = (LAST_CC, ADDR_STAGE);
+            crate::kprintln!(
+                "[xhci] hub port {}: device did not answer (completion code {} at {}); port reset, try {} of 3: {}, {} ms recovery",
+                hp, { LAST_CC }, { ADDR_STAGE }, n, scheme_name(bsr), ms
+            );
+        }
+        control(d, 0x23, 3, 4, hp as u16, 0); // SET_FEATURE(PORT_RESET)
+        let mut reset_done = false;
+        for _ in 0..50 {
+            crate::timer::busywait_ms(5);
+            if let Some((_, ch)) = hub_status(d, hp) {
+                if ch & 1 << 4 != 0 {
+                    reset_done = true;
+                    break;
+                }
             }
         }
+        control(d, 0x23, 1, 20, hp as u16, 0); // CLEAR_FEATURE(C_PORT_RESET)
+        control(d, 0x23, 1, 16, hp as u16, 0); // CLEAR_FEATURE(C_PORT_CONNECTION)
+        crate::timer::busywait_ms(20 + ms); // reset recovery, longer on each retry
+        let Some((st, _)) = hub_status(d, hp) else {
+            enabled = false;
+            break;
+        };
+        if !reset_done || st & 2 == 0 {
+            crate::kprintln!("[xhci] hub port {}: device did not enable after reset", hp);
+            enabled = false;
+            break;
+        }
+        let cspeed = if st & 1 << 9 != 0 { 2 } else if st & 1 << 10 != 0 { 3 } else { 1 };
+        let tt = if speed == 3 && cspeed < 3 { (slot, hp) } else { (tts, ttp) };
+        PATH = (hub_port_route(d, hp).0, tt.0, tt.1);
+        BSR_NOW = bsr;
+        LAST_CC = 0;
+        ok = hid(fd, port, cspeed);
+        BSR_NOW = BSR_FIRST;
+        PATH = saved;
+        answered = ok || LAST_OTHER.0 != 0 || LAST_OTHER.1 != 0;
+        if answered && n > 1 {
+            ADDR_RETRIED += 1;
+            crate::kprintln!("[xhci] hub port {}: answered on try {} ({})", hp, n, scheme_name(bsr));
+        }
+        if answered {
+            break;
+        }
     }
-    control(d, 0x23, 1, 20, hp as u16, 0); // CLEAR_FEATURE(C_PORT_RESET)
-    control(d, 0x23, 1, 16, hp as u16, 0); // CLEAR_FEATURE(C_PORT_CONNECTION)
-    crate::timer::busywait_ms(20); // reset recovery
-    let Some((st, _)) = hub_status(d, hp) else { return false };
-    if !reset_done || st & 2 == 0 {
-        crate::kprintln!("[xhci] hub port {}: device did not enable after reset", hp);
+    if !enabled {
+        return false; // gone, or the port would not enable: not an addressing failure
+    }
+    if !answered {
+        ADDR_ERR = (LAST_CC, ADDR_STAGE);
+        ADDR_NONE += 1;
+        crate::kprintln!("[xhci] hub port {}: device did not answer (descriptor not read), left alone", hp);
         return false;
     }
-    let cspeed = if st & 1 << 9 != 0 { 2 } else if st & 1 << 10 != 0 { 3 } else { 1 };
-    let tt = if speed == 3 && cspeed < 3 { (slot, hp) } else { (tts, ttp) };
-    PATH = (hub_port_route(d, hp).0, tt.0, tt.1);
-    let ok = hid(fd, port, cspeed);
     if !ok {
         note_other();
         let (v, pr, dc, ic) = LAST_OTHER;
@@ -1514,6 +2015,222 @@ unsafe fn hub_port(d: usize, hp: u32, fd: usize) -> bool {
     }
     PATH = saved;
     ok
+}
+
+/// Enumerate the device on root port `p` (PORTSC `sc`, enabled) as entry `fd`; true if this
+/// driver uses it. A device that did not answer at all (no descriptor read) gets its port reset
+/// and one more try; one that answered and is not ours is not tried again (field item F1).
+unsafe fn attach(fd: usize, p: u32, sc: u32) -> bool {
+    // F2: up to three tries, each after a port reset with a longer recovery, the second the
+    // other way of addressing (as Linux alternates its old and new schemes)
+    let mut sc = sc;
+    for (n, bsr, ms) in [(1u32, BSR_FIRST, 0u64), (2, !BSR_FIRST, 50), (3, BSR_FIRST, 100)] {
+        if n > 1 {
+            ADDR_ERR = (LAST_CC, ADDR_STAGE);
+            crate::kprintln!(
+                "[xhci] port {}: device did not answer (completion code {} at {}); port reset, try {} of 3: {}, {} ms recovery",
+                p, { LAST_CC }, { ADDR_STAGE }, n, scheme_name(bsr), ms
+            );
+            sc = r32(portsc(p));
+            w32(portsc(p), (sc & !(1 << 1 | 0x00FE_0000 | 1 << 4 | 1 << 31 | 1 << 16)) | 1 << 4); // PR
+            wait(|| r32(portsc(p)) & 1 << 21 != 0); // PRC
+            crate::timer::busywait_ms(ms); // reset recovery (USB 2.0 TRSTRCY is 10 ms at least)
+            sc = r32(portsc(p));
+            w32(portsc(p), (sc & !(1 << 1 | 0x00FE_0000 | 1 << 4 | 1 << 31 | 1 << 16)) | (sc & 0x00FE_0000));
+            if sc & 3 != 3 {
+                break; // gone, or the port would not enable
+            }
+        }
+        BSR_NOW = bsr;
+        LAST_CC = 0;
+        let ok = hid(fd, p, port_speed(CUR, p, (sc >> 10) & 0xF));
+        BSR_NOW = BSR_FIRST;
+        let answered = ok || LAST_OTHER.0 != 0 || LAST_OTHER.1 != 0;
+        if answered && n > 1 {
+            ADDR_RETRIED += 1;
+            crate::kprintln!("[xhci] port {}: answered on try {} ({})", p, n, scheme_name(bsr));
+        }
+        if answered {
+            return ok;
+        }
+    }
+    ADDR_ERR = (LAST_CC, ADDR_STAGE);
+    ADDR_NONE += 1;
+    false
+}
+
+fn scheme_name(bsr: bool) -> &'static str {
+    if bsr { "descriptor read before the address (BSR)" } else { "address first (plain)" }
+}
+
+/// `usbaddr` (F2): how new devices are given their address, and how that went since boot;
+/// `usbaddr bsr` reads the first descriptor before the address, `usbaddr plain` the default.
+pub fn addr_cmd(rest: &str) {
+    // SAFETY: shell context, single core; plain flags and counters.
+    unsafe {
+        match rest.trim() {
+            "" => {}
+            "bsr" => (BSR_FIRST, BSR_NOW) = (true, true),
+            "plain" => (BSR_FIRST, BSR_NOW) = (false, false),
+            "psi" => {
+                psi_test();
+                return;
+            }
+            r if r.starts_with("fail") => match r[4..].trim().parse::<u32>() {
+                Ok(n) if n <= 9 => {
+                    FAIL_NEXT = n;
+                    crate::kprintln!(
+                        "usb: test: the next {} addressing tr{} will fail at the first descriptor read (completion code 4)",
+                        n, if n == 1 { "y" } else { "ies" }
+                    );
+                    return;
+                }
+                _ => {
+                    crate::kprintln!("usbaddr: fail takes a number from 0 to 9");
+                    return;
+                }
+            },
+            _ => {
+                crate::kprintln!("usbaddr: say bsr, plain or psi (or nothing to see how devices were addressed)");
+                return;
+            }
+        }
+        crate::kprintln!(
+            "usb: new devices are tried first with {}; then the other way, then this way again",
+            scheme_name(BSR_FIRST)
+        );
+        for c in 0..NRUN {
+            let (ms, halted, intel) = RESET[c];
+            crate::kprintln!(
+                "  reset: controller {} {}ready {} ms after HCRST, first read after 1 ms{}",
+                c + 1, if halted { "halted, " } else { "not halted, " }, ms,
+                if intel { " (Intel host)" } else { "" }
+            );
+            let (t, n, ok) = SETTLE[c];
+            crate::kprintln!(
+                "  power-on: controller {}'s ports {} after {} ms, {} with a device",
+                c + 1, if ok { "steady" } else { "still changing" }, t, n
+            );
+        }
+        crate::kprintln!(
+            "  set address: {} ms for the device to take it, {} wait(s) made; first read {} bytes descriptor first, 8 plain; last EP0 packet size {}",
+            SET_ADDRESS_MS, { ADDR_WAITS }, FIRST_READ_BSR, { LAST_MPS0 }
+        );
+        dma_line("  ");
+        crate::kprintln!(
+            "  speed IDs: {} device(s) by a controller's own table{}",
+            { PSI_USED }, if PSI_TEST { " (test table on controller 1)" } else { "" }
+        );
+        addr_line();
+    }
+}
+
+/// F2 (9 Nov 2026): xHCI 1.2 table 6-1 says where the controller's structures may sit: device
+/// and input contexts, the device context array and the scratchpad array inside one 4 KiB page,
+/// every ring segment and every transfer's data buffer inside one 64 KiB block. QEMU does not
+/// care; a real controller may fetch a context that crosses a page from the wrong place. The
+/// statics are placed by the linker, and UEFI loads the image at a page boundary, so a page
+/// offset here is the same on every PC. Returns (structures checked, how many cross, the first).
+unsafe fn dma_check() -> (u32, u32, &'static str) {
+    const PG: u64 = 4096;
+    const K64: u64 = 65536;
+    let mut st = (0u32, 0u32, "");
+    fn chk(st: &mut (u32, u32, &'static str), name: &'static str, a: u64, len: usize, bound: u64) {
+        st.0 += 1;
+        if a / bound != (a + len as u64 - 1) / bound {
+            if st.1 == 0 {
+                st.2 = name;
+            }
+            st.1 += 1;
+        }
+    }
+    use core::mem::size_of;
+    for c in 0..NCTL {
+        chk(&mut st, "command ring", addr_of!(CMD[c]) as u64, size_of::<Ring<NCMD>>(), K64);
+        chk(&mut st, "event ring", addr_of!(EVT[c]) as u64, size_of::<Ring<NEV>>(), K64);
+        chk(&mut st, "device context array", addr_of!(DCBAA[c]) as u64, 256 * 8, PG);
+        chk(&mut st, "scratchpad array", addr_of!(SCRATCH_ARR[c]) as u64, 256 * 8, PG);
+    }
+    chk(&mut st, "input context", addr_of!(INCTX) as u64, 33 * CSZ, PG);
+    for d in 0..NDEV {
+        chk(&mut st, "device context", addr_of!(OUTCTX[d]) as u64, 32 * CSZ, PG);
+        chk(&mut st, "control ring", addr_of!(EP0[d]) as u64, size_of::<Ring<NXFER>>(), K64);
+        chk(&mut st, "interrupt ring", addr_of!(EPIN[d]) as u64, size_of::<Ring<NXFER>>(), K64);
+        chk(&mut st, "report buffer", addr_of!(REPORT[d]) as u64, 512, K64);
+    }
+    chk(&mut st, "control buffer", addr_of!(DBUF) as u64, 512, K64);
+    chk(&mut st, "stick ring", addr_of!(MSC_OUT_RING) as u64, size_of::<Ring<NXFER>>(), K64);
+    chk(&mut st, "stick command", addr_of!(CBW) as u64, 64, K64);
+    chk(&mut st, "stick status", addr_of!(CSW) as u64, 64, K64);
+    chk(&mut st, "stick block", addr_of!(MSCBUF) as u64, 4096, K64);
+    chk(&mut st, "stick read-ahead", addr_of!(MSC_RA) as u64, MSC_RA_BYTES, K64);
+    chk(&mut st, "stick write-behind", addr_of!(MSC_WB) as u64, MSC_RA_BYTES, K64);
+    chk(&mut st, "network ring", addr_of!(EPOUT) as u64, size_of::<Ring<NXFER>>(), K64);
+    for i in 0..NRXB {
+        chk(&mut st, "network receive buffer", addr_of!(NETRX[i]) as u64, FRAME, K64);
+    }
+    for i in 0..NTXB {
+        chk(&mut st, "network send buffer", addr_of!(NETTX[i]) as u64, FRAME, K64);
+    }
+    chk(&mut st, "serial ring", addr_of!(SER_RING) as u64, size_of::<Ring<NXFER>>(), K64);
+    chk(&mut st, "serial buffer", addr_of!(SER_TXBUF) as u64, 4096, K64);
+    chk(&mut st, "sound ring", addr_of!(AUD_RING) as u64, size_of::<Ring<NAUD>>(), K64);
+    for i in 0..NAUD {
+        chk(&mut st, "sound packet", addr_of!(AUDBUF[i]) as u64, AUD_PKT, K64);
+    }
+    st
+}
+
+/// One line on where the controller's structures sit (F2), at boot and in `usbaddr`.
+unsafe fn dma_line(lead: &str) {
+    let (n, bad, first) = dma_check();
+    if bad == 0 {
+        crate::kprintln!(
+            "{}memory: all {} controller structures inside their xHCI limits (contexts in one 4 KiB page, rings and buffers in one 64 KiB block)",
+            lead, n
+        );
+    } else {
+        crate::kprintln!(
+            "{}memory: {} of {} controller structures cross an xHCI limit (first: {})",
+            lead, bad, n, first
+        );
+    }
+}
+
+/// One line on addressing (two after a retry), for `usbaddr` and `lsusb`.
+unsafe fn addr_line() {
+    crate::kprintln!(
+        "  addressing: {} plain, {} descriptor first (BSR), {} answered on a later try, {} on no try",
+        { ADDR_PLAIN }, { ADDR_BSR }, { ADDR_RETRIED }, { ADDR_NONE }
+    );
+    if ADDR_RETRIED + ADDR_NONE > 0 {
+        let (cc, stage) = ADDR_ERR;
+        crate::kprintln!("  last addressing error: completion code {} at {}", cc, stage);
+    }
+    if FAILED_ON_PURPOSE + FAIL_NEXT > 0 {
+        crate::kprintln!(
+            "  test: {} tr{} made to fail (usbaddr fail), {} still to come",
+            { FAILED_ON_PURPOSE }, if FAILED_ON_PURPOSE == 1 { "y" } else { "ies" }, { FAIL_NEXT }
+        );
+    }
+}
+
+/// Root port `p` of controller `c` holds a device this driver does not use (or that did not
+/// answer): one line for it, and it is left alone until it is unplugged.
+unsafe fn left_alone(c: usize, p: u32, hot: bool) {
+    if p < 32 {
+        LEFT[c] |= 1 << p;
+    }
+    note_other();
+    let (v, pr, dc, ic) = LAST_OTHER;
+    if (v, pr) == (0, 0) {
+        crate::kprintln!("[xhci] port {}: device did not answer (descriptor not read), left alone until unplugged", p);
+    } else {
+        crate::kprintln!(
+            "[xhci] port {}: device {:04x}:{:04x} ({}) {}not one this driver uses",
+            p, v, pr, class_name(if dc != 0 { dc } else { ic }), if hot { "plugged in, " } else { "is " }
+        );
+    }
 }
 
 /// `service` for the root ports of controller `c` (the current one).
@@ -1530,6 +2247,10 @@ unsafe fn service_ports(c: usize) {
             let present = (0..NDEV).any(|d| DEVS[d].slot != 0 && DEVS[d].port == p && DEVS[d].ctl == c);
             if sc & 1 == 0 {
                 // unplugged: everything that hung off this root port goes
+                if LEFT[c] & 1 << p != 0 {
+                    LEFT[c] &= !(1 << p); // a device plugged in here next is tried afresh
+                    CONNECTED = CONNECTED.saturating_sub(1);
+                }
                 for d in 0..NDEV {
                     if DEVS[d].slot != 0 && DEVS[d].port == p && DEVS[d].ctl == c {
                         detach(d, c);
@@ -1539,8 +2260,8 @@ unsafe fn service_ports(c: usize) {
                 crate::kprintln!("[xhci] port {}: device unplugged", p);
                 continue;
             }
-            if present {
-                continue;
+            if present || LEFT[c] & 1 << p != 0 {
+                continue; // ours already, or left alone: the change was a reset or an enable bit
             }
             // plugged in: let the contacts settle (a connector bounces as it goes in), and only
             // go on if it is still connected 100 ms later
@@ -1567,16 +2288,11 @@ unsafe fn service_ports(c: usize) {
             };
             PATH = (0, 0, 0);
             CONNECTED += 1;
-            if hid(fd, p, (sc >> 10) & 0xF) {
+            if attach(fd, p, sc) {
                 PLUGS += 1;
                 crate::kprintln!("[xhci] port {}: device plugged in and ready", p);
             } else {
-                note_other();
-                let (v, pr, dc, ic) = LAST_OTHER;
-                crate::kprintln!(
-                    "[xhci] port {}: device {:04x}:{:04x} ({}) plugged in, not one this driver uses",
-                    p, v, pr, class_name(if dc != 0 { dc } else { ic })
-                );
+                left_alone(c, p, true);
             }
         }
     }
@@ -1590,8 +2306,8 @@ unsafe fn service_ports(c: usize) {
 /// served by `service` (`service_hub`), as a root port's is.
 unsafe fn hub_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16, protocol: u8) -> bool {
     let slot = DEVS[d].slot;
-    if speed == 4 {
-        // a SuperSpeed hub speaks another descriptor and port-status format (and wants
+    if speed >= 4 {
+        // a SuperSpeed (or SuperSpeedPlus) hub speaks another descriptor and port-status format (and wants
         // SET_HUB_DEPTH); every USB 3 hub is also a USB 2 hub on a USB 2 root port, and
         // keyboards, mice, sticks and USB 2 adapters behind it are reached through that half
         DEVS[d].kind = KIND_HUB;
@@ -1670,7 +2386,7 @@ unsafe fn hub_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16, protoco
     HUBI[d] = (speed, PATH.1, PATH.2, nports);
     crate::kprintln!(
         "[xhci] port {}: USB hub {:04x}:{:04x} ({} speed), slot {}, {} ports",
-        port, vid, pid, match speed { 1 => "full", 2 => "low", 3 => "high", 4 => "super", _ => "?" }, slot, nports
+        port, vid, pid, speed_name(speed), slot, nports
     );
     for hp in 1..=nports {
         control(d, 0x23, 3, 8, hp as u16, 0); // SET_FEATURE(PORT_POWER)
@@ -1791,13 +2507,34 @@ unsafe fn msc_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bool
         return true; // kept (it is set up), but not used for storage
     }
     let b = &mscbuf();
-    MSC_BLOCKS = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64 + 1;
+    let last10 = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    MSC_BLOCKS = last10 as u64 + 1;
     MSC_BS = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+    (MSC_LONG, MSC_LONGCHK) = (false, 0);
+    if last10 == 0xFFFF_FFFF {
+        // Too big for READ CAPACITY(10): SERVICE ACTION IN(16) / READ CAPACITY(16), 32 bytes back.
+        let cdb = [0x9E, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0];
+        if !bot(&cdb, 32, true) {
+            crate::kprintln!("[xhci] port {}: USB storage {:04x}:{:04x} did not report its capacity (READ CAPACITY(16))", port, vid, pid);
+            return true;
+        }
+        let b = &mscbuf();
+        MSC_BLOCKS = u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) + 1;
+        MSC_BS = u32::from_be_bytes([b[8], b[9], b[10], b[11]]);
+        MSC_LONG = true;
+        crate::kprintln!(
+            "[xhci] USB storage: {} blocks, past what READ(10) can address: READ(16)/WRITE(16) for every read and write",
+            { MSC_BLOCKS }
+        );
+    }
     let usable = matches!(MSC_BS, 512 | 1024 | 2048 | 4096) && msc_io(0, false) && {
         let s0 = &mscbuf()[..512];
         &s0[..8] == b"AFRIVFS1" || s0.iter().all(|&x| x == 0)
     };
     MSC_USABLE = usable;
+    if usable && MSC_LONG {
+        msc_long_check();
+    }
     let name = core::str::from_utf8(&*addr_of!(MSC_NAME)).unwrap_or("?");
     crate::kprintln!(
         "[xhci] port {}: USB storage {:04x}:{:04x} \"{}\", {} blocks of {} B ({} MiB), {}",
@@ -1805,7 +2542,201 @@ unsafe fn msc_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bool
         { MSC_BLOCKS }, { MSC_BS }, MSC_BLOCKS * MSC_BS as u64 / (1024 * 1024),
         if usable { "blank or ours: used for storage" } else { "holds other data: left alone" }
     );
+    msc_multi_check();
     true
+}
+
+/// At start-up: READ(10) of the first blocks in one command must equal the same blocks read one
+/// at a time, else multi-block reads stay off (and writes with them). One boot line says which.
+unsafe fn msc_multi_check() {
+    (MSC_MULTI, MSC_MULTIW, MSC_RA_N, MSC_WB_N) = (0, 0, 0, 0);
+    MSC_RSTATS = (0, 0, 0, 0);
+    MSC_WSTATS = (0, 0, 0);
+    if !MSC_USABLE {
+        return;
+    }
+    let k = (MSC_RA_BYTES as u64 / MSC_BS as u64).min(MSC_BLOCKS) as u32;
+    if k < 2 {
+        MSC_MULTI = 2;
+        return;
+    }
+    let ra = addr_of_mut!(MSC_RA.0) as *mut u8;
+    core::ptr::write_bytes(ra, 0xA5, MSC_RA_BYTES);
+    let mut same = msc_rw(0, k, false, ra as u64);
+    let read_ok = same;
+    for b in 0..k as u64 {
+        if !same {
+            break;
+        }
+        let off = b as usize * MSC_BS as usize;
+        same = msc_io(b, false)
+            && mscbuf()[..MSC_BS as usize] == core::slice::from_raw_parts(ra.add(off), MSC_BS as usize)[..];
+    }
+    if same {
+        (MSC_MULTI, MSC_RA_AT, MSC_RA_N) = (1, 0, k);
+        crate::kprintln!(
+            "[xhci] USB storage: multi-block reads on ({} of up to {} blocks per command; the first {} equal one at a time)",
+            if MSC_LONG { "READ(16)" } else { "READ(10)" }, k, k
+        );
+    } else {
+        MSC_MULTI = 2;
+        MSC_MULTIW = 2;
+        crate::kprintln!(
+            "[xhci] USB storage: multi-block reads off ({}): one block per command",
+            if read_ok { "they differed from one block at a time" } else { "the device refused one" }
+        );
+    }
+}
+
+/// The command block for `k` device blocks from `lba`: READ(10)/WRITE(10), or READ(16)/WRITE(16)
+/// on a disk past 2^32 blocks (MSC_LONG). Returns the block and its length (10 or 16).
+unsafe fn msc_cdb(lba: u64, k: u32, write: bool) -> ([u8; 16], usize) {
+    let mut c = [0u8; 16];
+    if MSC_LONG {
+        c[0] = if write { 0x8A } else { 0x88 };
+        c[2..10].copy_from_slice(&lba.to_be_bytes());
+        c[10..14].copy_from_slice(&k.to_be_bytes());
+        (c, 16)
+    } else {
+        c[0] = if write { 0x2A } else { 0x28 };
+        c[2..6].copy_from_slice(&(lba as u32).to_be_bytes());
+        c[7..9].copy_from_slice(&(k as u16).to_be_bytes());
+        (c, 10)
+    }
+}
+
+/// READ(10) / WRITE(10) (or the 16-byte forms) of `k` device blocks from `lba`, the data at `buf`.
+unsafe fn msc_rw(lba: u64, k: u32, write: bool, buf: u64) -> bool {
+    let (cdb, n) = msc_cdb(lba, k, write);
+    bot_at(&cdb[..n], k * MSC_BS, !write, buf)
+}
+
+/// At start-up on a disk past 2^32 blocks: the last block is read, a pattern holding its address
+/// written there with WRITE(16) and read back with READ(16), the old contents put back, and the
+/// block a 32-bit address would wrap to must not hold the pattern. One boot line says which.
+unsafe fn msc_long_check() {
+    let bs = MSC_BS as usize;
+    let last = MSC_BLOCKS - 1;
+    let wrap = last & 0xFFFF_FFFF;
+    let mut old = [0u8; 4096];
+    let mut pat = [0u8; 4096];
+    for (i, x) in pat[..bs].iter_mut().enumerate() {
+        *x = (i as u8) ^ 0xC3 ^ last.to_be_bytes()[i % 8];
+    }
+    let saved = msc_io(last, false) && {
+        old[..bs].copy_from_slice(&mscbuf()[..bs]);
+        true
+    };
+    mscbuf()[..bs].copy_from_slice(&pat[..bs]);
+    let wrote = saved && msc_io(last, true);
+    let back = wrote && msc_io(last, false) && mscbuf()[..bs] == pat[..bs];
+    let apart = back && msc_io(wrap, false) && mscbuf()[..bs] != pat[..bs];
+    mscbuf()[..bs].copy_from_slice(&old[..bs]);
+    let restored = !wrote || (msc_io(last, true) && msc_io(last, false) && mscbuf()[..bs] == old[..bs]);
+    let ok = back && apart && restored;
+    MSC_LONGCHK = if ok { 1 } else { 2 };
+    if ok {
+        crate::kprintln!(
+            "[xhci] USB storage: 16-byte commands checked at block {} (written, read back, put back; block {} untouched)",
+            last, wrap
+        );
+    } else {
+        let why = if !saved { "the last block could not be read" } else if !back { "the last block did not read back as written" }
+            else if !apart { "the write landed on a 32-bit wrapped block too" } else { "the last block could not be put back" };
+        crate::kprintln!("[xhci] USB storage: 16-byte command check did not pass ({}): disk left alone", why);
+        MSC_USABLE = false;
+    }
+}
+
+/// Device block `b` into MSCBUF: from the read-ahead when it holds it, else a new multi-block
+/// read of up to 8 KiB from it (once the boot check passed), else one block.
+unsafe fn msc_fetch(b: u64) -> bool {
+    MSC_RSTATS.0 += 1;
+    let bs = MSC_BS as usize;
+    if b >= MSC_RA_AT && b < MSC_RA_AT + MSC_RA_N as u64 {
+        let off = (b - MSC_RA_AT) as usize * bs;
+        mscbuf()[..bs].copy_from_slice(&(&*addr_of!(MSC_RA.0))[off..off + bs]);
+        MSC_RSTATS.1 += 1;
+        return true;
+    }
+    if MSC_MULTI == 1 {
+        let k = (MSC_RA_BYTES as u64 / MSC_BS as u64).min(MSC_BLOCKS - b) as u32;
+        if k > 1 {
+            MSC_RA_N = 0;
+            if msc_rw(b, k, false, addr_of!(MSC_RA.0) as u64) {
+                (MSC_RA_AT, MSC_RA_N) = (b, k);
+                mscbuf()[..bs].copy_from_slice(&(&*addr_of!(MSC_RA.0))[..bs]);
+                MSC_RSTATS.2 += 1;
+                return true;
+            }
+            MSC_MULTI = 2;
+            crate::kprintln!("[xhci] USB storage: a multi-block read at block {} failed: one block per command from now on", b);
+        }
+    }
+    MSC_RSTATS.3 += 1;
+    msc_io(b, false)
+}
+
+/// Device block `b` was written from `data` (or the write failed): keep the read-ahead true.
+unsafe fn msc_ra_update(b: u64, data: &[u8], ok: bool) {
+    if b >= MSC_RA_AT && b < MSC_RA_AT + MSC_RA_N as u64 {
+        if ok {
+            let off = (b - MSC_RA_AT) as usize * MSC_BS as usize;
+            (&mut (*addr_of_mut!(MSC_RA)).0)[off..off + data.len()].copy_from_slice(data);
+        } else {
+            MSC_RA_N = 0; // the device's copy is unknown now
+        }
+    }
+}
+
+/// Send the gathered writes: one WRITE(10) when multi-block writes are on (the first one is read
+/// back block by block and must be equal, else they go off and the run is rewritten one block
+/// at a time), else one WRITE(10) per block.
+unsafe fn msc_flush() -> bool {
+    let (at, k) = (MSC_WB_AT, MSC_WB_N);
+    if k == 0 {
+        return true;
+    }
+    MSC_WB_N = 0;
+    let wb = addr_of!(MSC_WB.0) as *const u8;
+    let bs = MSC_BS as usize;
+    let mut done = false;
+    if k > 1 && MSC_MULTI == 1 && MSC_MULTIW != 2 {
+        if msc_rw(at, k, true, wb as u64) {
+            MSC_WSTATS.1 += 1;
+            done = true;
+            if MSC_MULTIW == 0 {
+                for j in 0..k as u64 {
+                    let s = core::slice::from_raw_parts(wb.add(j as usize * bs), bs);
+                    if !(msc_io(at + j, false) && mscbuf()[..bs] == s[..]) {
+                        done = false;
+                        break;
+                    }
+                }
+                MSC_MULTIW = if done { 1 } else { 2 };
+                if done {
+                    crate::kprintln!("[xhci] USB storage: multi-block writes on ({} of up to {} blocks per command; the first {} read back equal)", if MSC_LONG { "WRITE(16)" } else { "WRITE(10)" }, MSC_RA_BYTES / bs, k);
+                } else {
+                    crate::kprintln!("[xhci] USB storage: multi-block writes off (read back differently: rewritten one block per command)");
+                }
+            }
+        } else {
+            MSC_MULTIW = 2;
+            crate::kprintln!("[xhci] USB storage: a multi-block write at block {} failed: one block per command from now on", at);
+        }
+    }
+    let mut ok = true;
+    for j in 0..k as u64 {
+        let s = core::slice::from_raw_parts(wb.add(j as usize * bs), bs);
+        let good = done || {
+            mscbuf()[..bs].copy_from_slice(s);
+            MSC_WSTATS.2 += 1;
+            msc_io(at + j, true)
+        };
+        msc_ra_update(at + j, s, good);
+        ok = ok && good;
+    }
+    ok
 }
 
 /// Wait for the transfer event of endpoint `dci` of `slot`, serving every other event.
@@ -1825,14 +2756,19 @@ unsafe fn wait_xfer(slot: u32, dci: u32) -> Option<Trb> {
 /// One Bulk-Only transaction: the command block wrapper out, `len` bytes of data in or out
 /// of MSCBUF, the command status wrapper in. True if the device reports success.
 unsafe fn bot(cdb: &[u8], len: u32, dir_in: bool) -> bool {
+    bot_at(cdb, len, dir_in, addr_of!(MSCBUF) as u64)
+}
+
+/// As bot, with the data in or out of the buffer at `buf` (MSCBUF, MSC_RA or MSC_WB).
+unsafe fn bot_at(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
     let was_busy = BUSY;
     BUSY = true; // the timer poll stands aside; wait_xfer serves the other devices
-    let ok = bot_inner(cdb, len, dir_in);
+    let ok = bot_inner(cdb, len, dir_in, buf);
     BUSY = was_busy;
     ok
 }
 
-unsafe fn bot_inner(cdb: &[u8], len: u32, dir_in: bool) -> bool {
+unsafe fn bot_inner(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
     let w = &mut (*addr_of_mut!(CBW)).0;
     w.fill(0);
     w[0..4].copy_from_slice(&0x4342_5355u32.to_le_bytes()); // "USBC"
@@ -1852,7 +2788,7 @@ unsafe fn bot_inner(cdb: &[u8], len: u32, dir_in: bool) -> bool {
     }
     // the data, if any; a STALL here is the device saying "no" -- clear it and read the status
     if len > 0 {
-        let c = cc_of(msc_xfer(dir_in, addr_of!(MSCBUF) as u64, len));
+        let c = cc_of(msc_xfer(dir_in, buf, len));
         if c == Some(CC_STALL) {
             unwedge(dir_in);
         } else if !good(c) {
@@ -1876,7 +2812,7 @@ unsafe fn bot_inner(cdb: &[u8], len: u32, dir_in: bool) -> bool {
     if cs[12] != 0 && cdb[0] != 0x03 {
         // a failed command: read its sense data, or many sticks refuse the next one
         let saved = *mscbuf();
-        bot_inner(&[0x03, 0, 0, 0, 18, 0], 18, true);
+        bot_inner(&[0x03, 0, 0, 0, 18, 0], 18, true, addr_of!(MSCBUF) as u64);
         *mscbuf() = saved;
     }
     cs[12] == 0
@@ -1929,11 +2865,10 @@ fn mscbuf() -> &'static mut [u8; 4096] {
     unsafe { &mut (*addr_of_mut!(MSCBUF)).0 }
 }
 
-/// READ(10) / WRITE(10) of one device block at `lba` through MSCBUF.
+/// READ(10) / WRITE(10) (or the 16-byte forms) of one device block at `lba` through MSCBUF.
 unsafe fn msc_io(lba: u64, write: bool) -> bool {
-    let l = (lba as u32).to_be_bytes();
-    let cdb = [if write { 0x2A } else { 0x28 }, 0, l[0], l[1], l[2], l[3], 0, 0, 1, 0];
-    bot(&cdb, MSC_BS, !write)
+    let (cdb, n) = msc_cdb(lba, 1, write);
+    bot(&cdb[..n], MSC_BS, !write)
 }
 
 fn msc_per() -> u64 {
@@ -1960,7 +2895,8 @@ pub fn msc_read(n: u64, out: &mut [u8; 512]) -> bool {
     // SAFETY: mainline (the VFS); bot() keeps the timer poll off the event ring meanwhile.
     unsafe {
         let Some(home) = on(DEVS[MSC_D].ctl) else { return false };
-        let ok = msc_io(n / msc_per(), false);
+        // writes still gathered go to the device before anything is read
+        let ok = msc_flush() && msc_fetch(n / msc_per());
         select(home);
         if !ok {
             return false;
@@ -1990,11 +2926,45 @@ pub fn msc_write(n: u64, data: &[u8; 512]) -> bool {
     // SAFETY: as msc_read.
     unsafe {
         let Some(home) = on(DEVS[MSC_D].ctl) else { return false };
-        let ok = (msc_per() == 1 || msc_io(n / msc_per(), false)) && {
-            let off = (n % msc_per()) as usize * 512;
-            mscbuf()[off..off + 512].copy_from_slice(data);
-            msc_io(n / msc_per(), true)
-        };
+        // the VFS saves its sectors in order, so a run of device blocks is gathered in MSC_WB
+        // (up to 8 KiB; one block while multi-block writes are off). A block bigger than a
+        // sector (1, 2 or 4 KiB) is read once when the run reaches it and its sectors changed
+        // in place, so a 4 KiB disk is written once per block, not once per sector. The run is
+        // sent when it is full and its last block complete, on a gap, before any read, or at the
+        // VFS's last sector (or a lone write past the VFS area: the self-test, a table backup).
+        let (per, bs) = (msc_per(), MSC_BS as usize);
+        let (b, off) = (n / per, (n % per) as usize * 512);
+        let cap = if MSC_MULTI == 1 && MSC_MULTIW != 2 { (MSC_RA_BYTES / bs) as u32 } else { 1 };
+        let mut ok = true;
+        let tail = MSC_WB_AT + MSC_WB_N as u64; // the block after the run
+        if MSC_WB_N > 0 && b + 1 != tail && !(b == tail && MSC_WB_N < cap) {
+            ok = msc_flush();
+        }
+        let new = MSC_WB_N == 0 || b == MSC_WB_AT + MSC_WB_N as u64;
+        // a new block's other sectors as they are on the device (msc_fetch: the read-ahead,
+        // kept equal to every block flushed, or the device)
+        let got = !new || per == 1 || msc_fetch(b);
+        if got {
+            let wb = &mut (*addr_of_mut!(MSC_WB)).0;
+            if MSC_WB_N == 0 {
+                MSC_WB_AT = b;
+            }
+            if new {
+                if per > 1 {
+                    let i = MSC_WB_N as usize * bs;
+                    wb[i..i + bs].copy_from_slice(&mscbuf()[..bs]);
+                }
+                MSC_WB_N += 1;
+            }
+            let i = (b - MSC_WB_AT) as usize * bs + off;
+            wb[i..i + 512].copy_from_slice(data);
+            MSC_WSTATS.0 += 1;
+            let last = n >= 2 * crate::vfs::MAX_FILES as u64;
+            if last || (off + 512 == bs && MSC_WB_N >= cap) {
+                ok = msc_flush() && ok;
+            }
+        }
+        let ok = ok && got;
         select(home);
         ok
     }
@@ -2139,7 +3109,7 @@ unsafe fn net_setup(d: usize, port: u32, speed: u32, ncfg: u8, vid: u16, pid: u1
             crate::kprintln!(
                 "[xhci] port {}: USB Ethernet adapter {:04x}:{:04x} ({}, {} speed), slot {}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 port, vid, pid, if rndis { "RNDIS" } else { "CDC-ECM" },
-                match speed { 1 => "full", 2 => "low", 3 => "high", 4 => "super", _ => "?" }, slot,
+                speed_name(speed), slot,
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
             );
             if rndis {
@@ -2509,7 +3479,7 @@ unsafe fn serial_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> b
     READY = true;
     crate::kprintln!(
         "[xhci] port {}: USB serial cable {:04x}:{:04x} (FTDI {}, {} speed), slot {}, 115200 baud 8N1, bulk IN {} / OUT {}: the console is mirrored to it",
-        port, vid, pid, chip, match speed { 1 => "full", 2 => "low", 3 => "high", 4 => "super", _ => "?" }, slot, epi, epo
+        port, vid, pid, chip, speed_name(speed), slot, epi, epo
     );
     true
 }
@@ -2626,7 +3596,7 @@ const NAUD: usize = 64; // isochronous TRB ring: 63 packets + the link
 const AUD_AHEAD: u64 = 40; // packets queued ahead of the device (40 ms at full speed)
 const AUD_PKT: usize = 1024; // the largest packet we build
 const SRC_HZ: u32 = 44_100; // the shared sound calls' sample rate (mono)
-#[repr(C, align(64))]
+#[repr(C, align(1024))]
 struct Pkt([u8; AUD_PKT]);
 static mut AUD_RING: Ring<NAUD> = Ring([TRB0; NAUD]);
 static mut PAUD: Prod = Prod { idx: 0, cycle: 1 };
@@ -2836,7 +3806,7 @@ unsafe fn audio_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bo
     READY = true;
     crate::kprintln!(
         "[xhci] port {}: USB audio {:04x}:{:04x} ({} speed), slot {}, {} channel(s) 16-bit at {} Hz, isochronous OUT endpoint {} every {} us{}",
-        port, vid, pid, match speed { 1 => "full", 2 => "low", 3 => "high", 4 => "super", _ => "?" }, slot,
+        port, vid, pid, speed_name(speed), slot,
         a.ch, a.rate, epn, us,
         if unmuted { ", unmuted" } else { "" }
     );
@@ -3007,29 +3977,6 @@ pub fn audio_cmd(rest: &str) {
     }
 }
 
-/// A click on the desktop's dock (tonga.rs: five tiles across 24..616, y 408..466) runs
-/// that tile's command, as if it were typed: back to the text console, then the command.
-unsafe fn dock_click(x: i32, y: i32) {
-    if !(408..466).contains(&y) || !(24..616).contains(&x) {
-        return;
-    }
-    let cmd: &[u8] = match (x - 24) / 118 {
-        0 => b"",
-        1 => b"ls",
-        2 => b"store",
-        3 => b"ask who are you",
-        _ => b"devices",
-    };
-    crate::screen::set_desktop(false);
-    for &c in b"clear\r".iter().chain(cmd.iter()) {
-        crate::uart::inject(c);
-    }
-    if !cmd.is_empty() {
-        crate::uart::inject(b'\r');
-    }
-    DOCK_CLICKS += 1;
-}
-
 /// An absolute pointer's report: the pointer goes to the place it names (buttons as they
 /// were, so a held button drags), then the buttons change there -- a tap lands where touched.
 unsafe fn tablet_report(r: &[u8]) {
@@ -3051,15 +3998,76 @@ unsafe fn tablet_report(r: &[u8]) {
     mouse_report(buttons, 0, 0);
 }
 
+/// A wheel mouse's report (report protocol, laid out by its descriptor): the move through
+/// the acceleration curve as a boot report's, and wheel notches scroll the console (HID:
+/// positive = rolled away from the user, which scrolls back), not on the desktop.
+unsafe fn mouse_rel_report(m: Rel, r: &[u8]) {
+    if m.id != 0 && r.first() != Some(&m.id) {
+        return; // another of the device's reports
+    }
+    if (r.len() as u32) * 8 < (m.x.bit + m.x.size).max(m.y.bit + m.y.size).max(m.wheel.bit + m.wheel.size) {
+        return;
+    }
+    MREPORTS += 1;
+    let mut buttons = 0u8;
+    for k in 0..m.nbtn.min(3) {
+        buttons |= (bits(r, m.btn + k, 1) as u8) << k;
+    }
+    let z = signed(r, m.wheel).clamp(-127, 127);
+    if z != 0 {
+        MWHEEL += z.unsigned_abs() as u64;
+        if !crate::desk::shown() {
+            crate::uart::console_wheel(-z);
+        }
+    }
+    let (dx, dy) = mouse_accel(signed(r, m.x), signed(r, m.y));
+    mouse_report(buttons, dx, dy);
+}
+
+/// A USB mouse report's move through the acceleration curve: its speed is its counts over
+/// the time since the report before (at least 1 ms, at most 100 ms; after a longer pause
+/// the carried fractions are dropped).
+unsafe fn mouse_accel(dx: i32, dy: i32) -> (i32, i32) {
+    let now = crate::timer::cycles();
+    let ms = (now.wrapping_sub(M_LAST) / (crate::timer::hz() / 1000).max(1)).clamp(1, 100) as u32;
+    M_LAST = now;
+    if ms == 100 {
+        M_REM = (0, 0);
+    }
+    let (ax, ay, sped) = crate::ps2::accelerate(dx, dy, ms, MOUSE_PER_MM, &mut *addr_of_mut!(M_REM));
+    M_SPED += sped as u64;
+    (ax, ay)
+}
+
+/// `accel` and `lsusb`: the USB mouse's acceleration and how many reports it sped up.
+pub fn accel_line() {
+    // SAFETY: scalar read of the counter.
+    let sped = unsafe { M_SPED };
+    if crate::ps2::accel_on() {
+        crate::kprintln!(
+            "usb: mouse acceleration on, the same curve at 16 counts/mm (400 dpi); {} report(s) sped up",
+            sped
+        );
+    } else {
+        crate::kprintln!("usb: mouse acceleration off (1:1); {} report(s) sped up before", sped);
+    }
+}
+
 /// One pointer report: buttons (bit 0 left, 1 right, 2 middle), then signed x and y moves.
 unsafe fn mouse_report(buttons: u8, dx: i32, dy: i32) {
     MCLICKS += (buttons & !MBUTTONS & 7).count_ones() as u64;
     let left_down = buttons & 1 != 0 && MBUTTONS & 1 == 0;
+    let released_left = buttons & 1 == 0 && MBUTTONS & 1 != 0;
     MBUTTONS = buttons & 7;
     // the window manager: a left press on a title bar picks the window up, moves carry it,
     // the release puts it down
-    if left_down && crate::screen::desktop() {
-        dock_click(MX, MY);
+    // the desktop (desk.rs) takes presses, releases and moves as events, drawn outside the interrupt
+    if crate::desk::shown() {
+        if left_down {
+            crate::desk::post_down(MX, MY);
+        } else if buttons & 1 == 0 && released_left {
+            crate::desk::post_up(MX, MY);
+        }
     }
     if buttons & 1 == 0 {
         DRAG = None;
@@ -3080,6 +4088,9 @@ unsafe fn mouse_report(buttons: u8, dx: i32, dy: i32) {
         }
         MX = x;
         MY = y;
+        if crate::desk::shown() {
+            crate::desk::post_move(x, y);
+        }
         crate::screen::mark(); // the pointer is drawn over the console on the next redraw
     }
 }
@@ -3114,6 +4125,7 @@ pub fn list() {
             select(c);
             let (b, d, f) = *addr_of!(PCI_AT);
             crate::kprintln!("usb: xHCI controller {:02x}:{:02x}.{}, {} ports, {} connected", b, d, f, { PORTS }, { CONNECTED });
+            kinds_line(c, "  ");
         }
         select(home);
         if HUBS > 0 {
@@ -3125,6 +4137,23 @@ pub fn list() {
                 "  storage: slot {}, {} blocks of {} B{}",
                 { MSC_SLOT }, { MSC_BLOCKS }, { MSC_BS }, if MSC_USABLE { "  <- storage" } else { "  (other data, read-only to us)" }
             );
+            if MSC_LONG {
+                let c = match MSC_LONGCHK { 1 => "checked at the last block", 2 => "check did not pass", _ => "not checked" };
+                crate::kprintln!("  storage commands: READ(16)/WRITE(16), over 2^32 blocks ({})", c);
+            }
+            if MSC_USABLE {
+                let (r, ra, rm, r1) = MSC_RSTATS;
+                let (w, wm, w1) = MSC_WSTATS;
+                let st = |m: u8| match m { 1 => "on", 2 => "off", _ => "not checked" };
+                crate::kprintln!(
+                    "  storage reads: {} sector(s), {} from the read-ahead, {} multi-block command(s), {} single ({})",
+                    r, ra, rm, r1, st(MSC_MULTI)
+                );
+                crate::kprintln!(
+                    "  storage writes: {} sector(s), {} multi-block command(s), {} single ({})",
+                    w, wm, w1, st(MSC_MULTIW)
+                );
+            }
             if MSC_RECOVERIES > 0 {
                 crate::kprintln!("  storage: {} stall/phase recoveries", { MSC_RECOVERIES });
             }
@@ -3132,6 +4161,7 @@ pub fn list() {
         if PLUGS + UNPLUGS > 0 {
             crate::kprintln!("  hot-plug: {} plugged in, {} unplugged since boot", { PLUGS }, { UNPLUGS });
         }
+        addr_line();
         let ctl_of = |kind: u8| (0..NDEV).find(|&d| DEVS[d].slot != 0 && DEVS[d].kind == kind).map(|d| DEVS[d].ctl);
         let (kctl, mctl, tctl, actl) = (ctl_of(KIND_KBD), ctl_of(KIND_MOUSE), ctl_of(KIND_TABLET), ctl_of(KIND_AUDIO));
         for c in 0..NRUN.max(1) {
@@ -3178,8 +4208,18 @@ pub fn list() {
                 { MOUSE_SLOT }, { MREPORTS }, { MX }, { MY }, { MBUTTONS }, { MCLICKS }
             );
             crate::kprintln!("  mouse: {} window drag(s)", { DRAGS });
-            if DOCK_CLICKS > 0 {
-                crate::kprintln!("  mouse: {} dock click(s) on the desktop", { DOCK_CLICKS });
+            crate::kprintln!(
+                "  mouse: acceleration {}, {} report(s) sped up",
+                if crate::ps2::accel_on() { "on" } else { "off" },
+                { M_SPED }
+            );
+            if (*addr_of!(MREL)).is_some() {
+                crate::kprintln!("  mouse: wheel on (report protocol); {} notch(es), 3 console lines each", { MWHEEL });
+            } else {
+                crate::kprintln!("  mouse: no wheel (boot protocol)");
+            }
+            if crate::desk::dock_clicks() > 0 {
+                crate::kprintln!("  mouse: {} dock click(s) on the desktop", crate::desk::dock_clicks());
             }
         }
         if TABLET_SLOT != 0 {
@@ -3187,7 +4227,7 @@ pub fn list() {
                 "  tablet: slot {}, {} reports, pointer at {},{}, buttons {:03b}, {} clicks",
                 { TABLET_SLOT }, { TREPORTS }, { MX }, { MY }, { MBUTTONS }, { MCLICKS }
             );
-            crate::kprintln!("  tablet: {} window drag(s), {} dock click(s)", { DRAGS }, { DOCK_CLICKS });
+            crate::kprintln!("  tablet: {} window drag(s), {} dock click(s)", { DRAGS }, crate::desk::dock_clicks());
         }
         if AUD_SLOT != 0 {
             crate::kprintln!(

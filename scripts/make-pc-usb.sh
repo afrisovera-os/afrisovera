@@ -76,6 +76,21 @@ To leave, press the power button once: AfriSovera saves its files and switches o
 nothing happens, hold it 4 seconds, and write down the "power button" boot line); take
 the stick out and it starts Windows as normal.
 
+SEND A REPORT TO YOUR MAIN PC (so the team can read how AfriSovera runs on this PC):
+  1. On your main Windows PC, double-click  tools\\report-receiver.bat  in the AfriSovera
+     folder (or run:  python tools\\report-receiver.py ). It shows a line such as
+         report 192.168.1.20
+     If Windows asks whether Python may use networks, tick "Private networks" and click
+     Allow. That is your choice; without it the report cannot arrive. Nothing else changes.
+  2. Plug this PC into the SAME router as the main PC with a network cable (Wi-Fi and
+     Bluetooth do not work yet).
+  3. Start AfriSovera here from the stick, wait for the  afrisovera>  prompt, and type the
+     line from step 1, e.g.   report 192.168.1.20
+  4. This PC says  [report] SENT ... bytes  and the main PC's window says  Saved ... .
+     The report is in  build\\field-reports\\  for the team to read.
+  It sends only when you type  report , only to the address you type, and nothing ever
+  comes back in. If it says NOT SENT, the line after it says why in plain words.
+
 What to send back (phone photos are perfect):
   1. The PC's make and model, and its processor (e.g. "Lenovo T14, Intel i5-1135G7").
   2. A photo of the WHOLE screen right after it starts (the boot lines matter).

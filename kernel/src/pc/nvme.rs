@@ -6,36 +6,16 @@
 //! needs no change (pc/disk.rs picks the disk). Same safety rule as AHCI: the namespace is
 //! used for storage only if its sector 0 is blank or already AFRIVFS1.
 //! NVMe base specification 1.4: registers 3.1, queues 4, admin commands 5, I/O commands 6.
+//! Multi-block commands (10 Nov 2026), as the USB disks got on 9-10 Nov: a read fetches up to
+//! 8 KiB (two 4 KiB pages: PRP1 + PRP2, NLB = k - 1) into a read-ahead the next reads are
+//! served from, and the VFS's in-order save is gathered by device block (on a 4 KiB-block SSD
+//! each block read once, its eight sectors changed in place) into runs of up to 8 KiB sent with
+//! one Write. Each way is checked once against one block at a time (reads at start-up, writes
+//! at the first save, read back) before it is trusted; a mismatch or a refusal turns it off.
 
 use crate::mmu;
-use core::arch::asm;
+use crate::pci;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
-
-unsafe fn outl(port: u16, v: u32) {
-    asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack, preserves_flags));
-}
-unsafe fn inl(port: u16) -> u32 {
-    let v: u32;
-    asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, nostack, preserves_flags));
-    v
-}
-fn cfg_addr(b: u8, d: u8, f: u8, off: u8) -> u32 {
-    0x8000_0000 | (b as u32) << 16 | (d as u32) << 11 | (f as u32) << 8 | (off as u32 & 0xFC)
-}
-fn cfg32(b: u8, d: u8, f: u8, off: u8) -> u32 {
-    // SAFETY: the PCI configuration ports; boot context, single core.
-    unsafe {
-        outl(0xCF8, cfg_addr(b, d, f, off));
-        inl(0xCFC)
-    }
-}
-fn cfg_write32(b: u8, d: u8, f: u8, off: u8, v: u32) {
-    // SAFETY: as cfg32.
-    unsafe {
-        outl(0xCF8, cfg_addr(b, d, f, off));
-        outl(0xCFC, v);
-    }
-}
 
 const R_CAP: u64 = 0x00;
 const R_VS: u64 = 0x08;
@@ -91,6 +71,26 @@ static mut SECTORS: u64 = 0;
 static mut PART: (u64, u64) = (0, 0);
 static mut LBA_BYTES: u64 = 0;
 static mut MODEL: [u8; 40] = [b' '; 40];
+/// Multi-block commands: the read-ahead (RA_N device blocks from RA_AT) and the gathered writes
+/// (WB_N device blocks from WB_AT), 8 KiB each, 8 KiB aligned so each is exactly two pages.
+const RA_BYTES: usize = 8192;
+#[repr(C, align(8192))]
+struct Ahead([u8; RA_BYTES]);
+static mut RA: Ahead = Ahead([0; RA_BYTES]);
+static mut RA_AT: u64 = 0;
+static mut RA_N: u32 = 0;
+static mut WB: Ahead = Ahead([0; RA_BYTES]);
+static mut WB_AT: u64 = 0;
+static mut WB_N: u32 = 0;
+/// 0 = not checked, 1 = on, 2 = off; reads and writes apart.
+static mut MULTI: u8 = 0;
+static mut MULTIW: u8 = 0;
+/// Largest transfer the controller takes (Identify Controller MDTS; 0 there = no limit), bytes.
+static mut MAXB: u64 = RA_BYTES as u64;
+/// Reads: sectors asked for, served from the read-ahead, multi-block commands, single-block ones.
+static mut RSTATS: (u64, u64, u64, u64) = (0, 0, 0, 0);
+/// Writes: sectors written, multi-block commands, single-block ones.
+static mut WSTATS: (u64, u64, u64) = (0, 0, 0);
 
 fn r32(off: u64) -> u32 {
     // SAFETY: BAR0 is mapped uncached by init before any register access.
@@ -176,32 +176,13 @@ fn cmd(opc: u8, nsid: u32, prp1: u64) -> [u32; 16] {
 
 /// Find the controller, bring it up with one I/O queue pair, and size namespace 1.
 pub fn init() {
-    let mut at = None;
-    'scan: for b in 0..8u8 {
-        for d in 0..32u8 {
-            for f in 0..8u8 {
-                let id = cfg32(b, d, f, 0);
-                if id & 0xFFFF == 0xFFFF {
-                    if f == 0 {
-                        break;
-                    }
-                    continue;
-                }
-                if cfg32(b, d, f, 8) >> 8 == 0x01_08_02 {
-                    at = Some((b, d, f));
-                    break 'scan;
-                }
-            }
-        }
-    }
-    let Some((b, d, f)) = at else { return };
-    let lo = cfg32(b, d, f, 0x10);
-    let bar = (lo & !0xF) as u64 | if lo & 0x6 == 0x4 { (cfg32(b, d, f, 0x14) as u64) << 32 } else { 0 };
+    let Some((b, d, f)) = pci::find_class(0x01_08_02, 8) else { return };
+    let bar = pci::bar_mem(b, d, f, 0);
     if bar == 0 || !mmu::map_mmio(bar, 0x2000) {
         crate::kprintln!("[nvme] controller at {:02x}:{:02x}.{} has no usable BAR0", b, d, f);
         return;
     }
-    cfg_write32(b, d, f, 4, cfg32(b, d, f, 4) | 0x406); // memory decoding + bus mastering, INTx off (polled)
+    pci::enable(b, d, f, 0x406); // memory decoding + bus mastering, INTx off (polled)
     // SAFETY: boot, single core, before any reader.
     unsafe {
         BAR = bar;
@@ -264,6 +245,10 @@ pub fn init() {
     }
     let mut model = [b' '; 40];
     model.copy_from_slice(&data()[24..64]);
+    // MDTS (byte 77): the largest transfer, in units of the 4 KiB page as a power of two
+    let mdts = data()[77] as u32;
+    // SAFETY: as above.
+    unsafe { MAXB = if mdts == 0 || mdts > 20 { RA_BYTES as u64 } else { (4096u64 << mdts).min(RA_BYTES as u64) } };
     // Identify namespace 1 (CNS 0): size in blocks, and the block size of its format.
     if submit(0, cmd(OPC_IDENTIFY, 1, buf)) != Some(0) {
         crate::kprintln!("[nvme] identify namespace 1 failed");
@@ -338,6 +323,177 @@ pub fn init() {
         "[nvme] controller {:02x}:{:02x}.{} (NVMe {}.{}), I/O queue pair ready",
         b, d, f, vs >> 16, (vs >> 8) & 0xFF
     );
+    if matches!(lba_bytes, 512 | 1024 | 2048 | 4096) {
+        multi_check();
+    }
+}
+
+/// Device blocks per multi-block command: 8 KiB (or the controller's MDTS) over the block size.
+fn kmax() -> u32 {
+    // SAFETY: scalar reads of boot-time state.
+    unsafe { (MAXB / LBA_BYTES.max(1)) as u32 }
+}
+
+/// At start-up: one Read of the first k blocks must equal the same blocks read one at a time,
+/// else multi-block reads stay off (and writes with them). Reads only: safe on any disk. One
+/// boot line says which.
+fn multi_check() {
+    // SAFETY: boot, single core; no command in flight.
+    unsafe {
+        let k = (kmax() as u64).min(SECTORS) as u32;
+        if k < 2 {
+            (MULTI, MULTIW) = (2, 2);
+            return;
+        }
+        let ra = addr_of_mut!(RA.0) as *mut u8;
+        core::ptr::write_bytes(ra, 0xA5, RA_BYTES);
+        let bs = LBA_BYTES as usize;
+        let read_ok = rw(OPC_READ, 0, k, ra as u64);
+        let mut same = read_ok;
+        for b in 0..k as u64 {
+            if !same {
+                break;
+            }
+            same = io(OPC_READ, b) && data()[..bs] == core::slice::from_raw_parts(ra.add(b as usize * bs), bs)[..];
+        }
+        if same {
+            (MULTI, RA_AT, RA_N) = (1, 0, k);
+            crate::kprintln!("[nvme] multi-block reads on (up to {} blocks per command; the first {} equal one at a time)", k, k);
+        } else {
+            (MULTI, MULTIW, RA_N) = (2, 2, 0);
+            crate::kprintln!(
+                "[nvme] multi-block reads off ({}): one block per command",
+                if read_ok { "they differed from one block at a time" } else { "the controller refused one" }
+            );
+        }
+    }
+}
+
+/// One Read or Write of `k` device blocks from `lba` on namespace 1 through `buf` (RA or WB:
+/// 8 KiB aligned, so a transfer over one page takes PRP2 = the second page, no PRP list).
+fn rw(opc: u8, lba: u64, k: u32, buf: u64) -> bool {
+    // SAFETY: scalar reads.
+    if !unsafe { READY } || k == 0 || k > kmax() {
+        return false;
+    }
+    let mut c = cmd(opc, 1, buf);
+    // SAFETY: scalar read.
+    if k as u64 * unsafe { LBA_BYTES } > 4096 {
+        let p2 = buf + 4096;
+        c[8] = p2 as u32;
+        c[9] = (p2 >> 32) as u32;
+    }
+    c[10] = lba as u32;
+    c[11] = (lba >> 32) as u32;
+    c[12] = k - 1; // NLB is zero-based
+    match submit(1, c) {
+        Some(0) => true,
+        Some(s) => {
+            crate::kprintln!("[nvme] {} of {} blocks at {} refused (status {:#x})", if opc == OPC_READ { "read" } else { "write" }, k, lba, s);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Device block `b` into DATA: from the read-ahead when it holds it, else a new multi-block read
+/// of up to 8 KiB from it (once the boot check passed), else one block.
+fn fetch(b: u64) -> bool {
+    // SAFETY: single core, kernel context, one command in flight.
+    unsafe {
+        RSTATS.0 += 1;
+        let bs = LBA_BYTES as usize;
+        if b >= RA_AT && b < RA_AT + RA_N as u64 {
+            let off = (b - RA_AT) as usize * bs;
+            data()[..bs].copy_from_slice(&(&*addr_of!(RA.0))[off..off + bs]);
+            RSTATS.1 += 1;
+            return true;
+        }
+        if MULTI == 1 {
+            let k = (kmax() as u64).min(SECTORS.saturating_sub(b)) as u32;
+            if k > 1 {
+                RA_N = 0;
+                if rw(OPC_READ, b, k, addr_of!(RA.0) as u64) {
+                    (RA_AT, RA_N) = (b, k);
+                    data()[..bs].copy_from_slice(&(&*addr_of!(RA.0))[..bs]);
+                    RSTATS.2 += 1;
+                    return true;
+                }
+                MULTI = 2;
+                crate::kprintln!("[nvme] a multi-block read at block {} was refused: one block per command from now on", b);
+            }
+        }
+        RSTATS.3 += 1;
+        io(OPC_READ, b)
+    }
+}
+
+/// Device block `b` was written from `src` (or the write failed): keep the read-ahead true.
+fn ra_update(b: u64, src: &[u8], ok: bool) {
+    // SAFETY: as fetch.
+    unsafe {
+        if b >= RA_AT && b < RA_AT + RA_N as u64 {
+            if ok {
+                let off = (b - RA_AT) as usize * LBA_BYTES as usize;
+                (&mut (*addr_of_mut!(RA)).0)[off..off + src.len()].copy_from_slice(src);
+            } else {
+                RA_N = 0; // the disk's copy is unknown now
+            }
+        }
+    }
+}
+
+/// Send the gathered writes: one Write when multi-block writes are on (the first one is read back
+/// block by block and must be equal, else they go off and the run is rewritten one block at a
+/// time), else one Write per block.
+fn flush() -> bool {
+    // SAFETY: as fetch.
+    unsafe {
+        let (at, k) = (WB_AT, WB_N);
+        if k == 0 {
+            return true;
+        }
+        WB_N = 0;
+        let wb = addr_of!(WB.0) as *const u8;
+        let bs = LBA_BYTES as usize;
+        let mut done = false;
+        if k > 1 && MULTI == 1 && MULTIW != 2 {
+            if rw(OPC_WRITE, at, k, wb as u64) {
+                WSTATS.1 += 1;
+                done = true;
+                if MULTIW == 0 {
+                    for j in 0..k as u64 {
+                        let s = core::slice::from_raw_parts(wb.add(j as usize * bs), bs);
+                        if !(io(OPC_READ, at + j) && data()[..bs] == s[..]) {
+                            done = false;
+                            break;
+                        }
+                    }
+                    MULTIW = if done { 1 } else { 2 };
+                    if done {
+                        crate::kprintln!("[nvme] multi-block writes on (up to {} blocks per command; the first {} read back equal)", kmax(), k);
+                    } else {
+                        crate::kprintln!("[nvme] multi-block writes off (read back differently: rewritten one block per command)");
+                    }
+                }
+            } else {
+                MULTIW = 2;
+                crate::kprintln!("[nvme] a multi-block write at block {} was refused: one block per command from now on", at);
+            }
+        }
+        let mut ok = true;
+        for j in 0..k as u64 {
+            let s = core::slice::from_raw_parts(wb.add(j as usize * bs), bs);
+            let good = done || {
+                data()[..bs].copy_from_slice(s);
+                WSTATS.2 += 1;
+                io(OPC_WRITE, at + j)
+            };
+            ra_update(at + j, s, good);
+            ok = ok && good;
+        }
+        ok
+    }
 }
 
 /// One block read or write on namespace 1 through the I/O queue, over DATA's first 512 B.
@@ -443,7 +599,8 @@ pub fn read_sector(n: u64, out: &mut [u8; 512]) -> bool {
     }
     // SAFETY: scalar read.
     let n = n + unsafe { PART.0 };
-    if !io(OPC_READ, n / per()) {
+    // writes still gathered go to the disk before anything is read
+    if !(flush() && fetch(n / per())) {
         return false;
     }
     let off = (n % per()) as usize * 512;
@@ -455,15 +612,50 @@ pub fn write_sector(n: u64, buf: &[u8; 512]) -> bool {
     if !present() || n >= capacity() {
         return false;
     }
+    // the VFS saves its sectors in order, so a run of device blocks is gathered in WB (up to
+    // 8 KiB; one block while multi-block writes are off). A block bigger than a sector (1, 2 or
+    // 4 KiB) is read once when the run reaches it and its sectors changed in place, so a 4 KiB
+    // SSD is written once per block, not once per sector. The run is sent when it is full and its
+    // last block complete, on a gap, before any read, or at the VFS's last sector (or a lone
+    // write past the VFS area: the self-test).
+    let last = n >= 2 * crate::vfs::MAX_FILES as u64;
     // SAFETY: scalar read.
     let n = n + unsafe { PART.0 };
-    // a sector smaller than the block: read the block, change our 512 bytes, write it back
-    if per() > 1 && !io(OPC_READ, n / per()) {
-        return false;
+    // SAFETY: single core, kernel context, one command in flight.
+    unsafe {
+        let (per, bs) = (per(), LBA_BYTES as usize);
+        let (b, off) = (n / per, (n % per) as usize * 512);
+        let cap = if MULTI == 1 && MULTIW != 2 { kmax() } else { 1 };
+        let mut ok = true;
+        let tail = WB_AT + WB_N as u64; // the block after the run
+        if WB_N > 0 && b + 1 != tail && !(b == tail && WB_N < cap) {
+            ok = flush();
+        }
+        let new = WB_N == 0 || b == WB_AT + WB_N as u64;
+        // a new block's other sectors as they are on the disk (fetch: the read-ahead, kept equal
+        // to every block flushed, or the disk)
+        let got = !new || per == 1 || fetch(b);
+        if got {
+            let wb = &mut (*addr_of_mut!(WB)).0;
+            if WB_N == 0 {
+                WB_AT = b;
+            }
+            if new {
+                if per > 1 {
+                    let i = WB_N as usize * bs;
+                    wb[i..i + bs].copy_from_slice(&data()[..bs]);
+                }
+                WB_N += 1;
+            }
+            let i = (b - WB_AT) as usize * bs + off;
+            wb[i..i + 512].copy_from_slice(buf);
+            WSTATS.0 += 1;
+            if last || (off + 512 == bs && WB_N >= cap) {
+                ok = flush() && ok;
+            }
+        }
+        ok && got
     }
-    let off = (n % per()) as usize * 512;
-    data()[off..off + 512].copy_from_slice(buf);
-    io(OPC_WRITE, n / per())
 }
 
 /// Read-only view for `lsparts`: (512-byte sectors, block bytes) of namespace 1 once the
@@ -476,7 +668,7 @@ pub fn raw_info() -> Option<(u64, u64)> {
 /// Read one 512-byte sector of namespace 1 even when the disk is not ours (never writes).
 pub fn raw_read(n: u64, out: &mut [u8; 512]) -> bool {
     let Some((cap, _)) = raw_info() else { return false };
-    if n >= cap || !io(OPC_READ, n / per()) {
+    if n >= cap || !(flush() && fetch(n / per())) {
         return false;
     }
     let off = (n % per()) as usize * 512;
@@ -488,12 +680,16 @@ pub fn raw_read(n: u64, out: &mut [u8; 512]) -> bool {
 /// (gpt.rs), and only after a matching table backup on a USB stick and the owner's typed code.
 pub fn table_write(n: u64, buf: &[u8; 512]) -> bool {
     let Some((cap, _)) = raw_info() else { return false };
-    if n >= cap || (per() > 1 && !io(OPC_READ, n / per())) {
+    if n >= cap || !flush() || (per() > 1 && !fetch(n / per())) {
         return false;
     }
     let off = (n % per()) as usize * 512;
     data()[off..off + 512].copy_from_slice(buf);
-    io(OPC_WRITE, n / per())
+    let ok = io(OPC_WRITE, n / per());
+    // SAFETY: scalar read.
+    let bs = unsafe { LBA_BYTES } as usize;
+    ra_update(n / per(), &data()[..bs], ok);
+    ok
 }
 
 /// `lsnvme`: the controller and its namespace.
@@ -519,5 +715,10 @@ pub fn list() {
             crate::kprintln!("  storage: AfriSovera's partition, sectors {}-{} ({} MiB); nothing outside it is written", pt.0, pt.0 + pt.1 - 1, pt.1 / 2048);
         }
         crate::kprintln!("  model: {}", core::str::from_utf8(m).unwrap_or("?").trim());
+        // SAFETY: scalar reads.
+        let (r, w, mr, mw) = unsafe { (RSTATS, WSTATS, MULTI, MULTIW) };
+        let word = |s: u8| match s { 1 => "on", 2 => "off", _ => "not checked yet" };
+        crate::kprintln!("  reads: {} sector(s), {} from the read-ahead, {} multi-block command(s), {} single ({})", r.0, r.1, r.2, r.3, word(mr));
+        crate::kprintln!("  writes: {} sector(s), {} multi-block command(s), {} single ({})", w.0, w.1, w.2, word(mw));
     }
 }

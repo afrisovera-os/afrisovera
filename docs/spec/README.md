@@ -31,8 +31,9 @@ Every spec here is open for comment for at least 7 days from its date (docs/poli
 | [AFR-0006](0006-afripay.md) | AfriPay payment-rail protocol | Designed (regulated: no live provider without owner + counsel) | nothing | 2026-11-15 |
 | [AFR-0007](0007-afriid.md) | AfriID identity protocol | Designed | nothing | 2026-11-15 |
 | [AFR-0008](0008-pc-boot-and-install.md) | PC boot and install chain (GPT, ESP, boot entries) | Implemented · Secure Boot, A/B Designed | UEFI app, `installdisk`, `installpart`, `bootcopy`, `bootentry`, `bootnext` | 2026-11-15 |
+| [AFR-0009](0009-sovereign-mesh-wire-format.md) | Sovereign Mesh wire format (link, bundle, tags, pairing) | Draft | nothing (crypto prerequisites not built) | 2026-11-16 |
 
-Test-vector files: [`vectors/`](vectors/). All use the public RFC 8032 test key 1 — never a real key.
+Test-vector files: [`vectors/`](vectors/). All use public RFC test keys (RFC 8032; RFC 7748 for AFR-0009) — never a real key.
 
 ## Registries
 
@@ -47,13 +48,16 @@ Test-vector files: [`vectors/`](vectors/). All use the public RFC 8032 test key 
 | `0x0400`–`0x04FF` | reserved: Tonga (surfaces, input focus, trusted overlay) |
 | `0x0500`–`0x05FF` | reserved: VFS / storage service |
 | `0x0600`–`0x06FF` | reserved: netstack |
+| `0x0701` Mesh (`0x0700`–`0x07FF` reserved) | Sovereign Mesh, AFR-0009 §11 |
 
 **Signature context strings** (AFR-0003 §5.3 block; every new signed format takes a new string):
 `AFRISOVERA-NIA-SIG-V1\0`, `AFRISOVERA-STORE-DESCRIPTOR-V1\0`, `AFRISOVERA-STORE-CATALOG-V1\0`,
-`AFRISOVERA-STORE-REVOKED-V1\0`, `AFRISOVERA-PAY-REQUEST-V1\0`.
+`AFRISOVERA-STORE-REVOKED-V1\0`, `AFRISOVERA-PAY-REQUEST-V1\0`, `AFRISOVERA-MESH-IDENTITY-V1\0`.
+Mesh derivation and protocol strings (AFR-0009 §3), unsigned: `AFRISOVERA-MESH-LINK-V1\0`, `…-SAS-V1\0`,
+`…-CONTACT-V1\0`, `…-TAG-V1\0`, `…-BEACON-V1\0`, `…-BUNDLE-V1\0`.
 
 **Permission names** (AFR-0003 §6; v0 bit in brackets): `print`(0) `putc`(1) `draw`(2) `file`(3) `time`(4)
-`input`(5) `ai`(6) `voice`(7) `net`(8) `random`(9) `pay`(10, reserved) `identity`(11, reserved).
+`input`(5) `ai`(6) `voice`(7) `net`(8) `random`(9) `pay`(10, reserved) `identity`(11, reserved) `mesh`(12, reserved).
 
 **GPT partition type GUIDs** (AFR-0008): `A5F1C0DE-0B5E-4A50-9AF1-50FE2A000001` AfriSovera data (built);
 `…000002` system slot A, `…000003` system slot B (designed).

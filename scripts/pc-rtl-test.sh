@@ -40,6 +40,13 @@ grade() { # grade <serial> <peer log>
     elif [ "$c1" -le 0 ] || [ "$c2" -le "$c1" ]; then
         _f "the Realtek NIC's own frame counters did not move ($c1 -> $c2)"
     fi
+    # every ring and packet buffer inside the card's DMA limits (buffers 8-byte aligned in one 4 KiB page)
+    has '^  memory: all [0-9]+ rings and buffers inside their limits \(rings [0-9]+-byte aligned, buffers 8-byte aligned in one 4 KiB page\)$' ||
+        _f "lsrtl did not report every ring and buffer inside the card's DMA limits"
+    if has '^  memory: [0-9]+ of [0-9]+ rings and buffers outside their limits'; then
+        _f "$(printf '%s
+' "$S" | grep -aE '^  memory: [0-9]+ of' | head -1)"
+    fi
     if has 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[rtl\] .*(stuck|did not|no usable|no MAC)'; then
         _f "$(printf '%s\n' "$S" | grep -aE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[rtl\] .*(stuck|did not|no usable|no MAC)' | head -1)"
     fi
@@ -52,12 +59,14 @@ GREEN="[rtl] RTL8139C+ (8139cp) at 00:02.0, MAC 52:54:00:12:34:56, link up
 afrisovera> lsrtl
 rtl: RTL8139C+ (8139cp) at 00:02.0 registers 0x81060000, MAC 52:54:00:12:34:56, link up
   frames sent 2, received 2
+  memory: all 42 rings and buffers inside their limits (rings 256-byte aligned, buffers 8-byte aligned in one 4 KiB page)
 afrisovera> ping
 [net] ICMP echo reply from 10.0.2.2 (ping OK)
 afrisovera> net tcp send 40000 $PAYLOAD
 [net] TCP data round-trip OK
 afrisovera> lsrtl
-  frames sent 12, received 11"
+  frames sent 12, received 11
+  memory: all 42 rings and buffers inside their limits (rings 256-byte aligned, buffers 8-byte aligned in one 4 KiB page)"
 PEER_OK="peer received ${#PAYLOAD} bytes: $PAYLOAD"
 
 selftest() {
@@ -84,10 +93,14 @@ selftest() {
     arm engines-off red "$(printf '%s\n[rtl] RTL8139C+ (8139cp): receiver and transmitter did not switch on' "$GREEN")" "$PEER_OK"
     arm wrong-card red "$(printf '%s\n' "$GREEN" | sed 's/^\[rtl\] RTL8139C+ (8139cp)/[rtl] RTL8111\/8168 (r8169)/')" "$PEER_OK"
     arm ring-stuck red "$(printf '%s\n[rtl] transmit ring stuck' "$GREEN")" "$PEER_OK"
+    arm no-memory-line red "$(printf '%%s
+' "$GREEN" | grep -v '^  memory:')" "$PEER_OK"
+    arm buffer-outside red "$(printf '%%s
+' "$GREEN" | sed '$s/^  memory: .*/  memory: 3 of 42 rings and buffers outside their limits (first: a receive buffer)/')" "$PEER_OK"
     arm empty red "" ""
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 14 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 16 ]
 }
 
 echo "== PC Realtek NIC (PC track step 3) =="
@@ -148,7 +161,7 @@ AFRISH_BOOT_GRACE="${AFRISH_BOOT_GRACE:-10}" python3 scripts/shell-demo.py 4974 
 kill "$QPID" 2> /dev/null
 wait "$QPID" 2> /dev/null
 wait "$PEER" 2> /dev/null
-tr -d '\r' < "$W/serial.log" | grep -aE '^\[rtl\]|^\[virtio\] slot|DHCP: IP|ping OK|TCP data|^rtl:|frames sent' | sed 's/^/  | /'
+tr -d '\r' < "$W/serial.log" | grep -aE '^\[rtl\]|^\[virtio\] slot|DHCP: IP|ping OK|TCP data|^rtl:|frames sent|  memory:' | sed 's/^/  | /'
 sed 's/^/  peer| /' "$W/peer.log"
 
 echo "  --- grading ---"

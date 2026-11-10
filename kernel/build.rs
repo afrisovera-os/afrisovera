@@ -30,4 +30,39 @@ fn main() {
     println!("cargo:rerun-if-changed=linker-raspi.ld");
     println!("cargo:rerun-if-changed=linker-rpi4.ld");
     println!("cargo:rerun-if-changed=build.rs");
+    stamp_commit();
+}
+
+/// The commit the kernel is built from, for the PC's `report` (pc/report.rs) -- read by
+/// `option_env!` there and nowhere in the ARM kernel, so the ARM image does not change with
+/// it. AFRI_COMMIT in the environment wins; no git gives "unknown". Re-run when HEAD moves.
+fn stamp_commit() {
+    use std::process::Command;
+    println!("cargo:rerun-if-env-changed=AFRI_COMMIT");
+    let git = |args: &[&str]| -> Option<String> {
+        let o = Command::new("git").args(args).output().ok()?;
+        if !o.status.success() {
+            return None;
+        }
+        let s = String::from_utf8(o.stdout).ok()?.trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    };
+    let commit = std::env::var("AFRI_COMMIT").ok().or_else(|| {
+        let c = git(&["rev-parse", "--short=8", "HEAD"])?;
+        let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).is_some();
+        Some(if dirty { c + "+changes" } else { c })
+    });
+    if let Some(c) = commit {
+        println!("cargo:rustc-env=AFRI_COMMIT={}", c);
+    }
+    if let Some(d) = git(&["log", "-1", "--format=%cI"]) {
+        println!("cargo:rustc-env=AFRI_COMMIT_DATE={}", d);
+    }
+    for p in ["HEAD", "logs/HEAD", "index"] {
+        if let Some(path) = git(&["rev-parse", "--path-format=absolute", "--git-path", p]) {
+            if std::path::Path::new(&path).exists() {
+                println!("cargo:rerun-if-changed={}", path);
+            }
+        }
+    }
 }

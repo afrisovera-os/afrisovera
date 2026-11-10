@@ -2136,11 +2136,24 @@ unsafe fn send_tcp_segment(
     // Copied out by value: the builder takes plain arrays, so it never holds a
     // reference into a mutable static.
     let dmac = read_volatile(addr_of!(GW_MAC));
+    // The field report (PC only) talks to a real home network: its own leased
+    // address and the next hop's own MAC, for the length of one report.
+    #[cfg(feature = "pc")]
+    let route = read_volatile(addr_of!(REPORT_ROUTE));
+    #[cfg(feature = "pc")]
+    let dmac = match route {
+        Some((_, m)) => m,
+        None => dmac,
+    };
     let smac = read_volatile(addr_of!(NET_MAC));
     let frame_len =
         build_tcp_frame(frame, &dmac, &smac, dst_ip, src_port, dst_port, seq, ack, flags, data);
     if frame_len == 0 {
         return 0;
+    }
+    #[cfg(feature = "pc")]
+    if let Some((sip, _)) = route {
+        set_src_ip(&mut frame[..frame_len], &sip);
     }
     let txd = addr_of_mut!(NET_TX_DESC) as *mut Desc;
     write_volatile(
@@ -3698,6 +3711,475 @@ pub fn net_tcp_data(dst_ip: [u8; 4], dst_port: u16, payload: &[u8]) -> bool {
                 return false;
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The field report's sender (PC only: `report <ip>[:port]`, pc/report.rs).
+//
+// Every other path in this stack was written for QEMU's user-mode network: it
+// sends from 10.0.2.15 and addresses every frame to the gateway's MAC. A spare
+// PC on a home router has its own leased address, and the owner's main PC sits
+// on the same wire, so the report needs three things the rest of the stack does
+// not have: the LEASED source address, the next hop's OWN MAC (ARP for the
+// destination when it is on the same subnet, else for the router), and a sender
+// that streams many segments rather than one. It is ONE-WAY: it opens one
+// connection to the address the owner typed, sends, and closes. Nothing the
+// other end sends is read as data, let alone as a command.
+// ---------------------------------------------------------------------------
+
+/// While a report is being sent: (our leased address, the next hop's MAC). Read
+/// by `send_tcp_segment`; `None` (the default) leaves every other path as it was.
+#[cfg(feature = "pc")]
+static mut REPORT_ROUTE: Option<([u8; 4], [u8; 6])> = None;
+
+/// Put `sip` in a built frame's IPv4 source and recompute both checksums (the IP
+/// header's and the TCP one, whose pseudo-header carries the source too).
+#[cfg(feature = "pc")]
+fn set_src_ip(frame: &mut [u8], sip: &[u8; 4]) {
+    if frame.len() < TCP_FRAME_MIN {
+        return;
+    }
+    frame[26..30].copy_from_slice(sip);
+    frame[24] = 0;
+    frame[25] = 0;
+    let ipck = inet_checksum(&frame[14..34]);
+    frame[24] = (ipck >> 8) as u8;
+    frame[25] = ipck as u8;
+    let seg_len = frame.len() - 34;
+    let mut pseudo = [0u8; 12];
+    pseudo[0..8].copy_from_slice(&frame[26..34]);
+    pseudo[9] = 6;
+    pseudo[10] = (seg_len >> 8) as u8;
+    pseudo[11] = seg_len as u8;
+    frame[50] = 0;
+    frame[51] = 0;
+    let mut sum = inet_sum_add(0, &pseudo);
+    sum = inet_sum_add(sum, &frame[34..]);
+    let tck = inet_sum_fold(sum);
+    frame[50] = (tck >> 8) as u8;
+    frame[51] = tck as u8;
+}
+
+/// Clears `REPORT_ROUTE` on every way out of `report_send`.
+#[cfg(feature = "pc")]
+struct RouteGuard;
+#[cfg(feature = "pc")]
+impl Drop for RouteGuard {
+    fn drop(&mut self) {
+        // SAFETY: a plain store to a static only this file uses, kernel context.
+        unsafe { write_volatile(addr_of_mut!(REPORT_ROUTE), None) }
+    }
+}
+
+/// Hand receive buffers that nobody read back to the card. Frames that arrive
+/// while the shell is idle (a home network's broadcasts: printers, phones, the
+/// router) sit in the used ring with no reader, and each one is a buffer the
+/// card can no longer fill; after `NBUF` of them the card is deaf. Every buffer
+/// not currently offered to the device is, in kernel context between commands,
+/// one of those. Returns how many were reclaimed.
+#[cfg(feature = "pc")]
+unsafe fn rx_reclaim() -> usize {
+    if NET_BASE == 0 {
+        return 0;
+    }
+    let avail = read_volatile(addr_of!(NET_RX_AVAIL.idx));
+    let used = read_volatile(addr_of!(NET_RX_USED.idx));
+    let offered = (avail.wrapping_sub(used) as usize).min(NBUF);
+    let ring = addr_of!(NET_RX_AVAIL.ring) as *const u16;
+    let mut owned = [false; NBUF];
+    for j in 0..offered {
+        let pos = avail.wrapping_sub(1 + j as u16) as usize % QSZ;
+        owned[read_volatile(ring.add(pos)) as usize % NBUF] = true;
+    }
+    let mut n = 0;
+    for (id, o) in owned.iter().enumerate() {
+        if !o {
+            net_rx_recycle(id as u32);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Hand one raw Ethernet frame to the TX queue and wait (briefly) for the device
+/// to take it, so the next frame cannot overwrite `TX_BUF` under it.
+#[cfg(feature = "pc")]
+unsafe fn tx_raw(frame: &[u8]) {
+    let tx = addr_of_mut!(TX_BUF) as *mut u8;
+    for i in 0..VNET_HDR {
+        *tx.add(i) = 0;
+    }
+    let n = frame.len().min(2048 - VNET_HDR);
+    core::ptr::copy_nonoverlapping(frame.as_ptr(), tx.add(VNET_HDR), n);
+    let txd = addr_of_mut!(NET_TX_DESC) as *mut Desc;
+    write_volatile(txd.add(0), Desc { addr: tx as u64, len: (VNET_HDR + n) as u32, flags: 0, next: 0 });
+    let tidx = read_volatile(addr_of!(NET_TX_AVAIL.idx));
+    let tring = addr_of_mut!(NET_TX_AVAIL.ring) as *mut u16;
+    write_volatile(tring.add((tidx as usize) % QSZ), 0);
+    dsb();
+    write_volatile(addr_of_mut!(NET_TX_AVAIL.idx), tidx.wrapping_add(1));
+    dsb();
+    w(NET_BASE, R_QUEUE_NOTIFY, 1);
+    tx_settle();
+}
+
+/// Wait up to 50 ms for the device to have used every queued TX descriptor.
+#[cfg(feature = "pc")]
+unsafe fn tx_settle() {
+    let end = tcp_rto_deadline(50);
+    while read_volatile(addr_of!(NET_TX_USED.idx)) != read_volatile(addr_of!(NET_TX_AVAIL.idx)) {
+        if end == 0 || crate::timer::cycles() >= end {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// An ARP frame: `op` 1 (who-has `tip`) or 2 (`sip` is-at our MAC, to `tmac`).
+#[cfg(feature = "pc")]
+unsafe fn arp_frame(op: u8, sip: &[u8; 4], tmac: &[u8; 6], tip: &[u8; 4]) -> [u8; 42] {
+    let me = read_volatile(addr_of!(NET_MAC));
+    let mut f = [0u8; 42];
+    f[0..6].copy_from_slice(if op == 1 { &[0xff; 6] } else { tmac });
+    f[6..12].copy_from_slice(&me);
+    f[12] = 0x08;
+    f[13] = 0x06;
+    f[14..22].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, op]);
+    f[22..28].copy_from_slice(&me);
+    f[28..32].copy_from_slice(sip);
+    f[32..38].copy_from_slice(if op == 1 { &[0; 6] } else { tmac });
+    f[38..42].copy_from_slice(tip);
+    f
+}
+
+/// If `fr` is an ARP request for `our_ip`, answer it (the receiver's PC asks who
+/// we are before it replies, and asks again whenever its cache entry expires).
+#[cfg(feature = "pc")]
+unsafe fn arp_answer(fr: *const u8, our_ip: &[u8; 4]) {
+    if *fr.add(12) != 0x08 || *fr.add(13) != 0x06 || *fr.add(21) != 1 {
+        return;
+    }
+    let tip = [*fr.add(38), *fr.add(39), *fr.add(40), *fr.add(41)];
+    if tip != *our_ip {
+        return;
+    }
+    let mut smac = [0u8; 6];
+    let mut sip = [0u8; 4];
+    for i in 0..6 {
+        smac[i] = *fr.add(22 + i);
+    }
+    for i in 0..4 {
+        sip[i] = *fr.add(28 + i);
+    }
+    let f = arp_frame(2, our_ip, &smac, &sip);
+    tx_raw(&f);
+}
+
+/// The MAC of `target` on this wire, asking up to three times a second apart.
+#[cfg(feature = "pc")]
+unsafe fn arp_resolve(target: &[u8; 4], our_ip: &[u8; 4]) -> Option<[u8; 6]> {
+    for _ in 0..3 {
+        let mut cur = read_volatile(addr_of!(NET_RX_USED.idx));
+        let f = arp_frame(1, our_ip, &[0; 6], target);
+        tx_raw(&f);
+        let end = tcp_rto_deadline(1000);
+        loop {
+            if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+                let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
+                let elem = read_volatile(uring.add((cur as usize) % QSZ));
+                cur = cur.wrapping_add(1);
+                RX_RAW_COUNT += 1;
+                let _slot = RxSlot(elem.id);
+                let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
+                if *fr.add(12) == 0x08 && *fr.add(13) == 0x06 {
+                    if *fr.add(21) == 2 && [*fr.add(28), *fr.add(29), *fr.add(30), *fr.add(31)] == *target {
+                        let mut m = [0u8; 6];
+                        for i in 0..6 {
+                            m[i] = *fr.add(22 + i);
+                        }
+                        RX_COUNT += 1;
+                        return Some(m);
+                    }
+                    arp_answer(fr, our_ip);
+                }
+                continue;
+            }
+            if end == 0 || crate::timer::cycles() >= end {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
+    None
+}
+
+/// Why a report could not be delivered, in words for the owner.
+#[cfg(feature = "pc")]
+pub enum ReportErr {
+    NoCard,
+    NoLease,
+    NoRoute,
+    NoArp([u8; 4]),
+    Refused,
+    NoAnswer,
+    Stalled(usize),
+    Reset(usize),
+}
+
+/// What a delivered report took.
+#[cfg(feature = "pc")]
+pub struct ReportSent {
+    pub segments: u32,
+    pub retransmits: u32,
+    pub closed: bool,
+    pub ms: u64,
+}
+
+/// Our leased address, mask and gateway, after a DHCP exchange if there is no
+/// lease yet. `None` if the router never answered.
+#[cfg(feature = "pc")]
+pub fn report_lease() -> Option<([u8; 4], [u8; 4], [u8; 4])> {
+    // SAFETY: kernel context; the DHCP statics are written only by net_dhcp.
+    unsafe {
+        if !DHCP_HAVE {
+            rx_reclaim();
+            net_dhcp();
+        }
+        if DHCP_HAVE {
+            Some((DHCP_IP, DHCP_MASK, DHCP_GW))
+        } else {
+            None
+        }
+    }
+}
+
+/// Open one TCP connection to `dst_ip`:`dst_port`, send all of `data`, close.
+/// Up to 8 segments of `TCP_MAX_PAYLOAD` are in flight; a silent second (then
+/// two, four, eight ...) sends again from the first unacknowledged byte. Whatever
+/// the far end sends as data is ignored: this is a one-way channel.
+#[cfg(feature = "pc")]
+pub fn report_send(dst_ip: [u8; 4], dst_port: u16, data: &[u8]) -> Result<ReportSent, ReportErr> {
+    const WIN: usize = 8 * TCP_MAX_PAYLOAD;
+    const MAX_TRIES: u32 = 6;
+    if !net_present() {
+        return Err(ReportErr::NoCard);
+    }
+    let (our_ip, mask, gw) = match report_lease() {
+        Some(l) => l,
+        None => return Err(ReportErr::NoLease),
+    };
+    let t0 = crate::timer::cycles();
+    // SAFETY: exclusive kernel-context access to the device + rings/buffers.
+    unsafe {
+        let back = rx_reclaim();
+        if back > 0 {
+            crate::kprintln!("[report] {} unread network buffer(s) handed back to the card", back);
+        }
+        let mut on_link = true;
+        for i in 0..4 {
+            if dst_ip[i] & mask[i] != our_ip[i] & mask[i] {
+                on_link = false;
+            }
+        }
+        let hop = if on_link { dst_ip } else { gw };
+        if hop == [0; 4] {
+            return Err(ReportErr::NoRoute);
+        }
+        let mac = match arp_resolve(&hop, &our_ip) {
+            Some(m) => m,
+            None => return Err(ReportErr::NoArp(hop)),
+        };
+        crate::kprintln!(
+            "[report] from {}.{}.{}.{}, {} {}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            our_ip[0], our_ip[1], our_ip[2], our_ip[3],
+            if on_link { "receiver" } else { "router" },
+            hop[0], hop[1], hop[2], hop[3], mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        );
+        write_volatile(addr_of_mut!(REPORT_ROUTE), Some((our_ip, mac)));
+        let _guard = RouteGuard;
+        let base = NET_BASE;
+        let dst = &dst_ip;
+        let sport: u16 = 41000 + (crate::rng::next_u32() % 20000) as u16;
+        let iss = crate::rng::next_u32();
+        let mut cur = read_volatile(addr_of!(NET_RX_USED.idx));
+
+        // --- open: SYN, resent after 1, 2, 4 ... s of silence ---
+        let mut our_ack = 0u32;
+        let mut open = false;
+        let mut tries = 0;
+        let mut rto = 1000u64;
+        while !open {
+            if tries >= MAX_TRIES {
+                return Err(ReportErr::NoAnswer);
+            }
+            if tries > 0 {
+                // say so: a silent minute reads as a frozen PC
+                crate::kprintln!(
+                    "[report] no answer from {}.{}.{}.{}:{} yet, asking again ({}/{})",
+                    dst[0], dst[1], dst[2], dst[3], dst_port, tries + 1, MAX_TRIES
+                );
+            }
+            tries += 1;
+            send_tcp_segment(base, dst, sport, dst_port, iss, 0, 0x02, &[]);
+            tx_settle();
+            let end = tcp_rto_deadline(rto);
+            rto = (rto * 2).min(4000); // 1+2+4+4+4+4 s: about 19 s in all
+            loop {
+                if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+                    let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
+                    let elem = read_volatile(uring.add((cur as usize) % QSZ));
+                    cur = cur.wrapping_add(1);
+                    RX_RAW_COUNT += 1;
+                    let _slot = RxSlot(elem.id);
+                    let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
+                    arp_answer(fr, &our_ip);
+                    if let Some(s) = parse_tcp(fr) {
+                        if s.dport == sport && s.sport == dst_port && s.src == *dst {
+                            RX_COUNT += 1;
+                            if s.flags & 0x04 != 0 {
+                                return Err(ReportErr::Refused);
+                            }
+                            if s.flags & 0x12 == 0x12 && s.ack == iss.wrapping_add(1) {
+                                our_ack = s.seq.wrapping_add(1);
+                                open = true;
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if end == 0 || crate::timer::cycles() >= end {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        let seq0 = iss.wrapping_add(1);
+        send_tcp_segment(base, dst, sport, dst_port, seq0, our_ack, 0x10, &[]);
+        tx_settle();
+        crate::kprintln!(
+            "[report] connected to {}.{}.{}.{}:{}, sending {} bytes",
+            dst[0], dst[1], dst[2], dst[3], dst_port, data.len()
+        );
+
+        // --- stream: go-back-N over a fixed window ---
+        let len = data.len();
+        let (mut acked, mut next) = (0usize, 0usize);
+        let (mut segments, mut retransmits, mut silent) = (0u32, 0u32, 0u32);
+        let mut rto = 1000u64;
+        let mut end = 0u64;
+        let mut peer_fin = false;
+        while acked < len {
+            while next < len && next - acked < WIN {
+                let n = (len - next).min(TCP_MAX_PAYLOAD);
+                let seq = seq0.wrapping_add(next as u32);
+                send_tcp_segment(base, dst, sport, dst_port, seq, our_ack, 0x18, &data[next..next + n]);
+                tx_settle();
+                segments += 1;
+                next += n;
+                end = tcp_rto_deadline(rto);
+            }
+            if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+                let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
+                let elem = read_volatile(uring.add((cur as usize) % QSZ));
+                cur = cur.wrapping_add(1);
+                RX_RAW_COUNT += 1;
+                let _slot = RxSlot(elem.id);
+                let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
+                arp_answer(fr, &our_ip);
+                if let Some(s) = parse_tcp(fr) {
+                    if s.dport == sport && s.sport == dst_port && s.src == *dst {
+                        RX_COUNT += 1;
+                        if s.flags & 0x04 != 0 {
+                            return Err(ReportErr::Reset(acked));
+                        }
+                        if s.flags & 0x01 != 0 && !peer_fin {
+                            peer_fin = true;
+                            our_ack = s.seq.wrapping_add(s.dlen as u32).wrapping_add(1);
+                        }
+                        if s.flags & 0x10 != 0 {
+                            let a = s.ack.wrapping_sub(seq0) as usize;
+                            if a > acked && a <= next {
+                                acked = a;
+                                silent = 0;
+                                rto = 1000;
+                                end = tcp_rto_deadline(rto);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            if end != 0 && crate::timer::cycles() >= end {
+                silent += 1;
+                if silent >= MAX_TRIES {
+                    return Err(ReportErr::Stalled(acked));
+                }
+                retransmits += 1;
+                crate::kprintln!("[report] no acknowledgement for {} ms, sending again from byte {}", rto, acked);
+                next = acked; // go back to the first byte not acknowledged
+                rto = (rto * 2).min(8000);
+                end = tcp_rto_deadline(rto);
+            }
+            core::hint::spin_loop();
+        }
+
+        // --- close: FIN, then the peer's ACK and FIN (not needed for delivery) ---
+        let fin_seq = seq0.wrapping_add(len as u32);
+        let mut fin_acked = false;
+        let mut tries = 0;
+        while tries < 3 && !(fin_acked && peer_fin) {
+            tries += 1;
+            send_tcp_segment(base, dst, sport, dst_port, fin_seq, our_ack, 0x11, &[]);
+            tx_settle();
+            let end = tcp_rto_deadline(1000);
+            loop {
+                if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+                    let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
+                    let elem = read_volatile(uring.add((cur as usize) % QSZ));
+                    cur = cur.wrapping_add(1);
+                    RX_RAW_COUNT += 1;
+                    let _slot = RxSlot(elem.id);
+                    let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
+                    arp_answer(fr, &our_ip);
+                    if let Some(s) = parse_tcp(fr) {
+                        if s.dport == sport && s.sport == dst_port && s.src == *dst {
+                            RX_COUNT += 1;
+                            if s.flags & 0x04 != 0 {
+                                break;
+                            }
+                            if s.flags & 0x10 != 0 && s.ack == fin_seq.wrapping_add(1) {
+                                fin_acked = true;
+                            }
+                            if s.flags & 0x01 != 0 && !peer_fin {
+                                peer_fin = true;
+                                our_ack = s.seq.wrapping_add(s.dlen as u32).wrapping_add(1);
+                            }
+                            if peer_fin {
+                                send_tcp_segment(base, dst, sport, dst_port, fin_seq.wrapping_add(1), our_ack, 0x10, &[]);
+                                tx_settle();
+                            }
+                            if fin_acked && peer_fin {
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if end == 0 || crate::timer::cycles() >= end {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        let hz = crate::timer::hz().max(1);
+        Ok(ReportSent {
+            segments,
+            retransmits,
+            closed: fin_acked && peer_fin,
+            ms: crate::timer::cycles().wrapping_sub(t0) * 1000 / hz,
+        })
     }
 }
 

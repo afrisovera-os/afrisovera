@@ -9,37 +9,16 @@
 //! is blank or already carries the VFS marker. A disk with a boot sector, a partition table
 //! or a file system (0x55AA at 510) is somebody's data -- on QEMU, the UEFI boot disk itself
 //! -- and is listed but never written.
+//! Multi-block commands (10 Nov 2026), as NVMe and the USB disks got on 9-10 Nov: on the storage
+//! disk a read fetches up to 8 KiB (16 sectors, or 2 on a 4Kn drive) with one READ DMA EXT into
+//! a read-ahead the next reads are served from, and the VFS's in-order save is gathered by device
+//! block (a 4Kn drive's block read once, its eight sectors changed in place) into runs of up to
+//! 8 KiB sent with one WRITE DMA EXT. Each way is checked once against one block at a time (reads
+//! at start-up or claim, writes at the first save, read back); a mismatch or a refusal turns it off.
 
 use crate::mmu;
-use core::arch::asm;
+use crate::pci;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
-
-// --- PCI configuration space (mechanism #1, ports 0xCF8/0xCFC) ---
-unsafe fn outl(port: u16, v: u32) {
-    asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack, preserves_flags));
-}
-unsafe fn inl(port: u16) -> u32 {
-    let v: u32;
-    asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, nostack, preserves_flags));
-    v
-}
-fn cfg_addr(b: u8, d: u8, f: u8, off: u8) -> u32 {
-    0x8000_0000 | (b as u32) << 16 | (d as u32) << 11 | (f as u32) << 8 | (off as u32 & 0xFC)
-}
-fn cfg32(b: u8, d: u8, f: u8, off: u8) -> u32 {
-    // SAFETY: the PCI configuration ports; single core with interrupts masked at init.
-    unsafe {
-        outl(0xCF8, cfg_addr(b, d, f, off));
-        inl(0xCFC)
-    }
-}
-fn cfg_write32(b: u8, d: u8, f: u8, off: u8, v: u32) {
-    // SAFETY: as cfg32.
-    unsafe {
-        outl(0xCF8, cfg_addr(b, d, f, off));
-        outl(0xCFC, v);
-    }
-}
 
 // --- HBA registers (AHCI 1.3.1, section 3) ---
 const CAP: u64 = 0x00;
@@ -110,6 +89,24 @@ static mut FOUND: [(u32, u64, bool); 32] = [(0, 0, false); 32];
 static mut BLANK: Option<(u32, u64)> = None;
 static mut N_FOUND: usize = 0;
 static mut MODEL: [u8; 40] = [b' '; 40];
+/// Multi-block commands on DISK_PORT: the read-ahead (RA_N device blocks from RA_AT) and the
+/// gathered writes (WB_N device blocks from WB_AT), 8 KiB each, each one PRD.
+const RA_BYTES: usize = 8192;
+#[repr(C, align(8192))]
+struct Ahead([u8; RA_BYTES]);
+static mut RA: Ahead = Ahead([0; RA_BYTES]);
+static mut RA_AT: u64 = 0;
+static mut RA_N: u32 = 0;
+static mut WB: Ahead = Ahead([0; RA_BYTES]);
+static mut WB_AT: u64 = 0;
+static mut WB_N: u32 = 0;
+/// 0 = not checked, 1 = on, 2 = off; reads and writes apart.
+static mut MULTI: u8 = 0;
+static mut MULTIW: u8 = 0;
+/// Reads: sectors asked for, served from the read-ahead, multi-block commands, single-block ones.
+static mut RSTATS: (u64, u64, u64, u64) = (0, 0, 0, 0);
+/// Writes: sectors written, multi-block commands, single-block ones.
+static mut WSTATS: (u64, u64, u64) = (0, 0, 0);
 
 fn hba(off: u64) -> u32 {
     // SAFETY: ABAR is mapped uncached by init before any caller runs.
@@ -164,13 +161,18 @@ fn start(p: u32) -> bool {
     true
 }
 
-/// One ATA command through slot 0 with one 512-byte PRD over BUF. Returns success.
+/// One ATA command through slot 0 with one PRD over BUF (one logical sector). Returns success.
 fn command(p: u32, ata: u8, lba: u64, write: bool) -> bool {
+    xfer(p, ata, lba, 1, addr_of!(BUF) as u64, write)
+}
+
+/// One ATA command of `k` logical sectors through slot 0 with one PRD over `buf` (BUF, RA or WB:
+/// physically contiguous, k * sector size bytes). Returns success.
+fn xfer(p: u32, ata: u8, lba: u64, k: u32, buf: u64, write: bool) -> bool {
     if !wait(|| port(p, P_TFD) & (TFD_BSY | TFD_DRQ) == 0) {
         crate::kprintln!("[ahci] port {} busy", p);
         return false;
     }
-    let buf = addr_of!(BUF) as u64;
     let ct = addr_of!(CTBL) as u64;
     // SAFETY: the DMA structures are ours alone; the HBA reads them only after CI is set.
     unsafe {
@@ -187,12 +189,13 @@ fn command(p: u32, ata: u8, lba: u64, write: bool) -> bool {
         t[8] = (lba >> 24) as u8;
         t[9] = (lba >> 32) as u8;
         t[10] = (lba >> 40) as u8;
-        t[12] = 1; // one sector
+        t[12] = k as u8; // sector count (0 would mean 65536: never sent)
+        t[13] = (k >> 8) as u8;
         // PRD 0: the buffer, byte count - 1
         t[0x80..0x84].copy_from_slice(&(buf as u32).to_le_bytes());
         t[0x84..0x88].copy_from_slice(&((buf >> 32) as u32).to_le_bytes());
         // byte count - 1: IDENTIFY is always 512 bytes, data is one logical sector
-        let bytes = if ata == ATA_IDENTIFY { 512 } else { LBS[p as usize & 31] };
+        let bytes = if ata == ATA_IDENTIFY { 512 } else { LBS[p as usize & 31] * k };
         t[0x8C..0x90].copy_from_slice(&(bytes - 1).to_le_bytes());
         let h = &mut (*addr_of_mut!(CLIST)).0;
         h[0] = 5 | if write { 1 << 6 } else { 0 } | 1 << 16; // CFL 5 dwords, W, PRDTL 1
@@ -224,31 +227,13 @@ fn buf() -> &'static mut [u8; 4096] {
 
 /// Find the controller, bring up every SATA disk, and choose the one the VFS may use.
 pub fn init() {
-    let mut at = None;
-    'scan: for b in 0..8u8 {
-        for d in 0..32u8 {
-            for f in 0..8u8 {
-                let id = cfg32(b, d, f, 0);
-                if id & 0xFFFF == 0xFFFF {
-                    if f == 0 {
-                        break;
-                    }
-                    continue;
-                }
-                if cfg32(b, d, f, 8) >> 8 == 0x01_06_01 {
-                    at = Some((b, d, f));
-                    break 'scan;
-                }
-            }
-        }
-    }
-    let Some((b, d, f)) = at else { return };
-    let abar = (cfg32(b, d, f, 0x24) & !0xF) as u64; // BAR5
+    let Some((b, d, f)) = pci::find_class(0x01_06_01, 8) else { return };
+    let abar = (pci::cfg_read32(b, d, f, 0x24) & !0xF) as u64; // BAR5 (always 32-bit in AHCI)
     if abar == 0 || !mmu::map_mmio(abar, 0x1100) {
         crate::kprintln!("[ahci] controller at {:02x}:{:02x}.{} has no usable ABAR", b, d, f);
         return;
     }
-    cfg_write32(b, d, f, 4, cfg32(b, d, f, 4) | 0x406); // memory decoding + bus mastering, INTx off (polled)
+    pci::enable(b, d, f, 0x406); // memory decoding + bus mastering, INTx off (polled)
     // SAFETY: init runs once at boot, single core, before any reader.
     unsafe {
         ABAR = abar;
@@ -263,7 +248,7 @@ pub fn init() {
     }
     hba_w(GHC, hba(GHC) | GHC_AE);
     // a 32-bit-only HBA cannot reach DMA structures above 4 GiB
-    if hba(CAP) & 1 << 31 == 0 && [addr_of!(CLIST) as u64, addr_of!(RFIS) as u64, addr_of!(CTBL) as u64, addr_of!(BUF) as u64].iter().any(|&a| a >> 32 != 0) {
+    if hba(CAP) & 1 << 31 == 0 && [addr_of!(CLIST) as u64, addr_of!(RFIS) as u64, addr_of!(CTBL) as u64, addr_of!(BUF) as u64, addr_of!(RA) as u64, addr_of!(WB) as u64].iter().any(|&a| a >> 32 != 0) {
         crate::kprintln!("[ahci] the controller has 32-bit DMA and our buffers are above 4 GiB: not used");
         return;
     }
@@ -379,6 +364,165 @@ pub fn init() {
         b, d, f, hba(VS) >> 16, (hba(VS) >> 8) & 0xFF, pi.count_ones(), n
     );
     let _ = hba(CAP);
+    if present() {
+        multi_check();
+    }
+}
+
+/// Device blocks per multi-block command on DISK_PORT (8 KiB over the sector size).
+fn kmax() -> u32 {
+    // SAFETY: scalar read.
+    let Some(p) = (unsafe { DISK_PORT }) else { return 1 };
+    (RA_BYTES as u64 / (per(p) * 512)) as u32
+}
+
+/// The device block after the storage area (its partition, or the whole disk).
+fn end_block() -> u64 {
+    // SAFETY: scalar reads.
+    let Some(p) = (unsafe { DISK_PORT }) else { return 0 };
+    // SAFETY: scalar reads.
+    (unsafe { PART.0 + DISK_SECTORS }) / per(p)
+}
+
+/// When a disk is taken for storage: one READ of the first k blocks of the storage area must equal
+/// the same blocks read one at a time, else multi-block reads stay off (and writes with them).
+/// Reads only: safe on any disk. One line says which.
+fn multi_check() {
+    // SAFETY: single core, kernel/shell context; no command in flight.
+    unsafe {
+        (MULTI, MULTIW, RA_N, WB_N) = (0, 0, 0, 0);
+        let Some(p) = DISK_PORT else { return };
+        let first = PART.0 / per(p);
+        let k = (kmax() as u64).min(end_block().saturating_sub(first)) as u32;
+        if k < 2 {
+            (MULTI, MULTIW) = (2, 2);
+            return;
+        }
+        let ra = addr_of_mut!(RA.0) as *mut u8;
+        core::ptr::write_bytes(ra, 0xA5, RA_BYTES);
+        let bs = LBS[p as usize & 31] as usize;
+        let read_ok = xfer(p, ATA_READ_DMA_EXT, first, k, ra as u64, false);
+        let mut same = read_ok;
+        for b in 0..k as u64 {
+            if !same {
+                break;
+            }
+            same = command(p, ATA_READ_DMA_EXT, first + b, false) && buf()[..bs] == core::slice::from_raw_parts(ra.add(b as usize * bs), bs)[..];
+        }
+        if same {
+            (MULTI, RA_AT, RA_N) = (1, first, k);
+            crate::kprintln!("[ahci] port {}: multi-block reads on (up to {} sectors per command; the first {} equal one at a time)", p, k, k);
+        } else {
+            (MULTI, MULTIW, RA_N) = (2, 2, 0);
+            crate::kprintln!(
+                "[ahci] port {}: multi-block reads off ({}): one sector per command",
+                p,
+                if read_ok { "they differed from one at a time" } else { "the disk refused one" }
+            );
+        }
+    }
+}
+
+/// Device block `b` of DISK_PORT into BUF: from the read-ahead when it holds it, else a new
+/// multi-block read of up to 8 KiB from it (once the check passed), else one block.
+fn fetch(p: u32, b: u64) -> bool {
+    // SAFETY: single core, kernel context, one command in flight.
+    unsafe {
+        RSTATS.0 += 1;
+        let bs = LBS[p as usize & 31] as usize;
+        if b >= RA_AT && b < RA_AT + RA_N as u64 {
+            let off = (b - RA_AT) as usize * bs;
+            buf()[..bs].copy_from_slice(&(&*addr_of!(RA.0))[off..off + bs]);
+            RSTATS.1 += 1;
+            return true;
+        }
+        if MULTI == 1 {
+            let k = (kmax() as u64).min(end_block().saturating_sub(b)) as u32;
+            if k > 1 {
+                RA_N = 0;
+                if xfer(p, ATA_READ_DMA_EXT, b, k, addr_of!(RA.0) as u64, false) {
+                    (RA_AT, RA_N) = (b, k);
+                    buf()[..bs].copy_from_slice(&(&*addr_of!(RA.0))[..bs]);
+                    RSTATS.2 += 1;
+                    return true;
+                }
+                MULTI = 2;
+                crate::kprintln!("[ahci] a multi-block read at sector {} was refused: one sector per command from now on", b);
+            }
+        }
+        RSTATS.3 += 1;
+        command(p, ATA_READ_DMA_EXT, b, false)
+    }
+}
+
+/// Device block `b` of DISK_PORT was written from `src` (or the write failed): keep the read-ahead true.
+fn ra_update(b: u64, src: &[u8], ok: bool) {
+    // SAFETY: as fetch.
+    unsafe {
+        if b >= RA_AT && b < RA_AT + RA_N as u64 {
+            if ok {
+                let Some(p) = DISK_PORT else { return };
+                let off = (b - RA_AT) as usize * LBS[p as usize & 31] as usize;
+                (&mut (*addr_of_mut!(RA)).0)[off..off + src.len()].copy_from_slice(src);
+            } else {
+                RA_N = 0; // the disk's copy is unknown now
+            }
+        }
+    }
+}
+
+/// Send the gathered writes: one WRITE DMA EXT when multi-block writes are on (the first one is
+/// read back block by block and must be equal, else they go off and the run is rewritten one block
+/// at a time), else one per block.
+fn flush() -> bool {
+    // SAFETY: as fetch.
+    unsafe {
+        let (at, k) = (WB_AT, WB_N);
+        if k == 0 {
+            return true;
+        }
+        WB_N = 0;
+        let Some(p) = DISK_PORT else { return false };
+        let wb = addr_of!(WB.0) as *const u8;
+        let bs = LBS[p as usize & 31] as usize;
+        let mut done = false;
+        if k > 1 && MULTI == 1 && MULTIW != 2 {
+            if xfer(p, ATA_WRITE_DMA_EXT, at, k, wb as u64, true) {
+                WSTATS.1 += 1;
+                done = true;
+                if MULTIW == 0 {
+                    for j in 0..k as u64 {
+                        let s = core::slice::from_raw_parts(wb.add(j as usize * bs), bs);
+                        if !(command(p, ATA_READ_DMA_EXT, at + j, false) && buf()[..bs] == s[..]) {
+                            done = false;
+                            break;
+                        }
+                    }
+                    MULTIW = if done { 1 } else { 2 };
+                    if done {
+                        crate::kprintln!("[ahci] port {}: multi-block writes on (up to {} sectors per command; the first {} read back equal)", p, kmax(), k);
+                    } else {
+                        crate::kprintln!("[ahci] port {}: multi-block writes off (read back differently: rewritten one sector per command)", p);
+                    }
+                }
+            } else {
+                MULTIW = 2;
+                crate::kprintln!("[ahci] a multi-block write at sector {} was refused: one sector per command from now on", at);
+            }
+        }
+        let mut ok = true;
+        for j in 0..k as u64 {
+            let s = core::slice::from_raw_parts(wb.add(j as usize * bs), bs);
+            let good = done || {
+                buf()[..bs].copy_from_slice(s);
+                WSTATS.2 += 1;
+                command(p, ATA_WRITE_DMA_EXT, at + j, true)
+            };
+            ra_update(at + j, s, good);
+            ok = ok && good;
+        }
+        ok
+    }
 }
 
 /// `claimdisk sata`: take the blank SATA disk for the VFS (the owner asked for it).
@@ -389,9 +533,25 @@ pub fn claim() -> bool {
             DISK_PORT = Some(p);
             DISK_SECTORS = s;
             BLANK = None;
+            keep_model(p);
+            multi_check();
             return true;
         }
         false
+    }
+}
+
+/// The model name of the disk on port `p` for lsahci, as init keeps it for a disk used from boot
+/// (a disk taken later by claimdisk or formatpart is identified again here).
+fn keep_model(p: u32) {
+    if command(p, ATA_IDENTIFY, 0, false) {
+        let id = buf();
+        // SAFETY: scalar state, shell context.
+        let m = unsafe { &mut *addr_of_mut!(MODEL) };
+        for i in 0..20 {
+            m[i * 2] = id[54 + i * 2 + 1];
+            m[i * 2 + 1] = id[54 + i * 2];
+        }
     }
 }
 
@@ -429,16 +589,8 @@ pub fn use_part(p: u32, a: u64, l: u64) -> bool {
             }
         }
     }
-    // the model name for lsahci, as init keeps it for a disk used from boot
-    if command(p, ATA_IDENTIFY, 0, false) {
-        let id = buf();
-        // SAFETY: scalar state, shell context.
-        let m = unsafe { &mut *addr_of_mut!(MODEL) };
-        for i in 0..20 {
-            m[i * 2] = id[54 + i * 2 + 1];
-            m[i * 2 + 1] = id[54 + i * 2];
-        }
-    }
+    keep_model(p);
+    multi_check();
     true
 }
 
@@ -453,6 +605,8 @@ pub fn release_part(p: u32) -> bool {
     // SAFETY: scalar state, shell context.
     unsafe {
         if DISK_PORT == Some(p) && PART.1 > 0 {
+            // the partition is out of the table: nothing more is written there, not even a half save
+            (WB_N, RA_N, MULTI, MULTIW) = (0, 0, 0, 0);
             DISK_PORT = None;
             DISK_SECTORS = 0;
             PART = (0, 0);
@@ -491,7 +645,8 @@ pub fn read_sector(n: u64, out: &mut [u8; 512]) -> bool {
     }
     // SAFETY: scalar read.
     let n = n + unsafe { PART.0 };
-    if !command(p, ATA_READ_DMA_EXT, n / per(p), false) {
+    // writes still gathered go to the disk before anything is read
+    if !(flush() && fetch(p, n / per(p))) {
         return false;
     }
     let off = (n % per(p)) as usize * 512;
@@ -505,15 +660,49 @@ pub fn write_sector(n: u64, data: &[u8; 512]) -> bool {
     if n >= capacity() {
         return false;
     }
+    // the VFS saves its sectors in order, so a run of device blocks is gathered in WB (up to 8 KiB;
+    // one block while multi-block writes are off). A 1, 2 or 4 KiB sector is read once when the
+    // run reaches it and its 512-byte pieces changed in place. The run is sent when it is full and
+    // its last block complete, on a gap, before any read, or at the VFS's last sector (or a lone
+    // write past the VFS area: the self-test).
+    let last = n >= 2 * crate::vfs::MAX_FILES as u64;
     // SAFETY: scalar read.
     let n = n + unsafe { PART.0 };
-    // smaller than the drive's sector: read it, change our 512 bytes, write it back
-    if per(p) > 1 && !command(p, ATA_READ_DMA_EXT, n / per(p), false) {
-        return false;
+    // SAFETY: single core, kernel context, one command in flight.
+    unsafe {
+        let (per, bs) = (per(p), LBS[p as usize & 31] as usize);
+        let (b, off) = (n / per, (n % per) as usize * 512);
+        let cap = if MULTI == 1 && MULTIW != 2 { kmax() } else { 1 };
+        let mut ok = true;
+        let tail = WB_AT + WB_N as u64; // the block after the run
+        if WB_N > 0 && b + 1 != tail && !(b == tail && WB_N < cap) {
+            ok = flush();
+        }
+        let new = WB_N == 0 || b == WB_AT + WB_N as u64;
+        // a new block's other sectors as they are on the disk (the read-ahead, kept equal to every
+        // block flushed, or the disk)
+        let got = !new || per == 1 || fetch(p, b);
+        if got {
+            let wb = &mut (*addr_of_mut!(WB)).0;
+            if WB_N == 0 {
+                WB_AT = b;
+            }
+            if new {
+                if per > 1 {
+                    let i = WB_N as usize * bs;
+                    wb[i..i + bs].copy_from_slice(&buf()[..bs]);
+                }
+                WB_N += 1;
+            }
+            let i = (b - WB_AT) as usize * bs + off;
+            wb[i..i + 512].copy_from_slice(data);
+            WSTATS.0 += 1;
+            if last || (off + 512 == bs && WB_N >= cap) {
+                ok = flush() && ok;
+            }
+        }
+        ok && got
     }
-    let off = (n % per(p)) as usize * 512;
-    buf()[off..off + 512].copy_from_slice(data);
-    command(p, ATA_WRITE_DMA_EXT, n / per(p), true)
 }
 
 /// Read-only view for `lsparts`: the i-th disk found (port, 512-byte sectors, sector bytes).
@@ -530,7 +719,10 @@ pub fn raw_disk(i: usize) -> Option<(u32, u64, u64)> {
 
 /// Read one 512-byte sector of the disk on port `p` whoever owns it (never writes).
 pub fn raw_read(p: u32, n: u64, out: &mut [u8; 512]) -> bool {
-    if !command(p, ATA_READ_DMA_EXT, n / per(p), false) {
+    // the storage disk: gathered writes first, then through the read-ahead
+    // SAFETY: scalar read.
+    let ours = unsafe { DISK_PORT } == Some(p);
+    if !(if ours { flush() && fetch(p, n / per(p)) } else { command(p, ATA_READ_DMA_EXT, n / per(p), false) }) {
         return false;
     }
     let off = (n % per(p)) as usize * 512;
@@ -542,12 +734,20 @@ pub fn raw_read(p: u32, n: u64, out: &mut [u8; 512]) -> bool {
 /// this (gpt.rs), and only after a matching table backup on a USB stick and the owner's code.
 pub fn table_write(p: u32, n: u64, data: &[u8; 512]) -> bool {
     let Some(cap) = (0..32).filter_map(raw_disk).find(|d| d.0 == p).map(|d| d.1) else { return false };
-    if n >= cap || per(p) > 1 && !command(p, ATA_READ_DMA_EXT, n / per(p), false) {
+    // SAFETY: scalar read.
+    let ours = unsafe { DISK_PORT } == Some(p);
+    if n >= cap || ours && !flush() || per(p) > 1 && !(if ours { fetch(p, n / per(p)) } else { command(p, ATA_READ_DMA_EXT, n / per(p), false) }) {
         return false;
     }
     let off = (n % per(p)) as usize * 512;
     buf()[off..off + 512].copy_from_slice(data);
-    command(p, ATA_WRITE_DMA_EXT, n / per(p), true)
+    let ok = command(p, ATA_WRITE_DMA_EXT, n / per(p), true);
+    if ours {
+        // SAFETY: scalar read.
+        let bs = unsafe { LBS[p as usize & 31] } as usize;
+        ra_update(n / per(p), &buf()[..bs], ok);
+    }
+    ok
 }
 
 /// `lsahci`: the controller and every disk on it.
@@ -584,6 +784,11 @@ pub fn list() {
         let m = unsafe { &*addr_of!(MODEL) };
         let model = core::str::from_utf8(m).unwrap_or("?").trim();
         crate::kprintln!("  storage disk model: {}", model);
+        // SAFETY: scalar reads.
+        let (r, w, mr, mw) = unsafe { (RSTATS, WSTATS, MULTI, MULTIW) };
+        let word = |s: u8| match s { 1 => "on", 2 => "off", _ => "not checked yet" };
+        crate::kprintln!("  reads: {} sector(s), {} from the read-ahead, {} multi-block command(s), {} single ({})", r.0, r.1, r.2, r.3, word(mr));
+        crate::kprintln!("  writes: {} sector(s), {} multi-block command(s), {} single ({})", w.0, w.1, w.2, word(mw));
         if let Some((p, a, l)) = part().filter(|x| x.2 > 0) {
             crate::kprintln!("  storage: port {}, AfriSovera's partition, sectors {}-{} ({} MiB); nothing outside it is written", p, a, a + l - 1, l / 2048);
         }

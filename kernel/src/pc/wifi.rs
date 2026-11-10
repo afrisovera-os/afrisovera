@@ -12,24 +12,8 @@
 //! and does not use are named from their vendor:product, and `wifi` also takes Device Manager's
 //! USB\VID_0BDA&PID_8179 form. A stick is the cheap way to give a PC a Wi-Fi chip we choose.
 
-use core::arch::asm;
-
-unsafe fn outl(port: u16, v: u32) {
-    asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack, preserves_flags));
-}
-unsafe fn inl(port: u16) -> u32 {
-    let v: u32;
-    asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, nostack, preserves_flags));
-    v
-}
-fn cfg32(b: u8, d: u8, f: u8, off: u8) -> u32 {
-    let a = 0x8000_0000 | (b as u32) << 16 | (d as u32) << 11 | (f as u32) << 8 | (off as u32 & 0xFC);
-    // SAFETY: the PCI configuration ports, read only; shell context, single core.
-    unsafe {
-        outl(0xCF8, a);
-        inl(0xCFC)
-    }
-}
+// PCI configuration space (read only here) through the shared pc/pci.rs (review R1-8).
+use crate::pci::cfg_read32 as cfg32;
 
 /// The Linux driver family a Wi-Fi chip needs, and what that means for AfriSovera.
 #[derive(Clone, Copy)]

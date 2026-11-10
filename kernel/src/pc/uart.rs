@@ -12,7 +12,28 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const COM1: u16 = 0x3F8;
 
+/// COM1 answers: its scratch register keeps what is written to it. A laptop without one
+/// (owner's HP ENVY, 8 Nov 2026: blank screen) must not spend a bounded wait on every byte.
+static PRESENT: AtomicBool = AtomicBool::new(true);
+
+pub fn present() -> bool {
+    PRESENT.load(Ordering::Relaxed)
+}
+
 pub fn init() {
+    // SAFETY: COM1's scratch register (offset 7): a 16550 holds the byte; nothing behind the
+    // port reads back 0xFF (or anything else), whatever was written.
+    let here = unsafe {
+        outb(COM1 + 7, 0x5A);
+        let a = inb(COM1 + 7);
+        outb(COM1 + 7, 0xA5);
+        let b = inb(COM1 + 7);
+        a == 0x5A && b == 0xA5
+    };
+    PRESENT.store(here, Ordering::Relaxed);
+    if !here {
+        return;
+    }
     // SAFETY: COM1's registers; the standard 16550 programming sequence.
     unsafe {
         outb(COM1 + 1, 0x00); // no UART interrupts: the console is polled
@@ -26,6 +47,9 @@ pub fn init() {
 }
 
 fn write_byte(b: u8) {
+    if !PRESENT.load(Ordering::Relaxed) {
+        return;
+    }
     // SAFETY: polling the line-status register, then writing the data register.
     unsafe {
         let mut spins = 0u32;
@@ -61,18 +85,137 @@ static mut RX_TAIL: usize = 0; // next free slot
 pub fn inject(b: u8) {
     // SAFETY: interrupts are off in the caller; `getc` takes the ring with them off.
     unsafe {
-        let next = (RX_TAIL + 1) % RING;
-        if next == RX_HEAD {
-            RX_DROPS.fetch_add(1, Ordering::Relaxed);
-        } else {
-            RX_RING[RX_TAIL] = b;
-            RX_TAIL = next;
+        put(b);
+    }
+}
+
+/// One byte into the ring (false if full: counted as a drop), and into the line tracker.
+/// Caller has interrupts off.
+unsafe fn put(b: u8) -> bool {
+    let next = (RX_TAIL + 1) % RING;
+    if next == RX_HEAD {
+        RX_DROPS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    RX_RING[RX_TAIL] = b;
+    RX_TAIL = next;
+    track(b);
+    true
+}
+
+// Shell history (9 Nov 2026, HP ENVY field item F5: the arrow keys did nothing at the
+// shell). The shared line editor (shell.rs read_line) is left as it is, so the ARM image
+// does not change: this file follows every byte that enters the ring the way read_line
+// will take it (printable bytes add, 0x08/0x7f remove, CR/LF ends the line), keeps the
+// last HIST lines, and Up/Down (from ps2.rs and xhci.rs) put DEL bytes for the line being
+// typed and then the recalled line into the ring, as if they had been typed.
+const HIST: usize = 16;
+const LINE: usize = 127; // shell.rs MAX_LINE - 1: the longest line read_line keeps
+static mut CUR: [u8; LINE] = [0; LINE];
+static mut CUR_LEN: usize = 0;
+static mut HBUF: [[u8; LINE]; HIST] = [[0; LINE]; HIST];
+static mut HLEN: [usize; HIST] = [0; HIST];
+static mut HCOUNT: usize = 0; // lines ever kept; the newest is in slot (HCOUNT - 1) % HIST
+static mut BROWSE: usize = 0; // 0: the line being typed; k: the k-th newest kept line
+static RECALLS: AtomicU64 = AtomicU64::new(0);
+static RECALL_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// Follow one byte as read_line will take it; a finished line joins the history (not an
+/// empty one, nor the same line twice in a row). Caller has interrupts off.
+unsafe fn track(b: u8) {
+    let cur = &mut *core::ptr::addr_of_mut!(CUR);
+    match b {
+        b'\r' | b'\n' => {
+            let n = CUR_LEN;
+            if n > 0 {
+                let (hb, hl) = (&mut *core::ptr::addr_of_mut!(HBUF), &mut *core::ptr::addr_of_mut!(HLEN));
+                let last = (HCOUNT + HIST - 1) % HIST;
+                if HCOUNT == 0 || hb[last][..hl[last]] != cur[..n] {
+                    let slot = HCOUNT % HIST;
+                    hb[slot][..n].copy_from_slice(&cur[..n]);
+                    hl[slot] = n;
+                    HCOUNT += 1;
+                }
+            }
+            CUR_LEN = 0;
+            BROWSE = 0;
         }
+        0x08 | 0x7f => CUR_LEN = CUR_LEN.saturating_sub(1),
+        0x20..=0x7e if CUR_LEN < LINE => {
+            cur[CUR_LEN] = b;
+            CUR_LEN += 1;
+        }
+        _ => {}
+    }
+}
+
+/// Up (older) or Down (newer) at the shell: the line being typed is replaced by a kept
+/// one (Down past the newest gives an empty line). Called from the keyboards' timer-
+/// interrupt polls, so interrupts are off. Nothing happens if the ring has no room.
+pub fn history_key(up: bool) {
+    // SAFETY: interrupts are off in the caller; `getc` takes the ring with them off.
+    unsafe {
+        let have = HCOUNT.min(HIST);
+        let to = match up {
+            true if BROWSE < have => BROWSE + 1,
+            false if BROWSE > 0 => BROWSE - 1,
+            _ => return,
+        };
+        let mut line = [0u8; LINE];
+        let n = if to == 0 {
+            0
+        } else {
+            let slot = (HCOUNT - to) % HIST;
+            let n = (*core::ptr::addr_of!(HLEN))[slot];
+            line[..n].copy_from_slice(&(&*core::ptr::addr_of!(HBUF))[slot][..n]);
+            n
+        };
+        let free = (RX_HEAD + RING - RX_TAIL - 1) % RING;
+        if free < CUR_LEN + n {
+            RECALL_DROPS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        for _ in 0..CUR_LEN {
+            put(0x7f);
+        }
+        for &b in &line[..n] {
+            put(b);
+        }
+        BROWSE = to;
+        RECALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `history`: the kept lines, oldest first, numbered from the first line typed.
+pub fn history_list() {
+    crate::cpu::cli();
+    let (count, mut lines) = (unsafe { HCOUNT }, [([0u8; LINE], 0usize); HIST]);
+    // SAFETY: interrupts are off, so no keyboard poll changes the history meanwhile.
+    unsafe {
+        for (i, l) in lines.iter_mut().enumerate().take(count.min(HIST)) {
+            let slot = (count.saturating_sub(HIST) + i) % HIST;
+            let n = (*core::ptr::addr_of!(HLEN))[slot];
+            l.0[..n].copy_from_slice(&(&*core::ptr::addr_of!(HBUF))[slot][..n]);
+            l.1 = n;
+        }
+    }
+    crate::cpu::sti();
+    let first = count.saturating_sub(HIST);
+    for (i, (b, n)) in lines.iter().take(count.min(HIST)).enumerate() {
+        crate::kprintln!("{:5}  {}", first + i + 1, core::str::from_utf8(&b[..*n]).unwrap_or("?"));
+    }
+    let (rc, rd) = (RECALLS.load(Ordering::Relaxed), RECALL_DROPS.load(Ordering::Relaxed));
+    crate::kprintln!("history: {} line(s) typed, the last {} kept; {} recalled with Up/Down", count, count.min(HIST), rc);
+    if rd > 0 {
+        crate::kprintln!("history: {} Up/Down press(es) not recalled (the input ring was full)", rd);
     }
 }
 
 /// One byte from the hardware, if the 16550 holds one (counts overruns).
 fn hw_byte() -> Option<u8> {
+    if !PRESENT.load(Ordering::Relaxed) {
+        return None;
+    }
     // SAFETY: COM1's line-status and receive-buffer registers.
     unsafe {
         let lsr = inb(COM1 + 5);
@@ -108,13 +251,7 @@ pub fn rx_irq() {
     while let Some(b) = hw_byte() {
         // SAFETY: interrupts are off inside the handler; `getc` takes the ring with them off.
         unsafe {
-            let next = (RX_TAIL + 1) % RING;
-            if next == RX_HEAD {
-                RX_DROPS.fetch_add(1, Ordering::Relaxed);
-            } else {
-                RX_RING[RX_TAIL] = b;
-                RX_TAIL = next;
-            }
+            put(b);
         }
     }
 }
@@ -133,7 +270,10 @@ pub fn getc() -> Option<u8> {
         } else if IRQ_ON.load(Ordering::Relaxed) {
             None // the interrupt fills the ring; nothing waiting yet
         } else {
-            hw_byte()
+            hw_byte().map(|b| {
+                track(b); // straight from the port (before the interrupt is on)
+                b
+            })
         }
     };
     if flags & 0x200 != 0 {
@@ -181,7 +321,11 @@ pub fn idle_wfi_count() -> u64 {
 struct Tee;
 impl Write for Tee {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        crate::conback::live(); // a scrolled-back console comes back first (conback.rs)
+        crate::conback::feed(s);
+        crate::report::feed(s); // kept for `report` (the boot log and the latest lines)
         let _ = Com1.write_str(s);
+        crate::early_write(s); // the boot trail on the real screen, until the shell starts
         crate::xhci::serial_write(s); // and a USB serial cable, when one is plugged in
         crate::framebuffer::console_write(s);
         crate::screen::mark();
@@ -213,11 +357,49 @@ pub fn _print(args: core::fmt::Arguments) {
     while PRINT_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
         core::hint::spin_loop();
     }
-    let _ = Tee.write_fmt(args);
+    if crate::helpview::on() {
+        crate::helpview::feed(args); // `help <word>` / `help <page>` (helpview.rs)
+    } else {
+        let _ = Tee.write_fmt(args);
+    }
     PRINT_LOCK.store(false, Ordering::Release);
     if flags & 0x200 != 0 {
         crate::cpu::sti();
     }
+}
+
+/// Everywhere a print goes, with the print lock already held: helpview.rs's lines.
+pub fn tee_str(s: &str) {
+    let _ = Tee.write_str(s);
+}
+
+/// The same, formatted.
+pub fn tee_fmt(args: core::fmt::Arguments) {
+    let _ = Tee.write_fmt(args);
+}
+
+/// COM1 only (not the screen): conback.rs's notes, with the print lock already held.
+pub fn com1_fmt(args: core::fmt::Arguments) {
+    let _ = Com1.write_fmt(args);
+}
+
+/// Shift+PgUp (`up`) / Shift+PgDn from the keyboards' polls (interrupts off): the console
+/// scrollback, under the print lock so the other core's prints wait (conback.rs).
+pub fn console_page(up: bool) {
+    while PRINT_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    crate::conback::page(up);
+    PRINT_LOCK.store(false, Ordering::Release);
+}
+
+/// Mouse-wheel notches (ps2.rs): scroll the console three lines a notch, under the print lock.
+pub fn console_wheel(notches: i32) {
+    while PRINT_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    crate::conback::wheel(notches);
+    PRINT_LOCK.store(false, Ordering::Release);
 }
 
 #[macro_export]

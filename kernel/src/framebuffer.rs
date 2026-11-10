@@ -209,6 +209,7 @@ fn console_init() {
 /// Write a string to the framebuffer console (no-op until the console is up).
 /// Called from `uart::_print`, so every `kprintln!` also lands on screen.
 pub fn console_write(s: &str) {
+    crate::desk::term_feed(s); // the desktop's Terminal shows the shell (desk.rs)
     // SAFETY: callers hold IRQs masked (uart::_print), single core → no aliasing.
     unsafe {
         if !CON_ON {

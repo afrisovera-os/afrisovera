@@ -17,34 +17,8 @@
 //! RTL8125 (2.5 GbE) moves the poll and interrupt registers and is not claimed.
 
 use crate::mmu;
-use core::arch::asm;
+use crate::pci;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
-
-unsafe fn outl(port: u16, v: u32) {
-    asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack, preserves_flags));
-}
-unsafe fn inl(port: u16) -> u32 {
-    let v: u32;
-    asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, nostack, preserves_flags));
-    v
-}
-fn cfg_addr(b: u8, d: u8, f: u8, off: u8) -> u32 {
-    0x8000_0000 | (b as u32) << 16 | (d as u32) << 11 | (f as u32) << 8 | (off as u32 & 0xFC)
-}
-fn cfg32(b: u8, d: u8, f: u8, off: u8) -> u32 {
-    // SAFETY: the PCI configuration ports; boot context, single core.
-    unsafe {
-        outl(0xCF8, cfg_addr(b, d, f, off));
-        inl(0xCFC)
-    }
-}
-fn cfg_write32(b: u8, d: u8, f: u8, off: u8, v: u32) {
-    // SAFETY: as cfg32.
-    unsafe {
-        outl(0xCF8, cfg_addr(b, d, f, off));
-        outl(0xCFC, v);
-    }
-}
 
 /// The parts this driver knows, by (vendor, device); wifi.rs names them too. The 8139 counts
 /// only from revision 0x20 (the C+ chip; older 8139s have no descriptor rings).
@@ -116,8 +90,12 @@ struct TxRing([Desc; NTX]);
 const D0: Desc = Desc { opts1: 0, opts2: 0, addr: 0 };
 static mut RXR: RxRing = RxRing([D0; NRX]);
 static mut TXR: TxRing = TxRing([D0; NTX]);
-static mut RXB: [[u8; BUF]; NRX] = [[0; BUF]; NRX];
-static mut TXB: [[u8; BUF]; NTX] = [[0; BUF]; NTX];
+/// Packet buffers, each BUF (2 KiB) aligned so none crosses a 4 KiB page: the r8169 family wants 8-byte
+/// aligned buffers and the 82545/82546 must not cross a 64 KiB line (Linux e1000_check_64k_bound).
+#[repr(C, align(2048))]
+struct Bufs<const N: usize>([[u8; BUF]; N]);
+static mut RXB: Bufs<NRX> = Bufs([[0; BUF]; NRX]);
+static mut TXB: Bufs<NTX> = Bufs([[0; BUF]; NTX]);
 
 static mut BAR: u64 = 0;
 /// The RTL8139C+ (QEMU's card) rather than the r8169 family.
@@ -167,11 +145,11 @@ fn wait(mut done: impl FnMut() -> bool) -> bool {
 fn mem_bar(b: u8, d: u8, f: u8) -> u64 {
     let mut i = 0u8;
     while i < 6 {
-        let v = cfg32(b, d, f, 0x10 + i * 4);
+        let v = pci::cfg_read32(b, d, f, 0x10 + i * 4);
         if v & 1 == 0 {
             let mut a = (v & !0xF) as u64;
             if v & 0x6 == 0x4 && i < 5 {
-                a |= (cfg32(b, d, f, 0x14 + i * 4) as u64) << 32;
+                a |= (pci::cfg_read32(b, d, f, 0x14 + i * 4) as u64) << 32;
             }
             if a != 0 {
                 return a;
@@ -196,36 +174,27 @@ fn link() -> bool {
 
 /// Find a known Realtek NIC, reset it and bring up its RX and TX rings. True when ready.
 pub fn init() -> bool {
-    let mut at = None;
-    'scan: for b in 0..8u8 {
-        for d in 0..32u8 {
-            for f in 0..8u8 {
-                let id = cfg32(b, d, f, 0);
-                if id & 0xFFFF == 0xFFFF {
-                    if f == 0 {
-                        break;
-                    }
-                    continue;
-                }
-                let (v, dv) = ((id & 0xFFFF) as u16, (id >> 16) as u16);
-                if let Some(&(_, _, name)) = PARTS.iter().find(|p| p.0 == v && p.1 == dv) {
-                    if dv == 0x8139 && cfg32(b, d, f, 0x08) & 0xFF < 0x20 {
-                        continue; // an 8139 before the C+: no descriptor rings
-                    }
-                    at = Some((b, d, f, name));
-                    break 'scan;
-                }
+    let mut name = "";
+    let hit = |b, d, f, id: u32| {
+        let (v, dv) = ((id & 0xFFFF) as u16, (id >> 16) as u16);
+        match PARTS.iter().find(|p| p.0 == v && p.1 == dv) {
+            // an 8139 before the C+ (revision < 0x20) has no descriptor rings
+            Some(_) if dv == 0x8139 && pci::cfg_read32(b, d, f, 0x08) & 0xFF < 0x20 => false,
+            Some(&(_, _, n)) => {
+                name = n;
+                true
             }
+            None => false,
         }
-    }
-    let Some((b, d, f, name)) = at else { return false };
+    };
+    let Some((b, d, f)) = pci::find_by(8, hit) else { return false };
     let bar = mem_bar(b, d, f);
     if bar == 0 || !mmu::map_mmio(bar, 0x1000) {
         crate::kprintln!("[rtl] {} at {:02x}:{:02x}.{} has no usable register BAR", name, b, d, f);
         return false;
     }
-    cfg_write32(b, d, f, 4, cfg32(b, d, f, 4) | 0x406); // memory decoding + bus mastering, INTx off (polled)
-    let is8139 = (cfg32(b, d, f, 0) >> 16) as u16 == 0x8139;
+    pci::enable(b, d, f, 0x406); // memory decoding + bus mastering, INTx off (polled)
+    let is8139 = (pci::cfg_read32(b, d, f, 0) >> 16) as u16 == 0x8139;
     // SAFETY: boot, single core, before any reader.
     unsafe {
         BAR = bar;
@@ -259,12 +228,12 @@ pub fn init() -> bool {
         let rx = &mut (*addr_of_mut!(RXR)).0;
         for (i, dsc) in rx.iter_mut().enumerate() {
             let end = if i == NRX - 1 { EOR } else { 0 };
-            *dsc = Desc { opts1: OWN | end | BUF as u32, opts2: 0, addr: addr_of!(RXB[i]) as u64 };
+            *dsc = Desc { opts1: OWN | end | BUF as u32, opts2: 0, addr: addr_of!(RXB.0[i]) as u64 };
         }
         let tx = &mut (*addr_of_mut!(TXR)).0;
         for (i, dsc) in tx.iter_mut().enumerate() {
             let end = if i == NTX - 1 { EOR } else { 0 };
-            *dsc = Desc { opts1: end, opts2: 0, addr: addr_of!(TXB[i]) as u64 };
+            *dsc = Desc { opts1: end, opts2: 0, addr: addr_of!(TXB.0[i]) as u64 };
         }
         RX_NEXT = 0;
         TX_NEXT = 0;
@@ -329,14 +298,14 @@ pub fn send(frame: &[u8]) -> bool {
             crate::kprintln!("[rtl] transmit ring stuck");
             return false;
         }
-        let buf = addr_of_mut!(TXB[i]) as *mut u8;
+        let buf = addr_of_mut!(TXB.0[i]) as *mut u8;
         core::ptr::copy_nonoverlapping(frame.as_ptr(), buf, frame.len());
         let n = frame.len().max(MIN_FRAME);
         if n > frame.len() {
             core::ptr::write_bytes(buf.add(frame.len()), 0, n - frame.len());
         }
         let end = if i == NTX - 1 { EOR } else { 0 };
-        write_volatile(addr_of_mut!((*dsc).addr), addr_of!(TXB[i]) as u64);
+        write_volatile(addr_of_mut!((*dsc).addr), addr_of!(TXB.0[i]) as u64);
         write_volatile(addr_of_mut!((*dsc).opts2), 0);
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         write_volatile(addr_of_mut!((*dsc).opts1), OWN | end | FS | LS | n as u32);
@@ -371,10 +340,10 @@ pub fn recv(dst: &mut [u8]) -> Option<usize> {
         DROPPING = st & LS == 0;
         let n = len.min(dst.len());
         if whole {
-            core::ptr::copy_nonoverlapping(addr_of!(RXB[i]) as *const u8, dst.as_mut_ptr(), n);
+            core::ptr::copy_nonoverlapping(addr_of!(RXB.0[i]) as *const u8, dst.as_mut_ptr(), n);
         }
         let end = if i == NRX - 1 { EOR } else { 0 };
-        write_volatile(addr_of_mut!((*dsc).addr), addr_of!(RXB[i]) as u64);
+        write_volatile(addr_of_mut!((*dsc).addr), addr_of!(RXB.0[i]) as u64);
         write_volatile(addr_of_mut!((*dsc).opts2), 0);
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         write_volatile(addr_of_mut!((*dsc).opts1), OWN | end | BUF as u32);
@@ -407,6 +376,47 @@ pub fn list() {
         name, b, d, f, bar, m[0], m[1], m[2], m[3], m[4], m[5], if link_up() { "up" } else { "down" }
     );
     crate::kprintln!("  frames sent {}, received {}", s, rcv);
+    dma_line();
+}
+
+/// Every ring and packet buffer against the card's DMA limits: rings 256-byte aligned, buffers 8-byte aligned
+/// inside one 4 KiB page. Returns (outside, total, first outside).
+fn dma_check() -> (usize, usize, &'static str) {
+    let mut bad = (0usize, "");
+    let mut see = |name: &'static str, a: u64, len: u64, align: u64| {
+        let ok = a % align == 0 && (if align == 8 { a >> 12 == (a + len - 1) >> 12 } else { true });
+        if !ok {
+            if bad.0 == 0 {
+                bad.1 = name;
+            }
+            bad.0 += 1;
+        }
+    };
+    // SAFETY: addresses only, nothing read or written.
+    unsafe {
+        see("the receive ring", addr_of!(RXR) as u64, core::mem::size_of::<RxRing>() as u64, 256);
+        see("the transmit ring", addr_of!(TXR) as u64, core::mem::size_of::<TxRing>() as u64, 256);
+        for i in 0..NRX {
+            see("a receive buffer", addr_of!(RXB.0[i]) as u64, BUF as u64, 8);
+        }
+        for i in 0..NTX {
+            see("a transmit buffer", addr_of!(TXB.0[i]) as u64, BUF as u64, 8);
+        }
+    }
+    (bad.0, 2 + NRX + NTX, bad.1)
+}
+
+/// The memory line of the `lsrtl` listing.
+fn dma_line() {
+    let (bad, total, first) = dma_check();
+    if bad == 0 {
+        crate::kprintln!(
+            "  memory: all {} rings and buffers inside their limits (rings 256-byte aligned, buffers 8-byte aligned in one 4 KiB page)",
+            total
+        );
+    } else {
+        crate::kprintln!("  memory: {} of {} rings and buffers outside their limits (first: {})", bad, total, first);
+    }
 }
 
 /// True once init found and set up a NIC.
