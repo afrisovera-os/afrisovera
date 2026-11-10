@@ -190,3 +190,19 @@ not sit as a 640x480 box in a dark frame.
   The copy to the screen is one row built and copied per logical row, as before.
 - **Later:** windows open in a cascade from the top left whatever the size; placing them relative to the canvas
   centre and remembering where they were moved is part of slice 2.
+
+## 14. Slice 2 (10 Nov 2026): windows placed by the screen, the keyboard walk, model and paint apart
+
+- **Windows open round the middle of the free space** (right of the Spine), in a cascade, whatever the screen's
+  size: each app has a place given as an offset from that centre (Files up and left, Terminal down, Settings and
+  About between), clamped so the lintel stays on the screen. On a big screen they no longer bunch in the top left.
+  Sizes stay as they are (they are in logical pixels, so the UI scale already makes them bigger on big screens).
+- **The keyboard walk.** While the Circle is open, the arrow keys walk round the ring (Right and Down go clockwise,
+  Left and Up back), the chosen app gets a gold cut frame, and Enter opens it; Esc closes the Circle as before. On
+  the Spine, Super+1 to Super+4 open, focus or restore its apps in order (Files, Terminal, Settings, About), as a
+  click on the tile does. `desk key up|down|left|right|enter|super-1..4` script the same keys.
+- **Model and paint apart** (architect's review): `kernel/src/sovereign/desk.rs` keeps the model (state, the input
+  ring, windows and focus, hit-testing geometry, the `desk` commands); `kernel/src/sovereign/paint.rs` holds the
+  theme (palette, cloths, cut-corner primitives, text, icons) and every drawing function. Paint reads the model;
+  the model never draws. When the phone moves over, it keeps this model and gets a phone paint (or the same one with
+  the touch profile), instead of a third copy of the desktop.

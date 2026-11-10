@@ -70,8 +70,8 @@ pub fn scale() -> usize {
 
 /// The canvas pixels, `width()` to a row.
 pub fn pixels() -> *const u32 {
-    // SAFETY: only the address is taken.
-    unsafe { addr_of_mut!(BUF) as *const u32 }
+    // only the address is taken (no unsafe needed)
+    addr_of_mut!(BUF) as *const u32
 }
 
 /// The rows drawn since the screen last copied the canvas (architect's review, 10 Nov 2026:

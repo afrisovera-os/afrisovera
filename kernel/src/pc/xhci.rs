@@ -626,6 +626,14 @@ fn desk_key(k: u8, alt: bool, sup: bool) -> Option<u32> {
         0x51 if sup => KEY_SUPER_DOWN,
         0x52 if sup => KEY_SUPER_UP,
         0x29 if !alt && !sup => KEY_ESC,
+        // the keyboard walk (sovereign-ui.md 14): arrows and Enter while the Circle is open,
+        // Super+1..4 for the Spine's apps
+        0x52 if !alt && !sup && walking() => KEY_UP,
+        0x51 if !alt && !sup && walking() => KEY_DOWN,
+        0x50 if !alt && !sup && walking() => KEY_LEFT,
+        0x4F if !alt && !sup && walking() => KEY_RIGHT,
+        0x28 | 0x58 if !alt && !sup && walking() => KEY_ENTER,
+        0x1E..=0x21 if sup => KEY_SUPER_1 + (k - 0x1E) as u32,
         _ => return None,
     })
 }
