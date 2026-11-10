@@ -2,8 +2,9 @@
 # PC track step 6 groundwork (5 Nov 2026): the Tonga desktop's dock answers the USB mouse.
 #
 # Boots the PC kernel with a USB keyboard and mouse. scripts/lib/usb-steps.py types `desk` on
-# the keyboard (since 9 Nov 2026, field item F8: `desk` alone opens it, as `gui` does) (the shared desktop, desk.rs: its dock of launcher, Files, Terminal, Settings,
-# About), moves the pointer from 320,240 onto the Files tile (281,444), clicks, and types
+# the keyboard (since 9 Nov 2026, field item F8: `desk` alone opens it, as `gui` does) (the PC desktop: since 10 Nov 2026 the Sovereign UI,
+# docs/design/sovereign-ui.md, its Spine down the left edge), moves the pointer from 320,240 onto
+# the Spine's Files tile (20,68), clicks, and types
 # `lsusb`. Since 8 Nov 2026 (docs/design/desktop.md) a dock click opens that app's window on
 # the desktop instead of running a command on the text console. Graded: the Files window
 # opened after the click, the desktop still on screen, lsusb counting one dock click, and
@@ -41,7 +42,7 @@ lsusb
   mouse: 1 dock click(s) on the desktop
 afrisovera> desk status
 [desk] pointer profile, on screen; 3 frame(s) drawn; 1 dock click(s); 1 notice(s); 0 event(s) dropped
-[desk] window files at 36,44 size 372x250 focused"
+[desk] window files at 60,20 size 372x250 focused"
 
 selftest() {
     local D pass=0 bad=0
@@ -91,7 +92,7 @@ qemu-system-aarch64 -M virt -m 256M -display none \
     -serial "tcp:127.0.0.1:4814,server,nowait" -qmp "tcp:127.0.0.1:4815,server,nowait" &
 QPID=$!
 python3 scripts/lib/usb-steps.py 4814 4815 "$W/serial.log" "$(winpath "$W/shot.png")" \
-    "type:desk" "move:-39,204" down up "wait:3" "type:lsusb" "type:desk status"
+    "type:desk" "move:-300,-172" down up "wait:3" "type:lsusb" "type:desk status"
 kill "$QPID" 2> /dev/null
 wait "$QPID" 2> /dev/null
 tr -d '\r' < "$W/serial.log" | grep -aE '\[desk\]|^afrisovera> (desk|desk status|clear|lsusb)$|dock click' | sed 's/^/  | /'

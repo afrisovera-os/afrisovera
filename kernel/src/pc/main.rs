@@ -88,7 +88,7 @@ mod store;
 #[path = "../tonga.rs"]
 mod tonga;
 
-#[path = "../desk.rs"]
+#[path = "../sovereign/desk.rs"] // the Sovereign UI (docs/design/sovereign-ui.md); the phone keeps ../desk.rs
 mod desk;
 #[allow(dead_code)]
 #[path = "../uart_ns16550.rs"]

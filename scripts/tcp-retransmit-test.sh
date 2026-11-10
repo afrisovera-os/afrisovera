@@ -92,11 +92,18 @@ afrish_wait_boot
 python3 - <<'PY'
 import socket, sys, time
 t0 = time.time()
-try:
-    s = socket.create_connection(("127.0.0.1", 4544), timeout=20)
-except OSError as e:
-    print("  the serial port never opened (%s)" % e)
-    sys.exit(1)
+# QEMU binds the serial port only after its other start-up work; on the PC (UEFI firmware and the
+# boot stick first) that is about a second later than on ARM, so retry while it is still binding,
+# as shell-demo.py does (10 Nov 2026: the PC walk lost this race every time).
+s = None
+while s is None:
+    try:
+        s = socket.create_connection(("127.0.0.1", 4544), timeout=20)
+    except OSError as e:
+        if time.time() - t0 > 20:
+            print("  the serial port never opened (%s)" % e)
+            sys.exit(1)
+        time.sleep(0.25)
 s.settimeout(1.0)
 buf = b""
 while time.time() - t0 < 120:

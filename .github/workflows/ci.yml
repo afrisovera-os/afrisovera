@@ -104,6 +104,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: quick-logs
+          include-hidden-files: true   # the per-suite logs live in .rat-logs/
           path: |
             rat.out
             .rat-results.tsv

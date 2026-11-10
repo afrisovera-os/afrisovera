@@ -2,11 +2,14 @@
 # The AfriSovera desktop on the PC, driven by a USB mouse and keyboard (8 Nov 2026,
 # docs/design/desktop.md section 6).
 #
+# Since 10 Nov 2026 the PC desktop is the Sovereign UI (docs/design/sovereign-ui.md): the Spine
+# down the left edge instead of a top bar and dock, cut corners, each app's woven cloth on the
+# focused window's lintel. The phone keeps the 8 Nov desktop (scripts/desk-test.sh).
 # Boots the PC kernel with a USB keyboard and mouse. scripts/lib/usb-steps.py types `gui`,
 # then, from the pointer's start at 320,240:
-#   click the dock's Terminal tile (327,444)            -> Terminal opens at 190,112
-#   click the dock's Files tile (281,444)               -> Files opens at 36,44, focused
-#   press on Files' title bar at 200,50, move +60,+40, release -> Files moved to 96,84
+#   click the Spine's Terminal tile (20,108)            -> Terminal opens at 210,120
+#   click the Spine's Files tile (20,68)                -> Files opens at 60,20, focused
+#   press on Files' lintel at 200,34, move +60,+40, release -> Files moved to 120,60
 #   Alt+Tab                                             -> Terminal focused
 #   Super (alone), then Esc                             -> launcher opens, closes
 #   Super+Down                                          -> Terminal minimised (no launcher)
@@ -14,23 +17,24 @@
 #   Alt+Tab                                             -> the minimised Terminal comes back
 # and types `lsusb` and `desk list` on the keyboard (into the shell the Terminal shows).
 # Graded: every step's serial line in order, 2 dock clicks, the final window list, and the
-# screenshot's PIXELS: top bar, kente band, dock, Terminal's gold focus line and body, and
-# the shell's own text drawn inside the Terminal window.
+# screenshot's PIXELS: the Spine and its woven edge, Terminal's cloth (malachite) on its lintel
+# and the lintel under it, Terminal's body, and the shell's own text drawn inside the Terminal.
 #   scripts/pc-desk-test.sh              # grader selftest, then the QEMU boot
 #   scripts/pc-desk-test.sh --selftest   # grader selftest only
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T="${TMPDIR:-/tmp}"
 
-POINTS="5,5 4,23 20,23 198,446 300,112 595,365 count:192,134,406,236,C8C2B6"
+POINTS="20,250 40,4 40,20 42,8 308,120 308,127 595,365 count:212,148,400,228,D8CEBE"
 want_px() {
     case "$1" in
-        5,5) echo 0B0B0D ;;      # the top bar
-        4,23) echo C99E44 ;;     # kente band: gold
-        20,23) echo 1B7A3D ;;    #             green
-        198,446) echo 141519 ;;  # the dock
-        300,112) echo F4CB57 ;;  # Terminal (focused): gold line along its title bar
-        595,365) echo 0C0C0E ;;  # Terminal's body
+        20,250) echo 100C0A ;;   # the Spine (night)
+        40,4) echo C8963A ;;     # its woven edge: gold-deep
+        40,20) echo 2E9E6A ;;    #                 malachite
+        42,8) echo C1121F ;;     #                 red (second column, offset half a block)
+        308,120) echo 2E9E6A ;;  # Terminal (focused): its cloth's malachite, on top of its lintel
+        308,127) echo 2A211B ;;  # Terminal's lintel under the cloth
+        595,365) echo 0E0B09 ;;  # Terminal's body
     esac
 }
 
@@ -44,7 +48,7 @@ grade() { # grade <serial> <pixels>
         '^\[gui\] Tonga desktop rendered'
         '\[desk\] open terminal$'
         '\[desk\] open files$'
-        '\[desk\] moved files to 96,84$'
+        '\[desk\] moved files to 120,60$'
         '\[desk\] focus terminal$'
         '\[desk\] launcher open$'
         '\[desk\] launcher closed$'
@@ -53,7 +57,7 @@ grade() { # grade <serial> <pixels>
         '\[desk\] focus terminal$'
         '^  mouse: 2 dock click\(s\) on the desktop$'
         '\[desk\] pointer profile, on screen; [0-9]+ frame\(s\) drawn; 2 dock click\(s\); 1 notice\(s\); 0 event\(s\) dropped$'
-        '\[desk\] window terminal at 190,112 size 410x260 focused$'
+        '\[desk\] window terminal at 210,120 size 410x260 focused$'
         '\[desk\] front to back: terminal$'
     )
     p="$(printf '%s\n' "$S" | DESK_PATS="$(printf '%s\n' "${steps[@]}")" awk '
@@ -80,7 +84,7 @@ GREEN="afrisovera> gui
 [gui] Tonga desktop rendered; type 'clear' to return to console
 afrisovera> [desk] open terminal
 [desk] open files
-[desk] moved files to 96,84
+[desk] moved files to 120,60
 [desk] focus terminal
 [desk] launcher open
 [desk] launcher closed
@@ -92,7 +96,7 @@ usb: xHCI 1.0 at 0xfebf0000
   mouse: 2 dock click(s) on the desktop
 afrisovera> desk list
 [desk] pointer profile, on screen; 14 frame(s) drawn; 2 dock click(s); 1 notice(s); 0 event(s) dropped
-[desk] window terminal at 190,112 size 410x260 focused
+[desk] window terminal at 210,120 size 410x260 focused
 [desk] front to back: terminal"
 GPX="$(for p in $POINTS; do case "$p" in count:*) echo "$p=812" ;; *) echo "$p=$(want_px "$p")" ;; esac; done)"
 
@@ -112,13 +116,13 @@ selftest() {
     arm crlf green "$(printf '%s\n' "$GREEN" | sed 's/$/\r/')" "$GPX"
     arm no-desktop red "$(printf '%s\n' "$GREEN" | grep -v '^\[gui\]')" "$GPX"
     arm click-missed red "$(printf '%s\n' "$GREEN" | sed 's/open terminal$/nothing/')" "$GPX"
-    arm drag-wrong red "$(printf '%s\n' "$GREEN" | sed 's/moved files to 96,84/moved files to 95,84/')" "$GPX"
+    arm drag-wrong red "$(printf '%s\n' "$GREEN" | sed 's/moved files to 120,60/moved files to 119,60/')" "$GPX"
     arm no-alt-tab red "$(printf '%s\n' "$GREEN" | sed '0,/^\[desk\] focus terminal$/{/^\[desk\] focus terminal$/d}')" "$GPX"
     arm super-down-opened-launcher red "$(printf '%s\n' "$GREEN" | sed 's/^\[desk\] minimise terminal$/[desk] launcher open\n[desk] minimise terminal/')" "$GPX"
-    arm alt-f4-ignored red "$(printf '%s\n' "$GREEN" | grep -v 'close files' | sed 's/^\[desk\] window terminal/[desk] window files at 96,84 size 372x250\n[desk] window terminal/')" "$GPX"
+    arm alt-f4-ignored red "$(printf '%s\n' "$GREEN" | grep -v 'close files' | sed 's/^\[desk\] window terminal/[desk] window files at 120,60 size 372x250\n[desk] window terminal/')" "$GPX"
     arm dock-count red "$(printf '%s\n' "$GREEN" | sed 's/2 dock click/3 dock click/g')" "$GPX"
     arm not-restored red "$(printf '%s\n' "$GREEN" | sed 's/size 410x260 focused/size 410x260 minimised/')" "$GPX"
-    arm no-focus-line red "$GREEN" "$(printf '%s\n' "$GPX" | sed 's/^300,112=.*/300,112=18191E/')"
+    arm no-focus-line red "$GREEN" "$(printf '%s\n' "$GPX" | sed 's/^308,120=.*/308,120=1C1613/')"
     arm empty-terminal red "$GREEN" "$(printf '%s\n' "$GPX" | sed 's/^\(count:[^=]*\)=.*/\1=0/')"
     arm console-not-desktop red "$GREEN" "$(printf '%s\n' "$GPX" | sed 's/=[0-9A-F]\{6\}$/=080B12/')"
     arm no-screenshot red "$GREEN" "error=not-a-png"
@@ -150,8 +154,8 @@ qemu-system-aarch64 -M virt -m 256M -display none \
     -serial "tcp:127.0.0.1:4942,server,nowait" -qmp "tcp:127.0.0.1:4943,server,nowait" &
 QPID=$!
 python3 scripts/lib/usb-steps.py 4942 4943 "$W/serial.log" "$(winpath "$W/shot.png")" \
-    "type:gui" "move:7,204" down up "wait:1" "move:-46,0" down up "wait:1" \
-    "move:-81,-394" down "move:60,40" up "wait:1" \
+    "type:gui" "move:-300,-132" down up "wait:1" "move:0,-40" down up "wait:1" \
+    "move:180,-34" down "move:60,40" up "wait:1" \
     "keys:alt+tab" "keys:meta_l" "keys:esc" "keys:meta_l+down" "keys:alt+f4" "keys:alt+tab" "wait:1" \
     "type:lsusb" "type:desk list" "wait:2"
 kill "$QPID" 2> /dev/null

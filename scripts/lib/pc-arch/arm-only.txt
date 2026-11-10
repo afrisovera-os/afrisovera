@@ -45,3 +45,8 @@ board-resolved -- qemu-virt (aarch64)
 board-machine  -- qemu-virt (aarch64) vs device tree
 frame-bounds   -- virt DRAM at 0x40000000 from the blueprint; PC RAM starts at 0
 heap           -- the arena must sit in the image QEMU's -kernel loads at 0x40000000 (ARM virt)
+#
+# The phone's desktop (added 10 Nov 2026, Sovereign UI): since then the PC draws its own desktop
+# (kernel/src/sovereign/desk.rs, docs/design/sovereign-ui.md) and pc-desk / pc-desktop grade it;
+# desk-test.sh grades the phone's 8 Nov desktop (kernel/src/desk.rs) by its pixels and places.
+desk           (the phone's desktop, kernel/src/desk.rs; the PC's is graded by pc-desk)
