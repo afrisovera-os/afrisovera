@@ -1,0 +1,28 @@
+# mesh-noise: a small no_std Noise_XX / Noise_KK (25519_ChaChaPoly_SHA256) driver for the kernel.
+#
+# Why hand-written: snow (used host-side in mesh-link) does NOT build no_std for aarch64-unknown-none - its
+# default resolver pulls getrandom/subtle, which hard-fail on bare-metal ("target is not supported"). Rather than
+# fight that, the kernel uses this small driver built ONLY on primitives we already vet: x25519-dalek,
+# chacha20poly1305 and mesh-crypto's SHA-256/HMAC (all no_std-capable). Correctness is proven by interoperating
+# with snow as the reference (handshake completes, handshake hashes agree, transport messages round-trip) and the
+# crate is verified to build for aarch64-unknown-none.
+#
+# Detached workspace; not a kernel dependency (the ARM image is untouched until the coordinated window). The
+# library is #![no_std] + alloc for every build except tests (which need std for the snow interop harness).
+[package]
+name = "mesh-noise"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Small no_std Noise XX/KK (25519_ChaChaPoly_SHA256) for the AfriSovera mesh kernel port; snow-interop verified."
+publish = false
+
+[dependencies]
+x25519-dalek = { version = "=2.0.1", default-features = false, features = ["static_secrets"] }
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
+mesh-crypto = { path = "../mesh-crypto" }
+
+[dev-dependencies]
+snow = "=0.9.6"
+
+[workspace]

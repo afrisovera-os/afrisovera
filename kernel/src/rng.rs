@@ -1,29 +1,22 @@
-//! Random number generation.
+//! Random number generation (ARM).
 //!
-//! A **SHA-256 hash-DRBG**: output blocks are `SHA-256(state || counter)`, drawn
-//! byte by byte and refilled as they are consumed; the counter advances per
-//! block. The state is seeded from real hardware entropy gathered at first use:
-//! the ARM generic-timer counter (`CNTPCT_EL0`, present on both boards), its
-//! frequency, a board time source (PL031 on QEMU virt / the BCM system timer on
-//! the Pi), and — when the host provides a **virtio-rng** device — 16 bytes of
-//! true device entropy. All of that is folded into the 32-byte state via SHA-256.
+//! The generator is the shared SP 800-90A **HMAC_DRBG over SHA-256** in `drbg.rs` (boot KAT against the NIST CAVP
+//! vectors, SP 800-90B health tests, reseeding, a fail-closed `fill_secret`). This file supplies the ARM entropy:
 //!
-//! This is a CSPRNG *construction* — a hash-DRBG over the (vector-validated)
-//! SHA-256 primitive, seeded from hardware entropy — suitable for nonces, IDs,
-//! tokens, and jitter. HONEST NOTE: it is NOT a formally-audited / NIST-validated
-//! DRBG: there is no continuous reseeding schedule, no prediction-resistance, and
-//! no on-line health tests. SHA-256 and Ed25519 are the audited primitives; this
-//! generator's construction is standard but its parameters are not certified.
+//! - **strong sources** (counted, health-tested): `RNDR` when the CPU has FEAT_RNG (ID_AA64ISAR0_EL1.RNDR), and a
+//!   **virtio-rng** device when the host provides one;
+//! - **uncounted context**: the generic-timer counter (`CNTPCT_EL0`) and frequency, and a board time source (PL031
+//!   on QEMU virt via `board::resolved().rtc`, the BCM system timer on the Pi); plus timer jitter.
+//!
+//! On a machine with no strong source (QEMU `-cpu cortex-a72` without virtio-rng), `fill` still works, seeded from
+//! the timers as before, but `fill_secret` refuses: secrets need counted hardware entropy.
 
 use core::arch::asm;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicBool, Ordering};
 
-static mut DRBG_STATE: [u8; 32] = [0; 32]; // the DRBG key / seed
-static mut DRBG_CTR: u64 = 0; // block counter
-static mut DRBG_BUF: [u8; 32] = [0; 32]; // current SHA-256 output block
-static mut DRBG_POS: usize = 32; // bytes consumed from DRBG_BUF (32 = exhausted)
-static SEEDED: AtomicBool = AtomicBool::new(false);
+use crate::drbg::{Generator, Platform, RngError, Status};
+
+static mut GEN: Generator = Generator::new();
 
 /// Read the generic-timer physical counter (present on both boards).
 fn cntpct() -> u64 {
@@ -41,101 +34,117 @@ fn cntfrq() -> u64 {
     v
 }
 
-/// Gather hardware entropy and derive the initial 32-byte DRBG state via SHA-256.
-fn seed() {
-    // 24 bytes of always-available timer entropy + up to 16 bytes of true device
-    // entropy from a virtio-rng device when one is present.
-    let mut buf = [0u8; 40];
-    buf[..8].copy_from_slice(&cntpct().to_le_bytes());
-    buf[8..16].copy_from_slice(&cntfrq().to_le_bytes());
-    #[cfg(not(feature = "board-raspi"))]
-    let ts = unsafe { core::ptr::read_volatile(crate::board::resolved().rtc as *const u32) } as u64;
-    #[cfg(feature = "board-raspi")]
-    let ts = unsafe { core::ptr::read_volatile(0x3F00_3004 as *const u32) } as u64;
-    buf[16..24].copy_from_slice(&ts.to_le_bytes());
-
-    let mut hw = [0u8; 16];
-    crate::virtio::virtio_entropy(&mut hw);
-    buf[24..40].copy_from_slice(&hw);
-
-    let d = crate::sha256::digest(&buf);
-    // SAFETY: single-accessor (core-0 shell/boot context).
-    unsafe {
-        (*addr_of_mut!(DRBG_STATE)).copy_from_slice(&d);
-        DRBG_CTR = 0;
-        DRBG_POS = 32; // force a fresh block on the first draw
-    }
-    SEEDED.store(true, Ordering::Relaxed);
+/// True when ID_AA64ISAR0_EL1.RNDR (bits 63:60) says FEAT_RNG is implemented.
+pub fn has_rndr() -> bool {
+    let v: u64;
+    // SAFETY: ID_AA64ISAR0_EL1 is readable at EL1 and side-effect-free.
+    unsafe { asm!("mrs {}, id_aa64isar0_el1", out(reg) v, options(nomem, nostack)) };
+    ((v >> 60) & 0xF) >= 1
 }
 
-/// Produce the next DRBG output block: SHA-256(state || counter), then bump the
-/// counter and reset the read position.
-fn generate_block() {
-    // SAFETY: single-accessor; fixed-size arrays.
-    unsafe {
-        let mut input = [0u8; 40];
-        input[..32].copy_from_slice(&*addr_of_mut!(DRBG_STATE));
-        input[32..40].copy_from_slice(&DRBG_CTR.to_le_bytes());
-        let d = crate::sha256::digest(&input);
-        (*addr_of_mut!(DRBG_BUF)).copy_from_slice(&d);
-        DRBG_CTR = DRBG_CTR.wrapping_add(1);
-        DRBG_POS = 0;
+/// One RNDR draw (s3_3_c2_c4_0). The instruction sets NZCV.Z on failure; a few retries, then None.
+fn rndr64() -> Option<u64> {
+    if !has_rndr() {
+        return None;
     }
-}
-
-/// Next random byte from the DRBG (seeds lazily on first use).
-fn next_byte() -> u8 {
-    if !SEEDED.load(Ordering::Relaxed) {
-        seed();
-    }
-    // SAFETY: single-accessor; DRBG_POS is kept in [0, 32].
-    unsafe {
-        if DRBG_POS >= 32 {
-            generate_block();
+    for _ in 0..10 {
+        let v: u64;
+        let nzcv: u64;
+        // SAFETY: FEAT_RNG is present (checked above); RNDR only writes its register and the flags.
+        unsafe {
+            asm!("mrs {v}, s3_3_c2_c4_0", "mrs {f}, nzcv", v = out(reg) v, f = out(reg) nzcv,
+                 options(nomem, nostack));
         }
-        let b = (*addr_of_mut!(DRBG_BUF))[DRBG_POS];
-        DRBG_POS += 1;
-        b
+        if nzcv & (1 << 30) == 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+struct Arm;
+
+impl Platform for Arm {
+    const STRONG: &'static [&'static str] = &["rndr", "virtio-rng"];
+    const ARCH: &'static [u8] = b"arm64";
+
+    fn strong(idx: usize, buf: &mut [u8]) -> usize {
+        match idx {
+            0 => {
+                let mut n = 0;
+                while n < buf.len() {
+                    match rndr64() {
+                        Some(v) => {
+                            let b = v.to_le_bytes();
+                            let k = (buf.len() - n).min(8);
+                            buf[n..n + k].copy_from_slice(&b[..k]);
+                            n += k;
+                        }
+                        None => break,
+                    }
+                }
+                n
+            }
+            1 => crate::virtio::virtio_entropy(buf),
+            _ => 0,
+        }
+    }
+
+    fn counter() -> u64 {
+        cntpct()
+    }
+
+    fn context(out: &mut [u8; 24]) {
+        out[..8].copy_from_slice(&cntpct().to_le_bytes());
+        out[8..16].copy_from_slice(&cntfrq().to_le_bytes());
+        #[cfg(not(feature = "board-raspi"))]
+        // SAFETY: the board's resolved RTC base is a mapped, readable MMIO register.
+        let ts = unsafe { core::ptr::read_volatile(crate::board::resolved().rtc as *const u32) } as u64;
+        #[cfg(feature = "board-raspi")]
+        // SAFETY: the BCM2837 system-timer low word, always mapped on the Pi.
+        let ts = unsafe { core::ptr::read_volatile(0x3F00_3004 as *const u32) } as u64;
+        out[16..24].copy_from_slice(&ts.to_le_bytes());
     }
 }
 
-/// Next 64-bit random value.
-#[allow(dead_code)] // public API; next_u32 is the current in-tree caller
+fn gen() -> &'static mut Generator {
+    // SAFETY: single accessor (the boot / shell core), as with the old generator.
+    unsafe { &mut *addr_of_mut!(GEN) }
+}
+
+/// Next 64-bit random value (non-secret uses).
+#[allow(dead_code)]
 pub fn next_u64() -> u64 {
     let mut b = [0u8; 8];
-    for x in b.iter_mut() {
-        *x = next_byte();
-    }
+    gen().fill::<Arm>(&mut b);
     u64::from_le_bytes(b)
 }
 
-/// Next 32-bit random value.
+/// Next 32-bit random value (non-secret uses).
 pub fn next_u32() -> u32 {
     let mut b = [0u8; 4];
-    for x in b.iter_mut() {
-        *x = next_byte();
-    }
+    gen().fill::<Arm>(&mut b);
     u32::from_le_bytes(b)
 }
 
-/// Fill a byte buffer with random data.
-#[allow(dead_code)] // provided for future callers (key / nonce generation)
+/// Fill a byte buffer with random data (non-secret uses; never fails).
+#[allow(dead_code)]
 pub fn fill(buf: &mut [u8]) {
-    for x in buf.iter_mut() {
-        *x = next_byte();
-    }
+    gen().fill::<Arm>(buf);
 }
 
-/// Reseed the DRBG state to a fixed value so a given seed reproduces a sequence
-/// (for testing / deterministic streams).
+/// Fill a buffer with SECRET random data (keys, nonces, ephemerals), or refuse. The only call the mesh may use.
 #[allow(dead_code)]
-pub fn reseed(s: u64) {
-    let d = crate::sha256::digest(&s.to_le_bytes());
-    // SAFETY: single-accessor.
-    unsafe {
-        (*addr_of_mut!(DRBG_STATE)).copy_from_slice(&d);
-        DRBG_CTR = 0;
-        DRBG_POS = 32;
-    }
-    SEEDED.store(true, Ordering::Relaxed);
+pub fn fill_secret(buf: &mut [u8]) -> Result<(), RngError> {
+    gen().fill_secret::<Arm>(buf)
+}
+
+/// Generator state for `rng status`.
+pub fn status() -> Status {
+    gen().status::<Arm>()
+}
+
+/// Source names, index-aligned with `Status::present`.
+pub fn source_names() -> &'static [&'static str] {
+    Arm::STRONG
 }

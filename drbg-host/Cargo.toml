@@ -1,0 +1,18 @@
+[package]
+name = "drbg-host"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host tests for the kernel's HMAC_DRBG (kernel/src/drbg.rs) against the NIST CAVP vectors."
+publish = false
+
+# The kernel files themselves, included by path: what is tested here is byte-for-byte what the kernel builds.
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+serde_json = "=1.0.128"
+hmac = "=0.12.1"
+sha2 = "=0.10.8"
+
+[workspace]

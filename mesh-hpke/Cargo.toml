@@ -1,0 +1,31 @@
+# mesh-hpke: AFR-0009 sealing primitives and (next) the HPKE mode_auth bundle.
+#
+# This is the crate-based half of the mesh crypto track (plan 10.3, owner go via coordinator): the
+# side-channel-sensitive primitives come from AUDITED no_std crates (RustCrypto / dalek), not hand-rolled.
+# Security-first: a subtle bug in a sealing primitive would defeat docs/17 section 8, so we use reviewed code.
+#
+# This milestone wires the three primitives (X25519, Ed25519 strict sign/verify, ChaCha20-Poly1305) and checks
+# each against its published RFC vector. The HPKE mode_auth key schedule and the AFR-0009 bundle seal/open
+# (reusing mesh-crypto's validated HKDF/HMAC) are the next step in this same crate.
+#
+# Detached workspace (its own empty [workspace]) so the repo-root kernel build and the ARM image are untouched.
+# Host-tested (the repo default target is bare-metal ARM): build for the host triple. The eventual in-kernel
+# port will set default-features = false + alloc on these crates for no_std. Versions are pinned and Cargo.lock
+# is committed for reproducibility (a sovereign/vendored mirror is a later follow-up).
+[package]
+name = "mesh-hpke"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "AFR-0009 sealing primitives (X25519, Ed25519 strict, ChaCha20-Poly1305) via audited crates; HPKE bundle next."
+publish = false
+
+[dependencies]
+# Exact version pins (coordinator steer): reproducible without a committed lockfile, well-known audited crates.
+x25519-dalek = { version = "=2.0.1", default-features = false, features = ["static_secrets"] }
+ed25519-dalek = { version = "=2.1.1", default-features = false }
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
+# The sovereign glue (SHA-256, HMAC/HKDF, wire layout, tag derivations), validated in milestone 1.
+mesh-crypto = { path = "../mesh-crypto" }
+
+[workspace]

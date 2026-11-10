@@ -1,0 +1,24 @@
+# mesh-link: AFR-0009 link layer (B1) - the hop-by-hop Noise session between neighbours.
+#
+# Noise is driven by the audited `snow` crate (the well-known Rust Noise implementation), configured for
+# AFR-0009's Noise_XX / Noise_KK over 25519_ChaChaPoly_SHA256. Hand-rolling a handshake is exactly what the
+# security-first default (plan 10.3) says not to do. snow's default resolver pulls the same audited RustCrypto /
+# dalek primitives we already use. On top of snow this crate adds AFR-0009's prologue, record framing and types,
+# and ties the handshake to the validated SAS (mesh-crypto) and bundle (mesh-hpke).
+#
+# Detached workspace (own empty [workspace]); NOT a kernel dependency, so the kernel build and ARM md5 are
+# untouched. Host-tested; the eventual in-kernel port is a separate effort. Versions pinned exactly.
+[package]
+name = "mesh-link"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "AFR-0009 link layer (B1): Noise XX/KK via snow, with AFR-0009 prologue, record framing, SAS and bundle."
+publish = false
+
+[dependencies]
+snow = "=0.9.6"
+mesh-crypto = { path = "../mesh-crypto" }
+mesh-hpke = { path = "../mesh-hpke" }
+
+[workspace]

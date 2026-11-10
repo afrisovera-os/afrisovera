@@ -3,6 +3,8 @@
 **/*.rs.bk
 *.pdb
 Cargo.lock
+# the workspace lock IS published (ADR 0007: the kernel's pinned crypto crates); sub-crates keep theirs ignored
+!/Cargo.lock
 
 # QEMU run artefacts
 /serial.log

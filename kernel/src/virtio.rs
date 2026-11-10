@@ -2844,6 +2844,17 @@ static mut TCP_OOO_BUF: [u8; TCP_ECHO_CAP] = [0; TCP_ECHO_CAP];
 /// `net_tcp_listen` and `net_tcp_data`, because a conversation that happened and
 /// then shut down badly is a different defect from one that never happened.
 pub fn net_tcp_serve(port: u16, wait_ms: u64, conns: u32) -> bool {
+    net_tcp_serve_with(port, wait_ms, conns, None)
+}
+
+/// The reply a `net_tcp_serve_with` handler builds for each in-order run of bytes (mesh Phase 0, architect
+/// review "minimal TCP 4401 hook"). It gets the received bytes AFTER the out-of-order hold, appends its reply
+/// (at most `TCP_MAX_PAYLOAD` bytes, one segment) and returns false to close from this end after that reply.
+pub type TcpHandler<'a> = &'a mut dyn FnMut(&[u8], &mut alloc::vec::Vec<u8>) -> bool;
+
+/// `net_tcp_serve` with the echo step replaced by `handler`. `None` IS the echo, byte for byte: the bytes are
+/// already in `TCP_ECHO_BUF` and are sent from there, exactly as before (suites tcp-serve, tcp-serve2, tcp-ooo).
+pub fn net_tcp_serve_with(port: u16, wait_ms: u64, conns: u32, mut handler: Option<TcpHandler>) -> bool {
     // SAFETY: exclusive kernel-context access to the device + rings/buffers.
     unsafe {
         // The cursor is taken BEFORE anything that can put a frame on the wire,
@@ -3136,6 +3147,36 @@ pub fn net_tcp_serve(port: u16, wait_ms: u64, conns: u32) -> bool {
                                     // holding; the ACK already told the peer where we
                                     // are.
                                 }
+                                // The handler hook (mesh Phase 0). With no handler this block
+                                // does nothing and the echo below is unchanged.
+                                let mut close_after = false;
+                                if let Some(h) = handler.as_deref_mut() {
+                                    let input = core::slice::from_raw_parts(addr_of!(TCP_ECHO_BUF) as *const u8, n).to_vec();
+                                    let mut out = alloc::vec::Vec::new();
+                                    close_after = !h(&input, &mut out);
+                                    if out.len() > TCP_ECHO_CAP {
+                                        crate::kprintln!(
+                                            "[net] serve: handler reply of {} byte(s) is past the {}-byte cap, not sent; closing",
+                                            out.len(), TCP_ECHO_CAP
+                                        );
+                                        out.clear();
+                                        close_after = true;
+                                    }
+                                    let dst = addr_of_mut!(TCP_ECHO_BUF) as *mut u8;
+                                    for (i, &b) in out.iter().enumerate() {
+                                        *dst.add(i) = b;
+                                    }
+                                    n = out.len();
+                                    if n == 0 {
+                                        // Nothing to say: acknowledge their bytes and carry on (or close).
+                                        send_tcp_segment(base, &peer_ip, port, peer_port, our_seq, our_ack, 0x10, &[]);
+                                        exchanges += 1;
+                                        if close_after {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                }
                                 let body =
                                     core::slice::from_raw_parts(addr_of!(TCP_ECHO_BUF) as *const u8, n);
                                 // PSH|ACK: the echo IS the acknowledgement. One segment
@@ -3162,6 +3203,11 @@ pub fn net_tcp_serve(port: u16, wait_ms: u64, conns: u32) -> bool {
                                 rto_ms = TCP_RTO_MS;
                                 rto_at = tcp_rto_deadline(rto_ms);
                                 retx = 0;
+                                if close_after {
+                                    // The handler is done: close from this end now. The
+                                    // reply goes out ahead of our FIN in sequence order.
+                                    break;
+                                }
                             }
                         }
                     }
@@ -3711,6 +3757,172 @@ pub fn net_tcp_data(dst_ip: [u8; 4], dst_port: u16, payload: &[u8]) -> bool {
                 return false;
             }
         }
+    }
+}
+
+/// Dial `dst_ip`:`dst_port`, send `first`, then CONVERSE: every in-order run of bytes the peer sends goes to
+/// `handler`, whose non-empty reply is sent as the next segment (one outstanding reply at a time, resent on the
+/// same RTO schedule as `net_tcp_data`). The handler returns false when it is done; the connection is then
+/// closed from this end. New code beside `net_tcp_data` (mesh Phase 0, architect review "minimal TCP 4401
+/// hook"): no existing caller changes. Returns true if the handler said it was done before anything failed.
+pub fn net_tcp_dial_with(dst_ip: [u8; 4], dst_port: u16, first: &[u8], wait_ms: u64, handler: TcpHandler) -> bool {
+    // SAFETY: exclusive kernel-context access to the device + rings/buffers.
+    unsafe {
+        let base = match tcp_ready("tcp dial") {
+            Some(b) => b,
+            None => return false,
+        };
+        if first.is_empty() || first.len() > TCP_MAX_PAYLOAD {
+            crate::kprintln!("[net] tcp dial: first segment must be 1..={} bytes (got {})", TCP_MAX_PAYLOAD, first.len());
+            return false;
+        }
+        let src_port: u16 = 41000 + (crate::rng::next_u32() % 20000) as u16;
+        let iss = crate::rng::next_u32();
+        let dst_ip = &dst_ip;
+        let (mut our_seq, mut our_ack, mut cur) = match tcp_open(base, dst_ip, src_port, dst_port, iss) {
+            TcpOpen::Established { our_seq, our_ack, cur } => (our_seq, our_ack, cur),
+            TcpOpen::Refused => {
+                crate::kprintln!("[net] tcp dial: nothing is listening on port {}", dst_port);
+                return false;
+            }
+            TcpOpen::NoReply => return false,
+        };
+        // The one outstanding segment: its bytes (kept for retransmission) and its sequence number.
+        let mut pending: alloc::vec::Vec<u8> = first.to_vec();
+        let mut pending_seq = our_seq;
+        if send_tcp_segment(base, dst_ip, src_port, dst_port, our_seq, our_ack, 0x18, &pending) == 0 {
+            crate::kprintln!("[net] tcp dial: could not build the first segment");
+            return false;
+        }
+        our_seq = our_seq.wrapping_add(pending.len() as u32);
+        let mut unacked = true;
+        let mut rto_ms = TCP_RTO_MS;
+        let mut rto_at = tcp_rto_deadline(rto_ms);
+        let mut retx = 0u32;
+        let until = tcp_rto_deadline(wait_ms);
+        let mut peer_fin = false;
+        let mut done = false;
+        let mut segs_in = 0u32;
+        let mut segs_out = 1u32;
+        let mut spins = 0u64;
+        loop {
+            if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+                let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
+                let elem = read_volatile(uring.add((cur as usize) % QSZ));
+                cur = cur.wrapping_add(1);
+                RX_RAW_COUNT += 1;
+                spins = 0;
+                let _slot = RxSlot(elem.id);
+                let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
+                let s = match parse_tcp(fr) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if s.dport != src_port || s.sport != dst_port || s.src != *dst_ip {
+                    continue;
+                }
+                RX_COUNT += 1;
+                if s.flags & 0x04 != 0 {
+                    crate::kprintln!("[net] tcp dial: RST from the peer after {} segment(s) in", segs_in);
+                    return false;
+                }
+                if unacked && s.flags & 0x10 != 0 && seq_ge(s.ack, our_seq) {
+                    unacked = false;
+                    retx = 0;
+                    rto_ms = TCP_RTO_MS;
+                }
+                if s.dlen > 0 {
+                    if s.seq != our_ack {
+                        // A duplicate (behind us) or a gap (ahead of us): re-ACK where we are and let the
+                        // peer resend in order. A run is never handed to the handler twice.
+                        send_tcp_segment(base, dst_ip, src_port, dst_port, our_seq, our_ack, 0x10, &[]);
+                    } else if done || unacked {
+                        // Not ready for a new run (our previous segment is still unacknowledged, or the
+                        // handler is finished): leave these bytes unacknowledged, the peer resends them.
+                    } else {
+                        let input = core::slice::from_raw_parts(fr.add(s.doff), s.dlen).to_vec();
+                        our_ack = s.seq.wrapping_add(s.dlen as u32);
+                        segs_in += 1;
+                        let mut out = alloc::vec::Vec::new();
+                        let more = handler(&input, &mut out);
+                        if out.len() > TCP_MAX_PAYLOAD {
+                            crate::kprintln!(
+                                "[net] tcp dial: handler reply of {} byte(s) is past the {}-byte cap, not sent",
+                                out.len(), TCP_MAX_PAYLOAD
+                            );
+                            out.clear();
+                            done = true;
+                        }
+                        if out.is_empty() {
+                            send_tcp_segment(base, dst_ip, src_port, dst_port, our_seq, our_ack, 0x10, &[]);
+                        } else {
+                            pending = out;
+                            pending_seq = our_seq;
+                            if send_tcp_segment(base, dst_ip, src_port, dst_port, our_seq, our_ack, 0x18, &pending) == 0 {
+                                crate::kprintln!("[net] tcp dial: could not build a reply segment");
+                                return false;
+                            }
+                            our_seq = our_seq.wrapping_add(pending.len() as u32);
+                            segs_out += 1;
+                            unacked = true;
+                            rto_ms = TCP_RTO_MS;
+                            rto_at = tcp_rto_deadline(rto_ms);
+                            retx = 0;
+                        }
+                        if !more {
+                            done = true;
+                        }
+                    }
+                }
+                if !peer_fin && s.flags & 0x01 != 0 && s.seq.wrapping_add(s.dlen as u32) == our_ack {
+                    peer_fin = true;
+                    our_ack = our_ack.wrapping_add(1);
+                    send_tcp_segment(base, dst_ip, src_port, dst_port, our_seq, our_ack, 0x10, &[]);
+                    if !done {
+                        crate::kprintln!("[net] tcp dial: the peer closed before the handler was done");
+                    }
+                }
+                if (done || peer_fin) && !unacked {
+                    break;
+                }
+                continue;
+            }
+            spins += 1;
+            if unacked && rto_at != 0 && crate::timer::cycles() >= rto_at {
+                if retx >= TCP_MAX_RETX {
+                    crate::kprintln!(
+                        "[net] tcp dial: seq {:#010x} unacknowledged after {} retransmissions, the peer is gone",
+                        pending_seq, retx
+                    );
+                    return false;
+                }
+                retx += 1;
+                send_tcp_segment(base, dst_ip, src_port, dst_port, pending_seq, our_ack, 0x18, &pending);
+                crate::kprintln!(
+                    "[net] tcp dial: retransmit {}/{}: {} byte(s), seq {:#010x}",
+                    retx, TCP_MAX_RETX, pending.len(), pending_seq
+                );
+                rto_ms = rto_ms.saturating_mul(2);
+                rto_at = tcp_rto_deadline(rto_ms);
+                spins = 0;
+            }
+            if (until != 0 && crate::timer::cycles() >= until) || spins > 60_000_000 {
+                crate::kprintln!(
+                    "[net] tcp dial: window closed ({} segment(s) out, {} in, done={})",
+                    segs_out, segs_in, done
+                );
+                break;
+            }
+        }
+        crate::kprintln!("[net] tcp dial: {} segment(s) out, {} in, done={}", segs_out, segs_in, done);
+        match tcp_close(base, dst_ip, src_port, dst_port, our_seq, our_ack, cur, peer_fin) {
+            TcpClose::Done => {}
+            TcpClose::FinWait2 => crate::kprintln!("[net] tcp dial: closed this end; the peer did not"),
+            TcpClose::FinWait1 | TcpClose::NotSent => {
+                crate::kprintln!("[net] tcp dial: the connection did NOT close cleanly")
+            }
+        }
+        done
     }
 }
 

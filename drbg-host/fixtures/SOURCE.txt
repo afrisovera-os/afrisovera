@@ -1,0 +1,27 @@
+NIST CAVP DRBG test vectors, fetched and parsed in the cloud by scripts/drbg-cavp-fetch.sh (the cloud runner job, 10 Nov 2026).
+Nothing in this folder or in kernel/src/drbg_kat.rs was typed by hand.
+
+CAVP URL: https://csrc.nist.gov/CSRC/media/Projects/cryptographic-algorithm-validation-program/documents/drbg/drbgtestvectors.zip
+zip bytes:  13682977
+zip sha256: 5f7e5658ebd5b4e6785a7b12fa32333511d2acc2f2d9c5ae1ffa16b699377769
+inner zip: drbgvectors_no_reseed.zip  sha256 8f9644adc655dd651c90b73190175b1d99164dc5a4861edab16e39862ead27ad
+inner zip: drbgvectors_pr_false.zip  sha256 73f9965ca0675bc74673aaba0733283a9874f74db1fd4c15bb707a8ab446d32c
+inner zip: drbgvectors_pr_true.zip  sha256 ed9b04480392ea56413cc9753a4732314e7ad745c16b9dd5d77de1560c6e0cc2
+HMAC_DRBG files found:
+  drbgvectors_pr_true/HMAC_DRBG.rsp
+  drbgvectors_pr_false/HMAC_DRBG.rsp
+  drbgvectors_no_reseed/HMAC_DRBG.rsp
+no_reseed HMAC_DRBG.rsp: build/drbg-cavp/unz/drbgvectors_no_reseed/HMAC_DRBG.rsp  sha256 9fdd7f11dbbe75e0a7e19c6ae57660008dd4e74672ebb67119cab287c7aa5a79
+pr_false  HMAC_DRBG.rsp: build/drbg-cavp/unz/drbgvectors_pr_false/HMAC_DRBG.rsp  sha256 4b7d03d4fb48c738c76baf09bd67d054514682f4fee36ff8741bec2ccd77b8d4
+wrote 240 entries to build/drbg-cavp/no_reseed.json
+wrote boot-KAT Rust constant to kernel/src/drbg_kat.rs
+wrote 240 entries to build/drbg-cavp/pr_false.json
+
+drbg-cavp-fetch: wrote build/drbg-cavp/no_reseed.json, build/drbg-cavp/pr_false.json and kernel/src/drbg_kat.rs
+RECORD IN THE COMMIT MESSAGE -> no_reseed HMAC_DRBG.rsp sha256: 9fdd7f11dbbe75e0a7e19c6ae57660008dd4e74672ebb67119cab287c7aa5a79
+                               pr_false  HMAC_DRBG.rsp sha256: 4b7d03d4fb48c738c76baf09bd67d054514682f4fee36ff8741bec2ccd77b8d4
+
+Generated files (sha256):
+44fc6f46c1ec88fbd03f70933e160f1c89560abc7472838091ce7321f411651d  kernel/src/drbg_kat.rs
+fadf5ca775a7ccfcd23af0fbb6aadcfc083be22bfefd6f1b549f8e3fcff7258a  drbg-host/fixtures/no_reseed.json
+5f5f8b12686ce54bd42f8dbae0770e832b7edb77e0deca78a88bfcc826755bf6  drbg-host/fixtures/pr_false.json

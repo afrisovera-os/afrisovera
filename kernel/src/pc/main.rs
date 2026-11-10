@@ -46,6 +46,12 @@ mod heap;
 #[path = "../sha256.rs"]
 mod sha256;
 #[allow(dead_code)]
+#[path = "../drbg.rs"]
+mod drbg;
+#[allow(dead_code)]
+#[path = "../drbg_kat.rs"]
+mod drbg_kat;
+#[allow(dead_code)]
 #[path = "../sha512.rs"]
 mod sha512;
 #[allow(dead_code)]

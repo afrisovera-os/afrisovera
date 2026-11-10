@@ -33,3 +33,14 @@ board-pine64 = []
 pc = []
 
 [dependencies]
+# ADR 0007 (kernel dependencies): third-party crates for CRYPTOGRAPHIC PRIMITIVES only, exact `=` pins, no
+# default features, confined to kernel/src/mesh/. They arrive through our own path crates, which hold the pins:
+# mesh-noise / mesh-hpke -> x25519-dalek =2.0.1, ed25519-dalek =2.1.1, chacha20poly1305 =0.10.1. Protocol
+# logic (Noise state machine, HPKE key schedule, AFR-0009 framing) is ours. Cargo.lock is committed.
+#
+# ARM only: the mesh module is in the ARM kernel only (Phase 0), and the PC kernel's x86_64-unknown-uefi target
+# cannot build poly1305's x86 SIMD backend (measured in the cloud, 10 Nov 2026). The PC binary links none of them.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+mesh-crypto = { path = "../mesh-crypto" }
+mesh-noise = { path = "../mesh-noise" }
+mesh-hpke = { path = "../mesh-hpke" }

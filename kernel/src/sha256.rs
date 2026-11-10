@@ -93,6 +93,66 @@ pub fn digest(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Streaming SHA-256 (same compression function as `digest`), for HMAC in the
+/// DRBG (`drbg.rs`) and the mesh, so the kernel carries ONE SHA-256 (review S3).
+/// `digest(x) == { let mut s = Sha256::new(); s.update(x); s.finish() }`.
+#[derive(Clone)]
+pub struct Sha256 {
+    h: [u32; 8],
+    buf: [u8; 64],
+    fill: usize,
+    total: u64,
+}
+
+impl Sha256 {
+    pub const fn new() -> Self {
+        Sha256 { h: H0, buf: [0; 64], fill: 0, total: 0 }
+    }
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.total = self.total.wrapping_add(data.len() as u64);
+        if self.fill > 0 {
+            let take = (64 - self.fill).min(data.len());
+            self.buf[self.fill..self.fill + take].copy_from_slice(&data[..take]);
+            self.fill += take;
+            data = &data[take..];
+            if self.fill < 64 {
+                return;
+            }
+            let b = self.buf;
+            compress(&mut self.h, &b);
+            self.fill = 0;
+        }
+        while data.len() >= 64 {
+            let mut b = [0u8; 64];
+            b.copy_from_slice(&data[..64]);
+            compress(&mut self.h, &b);
+            data = &data[64..];
+        }
+        self.buf[..data.len()].copy_from_slice(data);
+        self.fill = data.len();
+    }
+
+    pub fn finish(mut self) -> [u8; 32] {
+        let bitlen = self.total.wrapping_mul(8);
+        let rem = self.fill;
+        let mut block = [0u8; 64];
+        block[..rem].copy_from_slice(&self.buf[..rem]);
+        block[rem] = 0x80;
+        if rem >= 56 {
+            compress(&mut self.h, &block);
+            block = [0u8; 64];
+        }
+        block[56..64].copy_from_slice(&bitlen.to_be_bytes());
+        compress(&mut self.h, &block);
+        let mut out = [0u8; 32];
+        for (n, &word) in self.h.iter().enumerate() {
+            out[n * 4..n * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+}
+
 /// Write `digest` as lowercase hex into a 64-byte buffer.
 pub fn to_hex(d: &[u8; 32], out: &mut [u8; 64]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";

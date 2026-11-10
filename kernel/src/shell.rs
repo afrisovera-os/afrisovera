@@ -22205,6 +22205,77 @@ pub(crate) fn exec(line: &str) { pc_intercept!(line);
             // granted (it draws values) then denied (the kernel refuses).
             crate::nia::rand_demo();
         }
+        #[cfg(not(feature = "pc"))]
+        "mesh" => {
+            // Sovereign Mesh Phase 0 (AFR-0009, kernel/src/mesh/): `mesh id`, `mesh selftest`,
+            // `mesh listen [port] [secs]`, `mesh send <ip>[:port] <text>`. Port defaults to 4401.
+            let r = rest.trim();
+            if r == "id" {
+                crate::mesh::show_id();
+            } else if r == "selftest" {
+                crate::mesh::selftest();
+            } else if r == "listen" || r.starts_with("listen ") {
+                let mut it = r["listen".len()..].split_whitespace();
+                let port = it.next().and_then(|p| p.parse::<u16>().ok()).filter(|&p| p != 0).unwrap_or(crate::mesh::PORT);
+                let secs = it.next().and_then(|p| p.parse::<u64>().ok()).filter(|&t| t > 0 && t <= 120).unwrap_or(30);
+                crate::mesh::listen(port, secs * 1000);
+            } else if let Some(a) = r.strip_prefix("send ") {
+                let (dest, text) = match a.find(' ') {
+                    Some(i) => (a[..i].trim(), a[i + 1..].trim_start()),
+                    None => (a.trim(), ""),
+                };
+                let target = match dest.rfind(':') {
+                    Some(i) => parse_ipv4(&dest[..i]).zip(dest[i + 1..].parse::<u16>().ok().filter(|&p| p != 0)),
+                    None => parse_ipv4(dest).map(|ip| (ip, crate::mesh::PORT)),
+                };
+                match target {
+                    Some((ip, port)) if !text.is_empty() => {
+                        crate::mesh::send(ip, port, text.as_bytes(), 20_000);
+                    }
+                    _ => crate::kprintln!("[mesh] usage: mesh send <a.b.c.d>[:port] <text>"),
+                }
+            } else {
+                crate::kprintln!("[mesh] usage: mesh id | mesh selftest | mesh listen [port] [secs] | mesh send <ip>[:port] <text>");
+            }
+        }
+        "rng" => {
+            // The generator's state: HMAC_DRBG boot KAT, strong sources and their health, reseeds, and
+            // `rng secret` = one fail-closed draw (what the mesh uses for keys and ephemerals).
+            if rest.trim() == "secret" {
+                let mut b = [0u8; 16];
+                match crate::rng::fill_secret(&mut b) {
+                    Ok(()) => crate::kprintln!(
+                        "[rng] secret OK {:02x}{:02x}{:02x}{:02x}...",
+                        b[0], b[1], b[2], b[3]
+                    ),
+                    Err(e) => crate::kprintln!("[rng] secret REFUSED: {:?}", e),
+                }
+            }
+            let s = crate::rng::status();
+            crate::kprintln!(
+                "[rng] HMAC_DRBG-SHA256 kat={} seeded={} strong_bytes={} reseeds={} secret_ok={} secret_refused={}",
+                if s.kat_ok { "PASS" } else { "FAIL" },
+                s.seeded,
+                s.last_strong,
+                s.reseeds,
+                s.secret_ok,
+                s.secret_refused
+            );
+            for (i, name) in crate::rng::source_names().iter().enumerate() {
+                crate::kprintln!(
+                    "[rng] source {}: {} samples={}",
+                    name,
+                    if !s.present[i] {
+                        "absent"
+                    } else if s.healthy[i] {
+                        "healthy"
+                    } else {
+                        "FAILED-health"
+                    },
+                    s.samples[i]
+                );
+            }
+        }
         "entropy" => {
             // Read raw bytes from the virtio-rng hardware entropy device.
             if !crate::virtio::rng_present() {

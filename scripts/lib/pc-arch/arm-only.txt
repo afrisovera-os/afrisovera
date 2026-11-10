@@ -50,3 +50,8 @@ heap           -- the arena must sit in the image QEMU's -kernel loads at 0x4000
 # (kernel/src/sovereign/desk.rs, docs/design/sovereign-ui.md) and pc-desk / pc-desktop grade it;
 # desk-test.sh grades the phone's 8 Nov desktop (kernel/src/desk.rs) by its pixels and places.
 desk           (the phone's desktop, kernel/src/desk.rs; the PC's is graded by pc-desk)
+#
+# Sovereign Mesh Phase 0 (10 Nov 2026): built into the ARM kernel only, on virtio-net + virtio-rng. The PC
+# kernel has the hardened DRBG but no mesh module yet; these leave the list when the PC port lands.
+mesh-kernel    -- `mesh selftest` / `mesh id`: the mesh module is in the ARM kernel only
+mesh-phase0    -- two ARM machines over virtio-net + scripts/mesh-bridge.py

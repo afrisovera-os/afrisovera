@@ -1,0 +1,25 @@
+# mesh-crypto: AFR-0009 Sovereign Mesh derivation + wire-format layer.
+#
+# This is the FRICTION-FREE first milestone of the mesh crypto track (docs/design/mesh-engineering-plan.md):
+# the "sovereign glue" that stands on SHA-256 alone (HMAC-SHA256, HKDF-SHA256, the contact-root / recipient-tag /
+# beacon-tag / SAS derivations, and the identity-record and bundle byte layouts). The side-channel-sensitive
+# primitives (X25519, ChaCha20-Poly1305) are NOT here; they come from audited crates in the next step (plan 10.3).
+# So this crate has NO dependencies and needs no network to build or test.
+#
+# The library code is written core-only (no heap, no std) so it ports verbatim into the kernel's future
+# `kernel/src/mesh/` no_std modules. Host tests validate it against docs/spec/vectors/afr0009_vectors.py.
+#
+# The empty [workspace] table below detaches this crate from the repo's kernel workspace, so `cargo build` at the
+# repo root still builds only the kernel and the ARM image stays byte-identical. Build/test from this directory:
+#   cd mesh-crypto && cargo test
+[package]
+name = "mesh-crypto"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "AFR-0009 Sovereign Mesh derivation + wire-format layer (host-validated; ports into kernel no_std)."
+publish = false
+
+[dependencies]
+
+[workspace]
