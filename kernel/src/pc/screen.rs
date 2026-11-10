@@ -54,8 +54,13 @@ pub fn wm_moved() {
 }
 static ON: AtomicBool = AtomicBool::new(false);
 static mut PRESENTS: u64 = 0;
-/// One scaled screen row (up to 4x the 640-pixel console).
-static mut LINE: [u32; W * 4] = [0; W * 4];
+/// One scaled screen row: up to 4x the 640-pixel console, or the desktop canvas's row at its
+/// UI scale (a screen up to 4096 pixels wide).
+const LINE_MAX: usize = 4096;
+static mut LINE: [u32; LINE_MAX] = [0; LINE_MAX];
+/// What the last redraw showed: the desktop canvas (true) or the 640x480 console. A change
+/// repaints the frame around it (the canvas fills the screen; the console sits in bands).
+static LAST_DESK: AtomicBool = AtomicBool::new(false);
 
 /// How the 640x480 console is laid on a bigger screen (field item F9b, HP ENVY, 9 Nov 2026).
 /// The shell and the desktop are drawn into the shared 640x480 framebuffer (the ARM image's
@@ -91,9 +96,55 @@ pub fn attach(base: u64, w: usize, h: usize, stride: usize, bgr: bool) {
     // SAFETY: boot, single core, before the timer reads it.
     unsafe { GOP = Gop { base, w, h, stride, bgr } };
     place(MODE.load(Ordering::Relaxed));
+    crate::canvas::setup(w.min(LINE_MAX), h, 0);
     ON.store(true, Ordering::Relaxed);
     let s = scale(w, h);
     crate::kprintln!("[pc] screen: the {}x{} console shown on the {}x{} GOP screen at {}x", W, H, w, h, s);
+    crate::kprintln!(
+        "[pc] screen: the desktop at {}x{} logical pixels, UI scale {}x (the whole screen)",
+        crate::canvas::width(), crate::canvas::height(), crate::canvas::scale()
+    );
+}
+
+/// The pointer's range: the desktop canvas while the desktop is shown, else the console.
+pub fn pointer_area() -> (i32, i32) {
+    if crate::desk::shown() {
+        (crate::canvas::width() as i32, crate::canvas::height() as i32)
+    } else {
+        (W as i32, H as i32)
+    }
+}
+
+/// `screen ui`, `screen ui 1..4|auto`: the desktop's UI scale (section 13 of sovereign-ui.md).
+fn ui_command(arg: &str) {
+    if !ON.load(Ordering::Relaxed) {
+        crate::kprintln!("screen: no GOP framebuffer, so the desktop has no screen to fill (serial console only)");
+        return;
+    }
+    let s = match arg {
+        "" => {
+            crate::kprintln!(
+                "screen: the desktop is {}x{} logical pixels at UI scale {}x; type: screen ui 1, 2, 3, 4 or auto",
+                crate::canvas::width(), crate::canvas::height(), crate::canvas::scale()
+            );
+            return;
+        }
+        "auto" => 0,
+        "1" | "2" | "3" | "4" => (arg.as_bytes()[0] - b'0') as usize,
+        other => {
+            crate::kprintln!("screen: unknown UI scale {}; use: screen ui 1, 2, 3, 4 or auto", other);
+            return;
+        }
+    };
+    crate::canvas::set_scale(s);
+    crate::desk::relayout();
+    clear(FRAME);
+    FULL.store(true, Ordering::Relaxed); // the whole desktop, at its new size
+    mark();
+    crate::kprintln!(
+        "screen: the desktop is now {}x{} logical pixels at UI scale {}x",
+        crate::canvas::width(), crate::canvas::height(), crate::canvas::scale()
+    );
 }
 
 fn scale(w: usize, h: usize) -> usize {
@@ -146,6 +197,10 @@ pub fn command(arg: &str) {
         "whole" => WHOLE,
         "fit" => FIT,
         "fill" => FILL,
+        a if a == "ui" || a.starts_with("ui ") => {
+            ui_command(a[2..].trim());
+            return;
+        }
         other => {
             crate::kprintln!("screen: unknown mode {}; use: screen whole | screen fit | screen fill", other);
             return;
@@ -173,6 +228,12 @@ pub fn mark() {
 
 /// From the local-APIC timer: show a dirty framebuffer, at most every 4th tick.
 pub fn tick(ticks: u64) {
+    // the desktop's canvas is copied in mainline (`flush`, from desk::idle), never in this
+    // interrupt: at a laptop's own resolution a whole copy to an uncached framebuffer can take
+    // tens of milliseconds (architect's review, 10 Nov 2026)
+    if crate::desk::shown() {
+        return;
+    }
     if ticks % 4 == 0 && DIRTY.swap(false, Ordering::Relaxed) {
         if WM_DIRTY.swap(false, Ordering::Relaxed) && wm_view() {
             crate::tonga::win_present();
@@ -214,6 +275,15 @@ pub fn present() {
     // writes stay inside the mode the firmware reported (centred, scale chosen to fit).
     unsafe {
         let g = GOP;
+        let desk = crate::desk::shown();
+        if LAST_DESK.swap(desk, Ordering::Relaxed) != desk {
+            clear(FRAME); // desktop <-> console: the frame around changes
+            FULL.store(true, Ordering::Relaxed);
+        }
+        if desk {
+            present_canvas(g);
+            return;
+        }
         if MODE.load(Ordering::Relaxed) != WHOLE {
             present_stretched(g);
             return;
@@ -279,6 +349,106 @@ unsafe fn present_stretched(g: Gop) {
         cursor(g, (ox, oy, dw, dh), px, py);
     }
     PRESENTS += 1;
+}
+
+/// The desktop's copy to the screen, from mainline (desk::idle): when something drew or the
+/// pointer moved, copy what changed.
+pub fn flush() {
+    if crate::desk::shown() && DIRTY.swap(false, Ordering::Relaxed) {
+        present();
+    }
+}
+
+/// The next desktop copy is whole (after a switch from the console or a new UI scale).
+static FULL: AtomicBool = AtomicBool::new(true);
+/// Where the pointer was drawn by the last desktop copy (its rows are put back next time).
+static mut LAST_PTR: Option<(usize, usize)> = None;
+/// The desktop copy's time in microseconds: the last one and the worst one (`desk perf`).
+static mut COPY_US: (u64, u64) = (0, 0);
+
+/// (last, worst) desktop copy time in microseconds, and the redraw count, for `desk perf`.
+pub fn copy_perf() -> (u64, u64, u64) {
+    // SAFETY: scalar reads.
+    unsafe { (COPY_US.0, COPY_US.1, PRESENTS) }
+}
+
+/// `present` while the desktop is shown: its canvas (kernel/src/pc/canvas.rs), the screen's
+/// own size over a whole-number UI scale, centred (it fills the screen but for the few pixels
+/// a non-dividing scale leaves), then the pointer at that scale. Only the rows the desktop
+/// drew since the last copy, and the rows under the pointer's old and new place, are copied.
+/// SAFETY: as `present`; the canvas is width() x height() pixels, a row width() long.
+unsafe fn present_canvas(g: Gop) {
+    let t0 = crate::timer::cycles();
+    let (cw, ch, s) = (crate::canvas::width(), crate::canvas::height(), crate::canvas::scale());
+    let (dw, dh) = ((cw * s).min(g.w).min(LINE_MAX), (ch * s).min(g.h));
+    let (vw, vh) = (dw / s, dh / s); // the canvas pixels that fit
+    let (ox, oy) = ((g.w - vw * s) / 2, (g.h - vh * s) / 2);
+    let ptr = crate::xhci::pointer();
+    let mut spans: [(usize, usize); 3] = [(0, 0); 3];
+    if FULL.swap(false, Ordering::Relaxed) {
+        let _ = crate::canvas::take_damage();
+        spans[0] = (0, vh);
+    } else {
+        if let Some(d) = crate::canvas::take_damage() {
+            spans[0] = d;
+        }
+        if let Some((_, y)) = LAST_PTR {
+            spans[1] = (y, y + ARROW.len());
+        }
+        if let Some((_, y)) = ptr {
+            spans[2] = (y, y + ARROW.len());
+        }
+    }
+    for &(a, b) in spans.iter() {
+        copy_rows(g, (ox, oy, vw, s, cw), a, b.min(vh));
+    }
+    LAST_PTR = ptr;
+    if let Some((px, py)) = ptr {
+        let dst = g.base as *mut u32;
+        for (r, row) in ARROW.iter().enumerate() {
+            for (c, &b) in row.iter().enumerate() {
+                let (x, y) = (px + c, py + r);
+                if b == b'.' || x >= vw || y >= vh {
+                    continue;
+                }
+                let v = if b == b'#' { 0 } else { POINTER_FILL };
+                for sy in 0..s {
+                    for sx in 0..s {
+                        write_volatile(dst.add((oy + y * s + sy) * g.stride + ox + x * s + sx), v);
+                    }
+                }
+            }
+        }
+    }
+    PRESENTS += 1;
+    let us = crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / crate::timer::hz().max(1);
+    COPY_US = (us, COPY_US.1.max(us));
+}
+
+/// Copy canvas rows [y0, y1) to the screen at the UI scale.
+/// SAFETY: as `present_canvas`; (ox, oy, vw, s, cw) as it worked them out.
+unsafe fn copy_rows(g: Gop, (ox, oy, vw, s, cw): (usize, usize, usize, usize, usize), y0: usize, y1: usize) {
+    let src = crate::canvas::pixels();
+    let dst = g.base as *mut u32;
+    for y in y0..y1 {
+        let row = src.add(y * cw);
+        let line: *const u32 = if s == 1 && g.bgr {
+            row
+        } else {
+            let l = addr_of_mut!(LINE) as *mut u32;
+            for x in 0..vw {
+                let p = *row.add(x);
+                let v = if g.bgr { p } else { (p & 0xFF) << 16 | (p & 0xFF00) | (p >> 16) & 0xFF };
+                for sx in 0..s {
+                    *l.add(x * s + sx) = v;
+                }
+            }
+            l
+        };
+        for sy in 0..s {
+            core::ptr::copy_nonoverlapping(line, dst.add((oy + y * s + sy) * g.stride + ox), vw * s);
+        }
+    }
 }
 
 /// The pointer: an arrow 8 pixels wide, 12 tall, its tip at (px, py) of the console,

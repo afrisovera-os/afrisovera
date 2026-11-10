@@ -169,3 +169,24 @@ corners (the lopsided cut is the identity; the rule makes it consistent), and mo
 the Spine (the bottom is where people coming from Windows already look for them, and the top of the Spine is where the
 Circle button and the apps belong).
 
+
+## 13. The whole screen (slice 1b, 10 Nov 2026, field item F9)
+
+Asked by the OS lead after the owner merged slice 1: the desktop must fill the laptop's screen at its own resolution,
+not sit as a 640x480 box in a dark frame.
+
+- **A canvas of the screen's size, PC only.** The desktop draws into its own buffer (`kernel/src/pc/canvas.rs`),
+  sized from the firmware's screen mode when the kernel starts. The text console keeps the shared 640x480
+  framebuffer (and the phone keeps everything): the ARM image does not change and Tonga is not touched.
+- **A whole-number UI scale**, so the 8x8 font stays sharp: scale = the smaller of width/800 and height/500, at
+  least 1, at most 4. Logical size = screen size / scale. Examples: 1366x768 runs at 1x (1366x768 logical),
+  1920x1080 at 2x (960x540), 2560x1440 at 2x (1280x720), 3840x2160 at 4x (960x540). `screen ui 1..4` overrides it
+  until the next restart; `screen ui` shows it. The canvas holds at most 1920x1200 logical pixels; a bigger logical
+  size (a very wide screen at 1x) is centred in the dark frame.
+- **What follows the canvas while the desktop is shown:** the screen copy (whole-number scale, no stretching), the
+  mouse pointer's range, and every layout number (the Spine is full height, the Circle centred in the free space).
+  `clear` returns to the 640x480 console exactly as before.
+- **Speed:** the same flat fills; a 960x540 canvas is 1.7 times the pixels of 640x480, a 1366x768 one 3.4 times.
+  The copy to the screen is one row built and copied per logical row, as before.
+- **Later:** windows open in a cascade from the top left whatever the size; placing them relative to the canvas
+  centre and remembering where they were moved is part of slice 2.

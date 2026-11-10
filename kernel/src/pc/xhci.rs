@@ -3988,7 +3988,7 @@ unsafe fn tablet_report(r: &[u8]) {
         return;
     }
     TREPORTS += 1;
-    let (w, h) = (crate::framebuffer::WIDTH as i32, crate::framebuffer::HEIGHT as i32);
+    let (w, h) = crate::screen::pointer_area(); // the desktop canvas while it is shown (sovereign-ui.md 13)
     let (x, y) = (scale(r, a.x, w), scale(r, a.y, h));
     let mut buttons = 0u8;
     for k in 0..a.nbtn.min(3) {
@@ -4079,7 +4079,7 @@ unsafe fn mouse_report(buttons: u8, dx: i32, dy: i32) {
             crate::screen::wm_moved();
         }
     }
-    let (w, h) = (crate::framebuffer::WIDTH as i32, crate::framebuffer::HEIGHT as i32);
+    let (w, h) = crate::screen::pointer_area(); // the desktop canvas while it is shown (sovereign-ui.md 13)
     let (x, y) = ((MX + dx).clamp(0, w - 1), (MY + dy).clamp(0, h - 1));
     if (x, y) != (MX, MY) {
         if let Some(id) = DRAG {

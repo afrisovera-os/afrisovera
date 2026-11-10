@@ -152,6 +152,7 @@ mod nic;
 mod xhci;
 mod ps2;
 mod screen;
+mod canvas; // the desktop at the screen's own resolution (docs/design/sovereign-ui.md section 13)
 mod conback;
 mod helpview;
 mod font_lower;

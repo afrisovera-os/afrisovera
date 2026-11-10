@@ -9,6 +9,11 @@ The points are framebuffer coordinates. An ARM (ramfb) screenshot IS the 640x480
 (GOP) screenshot holds it centred and scaled by a whole number, as kernel/src/pc/screen.rs
 places it, so the point is mapped the same way. Prints "error=<why>" when it cannot read.
 Used by scripts/desk-test.sh and scripts/pc-desk-test.sh.
+
+    png-px.py <png> --desk <S> <point> ...   (10 Nov 2026) the PC desktop fills the screen at
+                                     its own resolution (docs/design/sovereign-ui.md section 13):
+                                     the points are desktop pixels at UI scale S, the desktop
+                                     being the screen's size over S (at most 1920x1200), centred
 """
 import struct
 import sys
@@ -60,7 +65,23 @@ def main():
         prev = line
     s = max(1, min(w // 640, h // 480, 4))
     ox, oy = (w - 640 * s) // 2, (h - 480 * s) // 2
-    for arg in sys.argv[2:]:
+    args = sys.argv[2:]
+    if len(args) >= 2 and args[0] == "--desk":
+        s = max(1, int(args[1]))
+        vw, vh = min(w // s, 1920), min(h // s, 1200)
+        ox, oy = (w - vw * s) // 2, (h - vh * s) // 2
+        args = args[2:]
+    for arg in args:
+        if arg == "size":  # the screenshot's own size (pc-desk: the desktop fills the screen)
+            print("size=%dx%d" % (w, h))
+            continue
+        if arg.startswith("raw:"):  # a screenshot pixel itself, unmapped (the frame round a capped desktop)
+            x, y = (int(v) for v in arg[4:].split(","))
+            if 0 <= x < w and 0 <= y < h:
+                print("%s=%02X%02X%02X" % ((arg,) + tuple(rows[y][x * bpp:x * bpp + 3])))
+            else:
+                print("%s=outside" % arg)
+            continue
         if arg.startswith("count:"):
             bx, by, bw, bh, col = arg[6:].split(",")
             want = bytes.fromhex(col)

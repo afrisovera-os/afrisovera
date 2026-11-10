@@ -16,8 +16,17 @@
 use crate::framebuffer as fb;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-const W: i32 = fb::WIDTH as i32;
-const H: i32 = fb::HEIGHT as i32;
+/// The desktop's size in logical pixels: the PC canvas (kernel/src/pc/canvas.rs), the screen's
+/// own size over the UI scale (sovereign-ui.md section 13), read at every use so `screen ui`
+/// re-lays the desktop out.
+#[allow(non_snake_case)]
+fn W() -> i32 {
+    crate::canvas::width() as i32
+}
+#[allow(non_snake_case)]
+fn H() -> i32 {
+    crate::canvas::height() as i32
+}
 
 // ---------------------------------------------------------------------------------------
 // Palette: Earth and Night (sovereign-ui.md section 4). Every colour on screen comes from
@@ -316,7 +325,7 @@ static mut CLIP: Option<(i32, i32, i32, i32, i32)> = None;
 
 fn rect(x: i32, y: i32, w: i32, h: i32, c: u32) {
     let (mut x0, mut y0) = (x.max(0), y.max(0));
-    let (mut x1, mut y1) = ((x + w).min(W), (y + h).min(H));
+    let (mut x1, mut y1) = ((x + w).min(W()), (y + h).min(H()));
     // SAFETY: CLIP is set and cleared around an app's body drawing, in mainline only.
     if let Some((cx, cy, cw, ch, k)) = unsafe { CLIP } {
         x0 = x0.max(cx);
@@ -326,19 +335,19 @@ fn rect(x: i32, y: i32, w: i32, h: i32, c: u32) {
         let zone = cy + ch - k; // the rows the bottom-right cut runs through
         if k > 0 && y1 > zone && x1 > cx + cw - k && x1 > x0 {
             if y0 < zone {
-                fb::fill_rect(x0 as usize, y0 as usize, (x1 - x0) as usize, (zone - y0) as usize, c);
+                crate::canvas::fill_rect(x0 as usize, y0 as usize, (x1 - x0) as usize, (zone - y0) as usize, c);
             }
             for yy in y0.max(zone)..y1 {
                 let r = (cx + cw - (yy - zone)).min(x1); // row j of the cut is inset by j + 1
                 if r > x0 {
-                    fb::fill_rect(x0 as usize, yy as usize, (r - x0) as usize, 1, c);
+                    crate::canvas::fill_rect(x0 as usize, yy as usize, (r - x0) as usize, 1, c);
                 }
             }
             return;
         }
     }
     if x1 > x0 && y1 > y0 {
-        fb::fill_rect(x0 as usize, y0 as usize, (x1 - x0) as usize, (y1 - y0) as usize, c);
+        crate::canvas::fill_rect(x0 as usize, y0 as usize, (x1 - x0) as usize, (y1 - y0) as usize, c);
     }
 }
 
@@ -689,7 +698,7 @@ fn spine_w() -> i32 {
 
 /// The Spine (x, y, w, h): the whole left edge.
 fn dock_box() -> (i32, i32, i32, i32) {
-    (0, 0, spine_w(), H)
+    (0, 0, spine_w(), H())
 }
 
 /// Tile i of the Spine (0 = the Circle button, 1.. = the apps): (x, y, size).
@@ -709,7 +718,7 @@ fn win_rect(a: usize) -> (i32, i32, i32, i32) {
     let s = st();
     if s.touch {
         let sw = spine_w();
-        return (sw, TOP, W - sw, H - TOP);
+        return (sw, TOP, W() - sw, H() - TOP);
     }
     let w = s.wins[a];
     (w.x, w.y, w.w, w.h)
@@ -739,8 +748,8 @@ fn inside(px: i32, py: i32, r: (i32, i32, i32, i32)) -> bool {
 /// The Circle: an octagon (x, y, size, size) centred in the space right of the Spine.
 fn launcher_box() -> (i32, i32, i32, i32) {
     let sw = spine_w();
-    let size = if st().touch { 340 } else { 300 }.min(H - 90).min(W - sw - 16);
-    (sw + (W - sw - size) / 2, (H - size - 56) / 2, size, size)
+    let size = if st().touch { 340 } else { 300 }.min(H() - 90).min(W() - sw - 16);
+    (sw + (W() - sw - size) / 2, (H() - size - 56) / 2, size, size)
 }
 
 /// The strip under the Circle: this device, and how to close.
@@ -769,12 +778,12 @@ fn launcher_tile(i: usize) -> (i32, i32, i32) {
 fn notes_box() -> (i32, i32, i32, i32) {
     let w = 280;
     let h = 30 + 18 * NNOTE as i32;
-    (spine_w() + 6, H - h - 8, w, h)
+    (spine_w() + 6, H() - h - 8, w, h)
 }
 
 /// The bell at the Spine's foot, above the clock.
 fn bell_box() -> (i32, i32, i32, i32) {
-    (0, H - 52, spine_w() - WEAVE, 22)
+    (0, H() - 52, spine_w() - WEAVE, 22)
 }
 /// The Circle button at the top of the Spine.
 fn brand_box() -> (i32, i32, i32, i32) {
@@ -817,9 +826,9 @@ fn open(a: usize) {
         let (x, y, w, h) = HOME[a];
         // keep the default inside the screen whatever its size (section 7)
         let sw = SPINE_P;
-        let w = w.min(W - sw - 8);
-        let h = h.min(H - TOP - 8);
-        s.wins[a] = Win { open: true, min: false, x: x.clamp(sw + 4, W - w), y: y.clamp(TOP, H - h), w, h };
+        let w = w.min(W() - sw - 8);
+        let h = h.min(H() - TOP - 8);
+        s.wins[a] = Win { open: true, min: false, x: x.clamp(sw + 4, W() - w), y: y.clamp(TOP, H() - h), w, h };
         if a == App::Files as usize {
             s.files_sel = None;
         }
@@ -860,8 +869,8 @@ fn move_by(a: usize, dx: i32, dy: i32) {
         return;
     }
     let w = &mut s.wins[a];
-    w.x = (w.x + dx).clamp(SPINE_P - (w.w - 48), W - 48); // a grip of the lintel stays clear of the Spine
-    w.y = (w.y + dy).clamp(TOP, H - TITLE_P);
+    w.x = (w.x + dx).clamp(SPINE_P - (w.w - 48), W() - 48); // a grip of the lintel stays clear of the Spine
+    w.y = (w.y + dy).clamp(TOP, H() - TITLE_P);
 }
 
 fn log(what: &[u8], a: usize) {
@@ -1160,16 +1169,16 @@ fn clock_secs() -> u64 {
 
 fn wallpaper() {
     let sw = spine_w();
-    for y in 0..H {
-        rect(sw, y, W - sw, 1, lerp(WALL_TOP, WALL_BOT, y * 100 / H));
+    for y in 0..H() {
+        rect(sw, y, W() - sw, 1, lerp(WALL_TOP, WALL_BOT, y * 100 / H()));
     }
     if st().wallpaper {
         // mud cloth (bogolanfini): a grid of small marks, a dot and a chevron in turn, one
         // shade above the soil, so they are felt more than seen (sovereign-ui.md section 6)
         let (mut y, mut j) = (12, 0);
-        while y < H - 8 {
+        while y < H() - 8 {
             let (mut x, mut i) = (sw + 12, 0);
-            while x < W - 8 {
+            while x < W() - 8 {
                 if (i + j) % 2 == 0 {
                     rect(x, y, 2, 2, MUD);
                 } else {
@@ -1185,9 +1194,9 @@ fn wallpaper() {
             j += 1;
         }
         // the monument, faint, standing behind the windows; a warm glow at its foot
-        let cx = sw + (W - sw) / 2;
-        let mh = (H * 55 / 100).max(60);
-        let top = (H - mh) / 2 - 4;
+        let cx = sw + (W() - sw) / 2;
+        let mh = (H() * 55 / 100).max(60);
+        let top = (H() - mh) / 2 - 4;
         for k in 0..24 {
             let c = lerp(0x24_18_0E, WALL_BOT, k * 100 / 24);
             rect(cx - 200 + k * 4, top + mh + 6 + k / 3, 400 - k * 8, 1, c);
@@ -1204,8 +1213,8 @@ fn wallpaper() {
 fn spine() {
     let s = st();
     let body = spine_w() - WEAVE;
-    rect(0, 0, body, H, NIGHT);
-    weave_v(body, 0, H, 2, &KENTE);
+    rect(0, 0, body, H(), NIGHT);
+    weave_v(body, 0, H(), 2, &KENTE);
     // the Circle button
     let (tx, ty, ts) = dock_tile(0);
     if s.launcher {
@@ -1246,9 +1255,9 @@ fn spine() {
         under.s(if hh < 12 { b"am" } else { b"pm" });
     }
     s.last_minute = secs / 60;
-    rect(8, H - 30, body - 16, 1, LINE);
-    text(mid - text_w(l.get(), 1) / 2, H - 23, l.get(), GOLD, 1);
-    text(mid - text_w(under.get(), 1) / 2, H - 12, under.get(), DIM, 1);
+    rect(8, H() - 30, body - 16, 1, LINE);
+    text(mid - text_w(l.get(), 1) / 2, H() - 23, l.get(), GOLD, 1);
+    text(mid - text_w(under.get(), 1) / 2, H() - 12, under.get(), DIM, 1);
 
     // bell, with the count of unread notices
     let (_, by, _, _) = bell_box();
@@ -1264,14 +1273,14 @@ fn spine() {
         text(gx + 20, gy + 3, num(s.unread as u64, &mut t), TEXT, 1);
     }
     // power: no battery driver yet, so a plug and "AC" (no fake levels)
-    let (px, py) = (mid - 11, H - 78);
+    let (px, py) = (mid - 11, H() - 78);
     rect(px, py + 3, 7, 6, TEXT);
     rect(px + 1, py, 1, 3, TEXT);
     rect(px + 5, py, 1, 3, TEXT);
     rect(px + 3, py + 9, 1, 3, TEXT);
     text(px + 10, py + 2, b"AC", DIM, 1);
     // network: a link glyph, gold with a lease, dim without, crossed without a device
-    let (nx, ny) = (mid - 10, H - 100);
+    let (nx, ny) = (mid - 10, H() - 100);
     let (present, ip) = (crate::virtio::net_present(), crate::virtio::dhcp_ip());
     let c = if !present {
         LINE
@@ -1496,7 +1505,7 @@ fn settings_app(a: usize, x: i32, y: i32, w: i32, _h: i32) {
     head(y + 10, b"Display");
     let rows = settings_rows();
     let mut l = Line::new();
-    l.u(W as u64).s(b" x ").u(H as u64).s(b" logical pixels");
+    l.u(W() as u64).s(b" x ").u(H() as u64).s(b" logical pixels");
     text(x + 14, y + 24, l.get(), DIM, 1);
     // input profile: a two-part switch
     label(y + rows[0] + 5, b"Input");
@@ -1654,7 +1663,7 @@ fn toast() {
     // pointer: the top right corner; touch: a snackbar at the foot, never over a lintel
     // (design review D2)
     let sw = spine_w();
-    let (x, y) = if s.touch { (sw + (W - sw - w) / 2, H - 46) } else { (W - w - 10, TOP + 10) };
+    let (x, y) = if s.touch { (sw + (W() - sw - w) / 2, H() - 46) } else { (W() - w - 10, TOP + 10) };
     cut(x + 3, y + 3, w, 28, 6, 0, 6, 0, SHADOW);
     cut(x, y, w, 28, 6, 0, 6, 0, SURFACE2);
     cut_frame(x, y, w, 28, 6, 0, 6, 0, GOLD_DARK);
@@ -1665,6 +1674,7 @@ fn toast() {
 /// Draw the whole desktop into the shared framebuffer.
 fn draw() {
     let s = st();
+    let t0 = crate::timer::cycles();
     wallpaper();
     for k in 0..s.nz {
         window(s.z[k]);
@@ -1678,9 +1688,14 @@ fn draw() {
         launcher();
     }
     s.frames += 1;
-    #[cfg(not(target_arch = "aarch64"))]
+    let us = crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / crate::timer::hz().max(1);
+    // SAFETY: mainline only.
+    unsafe { DRAW_US = (us, DRAW_US.1.max(us)) };
     crate::screen::mark();
 }
+
+/// The last and the worst whole-desktop draw, in microseconds (`desk perf`).
+static mut DRAW_US: (u64, u64) = (0, 0);
 
 // ---------------------------------------------------------------------------------------
 // Entry points.
@@ -1759,6 +1774,25 @@ pub fn idle() {
     if DIRTY.swap(false, Ordering::Relaxed) {
         draw();
     }
+    // the copy to the screen happens here, in mainline, never in the timer interrupt
+    crate::screen::flush();
+}
+
+/// The canvas changed size (`screen ui N`): keep every window's lintel on the screen and
+/// redraw (sovereign-ui.md section 13).
+pub fn relayout() {
+    let s = st();
+    for a in 0..NAPPS {
+        let w = &mut s.wins[a];
+        if w.open {
+            w.w = w.w.min(W() - SPINE_P - 8);
+            w.h = w.h.min(H() - TOP - 8);
+            w.x = w.x.clamp(SPINE_P - (w.w - 48), W() - 48);
+            w.y = w.y.clamp(TOP, H() - TITLE_P);
+        }
+    }
+    s.drag = None;
+    redraw_now();
 }
 
 fn redraw_now() {
@@ -1805,6 +1839,29 @@ pub fn command(rest: &str) {
             }
             None => crate::kprintln!("desk: no app '{}'. Apps: files terminal settings about", arg),
         },
+        "notes" => {
+            // the bell's list, as a click on the bell (scripts and screenshots: its place
+            // depends on the screen's height)
+            s.notes_open = !s.notes_open;
+            s.launcher = false;
+            if s.notes_open {
+                s.unread = 0;
+                crate::kprintln!("[desk] notifications open");
+            } else {
+                crate::kprintln!("[desk] notifications closed");
+            }
+        }
+        "perf" => {
+            // how long the desktop takes on this machine (the 2012 laptop target, sovereign-ui.md 8)
+            // SAFETY: scalar reads.
+            let (dl, dw) = unsafe { DRAW_US };
+            let (cl, cw, n) = crate::screen::copy_perf();
+            crate::kprintln!(
+                "[desk] perf: {}x{} at UI scale {}x; draw {} us (worst {} us) over {} frame(s); copy to the screen {} us (worst {} us) over {} copies",
+                W(), H(), crate::canvas::scale(), dl, dw, s.frames, cl, cw, n
+            );
+            return;
+        }
         "next" => key(KEY_ALT_TAB),
         "launcher" => key(KEY_SUPER),
         "key" => match arg {
@@ -1820,7 +1877,7 @@ pub fn command(rest: &str) {
         },
         "tap" => match (num_arg(Some(arg)), num_arg(it.next())) {
             (Some(x), Some(y)) => {
-                down(x.clamp(0, W - 1), y.clamp(0, H - 1));
+                down(x.clamp(0, W() - 1), y.clamp(0, H() - 1));
                 up();
             }
             _ => crate::kprintln!("desk: tap <x> <y>"),
@@ -1828,7 +1885,7 @@ pub fn command(rest: &str) {
         "drag" => match (num_arg(Some(arg)), num_arg(it.next()), num_arg(it.next()), num_arg(it.next())) {
             (Some(x), Some(y), Some(dx), Some(dy)) => {
                 down(x, y);
-                pointer_move((x + dx).clamp(0, W - 1), (y + dy).clamp(0, H - 1));
+                pointer_move((x + dx).clamp(0, W() - 1), (y + dy).clamp(0, H() - 1));
                 up();
             }
             _ => crate::kprintln!("desk: drag <x> <y> <dx> <dy>"),
@@ -1893,7 +1950,7 @@ pub fn command(rest: &str) {
         }
         _ => {
             crate::kprintln!("desk: open|close|min|focus <app>, next, launcher, key <name>, tap <x> <y>,");
-            crate::kprintln!("      drag <x> <y> <dx> <dy>, mode pointer|touch, notify <text>, list");
+            crate::kprintln!("      drag <x> <y> <dx> <dy>, mode pointer|touch, notify <text>, notes, perf, list");
             return;
         }
     }
