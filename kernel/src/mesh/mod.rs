@@ -17,6 +17,11 @@
 //! most 512 bytes per exchange (architect review, "size limit"); one link at a time; the identity key lives in
 //! RAM for this boot only (the keystore, review R2-6, is a prerequisite for anything longer); the bundle's
 //! `expires` is checked against its own `created`, not against a trusted clock.
+//!
+//! Secrets (F1, review S2): the identity key, ephemerals and every DH output, contact root and HPKE key are
+//! wiped when they go out of use (`Secret` here, `Drop` on mesh-noise's handshake and transport states, the
+//! dalek `zeroize` feature, and mesh-hpke's own wipes). `mesh forget` drops this boot's identity, which wipes it.
+//! Peer text (F4) reaches the console only through `mesh_crypto::console_safe`.
 
 use alloc::vec::Vec;
 use core::ptr::addr_of_mut;
@@ -39,8 +44,29 @@ const MAX_FRAME: usize = 512;
 const BUCKET: usize = 0;
 const TTL: u8 = 8;
 
-/// This node's X25519 identity for this boot (generated on first use from `fill_secret`).
-static mut IDENTITY: Option<([u8; 32], [u8; 32])> = None;
+/// A 32-byte secret that wipes itself when dropped (F1). Moves are bitwise copies the compiler may leave
+/// behind; keeping secrets in this type wipes every named copy we own.
+pub struct Secret(pub [u8; 32]);
+
+impl Secret {
+    fn copy(&self) -> Secret {
+        Secret(self.0)
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        crate::drbg::wipe(&mut self.0);
+    }
+}
+
+/// This node's X25519 identity for this boot, generated on first use from `fill_secret`. Review M1: the secret
+/// lives in ONE fixed buffer that is never moved or overwritten by an enum store; `forget()` wipes that buffer
+/// where it lies and clears the flag. (An `Option<(Secret, _)>` here failed the M1 selftest even when set to
+/// `None` in place: the store of `None` is not guaranteed to leave the payload bytes as the drop left them.)
+static mut IDENTITY_SK: Secret = Secret([0u8; 32]);
+static mut IDENTITY_PK: [u8; 32] = [0u8; 32];
+static mut HAVE_IDENTITY: bool = false;
 
 /// Why a mesh step failed, in words for the console and the suites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,28 +85,49 @@ pub enum MeshError {
 }
 
 /// 32 secret bytes from the hardened DRBG, or an error. Never all-zero (review S4).
-fn secret32() -> Result<[u8; 32], MeshError> {
-    let mut k = [0u8; 32];
-    crate::rng::fill_secret(&mut k).map_err(|_| MeshError::NoSecretRandom)?;
-    if k.iter().all(|&b| b == 0) {
+fn secret32() -> Result<Secret, MeshError> {
+    let mut k = Secret([0u8; 32]);
+    crate::rng::fill_secret(&mut k.0).map_err(|_| MeshError::NoSecretRandom)?;
+    if k.0.iter().all(|&b| b == 0) {
         return Err(MeshError::ZeroSecret);
     }
     Ok(k)
 }
 
-/// This node's (secret, public) X25519 identity, created on first use.
-pub fn identity() -> Result<([u8; 32], [u8; 32]), MeshError> {
+/// This node's (secret, public) X25519 identity, created on first use. The caller's copy wipes on drop.
+pub fn identity() -> Result<(Secret, [u8; 32]), MeshError> {
     // SAFETY: single accessor (the shell core), like the rest of the kernel's statics.
     unsafe {
-        let id = &mut *addr_of_mut!(IDENTITY);
-        if let Some(k) = *id {
-            return Ok(k);
+        let sk = &mut *addr_of_mut!(IDENTITY_SK);
+        let pk = &mut *addr_of_mut!(IDENTITY_PK);
+        if *addr_of_mut!(HAVE_IDENTITY) {
+            return Ok((sk.copy(), *pk));
         }
-        let sk = secret32()?;
-        let pk = mesh_noise::public_key(&sk);
-        *id = Some((sk, pk));
-        Ok((sk, pk))
+        let fresh = secret32()?; // wiped when it drops at the end of this block
+        sk.0.copy_from_slice(&fresh.0);
+        *pk = mesh_noise::public_key(&sk.0);
+        *addr_of_mut!(HAVE_IDENTITY) = true;
+        Ok((sk.copy(), *pk))
     }
+}
+
+/// `mesh forget`: wipe this boot's identity where it lies (review M1) and forget it. The next mesh step makes a
+/// new one. Returns false if there was none.
+pub fn forget() -> bool {
+    // SAFETY: single accessor (the shell core).
+    unsafe {
+        let had = *addr_of_mut!(HAVE_IDENTITY);
+        crate::drbg::wipe(&mut (*addr_of_mut!(IDENTITY_SK)).0);
+        crate::drbg::wipe(&mut *addr_of_mut!(IDENTITY_PK));
+        *addr_of_mut!(HAVE_IDENTITY) = false;
+        had
+    }
+}
+
+/// Address of the identity secret's bytes inside the static (for the M1 selftest).
+fn identity_secret_ptr() -> Option<*const u8> {
+    // SAFETY: only an address is taken.
+    Some(unsafe { (*addr_of_mut!(IDENTITY_SK)).0.as_ptr() })
 }
 
 fn prologue() -> [u8; 25] {
@@ -112,6 +159,15 @@ fn hex8(k: &[u8]) -> [u8; 16] {
 
 fn s(b: &[u8]) -> &str {
     core::str::from_utf8(b).unwrap_or("?")
+}
+
+/// F4: peer-supplied text as something safe to print between quotes (control bytes, bad UTF-8 and
+/// invisible reordering characters escaped; see `mesh_crypto::console_safe`).
+fn shown(text: &[u8]) -> alloc::string::String {
+    let mut o = alloc::vec![0u8; mesh_crypto::console_safe_room(text.len())];
+    let n = mesh_crypto::console_safe(text, &mut o);
+    o.truncate(n);
+    alloc::string::String::from_utf8(o).unwrap_or_default()
 }
 
 /// AFR-0009 section 4.2 stream framing: u16 LE length, then the Noise message.
@@ -188,14 +244,16 @@ fn finish(hs: Handshake) -> Result<(Link, u32), MeshError> {
 
 /// Seal `text` to `peer` as a bucket-0 AFR-0009 bundle from this node.
 fn seal_to(sk: &[u8; 32], pk: &[u8; 32], peer: &[u8; 32], text: &[u8]) -> Result<Vec<u8>, MeshError> {
-    let dh = mesh_hpke::x25519_dh(sk, peer);
-    let root = mesh_crypto::contact_root(pk, peer, &dh);
+    let mut dh = Secret(mesh_hpke::x25519_dh(sk, peer));
+    let mut root = Secret(mesh_crypto::contact_root(pk, peer, &dh.0));
+    crate::drbg::wipe(&mut dh.0);
     let created = now_unix();
-    let tag = mesh_crypto::recipient_tag(&root, pk, peer, mesh_crypto::tag_period(created));
+    let tag = mesh_crypto::recipient_tag(&root.0, pk, peer, mesh_crypto::tag_period(created));
+    crate::drbg::wipe(&mut root.0);
     let mut bid = [0u8; 16];
     crate::rng::fill_secret(&mut bid).map_err(|_| MeshError::NoSecretRandom)?;
     let ske = secret32()?;
-    mesh_hpke::bundle_seal(BUCKET, TTL, &bid, &tag, created + 86_400, created, 1, text, &ske, sk, peer)
+    mesh_hpke::bundle_seal(BUCKET, TTL, &bid, &tag, created + 86_400, created, 1, text, &ske.0, sk, peer)
         .map_err(|_| MeshError::Seal)
 }
 
@@ -204,9 +262,10 @@ fn open_from(sk: &[u8; 32], pk: &[u8; 32], peer: &[u8; 32], bundle: &[u8]) -> Re
     let (mtype, created, body) = mesh_hpke::bundle_open(bundle, sk, peer).ok_or(MeshError::Open)?;
     // AFR-0009 section 6 step 3 (caller's part): the tag must be the one this contact pair derives for the
     // bundle's period. The header is authenticated as AAD, so a tag that matches here was sealed by `peer`.
-    let dh = mesh_hpke::x25519_dh(sk, peer);
-    let root = mesh_crypto::contact_root(pk, peer, &dh);
-    let want = mesh_crypto::recipient_tag(&root, peer, pk, mesh_crypto::tag_period(created));
+    let dh = Secret(mesh_hpke::x25519_dh(sk, peer));
+    let root = Secret(mesh_crypto::contact_root(pk, peer, &dh.0));
+    let want = mesh_crypto::recipient_tag(&root.0, peer, pk, mesh_crypto::tag_period(created));
+    drop((dh, root));
     if bundle.len() < 44 || bundle[20..36] != want {
         return Err(MeshError::Tag);
     }
@@ -256,7 +315,7 @@ pub fn listen(port: u16, wait_ms: u64) -> bool {
                 match core::mem::replace(&mut st, RState::Done) {
                     RState::WaitM1 => {
                         let e = secret32()?;
-                        let mut hs = Handshake::xx_responder(sk, e, &prologue());
+                        let mut hs = Handshake::xx_responder(sk.0, e.0, &prologue());
                         let mut pl = Vec::new();
                         hs.read_message(&f, &mut pl).map_err(|_| MeshError::Handshake)?;
                         let mut m2 = Vec::new();
@@ -280,11 +339,12 @@ pub fn listen(port: u16, wait_ms: u64) -> bool {
                         let (rtype, body) = open_record(&mut link, &f)?;
                         match rtype {
                             REC_BUNDLE => {
-                                let (mtype, created, text) = open_from(&sk, &pk, &link.peer, &body)?;
+                                let (mtype, created, mut text) = open_from(&sk.0, &pk, &link.peer, &body)?;
                                 crate::kprintln!(
                                     "[mesh] bundle OPENED from {} ({} bytes sealed, type {}, created {}): \"{}\"",
-                                    s(&hex8(&link.peer)), body.len(), mtype, created, s(&text)
+                                    s(&hex8(&link.peer)), body.len(), mtype, created, shown(&text)
                                 );
+                                crate::drbg::wipe(&mut text);
                                 opened = true;
                                 push_record(out, &mut link, REC_CLOSE, &[0x00])?;
                                 Ok(false)
@@ -347,7 +407,7 @@ pub fn send(ip: [u8; 4], port: u16, text: &[u8], wait_ms: u64) -> bool {
             return false;
         }
     };
-    let mut hs = Handshake::xx_initiator(sk, e, &prologue());
+    let mut hs = Handshake::xx_initiator(sk.0, e.0, &prologue());
     let mut m1 = Vec::new();
     if hs.write_message(&[], &mut m1).is_err() {
         crate::kprintln!("[mesh] send: handshake message 1 failed");
@@ -385,7 +445,7 @@ pub fn send(ip: [u8; 4], port: u16, text: &[u8], wait_ms: u64) -> bool {
                         "[mesh] link UP (Noise XX initiator) peer {} SAS {:06}",
                         s(&hex8(&link.peer)), sas
                     );
-                    let bundle = seal_to(&sk, &pk, &link.peer, text)?;
+                    let bundle = seal_to(&sk.0, &pk, &link.peer, text)?;
                     push_frame(out, &m3);
                     push_record(out, &mut link, REC_BUNDLE, &bundle)?;
                     crate::kprintln!(
@@ -475,10 +535,10 @@ pub fn selftest() -> bool {
     check("drbg-kat", st.kat_ok, &mut pass, &mut total);
 
     // Keys and ephemerals from fill_secret (review S4: fresh, never zero, two handshakes' ephemerals differ).
-    let keys: Result<[[u8; 32]; 6], MeshError> = (|| -> Result<[[u8; 32]; 6], MeshError> {
+    let keys: Result<[Secret; 6], MeshError> = (|| -> Result<[Secret; 6], MeshError> {
         Ok([secret32()?, secret32()?, secret32()?, secret32()?, secret32()?, secret32()?])
     })();
-    let k = match keys {
+    let ks = match keys {
         Ok(k) => k,
         Err(e) => {
             crate::kprintln!("[mesh] selftest: no secret randomness ({:?}); boot with a virtio-rng device", e);
@@ -487,6 +547,7 @@ pub fn selftest() -> bool {
             return false;
         }
     };
+    let k: [[u8; 32]; 6] = [ks[0].0, ks[1].0, ks[2].0, ks[3].0, ks[4].0, ks[5].0];
     let distinct = (0..6).all(|i| (0..6).all(|j| i == j || k[i] != k[j]));
     check("fresh-ephemerals-distinct", distinct, &mut pass, &mut total);
 
@@ -575,6 +636,56 @@ pub fn selftest() -> bool {
         &mut total,
     );
 
+    // Review M1: `forget` must wipe the secret bytes INSIDE the static, not a moved copy. Read the static's
+    // own bytes through a raw pointer before and after; a "new identity differs" check cannot see this.
+    let forget_wipes = identity().is_ok()
+        && match identity_secret_ptr() {
+            Some(ptr) => {
+                // SAFETY: `ptr` points at 32 bytes inside the IDENTITY static, which lives for the whole boot;
+                // volatile reads, so the compiler cannot reuse values read before `forget`.
+                let read = || -> [u8; 32] {
+                    let mut b = [0u8; 32];
+                    for (i, x) in b.iter_mut().enumerate() {
+                        *x = unsafe { core::ptr::read_volatile(ptr.add(i)) };
+                    }
+                    b
+                };
+                let before = read();
+                let forgot = forget();
+                let after = read();
+                before != [0u8; 32] && forgot && after == [0u8; 32]
+            }
+            None => false,
+        };
+    check("forget-wipes-identity-in-static", forget_wipes, &mut pass, &mut total);
+
+    // F1: the wipes run on the real kernel build. Each value is dropped in place, then its bytes are read.
+    let mut sec = core::mem::ManuallyDrop::new(Secret([0xa5; 32]));
+    // SAFETY: dropped exactly once; afterwards only a plain byte array is read and ManuallyDrop never re-drops.
+    unsafe { core::ptr::drop_in_place(&mut *sec) };
+    check("secret-drop-wipes", sec.0 == [0u8; 32], &mut pass, &mut total);
+    let mut d = core::mem::ManuallyDrop::new(crate::drbg::HmacDrbg::instantiate(&k[0], &k[1], b"selftest"));
+    let mut probe = [0u8; 32];
+    let generated = d.generate(&mut probe, b"").is_ok() && probe != [0u8; 32];
+    // SAFETY: as above.
+    unsafe { core::ptr::drop_in_place(&mut *d) };
+    check("drbg-drop-wipes", generated && d.is_wiped(), &mut pass, &mut total);
+
+    // F4: peer text with a screen-clearing escape, a fake new line, a bidi override and a closing quote.
+    let nasty = "hi\x1b[2J\r\n[mesh] send done: delivered \u{202e}x\"".as_bytes();
+    check(
+        "peer-text-console-safe",
+        shown(nasty) == "hi\\x1b[2J\\x0d\\x0a[mesh] send done: delivered \\u{202e}x\\\""
+            && shown(b"Habari-from-A") == "Habari-from-A",
+        &mut pass,
+        &mut total,
+    );
+
+    // The plain copies of the six test keys (the `Secret`s in `ks` wipe themselves when dropped).
+    let mut k = k;
+    for x in k.iter_mut() {
+        crate::drbg::wipe(x);
+    }
     crate::kprintln!("[mesh] selftest {}/{} PASS", pass, total);
     pass == total
 }
@@ -582,7 +693,7 @@ pub fn selftest() -> bool {
 /// `mesh id`: this node's identity public key.
 pub fn show_id() {
     match identity() {
-        Ok((_, pk)) => {
+        Ok((_sk, pk)) => {
             const HEX: &[u8; 16] = b"0123456789abcdef";
             let mut h = [0u8; 64];
             for (i, &b) in pk.iter().enumerate() {

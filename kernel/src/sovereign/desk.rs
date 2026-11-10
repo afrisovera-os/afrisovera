@@ -19,6 +19,207 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 #[path = "paint.rs"]
 mod paint; // the theme and every drawing function (sovereign-ui.md section 14)
 
+// ---------------------------------------------------------------------------------------
+// Damage (sovereign-ui.md section 15): a change repaints only what it touches.
+// ---------------------------------------------------------------------------------------
+/// A box on the desktop: (x, y, w, h).
+type Rect = (i32, i32, i32, i32);
+const NDMG: usize = 8;
+/// The damaged boxes waiting for the next frame, and how many. Mainline only.
+static mut DMG: [Rect; NDMG] = [(0, 0, 0, 0); NDMG];
+static mut NDMG_USED: usize = 0;
+/// Something changed that no box describes: the next frame is whole.
+static FULL: AtomicBool = AtomicBool::new(true);
+
+fn grow(r: Rect, by: i32) -> Rect {
+    (r.0 - by, r.1 - by, r.2 + 2 * by, r.3 + 2 * by)
+}
+
+fn union(a: Rect, b: Rect) -> Rect {
+    let (x0, y0) = (a.0.min(b.0), a.1.min(b.1));
+    let (x1, y1) = ((a.0 + a.2).max(b.0 + b.2), (a.1 + a.3).max(b.1 + b.3));
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
+/// Mark a box for the next frame (clipped to the screen); a ninth folds all into one box.
+fn damage(r: Rect) {
+    let (x0, y0) = (r.0.max(0), r.1.max(0));
+    let (x1, y1) = ((r.0 + r.2).min(W()), (r.1 + r.3).min(H()));
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let mut r = (x0, y0, x1 - x0, y1 - y0);
+    // SAFETY: mainline only.
+    unsafe {
+        let d = &mut *core::ptr::addr_of_mut!(DMG);
+        // a box that overlaps (or nearly touches) one already marked joins it: one redraw of the
+        // windows there instead of two
+        let mut k = 0;
+        while k < NDMG_USED {
+            let b = d[k];
+            let near = grow(b, 8);
+            if r.0 < near.0 + near.2 && near.0 < r.0 + r.2 && r.1 < near.1 + near.3 && near.1 < r.1 + r.3 {
+                r = union(r, b);
+                NDMG_USED -= 1;
+                d[k] = d[NDMG_USED];
+                k = 0; // the bigger box may now meet another
+                continue;
+            }
+            k += 1;
+        }
+        if NDMG_USED == NDMG {
+            let mut all = r;
+            for b in d.iter() {
+                all = union(all, *b);
+            }
+            d[0] = all;
+            NDMG_USED = 1;
+        } else {
+            d[NDMG_USED] = r;
+            NDMG_USED += 1;
+        }
+    }
+}
+
+/// A window's box with its relief shadow (what drawing it can touch).
+fn win_box(a: usize) -> Rect {
+    let (x, y, w, h) = win_rect(a);
+    (x, y, w + 4, h + 4)
+}
+
+/// What the desktop shows, as far as the frame is concerned (compared before and after a
+/// batch of input, to find the boxes that changed).
+#[derive(Clone, Copy, PartialEq)]
+struct Snap {
+    wins: [(bool, Rect); NAPPS],
+    z: [usize; NAPPS],
+    nz: usize,
+    launcher: bool,
+    sel: usize,
+    notes: bool,
+    unread: usize,
+    nnotes: usize,
+    toast: Option<Rect>,
+    hover: Option<usize>,
+    files_sel: Option<usize>,
+    touch: bool,
+    wall: bool,
+    clock24: bool,
+    size: (i32, i32),
+}
+
+fn snap() -> Snap {
+    let s = st();
+    let mut wins = [(false, (0, 0, 0, 0)); NAPPS];
+    for (a, w) in wins.iter_mut().enumerate() {
+        *w = (s.wins[a].open && !s.wins[a].min, win_box(a));
+    }
+    Snap {
+        wins,
+        z: s.z,
+        nz: s.nz,
+        launcher: s.launcher,
+        sel: s.sel,
+        notes: s.notes_open,
+        unread: s.unread,
+        nnotes: s.nnotes,
+        toast: paint::toast_box(),
+        hover: s.hover_close,
+        files_sel: s.files_sel,
+        touch: s.touch,
+        wall: s.wallpaper,
+        clock24: s.clock24,
+        size: (W(), H()),
+    }
+}
+
+/// The boxes that changed between two snapshots; false when the change has no box (redraw all).
+fn diff(a: &Snap, b: &Snap) -> bool {
+    if a.touch != b.touch || a.wall != b.wall || a.size != b.size {
+        return false;
+    }
+    let spine = dock_box();
+    let top = |s: &Snap| if s.nz == 0 { None } else { Some(s.z[s.nz - 1]) };
+    let zpos = |s: &Snap, w: usize| s.z[..s.nz].iter().position(|&v| v == w);
+    for w in 0..NAPPS {
+        let (va, ra) = a.wins[w];
+        let (vb, rb) = b.wins[w];
+        let moved = (va, ra) != (vb, rb);
+        let restacked = zpos(a, w) != zpos(b, w);
+        let focus = (top(a) == Some(w)) != (top(b) == Some(w));
+        if moved || restacked || focus {
+            if va {
+                damage(ra);
+            }
+            if vb {
+                damage(rb);
+            }
+            damage(spine); // its beads
+        }
+    }
+    if a.launcher != b.launcher || (b.launcher && a.sel != b.sel) {
+        damage(grow(launcher_box(), 4));
+        damage(grow(circle_info_box(), 4));
+        damage(spine);
+    }
+    if a.notes != b.notes || a.unread != b.unread || a.nnotes != b.nnotes {
+        if a.notes || b.notes {
+            damage(grow(notes_box(), 4));
+        }
+        damage(spine); // the bell
+    }
+    if a.toast != b.toast {
+        for t in [a.toast, b.toast].into_iter().flatten() {
+            damage(t);
+        }
+    }
+    if a.hover != b.hover {
+        for w in [a.hover, b.hover].into_iter().flatten() {
+            damage(grow(title_buttons(w).0, 1));
+        }
+    }
+    if a.files_sel != b.files_sel && b.wins[App::Files as usize].0 {
+        damage(b.wins[App::Files as usize].1);
+    }
+    if a.clock24 != b.clock24 {
+        damage(spine);
+    }
+    true
+}
+
+/// The network state the desktop last showed (settle redraws its places when it changes).
+static mut LAST_NET: Option<(bool, [u8; 4])> = None;
+
+/// Draw what is waiting: the whole desktop, or only the damaged boxes.
+fn frame(want: bool) {
+    // SAFETY: mainline only.
+    let n = unsafe { core::mem::replace(&mut *core::ptr::addr_of_mut!(NDMG_USED), 0) };
+    if FULL.swap(false, Ordering::Relaxed) || (want && n == 0) {
+        paint::draw();
+    } else if n > 0 {
+        // SAFETY: mainline only; a copy, so the static is not borrowed while paint runs.
+        let boxes: [Rect; NDMG] = unsafe { DMG };
+        paint::draw_damage(&boxes[..n]);
+    }
+}
+
+/// `desk verify`: hash every row as the partial frames left it, redraw everything, count the
+/// rows that differ (0 = the damage boxes missed nothing).
+static mut ROWS: [u64; crate::canvas::MAX_H] = [0; crate::canvas::MAX_H];
+static mut ROWS_NOW: [u64; crate::canvas::MAX_H] = [0; crate::canvas::MAX_H];
+fn row_hashes(out: &mut [u64]) {
+    let (cw, ch) = (crate::canvas::width(), crate::canvas::height());
+    let px = crate::canvas::pixels();
+    for (y, h) in out.iter_mut().enumerate().take(ch) {
+        let mut v: u64 = 0xcbf2_9ce4_8422_2325;
+        for x in 0..cw {
+            // SAFETY: inside the canvas.
+            v = (v ^ unsafe { *px.add(y * cw + x) } as u64).wrapping_mul(0x100_0000_01b3);
+        }
+        *h = v;
+    }
+}
+
 /// The desktop's size in logical pixels: the PC canvas (kernel/src/pc/canvas.rs), the screen's
 /// own size over the UI scale (sovereign-ui.md section 13), read at every use so `screen ui`
 /// re-lays the desktop out.
@@ -805,6 +1006,7 @@ fn key(k: u32) {
 /// A click inside an app's body at (bx, by) relative to the body's top-left.
 fn body_click(a: usize, bx: i32, by: i32) {
     let s = st();
+    damage(win_box(a)); // a selected file, a switch
     match APPS[a] {
         App::Files => {
             if bx < files_split(a) && by >= 22 {
@@ -922,6 +1124,7 @@ pub fn idle() {
     if !SHOWN.load(Ordering::Relaxed) {
         return;
     }
+    let before = snap();
     let mut moved: Option<(i32, i32)> = None;
     TERM_MUTE.store(true, Ordering::Relaxed);
     loop {
@@ -953,22 +1156,8 @@ pub fn idle() {
         pointer_move(mx, my);
     }
     TERM_MUTE.store(false, Ordering::Relaxed);
-    let s = st();
-    if TERM_DIRTY.swap(false, Ordering::Relaxed) && s.wins[App::Terminal as usize].open && !s.wins[App::Terminal as usize].min {
-        DIRTY.store(true, Ordering::Relaxed);
-    }
-    let t = crate::sched::ticks();
-    if s.toast_until != 0 && t >= s.toast_until {
-        s.toast_until = 0;
-        DIRTY.store(true, Ordering::Relaxed);
-    }
-    if t / 100 != LAST_CHECK.swap(t / 100, Ordering::Relaxed) && clock_secs() / 60 != s.last_minute {
-        DIRTY.store(true, Ordering::Relaxed);
-    }
-    if DIRTY.swap(false, Ordering::Relaxed) {
-        paint::draw();
-    }
-    WALK.store(s.launcher, Ordering::Relaxed);
+    settle(before);
+    WALK.store(st().launcher, Ordering::Relaxed);
     // the copy to the screen happens here, in mainline, never in the timer interrupt
     crate::screen::flush();
 }
@@ -990,7 +1179,68 @@ pub fn relayout() {
     redraw_now();
 }
 
+/// After a batch of input: find the damaged boxes (the snapshot taken before it, the changes
+/// that mark themselves) and draw them, or the whole desktop.
+fn settle(before: Snap) {
+    let s = st();
+    let mut want = DIRTY.swap(false, Ordering::Relaxed);
+    if TERM_DIRTY.swap(false, Ordering::Relaxed) && s.wins[App::Terminal as usize].open && !s.wins[App::Terminal as usize].min {
+        damage(win_box(App::Terminal as usize)); // new shell text
+        want = true;
+    }
+    let t = crate::sched::ticks();
+    if s.toast_until != 0 && t >= s.toast_until {
+        s.toast_until = 0;
+        want = true; // the toast's box, from the snapshots
+    }
+    if t / 100 != LAST_CHECK.swap(t / 100, Ordering::Relaxed) {
+        // once a second: what changes with time alone
+        if clock_secs() / 60 != s.last_minute {
+            damage((0, H() - 34, spine_w(), 34)); // the clock at the Spine's foot
+            want = true;
+        }
+        // the uptime line in About and Settings and under the Circle
+        for a in [App::Settings as usize, App::About as usize] {
+            if s.wins[a].open && !s.wins[a].min && !s.touch {
+                damage(paint::uptime_box(a));
+                want = true;
+            } else if s.wins[a].open && !s.wins[a].min {
+                damage(win_box(a));
+                want = true;
+            }
+        }
+        if s.launcher {
+            let (ix, iy, iw, _) = circle_info_box();
+            damage((ix, iy + 26, iw, 9));
+            want = true;
+        }
+        // the network: the Spine's glyph, Settings and the Circle show it
+        let net = (crate::virtio::net_present(), crate::virtio::dhcp_ip());
+        // SAFETY: mainline only.
+        if unsafe { core::mem::replace(&mut *core::ptr::addr_of_mut!(LAST_NET), Some(net)) } != Some(net) {
+            damage(dock_box());
+            for a in [App::Settings as usize] {
+                if s.wins[a].open && !s.wins[a].min {
+                    damage(win_box(a));
+                }
+            }
+            if s.launcher {
+                damage(grow(circle_info_box(), 4));
+            }
+            want = true;
+        }
+    }
+    let after = snap();
+    if want && before != after && !diff(&before, &after) {
+        FULL.store(true, Ordering::Relaxed);
+    }
+    frame(want);
+}
+
 fn redraw_now() {
+    // SAFETY: mainline only.
+    unsafe { NDMG_USED = 0 };
+    FULL.store(false, Ordering::Relaxed);
     DIRTY.store(false, Ordering::Relaxed);
     WALK.store(st().launcher, Ordering::Relaxed);
     if st().shown {
@@ -1047,14 +1297,42 @@ pub fn command(rest: &str) {
                 crate::kprintln!("[desk] notifications closed");
             }
         }
+        "verify" => {
+            // the rows as the partial frames left them, against a full redraw (section 15). The
+            // uptime shown changes with the second, so a check the second turned under is not a
+            // damage error: it is taken again (at most 3 times)
+            let ch = crate::canvas::height();
+            let mut differ = 0;
+            for _ in 0..3 {
+                let sec = crate::sched::ticks() / 100;
+                settle(snap());
+                // SAFETY: mainline only.
+                let rows = unsafe { &mut *core::ptr::addr_of_mut!(ROWS) };
+                row_hashes(rows);
+                paint::draw();
+                // SAFETY: mainline only.
+                let now = unsafe { &mut *core::ptr::addr_of_mut!(ROWS_NOW) };
+                row_hashes(now);
+                differ = (0..ch).filter(|&y| now[y] != rows[y]).count();
+                if crate::sched::ticks() / 100 == sec {
+                    break;
+                }
+            }
+            // SAFETY: scalar read.
+            let parts = unsafe { paint::PART_US.2 };
+            crate::kprintln!("[desk] verify: {} of {} rows differ after a full redraw ({} partial frame(s) drawn before it)", differ, ch, parts);
+            return;
+        }
         "perf" => {
             // how long the desktop takes on this machine (the 2012 laptop target, sovereign-ui.md 8)
             // SAFETY: scalar reads.
             let (dl, dw) = unsafe { paint::DRAW_US };
+            // SAFETY: scalar reads.
+            let (pl, pw, pn) = unsafe { paint::PART_US };
             let (cl, cw, n) = crate::screen::copy_perf();
             crate::kprintln!(
-                "[desk] perf: {}x{} at UI scale {}x; draw {} us (worst {} us) over {} frame(s); copy to the screen {} us (worst {} us) over {} copies",
-                W(), H(), crate::canvas::scale(), dl, dw, s.frames, cl, cw, n
+                "[desk] perf: {}x{} at UI scale {}x; draw {} us (worst {} us) over {} frame(s); partial {} us (worst {} us) over {} frame(s); copy to the screen {} us (worst {} us) over {} copies",
+                W(), H(), crate::canvas::scale(), dl, dw, s.frames - pn, pl, pw, pn, cl, cw, n
             );
             return;
         }
@@ -1171,7 +1449,7 @@ pub fn command(rest: &str) {
         }
         _ => {
             crate::kprintln!("desk: open|close|min|focus <app>, next, launcher, key <name>, tap <x> <y>,");
-            crate::kprintln!("      drag <x> <y> <dx> <dy>, mode pointer|touch, notify <text>, notes, perf, select <file>,");
+            crate::kprintln!("      drag <x> <y> <dx> <dy>, mode pointer|touch, notify <text>, notes, perf, verify, select <file>,");
             crate::kprintln!("      move <app> <dx> <dy>, list");
             return;
         }

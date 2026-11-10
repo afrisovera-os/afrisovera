@@ -30,9 +30,14 @@ SECTIONS
     . = ALIGN(16);
     __bss_end = .;
 
-    /* Boot stack: grows down from __stack_top. 512 KiB is plenty for Phase 0. */
+    /* Boot stack: grows down from __stack_top, into the top of .bss if it overflows (no guard page).
+     * 1 MiB since 10 Nov 2026: 512 KiB was NOT enough for the debug-build shell. The `wasmops` and
+     * Asili voice commands ran past it; on master that landed silently on the top of the 1 MiB heap,
+     * and when a .bss reorder put nia::WASM_MEM / voice::UTTER there instead, zeroing WASM_MEM wiped
+     * the live stack and the shell hung (smoke + wasm-ops red, green again with only this line
+     * changed: Actions 42919704846). See the mesh F1/F4 hand-over note. */
     . = ALIGN(16);
-    . += 0x80000;
+    . += 0x100000;
     __stack_top = .;
 
     /* Per-core stack for a secondary CPU brought up via PSCI (SMP). */

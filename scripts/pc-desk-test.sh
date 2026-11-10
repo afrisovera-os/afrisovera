@@ -161,6 +161,9 @@ grade() { # grade <serial> <pixels>
     fi
     printf '%s\n' "$S" | grep -aqE '^\[desk\] perf: [0-9]+x[0-9]+ at UI scale [0-9]x; draw [0-9]+ us \(worst [0-9]+ us\)' ||
         _f "desk perf did not report the draw and copy times"
+    # slice 3 (sovereign-ui.md 15): the partial frames left exactly what a full redraw draws
+    printf '%s\n' "$S" | grep -aqE '^\[desk\] verify: 0 of [0-9]+ rows differ after a full redraw \([1-9][0-9]* partial frame' ||
+        _f "desk verify did not find the desktop as a full redraw draws it after partial frames (or none were partial)"
     if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
     return "$fail"
 }
@@ -196,7 +199,9 @@ afrisovera> desk list
 afrisovera> screen ui
 screen: the desktop is ${DW}x${DH} logical pixels at UI scale ${SC}x; type: screen ui 1, 2, 3, 4 or auto
 afrisovera> desk perf
-[desk] perf: ${DW}x${DH} at UI scale ${SC}x; draw 2210 us (worst 4120 us) over 31 frame(s); copy to the screen 180 us (worst 2950 us) over 40 copies"
+[desk] perf: ${DW}x${DH} at UI scale ${SC}x; draw 2210 us (worst 4120 us) over 31 frame(s); copy to the screen 180 us (worst 2950 us) over 40 copies
+afrisovera> desk verify
+[desk] verify: 0 of ${DH} rows differ after a full redraw (25 partial frame(s) drawn before it)"
 }
 green_px() {
     local DW DH SC FX FY TX TY SX SY p
@@ -248,6 +253,9 @@ selftest() {
     arm corner-is-frame red "$G" "$(printf '%s\n' "$GPX" | sed 's/^corner=.*/corner=0A0E14/')"
     arm no-screen-ui red "$(printf '%s\n' "$G" | grep -v '^screen: the desktop')" "$GPX"
     arm no-perf red "$(printf '%s\n' "$G" | grep -v '^\[desk\] perf')" "$GPX"
+    arm stale-rows red "$(printf '%s\n' "$G" | sed 's/verify: 0 of/verify: 12 of/')" "$GPX"
+    arm no-partial-frames red "$(printf '%s\n' "$G" | sed 's/(25 partial/(0 partial/')" "$GPX"
+    arm no-verify red "$(printf '%s\n' "$G" | grep -v '^\[desk\] verify')" "$GPX"
     PC_DESK_SCREEN=1920x1080 arm wrong-screen-size red "$G" "$GPX"
     # the other screens the wrapper suites ask for: their own green logs pass
     G1="$(PC_DESK_SCREEN=1920x1080 green_log)" P1="$(PC_DESK_SCREEN=1920x1080 green_px)"
@@ -262,7 +270,7 @@ selftest() {
     PC_DESK_SCREEN=2560x1440 PC_DESK_UI=1 PC_DESK_CAPPED=1 arm not-cut red "$(printf '%s\n' "$BIG" | sed 's/is 1920x1200 logical/is 2560x1440 logical/')" "$BIGPX"
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 31 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 34 ]
 }
 
 echo "== the desktop on the PC: USB mouse and keyboard =="
@@ -299,7 +307,7 @@ python3 scripts/lib/usb-steps.py 4942 4943 "$W/serial.log" "$(winpath "$W/shot.p
     "move:$((FX + 140 - 20)),$((FY + 14 - 68))" down "move:60,40" up "wait:1" \
     "keys:alt+tab" "keys:meta_l" "keys:esc" "keys:meta_l+down" "keys:alt+f4" "keys:alt+tab" "wait:1" \
     "keys:meta_l" "keys:right" "keys:right" "keys:ret" "wait:1" "keys:meta_l+2" "wait:1" \
-    "type:lsusb" "type:desk list" "type:screen ui" "type:desk perf" "wait:2"
+    "type:lsusb" "type:desk list" "type:screen ui" "type:desk perf" "type:desk verify" "wait:2"
 kill "$QPID" 2> /dev/null
 wait "$QPID" 2> /dev/null
 {

@@ -22,10 +22,13 @@ publish = false
 
 [dependencies]
 # Exact version pins (coordinator steer): reproducible without a committed lockfile, well-known audited crates.
-x25519-dalek = { version = "=2.0.1", default-features = false, features = ["static_secrets"] }
-ed25519-dalek = { version = "=2.1.1", default-features = false }
+# "zeroize": the dalek secret types wipe themselves on drop (F1, review S2).
+x25519-dalek = { version = "=2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
+ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["zeroize"] }
 chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
 # The sovereign glue (SHA-256, HMAC/HKDF, wire layout, tag derivations), validated in milestone 1.
 mesh-crypto = { path = "../mesh-crypto" }
+# Already in the tree through chacha20poly1305 (same pinned version): used to wipe secrets (F1).
+zeroize = { version = "=1.9.1", default-features = false }
 
 [workspace]

@@ -16,11 +16,21 @@
 # (scripts/lib/pc-arch) on PATH itself.
 #   scripts/pc-bootplan-test.sh              # grader selftest, then the two QEMU boots
 #   scripts/pc-bootplan-test.sh --selftest   # grader selftest only
+# BOOTPLAN_KIND=ide (scripts/pc-bootplan-ide-test.sh, 10 Nov 2026): the same two boots with the GPT disks on SATA disks
+# in IDE mode (QEMU's piix3-ide): the Windows-like disk is ide1 (primary slave) in boot 1; the full one is ide1, the one
+# not closed cleanly ide2 (secondary master) and the MBR disk ide3 (secondary slave) in boot 2. The primary master
+# (ide0) is an empty FAT folder disk only so the firmware's NvVars file lands there, as in pc-bootcopy-ide.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T="${TMPDIR:-/tmp}"
 
 FILE_RE='\\EFI\\afrisovera\\afrisovera\.efi'
+KIND="${BOOTPLAN_KIND:-sata}"
+if [ "$KIND" = ide ]; then
+    DN2=ide1; DN3=ide2; DN4=ide3; PORT=6380; UP=" IDE"
+else
+    DN2="sata port 2"; DN3="sata port 3"; DN4="sata port 4"; PORT=5380; UP=""
+fi
 grade() { # grade <boot1 log> <boot2 log>
     local fail=0 A B
     _f() { echo "  FAIL: $*"; fail=1; }
@@ -36,28 +46,28 @@ grade() { # grade <boot1 log> <boot2 log>
     AP="$(blk "$A" 'bootplan')"; AE="$(blk "$A" 'bootentries')"; BP="$(blk "$B" 'bootplan')"
     in_blk "$AP" "bootplan: AfriSovera's boot file is [1-9][0-9]* KiB \(kept at power-on\)" ||
         _f "boot 1: bootplan did not give the boot file's size"
-    N1="$(disk "$AP" 'sata port 2')"
+    N1="$(disk "$AP" "$DN2")"
     in_blk "$AP" '  it holds no file system we know' || _f "boot 1: the unformatted EFI partition on NVMe was not passed over"
-    in_blk "$N1" 'bootplan: sata port 2: EFI system partition \(GPT entry 1, LBA 2048-206847, 100 MiB\)' ||
-        _f "boot 1: the SATA disk's EFI partition was not found as GPT entry 1, LBA 2048-206847"
+    in_blk "$N1" "bootplan: $DN2: EFI system partition \\(GPT entry 1, LBA 2048-206847, 100 MiB\\)" ||
+        _f "boot 1: the $DN2 disk's EFI partition was not found as GPT entry 1, LBA 2048-206847"
     in_blk "$N1" '  FAT32, 512-byte clusters, 100776 KiB free' || _f "boot 1: the EFI partition's free room was not 100776 KiB"
     in_blk "$N1" '  \\EFI holds: Microsoft, BOOT' || _f "boot 1: \\EFI's folders (Microsoft by its long name, BOOT) were not listed"
     in_blk "$N1" "  plan: AfriSovera's boot file would be copied to $FILE_RE \([1-9][0-9]* KiB of the 100776 KiB free\); nothing else in this partition changes" ||
         _f "boot 1: the boot file was not planned into the EFI partition"
     local num free
-    num="$(printf '%s\n' "$AP" | sed -nE 's/^  boot entry: (Boot[0-9A-F]{4}) "AfriSovera" -> sata port 2 partition 1 \(start 2048\)\\EFI\\afrisovera\\afrisovera\.efi would be added at the END of BootOrder$/\1/p')"
+    num="$(printf '%s\n' "$AP" | sed -nE 's/^  boot entry: (Boot[0-9A-F]{4}) "AfriSovera" -> '"$DN2"' partition 1 \(start 2048\)\\EFI\\afrisovera\\afrisovera\.efi would be added at the END of BootOrder$/\1/p')"
     free="$(printf '%s\n' "$AE" | sed -nE 's/^  [0-9]+ entries; the next free number is (Boot[0-9A-F]{4})$/\1/p')"
-    if [ -z "$num" ]; then _f "boot 1: no boot entry was planned at the end of BootOrder for sata port 2 partition 1"
+    if [ -z "$num" ]; then _f "boot 1: no boot entry was planned at the end of BootOrder for $DN2 partition 1"
     elif [ "$num" != "$free" ]; then _f "boot 1: the planned entry $num is not the next free number bootentries gives (${free:-none})"; fi
     in_blk "$AP" "  the PC keeps starting \".+\" first; AfriSovera is picked from the firmware's boot menu" ||
         _f "boot 1: bootplan did not say the PC keeps its first choice"
-    S2="$(disk "$BP" 'sata port 2')"; S3="$(disk "$BP" 'sata port 3')"
+    S2="$(disk "$BP" "$DN2")"; S3="$(disk "$BP" "$DN3")"
     in_blk "$(disk "$BP" nvme)" '  it holds no file system we know' || _f "boot 2: the unformatted EFI partition was not refused"
     in_blk "$S2" '  FAT32, 512-byte clusters, 64 KiB free' || _f "boot 2: the full EFI partition's 64 KiB free was not counted"
     in_blk "$S2" '  plan: none -- the boot file needs [1-9][0-9]* KiB here, only 64 KiB free' || _f "boot 2: the full EFI partition was not refused for room"
     in_blk "$S3" "  plan: none -- the file system was not closed cleanly \(Windows Fast Startup or a crash\): not changed until Windows has checked it" ||
         _f "boot 2: the EFI partition not closed cleanly was not refused"
-    in_blk "$BP" 'bootplan: sata port 4: an old MBR disk \(boot entries are planned on GPT disks only\)' || _f "boot 2: the MBR disk was not left out"
+    in_blk "$BP" "bootplan: $DN4: an old MBR disk \\(boot entries are planned on GPT disks only\\)" || _f "boot 2: the MBR disk was not left out"
     in_blk "$BP" '  boot entry: none planned -- no EFI system partition with room' || _f "boot 2: an entry was planned with no partition to hold the file"
     printf '%s\n' "$BP" | grep -aq 'would be copied to' && _f "boot 2: a boot file was planned where none fits"
     for L in "$AP" "$BP"; do
@@ -110,6 +120,13 @@ bootplan: sata port 4: an old MBR disk (boot entries are planned on GPT disks on
 bootplan: a plan only -- nothing was written; adding it will ask for the owner's word, with the way back
 afrisovera>
 harness: disk images unchanged"
+if [ "$KIND" = ide ]; then # the same output with the disks named as IDE-mode disks, ide0 being the NvVars folder disk
+    M0='bootplan: sata port 0: an old MBR disk (boot entries are planned on GPT disks only)'
+    M1="$M0
+bootplan: ide0: an old MBR disk (boot entries are planned on GPT disks only)"
+    B1="${B1//sata port 2/$DN2}"; B1="${B1//"$M0"/$M1}"
+    B2="${B2//sata port 4/$DN4}"; B2="${B2//sata port 3/$DN3}"; B2="${B2//sata port 2/$DN2}"; B2="${B2//"$M0"/$M1}"
+fi
 
 selftest() {
     local D pass=0 bad=0
@@ -135,7 +152,7 @@ selftest() {
     arm unformatted-ok red "$B1" "$(printf '%s\n' "$B2" | grep -v 'holds no file system')"
     arm full-planned red "$B1" "$(printf '%s\n' "$B2" | sed 's/  plan: none -- the boot file needs 2354 KiB here, only 64 KiB free/  plan: AfriSovera'"'"'s boot file would be copied to \\EFI\\afrisovera\\afrisovera.efi (2354 KiB of the 64 KiB free); nothing else in this partition changes/')"
     arm dirty-not-refused red "$B1" "$(printf '%s\n' "$B2" | grep -v 'not closed cleanly')"
-    arm mbr-not-named red "$B1" "$(printf '%s\n' "$B2" | grep -v 'sata port 4: an old MBR')"
+    arm mbr-not-named red "$B1" "$(printf '%s\n' "$B2" | grep -v "$DN4: an old MBR")"
     arm entry-without-room red "$B1" "$(printf '%s\n' "$B2" | grep -v 'none planned')"
     arm no-plan-only-line red "$(printf '%s\n' "$B1" | grep -v '^bootplan: a plan only')" "$B2"
     arm image-changed red "$B1" "$(printf '%s\n' "$B2" | sed 's/disk images unchanged/disk images CHANGED/')"
@@ -146,9 +163,9 @@ selftest() {
     [ "$bad" -eq 0 ] && [ "$pass" -eq 19 ]
 }
 
-echo "== PC boot plan next to Windows, read only (PC track step 5) =="
-if ! selftest; then echo "PC BOOTPLAN TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC BOOTPLAN SELFTEST ONLY -- no measurement taken"; exit 0; }
+echo "== PC boot plan next to Windows, read only${UP:+, disks in IDE mode} (PC track step 5) =="
+if ! selftest; then echo "PC BOOTPLAN${UP} TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC BOOTPLAN${UP} SELFTEST ONLY -- no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }
@@ -169,6 +186,14 @@ for k in gpt gpt-esp gpt-esp-full gpt-esp-dirty mbr; do
     "$PY" scripts/lib/make-disk-image.py "$k" "$W/$k.img" || { echo "PC BOOTPLAN TEST FAILED (harness: could not make $k.img)"; exit 1; }
 done
 (cd "$W" && md5sum gpt.img gpt-esp.img gpt-esp-full.img gpt-esp-dirty.img mbr.img > before.md5)
+if [ "$KIND" = ide ]; then # piix3-ide: ide0 is the NvVars folder disk, then ide1, ide2, ide3 in this order
+    mkdir -p "$W/nvvars"
+    NV="$W/nvvars"; command -v cygpath > /dev/null && NV="$(cygpath -m "$NV")"
+    NVD=(-device piix3-ide,id=pide -drive "file=fat:rw:$NV,if=none,format=raw,id=nv" -device ide-hd,drive=nv,bus=pide.0,unit=0)
+    AT2=bus=pide.0,unit=1; AT3=bus=pide.1,unit=0; AT4=bus=pide.1,unit=1
+else
+    NVD=(); AT2=bus=ide.2; AT3=bus=ide.3; AT4=bus=ide.4
+fi
 
 boot() { # boot <serial port> <log> <nvme image> <commands (| between)> <extra qemu args...>
     local sp=$1 log=$2 img=$3 cmds=$4; shift 4
@@ -183,22 +208,22 @@ boot() { # boot <serial port> <log> <nvme image> <commands (| between)> <extra q
     if (cd "$W" && md5sum -c --quiet before.md5 > /dev/null 2>&1); then printf '\nharness: disk images unchanged\n' >> "$log"
     else printf '\nharness: disk images CHANGED\n' >> "$log"; fi
 }
-echo "  --- boot 1: unformatted EFI partition on NVMe, Windows-like FAT32 EFI partition on SATA 2: bootentries, bootplan ---"
-boot 5380 "$W/boot1.log" "$W/gpt.img" 'bootentries|bootplan' \
-    -drive "file=$W/gpt-esp.img,if=none,format=raw,id=sb" -device ide-hd,drive=sb,bus=ide.2
-echo "  --- boot 2: unformatted EFI partition on NVMe, full / not-closed EFI partitions on SATA 2 / 3, MBR on SATA 4 ---"
-boot 5384 "$W/boot2.log" "$W/gpt.img" 'bootplan' \
-    -drive "file=$W/gpt-esp-full.img,if=none,format=raw,id=sb" -device ide-hd,drive=sb,bus=ide.2 \
-    -drive "file=$W/gpt-esp-dirty.img,if=none,format=raw,id=sc" -device ide-hd,drive=sc,bus=ide.3 \
-    -drive "file=$W/mbr.img,if=none,format=raw,id=se" -device ide-hd,drive=se,bus=ide.4
+echo "  --- boot 1: unformatted EFI partition on NVMe, Windows-like FAT32 EFI partition on $DN2: bootentries, bootplan ---"
+boot "$PORT" "$W/boot1.log" "$W/gpt.img" 'bootentries|bootplan' "${NVD[@]}" \
+    -drive "file=$W/gpt-esp.img,if=none,format=raw,id=sb" -device "ide-hd,drive=sb,$AT2"
+echo "  --- boot 2: unformatted EFI partition on NVMe, full / not-closed EFI partitions on $DN2 / $DN3, MBR on $DN4 ---"
+boot "$((PORT+4))" "$W/boot2.log" "$W/gpt.img" 'bootplan' "${NVD[@]}" \
+    -drive "file=$W/gpt-esp-full.img,if=none,format=raw,id=sb" -device "ide-hd,drive=sb,$AT2" \
+    -drive "file=$W/gpt-esp-dirty.img,if=none,format=raw,id=sc" -device "ide-hd,drive=sc,$AT3" \
+    -drive "file=$W/mbr.img,if=none,format=raw,id=se" -device "ide-hd,drive=se,$AT4"
 cat "$W/boot1.log" "$W/boot2.log" | tr -d '\r' | grep -aE '^afrisovera> boot|^bootplan|^  (FAT32|\\EFI|no \\EFI|it |plan|boot entry|the PC|[0-9]+ entries)|^harness' | sed 's/^/  | /'
 
 echo "  --- grading ---"
 if grade "$W/boot1.log" "$W/boot2.log"; then
     rm -rf "$W"
-    echo "PC BOOTPLAN TEST PASSED"
+    echo "PC BOOTPLAN${UP} TEST PASSED"
     exit 0
 fi
 echo "  logs kept in $W"
-echo "PC BOOTPLAN TEST FAILED"
+echo "PC BOOTPLAN${UP} TEST FAILED"
 exit 1

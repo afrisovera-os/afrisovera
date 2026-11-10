@@ -206,3 +206,24 @@ not sit as a 640x480 box in a dark frame.
   theme (palette, cloths, cut-corner primitives, text, icons) and every drawing function. Paint reads the model;
   the model never draws. When the phone moves over, it keeps this model and gets a phone paint (or the same one with
   the touch profile), instead of a third copy of the desktop.
+
+## 15. Slice 3 (10 Nov 2026): a change repaints only what it touches
+
+Until now every change (a window dragged one step, a close button lit, the clock's minute) redrew the whole desktop:
+about 64 ms in QEMU for 960x540, far more pixels than changed.
+
+- **What changed is found, not guessed.** Before the desktop handles a batch of input it takes a small snapshot of
+  the scene (each window's place, open or minimised, focus and stacking; the Circle and its chosen app; the
+  notification list and the bell's count; the toast; the lit close button). After the batch it compares: each
+  window that moved, opened, closed or changed focus damages its old and new box (shadow included) and the Spine (its
+  beads); the Circle, the list and the toast damage their own boxes. Changes the snapshot cannot see mark their box
+  themselves: new Terminal text (Terminal's window), the clock's minute (the Spine's foot), a click in Files or
+  Settings (that window).
+- **At most 8 damaged boxes** per frame; a ninth folds them all into one box round them. Anything the desktop cannot
+  place (a new UI scale, the input profile, a script command) redraws everything, as before. If something asked for
+  a redraw and no box was found, the whole desktop is redrawn: correctness first.
+- **Paint draws each box on its own:** every fill is clipped to the box, and a window, the Spine, the Circle, the list
+  or the toast that does not touch the box is skipped whole. The wallpaper draws only the box's rows and marks.
+- **Checked, not trusted:** `desk verify` hashes every row of the desktop as the boxes left it, redraws everything,
+  and counts the rows that differ; pc-desk requires 0 after its mouse and keyboard walk. `desk perf` counts full and
+  partial frames and times them apart.

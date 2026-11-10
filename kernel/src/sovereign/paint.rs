@@ -64,7 +64,19 @@ const CLOTH: [[u32; 3]; 4] = [[OCHRE, NIGHT, GOLD], [GREEN, NIGHT, GOLD], [INDIG
 /// window's bottom-right cut corner stays cut: (x, y, w, h, cut). Mainline only.
 static mut CLIP: Option<(i32, i32, i32, i32, i32)> = None;
 
+/// The damaged box being redrawn (sovereign-ui.md section 15): every fill is clipped to it.
+/// The whole screen when a full frame is drawn. Mainline only.
+static mut DCLIP: Rect = (0, 0, i32::MAX / 2, i32::MAX / 2);
+
 fn rect(x: i32, y: i32, w: i32, h: i32, c: u32) {
+    // SAFETY: DCLIP is set and reset around a partial frame, in mainline only.
+    let (dx, dy, dw, dh) = unsafe { DCLIP };
+    let (x0c, y0c) = (x.max(dx), y.max(dy));
+    let (w, h) = ((x + w).min(dx + dw) - x0c, (y + h).min(dy + dh) - y0c);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let (x, y) = (x0c, y0c);
     let (mut x0, mut y0) = (x.max(0), y.max(0));
     let (mut x1, mut y1) = ((x + w).min(W()), (y + h).min(H()));
     // SAFETY: CLIP is set and cleared around an app's body drawing, in mainline only.
@@ -230,6 +242,12 @@ fn ink(g: &[u8; 8]) -> Option<(i32, i32)> {
 
 /// Proportional text (as framebuffer::draw_string) with lower case; returns the end x.
 fn text(x0: i32, y0: i32, s: &[u8], c: u32, scale: i32) -> i32 {
+    // a line wholly above or below the box being redrawn: only its width is needed
+    // SAFETY: mainline only.
+    let (_, dy, _, dh) = unsafe { DCLIP };
+    if !s.is_empty() && (y0 >= dy + dh || y0 + 8 * scale <= dy) {
+        return x0 + text_w(s, scale) + scale;
+    }
     let mut x = x0;
     for &b in s {
         if b == b' ' {
@@ -266,6 +284,11 @@ fn text_w(s: &[u8], scale: i32) -> i32 {
 
 /// Monospace text (the Terminal), clipped to `cols` characters of 6 px.
 fn mono(x: i32, y: i32, s: &[u8], c: u32, cols: usize) {
+    // SAFETY: mainline only.
+    let (_, dy, _, dh) = unsafe { DCLIP };
+    if y >= dy + dh || y + 8 <= dy {
+        return; // a line outside the box being redrawn
+    }
     for (i, &b) in s.iter().take(cols).enumerate() {
         let g = glyph(b);
         for (row, bits) in g.iter().enumerate() {
@@ -358,16 +381,21 @@ fn icon(app: Option<App>, x: i32, y: i32, s: i32) {
 
 fn wallpaper() {
     let sw = spine_w();
-    for y in 0..H() {
+    // SAFETY: mainline only.
+    let (cx0, cy0, cw, ch) = unsafe { DCLIP };
+    let (y0, y1) = (cy0.max(0), (cy0 + ch).min(H()));
+    for y in y0..y1 {
         rect(sw, y, W() - sw, 1, lerp(WALL_TOP, WALL_BOT, y * 100 / H()));
     }
     if st().wallpaper {
         // mud cloth (bogolanfini): a grid of small marks, a dot and a chevron in turn, one
-        // shade above the soil, so they are felt more than seen (sovereign-ui.md section 6)
-        let (mut y, mut j) = (12, 0);
-        while y < H() - 8 {
-            let (mut x, mut i) = (sw + 12, 0);
-            while x < W() - 8 {
+        // shade above the soil, so they are felt more than seen (sovereign-ui.md section 6);
+        // only the marks near the clip (a partial frame) are visited
+        let (jy0, ix0) = (((y0 - 12 - 4) / 24).max(0), ((cx0 - sw - 12 - 4) / 24).max(0));
+        let (mut y, mut j) = (12 + jy0 * 24, jy0);
+        while y < (H() - 8).min(y1 + 4) {
+            let (mut x, mut i) = (sw + 12 + ix0 * 24, ix0);
+            while x < (W() - 8).min(cx0 + cw + 4) {
                 if (i + j) % 2 == 0 {
                     rect(x, y, 2, 2, MUD);
                 } else {
@@ -740,6 +768,19 @@ fn settings_app(a: usize, x: i32, y: i32, w: i32, _h: i32) {
     let _ = (w, a);
 }
 
+/// The line where Settings or About shows the uptime (it changes every second), as a box on
+/// the desktop; the model damages only that line once a second (sovereign-ui.md section 15).
+pub(super) fn uptime_box(a: usize) -> Rect {
+    let (x, y, w, h) = win_rect(a);
+    let th = title_h();
+    let (bx, by, bw, bh) = (x + 1, y + th + 1, w - 2, h - th - 2);
+    if APPS[a] == App::Settings {
+        return (bx, by + 212, bw, 9);
+    }
+    let mh = (bh * 38 / 100).max(40);
+    (bx, by + 16 + mh + 14 + 22 + 18 + 10 + 3 * 14, bw, 9)
+}
+
 fn about_app(x: i32, y: i32, w: i32, h: i32) {
     rect(x, y, w, h, 0x0C_09_07);
     let mh = (h * 38 / 100).max(40);
@@ -846,18 +887,27 @@ fn notes_panel() {
     }
 }
 
-fn toast() {
+/// The toast's box while it shows (shadow included), else None. The model uses it for damage.
+pub(super) fn toast_box() -> Option<Rect> {
     let s = st();
     if s.nnotes == 0 || s.notes_open || crate::sched::ticks() >= s.toast_until {
-        return;
+        return None;
     }
     let i = (s.nnotes - 1) % NNOTE;
-    let msg = &s.notes[i][..s.note_len[i]];
-    let w = text_w(msg, 1) + 40;
+    let w = text_w(&s.notes[i][..s.note_len[i]], 1) + 40;
     // pointer: the top right corner; touch: a snackbar at the foot, never over a lintel
     // (design review D2)
     let sw = spine_w();
     let (x, y) = if s.touch { (sw + (W() - sw - w) / 2, H() - 46) } else { (W() - w - 10, TOP + 10) };
+    Some((x, y, w + 3, 28 + 3))
+}
+
+fn toast() {
+    let s = st();
+    let Some((x, y, w, _)) = toast_box() else { return };
+    let w = w - 3;
+    let i = (s.nnotes - 1) % NNOTE;
+    let msg = &s.notes[i][..s.note_len[i]];
     cut(x + 3, y + 3, w, 28, 6, 0, 6, 0, SHADOW);
     cut(x, y, w, 28, 6, 0, 6, 0, SURFACE2);
     cut_frame(x, y, w, 28, 6, 0, 6, 0, GOLD_DARK);
@@ -890,3 +940,46 @@ pub(super) fn draw() {
 
 /// The last and the worst whole-desktop draw, in microseconds (`desk perf`).
 pub(super) static mut DRAW_US: (u64, u64) = (0, 0);
+/// Partial frames (only the damaged boxes): last and worst time in microseconds, and how many.
+pub(super) static mut PART_US: (u64, u64, u64) = (0, 0, 0);
+
+fn touches(a: Rect, b: Rect) -> bool {
+    a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
+}
+
+/// Redraw only the damaged boxes (sovereign-ui.md section 15): each box on its own, every fill
+/// clipped to it, and whatever does not touch it skipped whole.
+pub(super) fn draw_damage(boxes: &[Rect]) {
+    let s = st();
+    let t0 = crate::timer::cycles();
+    for &r in boxes {
+        // SAFETY: mainline only; reset below.
+        unsafe { DCLIP = r };
+        wallpaper();
+        for k in 0..s.nz {
+            let a = s.z[k];
+            if touches(win_box(a), r) {
+                window(a);
+            }
+        }
+        if touches(dock_box(), r) {
+            spine();
+        }
+        if toast_box().is_some_and(|b| touches(b, r)) {
+            toast();
+        }
+        if s.notes_open && touches(grow(notes_box(), 4), r) {
+            notes_panel();
+        }
+        if s.launcher && (touches(grow(launcher_box(), 4), r) || touches(grow(circle_info_box(), 4), r)) {
+            launcher();
+        }
+    }
+    // SAFETY: as above.
+    unsafe { DCLIP = (0, 0, i32::MAX / 2, i32::MAX / 2) };
+    s.frames += 1;
+    let us = crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / crate::timer::hz().max(1);
+    // SAFETY: mainline only.
+    unsafe { PART_US = (us, PART_US.1.max(us), PART_US.2 + 1) };
+    crate::screen::mark();
+}

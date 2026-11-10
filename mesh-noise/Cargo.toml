@@ -18,9 +18,12 @@ description = "Small no_std Noise XX/KK (25519_ChaChaPoly_SHA256) for the AfriSo
 publish = false
 
 [dependencies]
-x25519-dalek = { version = "=2.0.1", default-features = false, features = ["static_secrets"] }
+# "zeroize": dalek's StaticSecret / SharedSecret wipe themselves on drop (F1, review S2).
+x25519-dalek = { version = "=2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
 chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
 mesh-crypto = { path = "../mesh-crypto" }
+# Already in the tree through chacha20poly1305 (same pinned version): used to wipe secrets (F1).
+zeroize = { version = "=1.9.1", default-features = false }
 
 [dev-dependencies]
 snow = "=0.9.6"

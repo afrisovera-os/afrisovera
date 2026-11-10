@@ -18,6 +18,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 /// X25519 public key for a (clamped) secret scalar.
 pub fn x25519_public(secret: &[u8; 32]) -> [u8; 32] {
@@ -76,6 +77,7 @@ pub fn aead_open(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]
 
 /// X25519 with the RFC 9180 "contributory" check (review S1): reject an all-zero shared secret (a low-order
 /// peer key), returning `None` so the HPKE step fails cleanly instead of using a degenerate secret.
+// The dalek `zeroize` feature makes the StaticSecret and SharedSecret here wipe themselves on drop (F1).
 fn x25519_dh_checked(secret: &[u8; 32], peer: &[u8; 32]) -> Option<[u8; 32]> {
     let shared = StaticSecret::from(*secret).diffie_hellman(&PublicKey::from(*peer));
     if shared.was_contributory() {
@@ -121,10 +123,12 @@ fn labeled_expand(suite: &[u8], prk: &[u8; 32], label: &[u8], info: &[u8], l: us
 }
 
 fn extract_and_expand(dh: &[u8], kem_context: &[u8]) -> [u8; 32] {
-    let eae = labeled_extract(SUITE_KEM, &[], b"eae_prk", dh);
-    let ss = labeled_expand(SUITE_KEM, &eae, b"shared_secret", kem_context, 32);
+    let mut eae = labeled_extract(SUITE_KEM, &[], b"eae_prk", dh);
+    let mut ss = labeled_expand(SUITE_KEM, &eae, b"shared_secret", kem_context, 32);
     let mut out = [0u8; 32];
     out.copy_from_slice(&ss);
+    eae.zeroize();
+    ss.zeroize();
     out
 }
 
@@ -140,7 +144,9 @@ fn auth_encap(pk_r: &[u8; 32], sk_e: &[u8; 32], sk_s: &[u8; 32]) -> Option<([u8;
     ctx[..32].copy_from_slice(&enc);
     ctx[32..64].copy_from_slice(pk_r);
     ctx[64..].copy_from_slice(&pk_s);
-    Some((extract_and_expand(&dh, &ctx), enc))
+    let ss = extract_and_expand(&dh, &ctx);
+    dh.zeroize();
+    Some((ss, enc))
 }
 
 /// DHKEM AuthDecap: the shared secret, given the sender's claimed static key `pk_s`. `None` if either X25519 is
@@ -154,7 +160,9 @@ fn auth_decap(enc: &[u8; 32], sk_r: &[u8; 32], pk_s: &[u8; 32]) -> Option<[u8; 3
     ctx[..32].copy_from_slice(enc);
     ctx[32..64].copy_from_slice(&pk_r);
     ctx[64..].copy_from_slice(pk_s);
-    Some(extract_and_expand(&dh, &ctx))
+    let ss = extract_and_expand(&dh, &ctx);
+    dh.zeroize();
+    Some(ss)
 }
 
 fn key_schedule(mode: u8, ss: &[u8; 32], info: &[u8]) -> ([u8; 32], [u8; 12]) {
@@ -164,29 +172,38 @@ fn key_schedule(mode: u8, ss: &[u8; 32], info: &[u8]) -> ([u8; 32], [u8; 12]) {
     ctx.push(mode);
     ctx.extend_from_slice(&psk_id_hash);
     ctx.extend_from_slice(&info_hash);
-    let secret = labeled_extract(SUITE, ss, b"secret", &[]);
-    let keyv = labeled_expand(SUITE, &secret, b"key", &ctx, 32);
-    let noncev = labeled_expand(SUITE, &secret, b"base_nonce", &ctx, 12);
+    let mut secret = labeled_extract(SUITE, ss, b"secret", &[]);
+    let mut keyv = labeled_expand(SUITE, &secret, b"key", &ctx, 32);
+    let mut noncev = labeled_expand(SUITE, &secret, b"base_nonce", &ctx, 12);
     let mut key = [0u8; 32];
     key.copy_from_slice(&keyv);
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&noncev);
+    secret.zeroize();
+    keyv.zeroize();
+    noncev.zeroize();
     (key, nonce)
 }
 
 /// HPKE mode_auth single-shot seal (sequence 0): returns (enc, ciphertext||tag). `None` on a non-contributory
 /// X25519 or an AEAD refusal (review S1, P6).
 pub fn hpke_auth_seal(pk_r: &[u8; 32], sk_e: &[u8; 32], sk_s: &[u8; 32], info: &[u8], aad: &[u8], pt: &[u8]) -> Option<([u8; 32], Vec<u8>)> {
-    let (ss, enc) = auth_encap(pk_r, sk_e, sk_s)?;
-    let (key, nonce) = key_schedule(0x02, &ss, info);
-    Some((enc, aead_seal(&key, &nonce, aad, pt)?))
+    let (mut ss, enc) = auth_encap(pk_r, sk_e, sk_s)?;
+    let (mut key, nonce) = key_schedule(0x02, &ss, info);
+    let ct = aead_seal(&key, &nonce, aad, pt);
+    ss.zeroize();
+    key.zeroize();
+    Some((enc, ct?))
 }
 
 /// HPKE mode_auth single-shot open (sequence 0): `None` on authentication failure or a non-contributory X25519.
 pub fn hpke_auth_open(enc: &[u8; 32], sk_r: &[u8; 32], pk_s: &[u8; 32], info: &[u8], aad: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
-    let ss = auth_decap(enc, sk_r, pk_s)?;
-    let (key, nonce) = key_schedule(0x02, &ss, info);
-    aead_open(&key, &nonce, aad, ct)
+    let mut ss = auth_decap(enc, sk_r, pk_s)?;
+    let (mut key, nonce) = key_schedule(0x02, &ss, info);
+    let pt = aead_open(&key, &nonce, aad, ct);
+    ss.zeroize();
+    key.zeroize();
+    pt
 }
 
 // ---- AFR-0009 bundle (section 6) --------------------------------------------------------------------
@@ -226,7 +243,9 @@ pub fn bundle_seal(
     inner.resize(size - 92, 0);
     let hdr = mesh_crypto::bundle_header(ttl, bucket as u8, bundle_id, tag, expires);
     let aad = mesh_crypto::bundle_aad(&hdr);
-    let (enc, ct) = hpke_auth_seal(pk_r, sk_e, sk_s, CTX_BUNDLE, &aad, &inner).ok_or(Error::Crypto)?;
+    let sealed = hpke_auth_seal(pk_r, sk_e, sk_s, CTX_BUNDLE, &aad, &inner);
+    inner.zeroize(); // the plaintext body (F1)
+    let (enc, ct) = sealed.ok_or(Error::Crypto)?;
     let mut out = Vec::with_capacity(size);
     out.extend_from_slice(&hdr);
     out.extend_from_slice(&enc);
@@ -255,7 +274,13 @@ pub fn bundle_open(bundle: &[u8], sk_r: &[u8; 32], pk_s: &[u8; 32]) -> Option<(u
     enc.copy_from_slice(&bundle[44..76]);
     let ct = &bundle[76..];
     let aad = mesh_crypto::bundle_aad(&hdr);
-    let pt = hpke_auth_open(&enc, sk_r, pk_s, CTX_BUNDLE, &aad, ct)?;
+    let mut pt = hpke_auth_open(&enc, sk_r, pk_s, CTX_BUNDLE, &aad, ct)?;
+    let r = parse_inner(&pt);
+    pt.zeroize(); // the opened plaintext; the caller gets only its own copy of the body (F1)
+    r
+}
+
+fn parse_inner(pt: &[u8]) -> Option<(u8, u64, Vec<u8>)> {
     if pt.len() < 12 || pt[1] != 0 {
         return None;
     }

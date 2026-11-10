@@ -153,6 +153,22 @@ impl Sha256 {
     }
 }
 
+/// F1 (review S2): an HMAC hash state carries key material (the padded key is its first block), so a
+/// streaming state wipes its chaining value and buffer when dropped.
+impl Drop for Sha256 {
+    fn drop(&mut self) {
+        for w in self.h.iter_mut() {
+            // SAFETY: a valid &mut u32.
+            unsafe { core::ptr::write_volatile(w, 0) };
+        }
+        for b in self.buf.iter_mut() {
+            // SAFETY: a valid &mut u8.
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Write `digest` as lowercase hex into a 64-byte buffer.
 pub fn to_hex(d: &[u8; 32], out: &mut [u8; 64]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";

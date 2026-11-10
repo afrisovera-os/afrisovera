@@ -15,6 +15,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use mesh_crypto::sha256::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 const NAME_XX: &[u8] = b"Noise_XX_25519_ChaChaPoly_SHA256"; // exactly 32 bytes
 const NAME_KK: &[u8] = b"Noise_KK_25519_ChaChaPoly_SHA256"; // exactly 32 bytes
@@ -37,10 +38,12 @@ fn sha(parts: &[&[u8]]) -> [u8; 32] {
 }
 
 // Noise HKDF with two outputs: temp = HMAC(ck, ikm); out1 = HMAC(temp, 0x01); out2 = HMAC(temp, out1 || 0x02).
+// F1: `temp` is key material; it is wiped before return (the outputs are the caller's to wipe).
 fn hkdf2(ck: &[u8; 32], ikm: &[u8]) -> ([u8; 32], [u8; 32]) {
-    let temp = mesh_crypto::hmac_parts(ck, &[ikm]);
+    let mut temp = mesh_crypto::hmac_parts(ck, &[ikm]);
     let o1 = mesh_crypto::hmac_parts(&temp, &[&[0x01u8]]);
     let o2 = mesh_crypto::hmac_parts(&temp, &[&o1, &[0x02u8]]);
+    temp.zeroize();
     (o1, o2)
 }
 
@@ -157,16 +160,21 @@ impl Handshake {
     }
 
     fn mixkey(&mut self, ikm: &[u8; 32]) {
-        let (ck, k) = hkdf2(&self.ck, ikm);
+        let (mut ck, mut k) = hkdf2(&self.ck, ikm);
         self.ck = ck;
+        if let Some(old) = self.k.as_mut() {
+            old.zeroize();
+        }
         self.k = Some(k);
         self.n = 0;
+        ck.zeroize();
+        k.zeroize();
     }
 
     fn encrypt_and_hash(&mut self, pt: &[u8]) -> Option<Vec<u8>> {
-        let out = match self.k {
+        let out = match self.k.as_ref() {
             Some(k) => {
-                let c = aead_seal(&k, self.n, &self.h, pt)?;
+                let c = aead_seal(k, self.n, &self.h, pt)?;
                 self.n += 1;
                 c
             }
@@ -177,9 +185,9 @@ impl Handshake {
     }
 
     fn decrypt_and_hash(&mut self, ct: &[u8]) -> Option<Vec<u8>> {
-        let pt = match self.k {
+        let pt = match self.k.as_ref() {
             Some(k) => {
-                let p = aead_open(&k, self.n, &self.h, ct)?;
+                let p = aead_open(k, self.n, &self.h, ct)?;
                 self.n += 1;
                 p
             }
@@ -190,7 +198,7 @@ impl Handshake {
     }
 
     fn mix_token(&mut self, t: Tok) -> Result<(), ()> {
-        let d = match t {
+        let mut d = match t {
             Tok::Ee => dh(&self.e_priv, &self.re.ok_or(())?),
             Tok::Es => {
                 if self.initiator {
@@ -210,6 +218,7 @@ impl Handshake {
             _ => return Err(()),
         };
         self.mixkey(&d);
+        d.zeroize();
         Ok(())
     }
 
@@ -320,12 +329,30 @@ impl Handshake {
 
     /// Split into the two transport cipher states: (send, receive) for this side's role.
     pub fn split(self) -> (CipherState, CipherState) {
-        let (k1, k2) = hkdf2(&self.ck, &[]);
-        if self.initiator {
+        let (mut k1, mut k2) = hkdf2(&self.ck, &[]);
+        let pair = if self.initiator {
             (CipherState::new(k1), CipherState::new(k2))
         } else {
             (CipherState::new(k2), CipherState::new(k1))
+        };
+        k1.zeroize();
+        k2.zeroize();
+        pair
+        // `self` drops here, which wipes ck, k and both private keys (F1).
+    }
+}
+
+/// F1 (review S2): a handshake wipes its chaining key, cipher key and both private keys when it is dropped,
+/// whether it finished, failed or was abandoned. The transcript hash `h` is not secret (it feeds the SAS).
+impl Drop for Handshake {
+    fn drop(&mut self) {
+        self.ck.zeroize();
+        if let Some(k) = self.k.as_mut() {
+            k.zeroize();
         }
+        self.k = None;
+        self.s_priv.zeroize();
+        self.e_priv.zeroize();
     }
 }
 
@@ -361,9 +388,17 @@ impl CipherState {
     /// Noise Rekey (review P5): derive a fresh key without advancing the nonce. AFR-0009 section 4.2 rekeys
     /// after 10000 messages or 1 hour; call this before the nonce nears exhaustion.
     pub fn rekey(&mut self) {
-        if let Some(out) = aead_seal(&self.k, u64::MAX, &[], &[0u8; 32]) {
+        if let Some(mut out) = aead_seal(&self.k, u64::MAX, &[], &[0u8; 32]) {
             self.k.copy_from_slice(&out[..32]);
+            out.zeroize();
         }
+    }
+}
+
+/// F1 (review S2): a transport key is wiped when its link is dropped.
+impl Drop for CipherState {
+    fn drop(&mut self) {
+        self.k.zeroize();
     }
 }
 
@@ -601,5 +636,34 @@ mod tests {
         c2.rekey();
         // Same nonce counter (0) but different keys now, so ciphertexts differ.
         assert_ne!(c1.encrypt(b"", b"x").unwrap(), c2.encrypt(b"", b"x").unwrap());
+    }
+
+    // F1: dropping a handshake wipes its private keys, chaining key and cipher key; dropping a transport
+    // state wipes its key. Checked through ManuallyDrop so the fields can be read after the destructor ran.
+    #[test]
+    fn drop_wipes_secrets() {
+        let a = arr32(XA);
+        let b = arr32(XB);
+        let mut i = Handshake::xx_initiator(a, b, &pro());
+        let mut r = Handshake::xx_responder(b, a, &pro());
+        let (mut m, mut pl) = (Vec::new(), Vec::new());
+        i.write_message(&[], &mut m).unwrap();
+        r.read_message(&m, &mut pl).unwrap();
+        m.clear();
+        r.write_message(&[], &mut m).unwrap();
+        i.read_message(&m, &mut pl).unwrap();
+        assert!(i.k.is_some() && i.ck != [0u8; 32]);
+        let mut hs = core::mem::ManuallyDrop::new(i);
+        // SAFETY: dropped once, then only plain byte arrays are read; ManuallyDrop never drops it again.
+        unsafe { core::ptr::drop_in_place(&mut *hs) };
+        assert_eq!(hs.s_priv, [0u8; 32]);
+        assert_eq!(hs.e_priv, [0u8; 32]);
+        assert_eq!(hs.ck, [0u8; 32]);
+        assert!(hs.k.is_none());
+
+        let mut cs = core::mem::ManuallyDrop::new(CipherState::new([7u8; 32]));
+        // SAFETY: as above.
+        unsafe { core::ptr::drop_in_place(&mut *cs) };
+        assert_eq!(cs.k, [0u8; 32]);
     }
 }

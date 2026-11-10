@@ -6,7 +6,11 @@
 #   - `rng secret`  : a fail-closed secret draw succeeds;
 #   - `mesh selftest`: SHA-256 kernel == mesh-crypto (review S3), DRBG KAT, fresh distinct ephemerals (S4), Noise
 #                     XX + KK in memory, a flipped byte and a wrong KK static rejected, bundle seal/open with
-#                     tamper and wrong-sender rejects, bundle size = bucket 0. Every line PASS, N/N.
+#                     tamper and wrong-sender rejects, bundle size = bucket 0; F1: a Secret and a DRBG state
+#                     read back all zero after their destructors ran; F4: peer text with ESC, CR/LF, a bidi
+#                     override and a closing quote comes out escaped; review M1: after `forget` the
+#                     identity's own bytes in the static read zero. Every line PASS, N/N (at least 16 rows).
+#   - `mesh id`, `mesh forget`, `mesh id`: the identity is dropped (and so wiped) and a NEW one is made.
 # Boot 2, WITHOUT any strong source (QEMU cortex-a72 has no RNDR, no virtio-rng):
 #   - `rng secret`  : REFUSED (NoStrongSource): the fail-closed half, which a test only of the happy path
 #                     could never see;
@@ -29,7 +33,7 @@ qemu-system-aarch64 -M virt -cpu cortex-a72 -smp 1 -m 256M \
     -qmp tcp:127.0.0.1:4405,server,nowait -kernel "$BIN" &
 QPID=$!
 afrish_wait_boot
-python3 scripts/shell-demo.py 4404 4405 "$T/mesh-kernel-1.png" "rng" "rng secret" "mesh selftest" "mesh id" > "$OUT1" 2>&1
+python3 scripts/shell-demo.py 4404 4405 "$T/mesh-kernel-1.png" "rng" "rng secret" "mesh selftest" "mesh id" "mesh forget" "mesh id" > "$OUT1" 2>&1
 kill "$QPID" 2>/dev/null
 wait "$QPID" 2>/dev/null
 
@@ -60,11 +64,17 @@ m = re.search(r"\[rng\] source virtio-rng: healthy samples=(\d+)", a)
 need(m and int(m.group(1)) >= 1024, "boot 1: fewer than 1024 start-up samples through the health tests")
 need(re.search(r"\[rng\] secret OK [0-9a-f]{8}", a), "boot 1: rng secret was not OK")
 rows = re.findall(r"\[mesh\] selftest ([a-z0-9-]+): (PASS|FAIL)", a)
-need(len(rows) >= 12, "boot 1: expected >= 12 mesh selftest rows, got %d" % len(rows))
+need(len(rows) >= 16, "boot 1: expected >= 16 mesh selftest rows, got %d" % len(rows))
+names = [r[0] for r in rows]
+for n in ("secret-drop-wipes", "drbg-drop-wipes", "peer-text-console-safe", "forget-wipes-identity-in-static"):
+    need(n in names, "boot 1: selftest row %s missing (F1/F4)" % n)
 need(all(r[1] == "PASS" for r in rows), "boot 1: failing selftest rows: %s" % [r[0] for r in rows if r[1] != "PASS"])
 t = re.search(r"\[mesh\] selftest (\d+)/(\d+) PASS", a)
 need(t and t.group(1) == t.group(2), "boot 1: mesh selftest total not N/N")
-need(re.search(r"\[mesh\] identity x25519 [0-9a-f]{64}", a), "boot 1: no mesh identity")
+ids = re.findall(r"\[mesh\] identity x25519 ([0-9a-f]{64})", a)
+need(len(ids) == 2, "boot 1: expected two identity lines (before and after forget), got %d" % len(ids))
+need(re.search(r"\[mesh\] identity forgotten \(secret key wiped\)", a), "boot 1: mesh forget did not drop the identity")
+need(len(ids) == 2 and ids[0] != ids[1], "boot 1: the identity after forget is the same key")
 # boot 2
 need(re.search(r"\[rng\] secret REFUSED: NoStrongSource", b), "boot 2: secret draw was NOT refused without a strong source")
 need(re.search(r"\[mesh\] identity REFUSED: NoSecretRandom", b), "boot 2: mesh made a key without a strong source")

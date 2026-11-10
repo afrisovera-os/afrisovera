@@ -693,12 +693,21 @@ impl Fat {
         }
     }
 
+    /// Writes the first `n` sectors gathered in BIG at sector `at` (one write_run).
+    fn put_big(&self, at: u64, n: usize) -> bool {
+        // SAFETY: shell context only; nothing else uses BIG while a copy runs.
+        let run = unsafe { &(&*core::ptr::addr_of!(BIG))[..n * 512] };
+        self.dk.write_run(at, run)
+    }
+
     /// Takes `need` free clusters, lowest first, as one chain; `data` (zero filled after its
     /// end) is written into each cluster BEFORE its FAT entry changes. The chain's first cluster.
     fn take(&self, need: u64, data: &[u8]) -> Result<u32, &'static str> {
         let last = self.clusters + 1;
         let cb = self.cluster_bytes() as usize;
         let (mut first, mut prev, mut got) = (0u32, 0u32, 0u64);
+        // the run being gathered in BIG: its first sector and how many sectors
+        let (mut ps, mut pn) = (0u64, 0usize);
         let mut a = [0u8; 512];
         for k in 0..self.fat512 {
             if k * 128 > last {
@@ -719,22 +728,31 @@ impl Fat {
                     continue;
                 }
                 let base = self.at(c as u32);
-                // the cluster in runs of up to RUN sectors (one command and one flush each on an IDE-mode disk)
+                // the cluster's sectors join the run being gathered when they follow it on disk; the run (up
+                // to RUN sectors) is one command and one flush on an IDE-mode disk. Small clusters (512 bytes
+                // on a 100 MiB EFI partition) were one command and one flush each before (10 Nov 2026).
                 let mut q = 0u64;
                 while q < self.c512() {
-                    let k = (self.c512() - q).min(crate::gpt::RUN as u64) as usize;
+                    if pn > 0 && (ps + pn as u64 != base + q || pn == crate::gpt::RUN) {
+                        if !self.put_big(ps, pn) {
+                            return Err("a write FAILED");
+                        }
+                        pn = 0;
+                    }
+                    if pn == 0 {
+                        ps = base + q;
+                    }
+                    let n = (self.c512() - q).min((crate::gpt::RUN - pn) as u64) as usize;
                     // SAFETY: shell context only; nothing else uses BIG while a copy runs.
-                    let run = unsafe { &mut (&mut *core::ptr::addr_of_mut!(BIG))[..k * 512] };
+                    let run = unsafe { &mut (&mut *core::ptr::addr_of_mut!(BIG))[pn * 512..(pn + n) * 512] };
                     run.fill(0);
                     let from = got as usize * cb + q as usize * 512;
                     if from < data.len() {
-                        let to = (from + k * 512).min(data.len());
+                        let to = (from + n * 512).min(data.len());
                         run[..to - from].copy_from_slice(&data[from..to]);
                     }
-                    if !self.dk.write_run(base + q, run) {
-                        return Err("a write FAILED");
-                    }
-                    q += k as u64;
+                    pn += n;
+                    q += n as u64;
                 }
                 a[o..o + 4].copy_from_slice(&((v & 0xF000_0000) | EOC).to_le_bytes());
                 changed = true;
@@ -743,8 +761,15 @@ impl Fat {
                         let po = (prev as usize % 128) * 4;
                         let pv = u32le(&a, po);
                         a[po..po + 4].copy_from_slice(&((pv & 0xF000_0000) | c as u32).to_le_bytes());
-                    } else if !self.link(prev, c as u32) {
-                        return Err("a write FAILED");
+                    } else {
+                        // the data reaches the disk before any FAT entry points at it
+                        if pn > 0 && !self.put_big(ps, pn) {
+                            return Err("a write FAILED");
+                        }
+                        pn = 0;
+                        if !self.link(prev, c as u32) {
+                            return Err("a write FAILED");
+                        }
                     }
                 }
                 if first == 0 {
@@ -755,6 +780,12 @@ impl Fat {
                 if got == need {
                     break;
                 }
+            }
+            if pn > 0 {
+                if !self.put_big(ps, pn) {
+                    return Err("a write FAILED");
+                }
+                pn = 0;
             }
             if changed && !self.fat_put(k, &a) {
                 return Err("a write FAILED");

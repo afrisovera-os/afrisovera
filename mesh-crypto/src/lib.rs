@@ -191,6 +191,93 @@ pub fn bundle_aad(header: &[u8; 44]) -> [u8; 44] {
 }
 
 // =====================================================================================================
+// F4: text a peer sent is shown on a console only through this filter.
+
+/// Room `console_safe` needs: every input byte becomes at most 4 output bytes (`\xNN`), and a 3-byte
+/// invisible character becomes 8 (`\u{NNNN}`), which is less than 4 per byte.
+pub const fn console_safe_room(input_len: usize) -> usize {
+    input_len * 4
+}
+
+/// True for the invisible characters that can reorder or hide text on a terminal: zero-width marks and the
+/// bidirectional embeddings, overrides and isolates (the "Trojan Source" set), plus the byte-order mark.
+fn invisible(c: char) -> bool {
+    matches!(c as u32, 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x2069 | 0xFEFF)
+}
+
+struct Out<'a> {
+    buf: &'a mut [u8],
+    n: usize,
+    full: bool,
+}
+
+impl Out<'_> {
+    fn put(&mut self, b: &[u8]) {
+        if self.full || self.n + b.len() > self.buf.len() {
+            self.full = true; // never write half an escape
+            return;
+        }
+        self.buf[self.n..self.n + b.len()].copy_from_slice(b);
+        self.n += b.len();
+    }
+    fn hex2(&mut self, x: u8) {
+        const H: &[u8; 16] = b"0123456789abcdef";
+        self.put(&[b'\\', b'x', H[(x >> 4) as usize], H[(x & 15) as usize]]);
+    }
+    fn uni4(&mut self, c: u32) {
+        const H: &[u8; 16] = b"0123456789abcdef";
+        let d = |sh: u32| H[((c >> sh) & 15) as usize];
+        self.put(&[b'\\', b'u', b'{', d(12), d(8), d(4), d(0), b'}']);
+    }
+    fn text(&mut self, s: &str) {
+        for c in s.chars() {
+            let u = c as u32;
+            if c == '"' || c == '\\' {
+                self.put(&[b'\\', u as u8]);
+            } else if c.is_control() {
+                self.hex2(u as u8); // C0, DEL and C1 are all below 0x100
+            } else if invisible(c) {
+                self.uni4(u);
+            } else {
+                let mut b = [0u8; 4];
+                self.put(c.encode_utf8(&mut b).as_bytes());
+            }
+        }
+    }
+}
+
+/// F4: copy peer-supplied `input` into `out` so it is safe to print inside double quotes on a console, and
+/// return the number of bytes written. Printable text (including non-ASCII letters) is kept as it is; control
+/// characters (C0 such as ESC, CR, LF and BEL, DEL, and C1) and bytes that are not UTF-8 become `\xNN`; the
+/// invisible reordering characters become `\u{NNNN}`; `"` and `\` are escaped, so the shown text cannot fake
+/// the end of its own quotes. Output is cut (at a whole escape) if `out` is shorter than
+/// `console_safe_room(input.len())`. Never panics.
+pub fn console_safe(input: &[u8], out: &mut [u8]) -> usize {
+    let mut w = Out { buf: out, n: 0, full: false };
+    let mut rest = input;
+    while !rest.is_empty() && !w.full {
+        match core::str::from_utf8(rest) {
+            Ok(s) => {
+                w.text(s);
+                break;
+            }
+            Err(e) => {
+                let good = e.valid_up_to();
+                if let Ok(s) = core::str::from_utf8(&rest[..good]) {
+                    w.text(s);
+                }
+                let bad = e.error_len().unwrap_or(rest.len() - good);
+                for &b in &rest[good..good + bad] {
+                    w.hex2(b);
+                }
+                rest = &rest[good + bad..];
+            }
+        }
+    }
+    w.n
+}
+
+// =====================================================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +388,52 @@ mod tests {
             bundle_aad(&hdr).to_vec(),
             unhex("01000000000102030405060708090a0b0c0d0e0f5a19f125776210e2961e5d3b64a822714007f36a00000000")
         );
+    }
+
+    fn safe(b: &[u8]) -> String {
+        let mut o = vec![0u8; console_safe_room(b.len())];
+        let n = console_safe(b, &mut o);
+        String::from_utf8(o[..n].to_vec()).expect("console_safe output is UTF-8")
+    }
+
+    // F4: plain text, including non-ASCII letters, is shown unchanged.
+    #[test]
+    fn console_safe_keeps_text() {
+        assert_eq!(safe(b"Habari-from-A-18746"), "Habari-from-A-18746");
+        assert_eq!(safe("Ng'ombe na ñame, привет".as_bytes()), "Ng'ombe na ñame, привет");
+        assert_eq!(safe(b""), "");
+    }
+
+    // F4: every control character, invalid UTF-8 byte and reordering mark is escaped; quotes cannot be closed.
+    #[test]
+    fn console_safe_escapes() {
+        assert_eq!(safe(b"a\x1b[2Jb"), "a\\x1b[2Jb"); // ESC: clear screen
+        assert_eq!(safe(b"x\r\n[mesh] send done: delivered"), "x\\x0d\\x0a[mesh] send done: delivered");
+        assert_eq!(safe(b"\x07\x00\x7f"), "\\x07\\x00\\x7f");
+        assert_eq!(safe("\u{9b}31m".as_bytes()), "\\x9b31m"); // C1 CSI
+        assert_eq!(safe(b"ok\xff\xfeok"), "ok\\xff\\xfeok"); // not UTF-8
+        assert_eq!(safe(b"\xe2\x82"), "\\xe2\\x82"); // truncated sequence at the end
+        assert_eq!(safe("abc\u{202e}def".as_bytes()), "abc\\u{202e}def"); // right-to-left override
+        assert_eq!(safe("\u{200b}\u{2066}\u{feff}".as_bytes()), "\\u{200b}\\u{2066}\\u{feff}");
+        assert_eq!(safe(b"say \"hi\" \\ bye"), "say \\\"hi\\\" \\\\ bye");
+        // Nothing below 0x20 and no DEL survives, for every byte value.
+        for b in 0u8..=255 {
+            let s = safe(&[b'a', b, b'z']);
+            assert!(s.bytes().all(|c| c >= 0x20 && c != 0x7f), "byte {b:#04x} -> {s:?}");
+        }
+    }
+
+    // F4: worst case fits the stated room; a short buffer cuts at a whole escape, never half of one.
+    #[test]
+    fn console_safe_room_and_cut() {
+        let all: Vec<u8> = (0u8..=255).collect();
+        let mut o = vec![0u8; console_safe_room(all.len())];
+        let n = console_safe(&all, &mut o);
+        assert!(n <= o.len());
+        let bidi = "\u{202e}".repeat(50);
+        assert_eq!(safe(bidi.as_bytes()).len(), 8 * 50);
+        let mut small = [0u8; 6];
+        let n = console_safe(b"\x1b\x1b", &mut small);
+        assert_eq!(&small[..n], b"\\x1b");
     }
 }

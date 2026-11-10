@@ -38,6 +38,20 @@ pub const STARTUP_SAMPLES: usize = 1024;
 pub const MAX_SOURCES: usize = 3;
 
 // ---------------------------------------------------------------------------------------------------------------
+// Wiping (F1, review S2): every buffer that held entropy, a seed, a key or DRBG state is overwritten with zeros
+// before it goes out of scope. Volatile writes plus a compiler fence, so the optimiser cannot drop the stores as
+// dead. (Copies the compiler makes on its own, in registers or spill slots, are out of reach of any wipe.)
+
+/// Overwrite `b` with zeros in a way the optimiser may not remove.
+pub fn wipe(b: &mut [u8]) {
+    for x in b.iter_mut() {
+        // SAFETY: a valid &mut u8.
+        unsafe { core::ptr::write_volatile(x, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // HMAC-SHA-256 over byte parts (no concatenation buffer, no length limit)
 
 /// HMAC-SHA-256(key, parts[0] || parts[1] || ...), for a key of at most 64 bytes.
@@ -59,11 +73,17 @@ pub fn hmac_parts(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     for p in parts {
         inner.update(p);
     }
-    let ih = inner.finish();
+    let mut ih = inner.finish();
     let mut outer = Sha256::new();
     outer.update(&opad);
     outer.update(&ih);
-    outer.finish()
+    let mac = outer.finish();
+    // The padded keys and the inner hash are key material (F1); the Sha256 states wipe themselves on drop.
+    wipe(&mut k0);
+    wipe(&mut ipad);
+    wipe(&mut opad);
+    wipe(&mut ih);
+    mac
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -136,13 +156,24 @@ impl HmacDrbg {
         Ok(())
     }
 
-    /// Wipe the working state (used when a KAT instance is dropped).
+    /// Wipe the working state. Also runs on drop, so a replaced or KAT instance never leaves K and V behind.
     pub fn wipe(&mut self) {
-        for b in self.k.iter_mut().chain(self.v.iter_mut()) {
-            // SAFETY: a valid &mut u8; volatile so the wipe is not optimised away.
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
+        wipe(&mut self.k);
+        wipe(&mut self.v);
         self.reseed_counter = 0;
+    }
+}
+
+impl HmacDrbg {
+    /// True when K and V are all zero (what `wipe` leaves); for the in-kernel selftest of F1.
+    pub fn is_wiped(&self) -> bool {
+        self.k == [0u8; 32] && self.v == [0u8; 32] && self.reseed_counter == 0
+    }
+}
+
+impl Drop for HmacDrbg {
+    fn drop(&mut self) {
+        self.wipe();
     }
 }
 
@@ -292,13 +323,13 @@ impl Generator {
     /// number of bytes written. A source that trips a health test is dropped for the rest of the boot.
     fn draw_strong<P: Platform>(&mut self, dst: &mut [u8], want: usize) -> usize {
         let mut n = 0;
+        let mut chunk = [0u8; 64];
         for i in 0..P::STRONG.len().min(MAX_SOURCES) {
             if !self.present[i] || self.health[i].failed {
                 continue;
             }
             let mut got_here = 0;
             while got_here < want && n < dst.len() {
-                let mut chunk = [0u8; 64];
                 let ask = (want - got_here).min(64).min(dst.len() - n);
                 let g = P::strong(i, &mut chunk[..ask]).min(ask);
                 if g == 0 {
@@ -316,13 +347,15 @@ impl Generator {
                 got_here += g;
             }
             if self.health[i].failed {
-                // Do not count anything from a source that failed during this draw.
+                // Do not count anything from a source that failed during this draw (and do not leave it in dst).
+                wipe(&mut dst[n - got_here..n]);
                 n -= got_here;
             }
             if n >= want {
                 break;
             }
         }
+        wipe(&mut chunk);
         n
     }
 
@@ -343,18 +376,22 @@ impl Generator {
         h.finish()
     }
 
-    /// Gather one entropy input: strong bytes (counted) || jitter hash || context. Returns (buf, len, strong).
-    fn gather<P: Platform>(&mut self) -> ([u8; 128], usize, usize) {
-        let mut buf = [0u8; 128];
+    /// Gather one entropy input into the caller's `buf`: strong bytes (counted) || jitter hash || context.
+    /// Returns (len, strong). The caller owns `buf` and wipes it once the seed is absorbed (F1); nothing that
+    /// held entropy is returned by value, so no copy is left in this frame.
+    fn gather<P: Platform>(&mut self, buf: &mut [u8; 128]) -> (usize, usize) {
         let strong = self.draw_strong::<P>(&mut buf[..SEED_STRONG_BYTES], SEED_STRONG_BYTES);
         let mut len = strong;
-        buf[len..len + 32].copy_from_slice(&Self::jitter::<P>());
+        let mut j = Self::jitter::<P>();
+        buf[len..len + 32].copy_from_slice(&j);
+        wipe(&mut j);
         len += 32;
         let mut ctx = [0u8; 24];
         P::context(&mut ctx);
         buf[len..len + 24].copy_from_slice(&ctx);
+        wipe(&mut ctx);
         len += 24;
-        (buf, len, strong)
+        (len, strong)
     }
 
     fn ensure<P: Platform>(&mut self) {
@@ -366,14 +403,19 @@ impl Generator {
             self.kat_ran = true;
         }
         self.probe_absent::<P>();
-        let (e, el, s1) = self.gather::<P>();
-        let (n, nl, _) = self.gather::<P>();
+        let mut e = [0u8; 128];
+        let mut n = [0u8; 128];
+        let (el, s1) = self.gather::<P>(&mut e);
+        let (nl, _) = self.gather::<P>(&mut n);
         let mut pers = [0u8; 32];
         let tag = b"AFRISOVERA-RNG-V1/";
         pers[..tag.len()].copy_from_slice(tag);
         let al = P::ARCH.len().min(32 - tag.len());
         pers[tag.len()..tag.len() + al].copy_from_slice(&P::ARCH[..al]);
+        // Assigning drops (and so wipes) the previous state.
         self.drbg = HmacDrbg::instantiate(&e[..el], &n[..nl.min(48)], &pers[..tag.len() + al]);
+        wipe(&mut e);
+        wipe(&mut n);
         self.last_strong = s1;
         self.seeded = true;
     }
@@ -407,13 +449,16 @@ impl Generator {
                 }
                 tested += g;
             }
+            wipe(&mut probe);
         }
     }
 
     fn reseed<P: Platform>(&mut self) -> usize {
         self.probe_absent::<P>();
-        let (e, el, s) = self.gather::<P>();
+        let mut e = [0u8; 128];
+        let (el, s) = self.gather::<P>(&mut e);
         self.drbg.reseed(&e[..el], b"");
+        wipe(&mut e);
         self.last_strong = s;
         self.reseeds += 1;
         s
@@ -452,9 +497,7 @@ impl Generator {
         }
         // Cannot fail: just reseeded and the length is checked above.
         if self.drbg.generate(out, b"").is_err() {
-            for b in out.iter_mut() {
-                *b = 0;
-            }
+            wipe(out);
             self.secret_refused += 1;
             return Err(RngError::TooLong);
         }

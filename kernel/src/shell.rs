@@ -22207,11 +22207,17 @@ pub(crate) fn exec(line: &str) { pc_intercept!(line);
         }
         #[cfg(not(feature = "pc"))]
         "mesh" => {
-            // Sovereign Mesh Phase 0 (AFR-0009, kernel/src/mesh/): `mesh id`, `mesh selftest`,
+            // Sovereign Mesh Phase 0 (AFR-0009, kernel/src/mesh/): `mesh id`, `mesh forget`, `mesh selftest`,
             // `mesh listen [port] [secs]`, `mesh send <ip>[:port] <text>`. Port defaults to 4401.
             let r = rest.trim();
             if r == "id" {
                 crate::mesh::show_id();
+            } else if r == "forget" {
+                if crate::mesh::forget() {
+                    crate::kprintln!("[mesh] identity forgotten (secret key wiped); the next mesh step makes a new one");
+                } else {
+                    crate::kprintln!("[mesh] no identity to forget");
+                }
             } else if r == "selftest" {
                 crate::mesh::selftest();
             } else if r == "listen" || r.starts_with("listen ") {
@@ -22235,7 +22241,7 @@ pub(crate) fn exec(line: &str) { pc_intercept!(line);
                     _ => crate::kprintln!("[mesh] usage: mesh send <a.b.c.d>[:port] <text>"),
                 }
             } else {
-                crate::kprintln!("[mesh] usage: mesh id | mesh selftest | mesh listen [port] [secs] | mesh send <ip>[:port] <text>");
+                crate::kprintln!("[mesh] usage: mesh id | mesh forget | mesh selftest | mesh listen [port] [secs] | mesh send <ip>[:port] <text>");
             }
         }
         "rng" => {

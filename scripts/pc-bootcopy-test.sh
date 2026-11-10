@@ -22,8 +22,9 @@
 #   scripts/pc-bootcopy-test.sh              # grader selftest, then the four QEMU boots
 #   scripts/pc-bootcopy-test.sh --selftest   # grader selftest only
 # BOOTCOPY_KIND=ide (scripts/pc-bootcopy-ide-test.sh, 10 Nov 2026): the same four boots with the Windows-like disk on
-# a SATA disk in IDE mode (QEMU's piix3-ide, primary slave, ide1); boot 2 also runs lside (for the log only: this
-# partition has 512-byte clusters and esp.rs writes one cluster per call, so no multi-sector run is made). The primary master is an empty FAT disk only so
+# a SATA disk in IDE mode (QEMU's piix3-ide, primary slave, ide1); boot 2 also runs lside, which must count the copy
+# as big copies in runs of several sectors (this partition has 512-byte clusters; since 10 Nov 2026 esp.rs gathers
+# clusters that follow each other on disk into one run of up to 16 sectors). The primary master is an empty FAT disk only so
 # the firmware's NvVars file lands there: piix3-ide sits on a lower PCI slot than the boot stick's AHCI controller, so
 # without it OVMF wrote NvVars into the Windows EFI partition at every boot (the first Actions run, 10 Nov).
 set -uo pipefail
@@ -33,7 +34,7 @@ T="${TMPDIR:-/tmp}"
 FILE_RE='\\EFI\\afrisovera\\afrisovera\.efi'
 KIND="${BOOTCOPY_KIND:-sata}"
 if [ "$KIND" = ide ]; then
-    NAME=ide1; PORT=6390; UP=" IDE"; NARMS=19 # DEV is set once the work folder exists (the NvVars disk lives there)
+    NAME=ide1; PORT=6390; UP=" IDE"; NARMS=20 # DEV is set once the work folder exists (the NvVars disk lives there)
 else
     NAME="sata port 2"; DEV=(-device ide-hd,drive=sb,bus=ide.2); PORT=5390; UP=""; NARMS=19
 fi
@@ -71,6 +72,10 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     in_blk "$B2" "bootcopy: $NAME partition 1 already holds \\\\EFI\\\\afrisovera -- nothing to copy \(bootcopy remove takes it out\)" ||
         _f "boot 2: a second bootcopy did not refuse"
     printf '%s\n' "$B" | grep -aqx 'harness: bootcopy image check PASSED' || _f "boot 2: the image check did not pass"
+    if [ "$KIND" = ide ]; then # the copy goes in runs of several sectors, one command and one cache flush each
+        in_blk "$(blk "$B" lside)" '  big copies \(installdisk, bootcopy\): [1-9][0-9]* run\(s\) in one command, [1-9][0-9]* sector\(s\), each read back and flushed once \(on\)' ||
+            _f "boot 2: bootcopy did not write the file in runs of several sectors (lside)"
+    fi
     in_blk "$(blk "$C" 'bootcopy remove')" "bootcopy remove: $NAME partition 1 \(start 2048\): \\\\EFI\\\\afrisovera \($kb KiB\) would be taken out; nothing else in the partition changes" ||
         _f "boot 3: bootcopy remove did not say what goes"
     in_blk "$(blk "$C" 'bootcopy remove')" 'bootcopy remove: nothing written yet. To do it, type exactly: bootcopy remove yes [0-9a-f]{4}' ||
@@ -144,6 +149,7 @@ if [ "$KIND" = ide ]; then
 check:/afrisovera> lside
 ide: controller 00:04.0, interface 0x80
   ide1: primary slave (0x1f0): QEMU HARDDISK, 327680 sectors (160 MiB)  (other data, read-only to us)
+  big copies (installdisk, bootcopy): 296 run(s) in one command, 4724 sector(s), each read back and flushed once (on)
 afrisovera>
 check:}"
 fi
@@ -179,6 +185,7 @@ selftest() {
     arm removal-check-failed red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | grep -v 'removal check PASSED')"
     arm panic red "$(printf '%s\nKERNEL PANIC at esp.rs' "$L1")" "$L2" "$L3" "$L4"
     arm empty red "" "" "" ""
+    [ "$KIND" = ide ] && arm no-runs red "$L1" "$(printf '%s\n' "$L2" | grep -v 'big copies')" "$L3" "$L4"
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
     [ "$bad" -eq 0 ] && [ "$pass" -eq "$NARMS" ]

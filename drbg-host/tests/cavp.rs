@@ -275,3 +275,30 @@ fn a_source_that_appears_later_is_picked_up() {
     let mut s = [0u8; 32];
     g.fill_secret::<Late>(&mut s).expect("the reseed before a secret re-probes and finds the source");
 }
+
+// F1: wipe() zeroes, and a dropped DRBG state (K, V, counter) reads back all zero.
+#[test]
+fn wipe_and_drop_zero_the_state() {
+    let mut b = [0x5au8; 100];
+    drbg_host::drbg::wipe(&mut b);
+    assert_eq!(b, [0u8; 100]);
+    let mut d = std::mem::ManuallyDrop::new(HmacDrbg::instantiate(&[1u8; 32], &[2u8; 16], b"t"));
+    let mut out = [0u8; 32];
+    d.generate(&mut out, b"").unwrap();
+    assert!(!d.is_wiped());
+    // SAFETY: dropped exactly once; only plain arrays are read afterwards; ManuallyDrop never drops it again.
+    unsafe { std::ptr::drop_in_place(&mut *d) };
+    assert!(d.is_wiped());
+    // A Sha256 that absorbed a key block no longer holds its chaining value after drop: finishing what is
+    // left gives a different digest from the real one (the fields are private, so this is how to see it).
+    let mut h = std::mem::ManuallyDrop::new(Sha256::new());
+    h.update(&[0x36u8; 64]);
+    h.update(b"partial");
+    // SAFETY: as above.
+    unsafe { std::ptr::drop_in_place(&mut *h) };
+    let after = (*h).clone().finish();
+    let mut real = Sha256::new();
+    real.update(&[0x36u8; 64]);
+    real.update(b"partial");
+    assert_ne!(after, real.finish());
+}
