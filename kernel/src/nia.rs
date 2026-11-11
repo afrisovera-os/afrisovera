@@ -12,6 +12,7 @@
 //! interpreter itself inside a userspace EL0 process is a further step. The
 //! capability gating of host imports — the security-relevant part — is real.)
 
+use core::cell::Cell;
 use core::ptr::addr_of_mut;
 
 const MAX_TYPES: usize = 16;
@@ -22,6 +23,12 @@ const LOCALS_CAP: usize = 32;
 const MAX_GLOBALS: usize = 16;
 const CTRL_CAP: usize = 32;
 const MEM_SIZE: usize = 65536; // 1 WASM page
+// Nia guard (claude/nia-guard): how many WASM functions may be active at once
+// (`run` counts as one). Each level costs `invoke` + `run_body` frames on the
+// KERNEL stack, so recursion without a limit overran it. Host calls are not
+// counted. Apps built with nia-apps need at most 8. `wasmfuzz` measures the
+// frame per level and the stack left at this depth.
+const MAX_CALL_DEPTH: usize = 16;
 
 // Capabilities a Nia app may hold (which host imports it may call).
 const CAP_PRINT: u32 = 1 << 0; // host "print"(i32)
@@ -1519,32 +1526,57 @@ fn matching(code: &[u8], from: usize) -> (Option<usize>, usize) {
 // byte-for-byte as before. i64 ops use `push_i64`/`pop_i64` to move the full
 // 64-bit value. (In a well-typed module an i64 cell is only ever consumed by an
 // i64 op, so the widening is transparent.)
+//
+// Nia guard: a push onto a full stack or a pop from an empty one never indexes
+// out of range. It sets `bad` instead (the push is dropped, the pop yields 0),
+// and the interpreter turns `bad` into a TRAP: at the top of every instruction,
+// after the arguments of a call are popped, before a branch carries values and
+// before a function hands back its results.
 struct Stack {
     d: [i64; STACK_CAP],
     sp: usize,
+    bad: bool,
 }
 impl Stack {
     fn new() -> Self {
-        Stack { d: [0; STACK_CAP], sp: 0 }
+        Stack { d: [0; STACK_CAP], sp: 0, bad: false }
     }
     fn push(&mut self, v: i32) {
-        self.d[self.sp] = v as i64; // sign-extend the i32 into the 64-bit cell
-        self.sp += 1;
+        self.push_i64(v as i64); // sign-extend the i32 into the 64-bit cell
     }
     fn pop(&mut self) -> i32 {
-        self.sp -= 1;
-        self.d[self.sp] as i32 // truncate back to i32 (low 32 bits)
+        self.pop_i64() as i32 // truncate back to i32 (low 32 bits)
     }
-    fn top_i64(&self) -> i64 {
+    fn top_i64(&mut self) -> i64 {
+        if self.sp == 0 {
+            self.bad = true;
+            return 0;
+        }
         self.d[self.sp - 1]
     }
     fn push_i64(&mut self, v: i64) {
+        if self.sp >= STACK_CAP {
+            self.bad = true;
+            return;
+        }
         self.d[self.sp] = v;
         self.sp += 1;
     }
     fn pop_i64(&mut self) -> i64 {
+        if self.sp == 0 {
+            self.bad = true;
+            return 0;
+        }
         self.sp -= 1;
         self.d[self.sp]
+    }
+    /// The TRAP for a stack that went wrong, if it did.
+    fn check(&self) -> Result<(), &'static str> {
+        if self.bad {
+            Err("value stack overflow or underflow")
+        } else {
+            Ok(())
+        }
     }
     // f64 values ride in the same 64-bit cell as a raw IEEE-754 bit pattern, so
     // no separate float stack is needed.
@@ -1580,9 +1612,13 @@ struct Module<'a> {
     import_host: [u8; MAX_IMPORTS],
     import_type: [usize; MAX_IMPORTS],
     nfuncs: usize,
+    ntypes: usize,
     import_count: usize,
     run_index: usize,
     caps: u32,
+    // WASM functions active now (Nia guard). A fresh Module per run_app, so it
+    // starts at 0 for every app; `invoke` brings it back down on every way out.
+    depth: Cell<usize>,
 }
 
 pub fn run_demo() {
@@ -2031,7 +2067,165 @@ pub fn fuzz() {
         crate::kprintln!("[fuzz] case '{}' ({} bytes):", name, bytes.len());
         run_app(name, bytes, CAP_ALL); // must print an error, never panic
     }
+    guard_cases();
     crate::kprintln!("[fuzz] survived: every malformed module was rejected, no kernel panic");
+}
+
+// --- Nia guard test modules (claude/nia-guard; made by a script, checked with the
+// nia-apps emulator). Each one used to crash the kernel or overrun its stack. ---
+static WASM_BAD_17FUNCS: [u8; 97] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x12,
+    0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00, 0x0A, 0x34, 0x11, 0x02, 0x00,
+    0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B,
+    0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02,
+    0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00,
+    0x0B,
+];
+static WASM_BAD_NOCODE: [u8; 27] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02,
+    0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00,
+];
+static WASM_BAD_BROUT: [u8; 38] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02,
+    0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00, 0x0A, 0x09, 0x01, 0x07, 0x00,
+    0x02, 0x40, 0x0C, 0x05, 0x0B, 0x0B,
+];
+static WASM_BAD_DEEP: [u8; 132] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02,
+    0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00, 0x0A, 0x67, 0x01, 0x65, 0x00,
+    0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40,
+    0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40,
+    0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40,
+    0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40,
+    0x02, 0x40, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B,
+    0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B,
+    0x0B, 0x0B, 0x0B, 0x0B,
+];
+static WASM_BAD_EMPTYADD: [u8; 34] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02,
+    0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00, 0x0A, 0x05, 0x01, 0x03, 0x00,
+    0x6A, 0x0B,
+];
+static WASM_DEPTH16: [u8; 78] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60, 0x01, 0x7F, 0x00, 0x60,
+    0x00, 0x00, 0x02, 0x0E, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74,
+    0x00, 0x00, 0x03, 0x03, 0x02, 0x00, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x02,
+    0x0A, 0x1C, 0x02, 0x13, 0x00, 0x20, 0x00, 0x04, 0x40, 0x20, 0x00, 0x41, 0x01, 0x6B, 0x10, 0x01,
+    0x05, 0x41, 0x10, 0x10, 0x00, 0x0B, 0x0B, 0x06, 0x00, 0x41, 0x0E, 0x10, 0x01, 0x0B,
+];
+static WASM_BAD_RECURSE: [u8; 79] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60, 0x01, 0x7F, 0x00, 0x60,
+    0x00, 0x00, 0x02, 0x0E, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74,
+    0x00, 0x00, 0x03, 0x03, 0x02, 0x00, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x02,
+    0x0A, 0x1D, 0x02, 0x13, 0x00, 0x20, 0x00, 0x04, 0x40, 0x20, 0x00, 0x41, 0x01, 0x6B, 0x10, 0x01,
+    0x05, 0x41, 0x10, 0x10, 0x00, 0x0B, 0x0B, 0x07, 0x00, 0x41, 0xE8, 0x07, 0x10, 0x01, 0x0B,
+];
+
+// Where each call level's `Stack` sits on the kernel stack (index = depth), so
+// `wasmfuzz` can report the frame per level. Written by `invoke_wasm`.
+static mut NIA_SP_AT: [usize; MAX_CALL_DEPTH + 1] = [0; MAX_CALL_DEPTH + 1];
+
+fn note_sp(depth: usize, addr: usize) {
+    if depth <= MAX_CALL_DEPTH {
+        // SAFETY: single-threaded interpreter; plain store into a static array.
+        unsafe { (*addr_of_mut!(NIA_SP_AT))[depth] = addr };
+    }
+}
+
+/// (bottom, top) of the stack the shell runs on, for the stack report.
+#[cfg(target_arch = "aarch64")]
+fn shell_stack() -> (usize, usize) {
+    let e = crate::stackwater::boot();
+    (e.bottom, e.top)
+}
+#[cfg(target_arch = "x86_64")]
+fn shell_stack() -> (usize, usize) {
+    let (b, t) = crate::stackinfo::kstack();
+    (b as usize, t as usize)
+}
+
+fn stack_report() {
+    #[cfg(target_arch = "aarch64")]
+    crate::stackwater::report();
+    #[cfg(target_arch = "x86_64")]
+    crate::stackinfo::report();
+}
+
+/// 257 `i32.const 1` in a row: one more value than Nia's stack holds. Built here
+/// rather than spelled out as 549 bytes.
+fn flood_module(buf: &mut [u8; 600]) -> usize {
+    const HEAD: [u8; 27] = [
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, // magic, version
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type 0: () -> ()
+        0x03, 0x02, 0x01, 0x00, // one function, type 0
+        0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00, // export "run" = func 0
+    ];
+    // body = 0 locals, 257 x (i32.const 1), end = 516 bytes (uleb 0x84 0x04);
+    // section = count 1 + body size (2) + body = 519 bytes (uleb 0x87 0x04).
+    const CODE_HEAD: [u8; 6] = [0x0A, 0x87, 0x04, 0x01, 0x84, 0x04];
+    let mut n = 0;
+    for b in HEAD.iter().chain(CODE_HEAD.iter()) {
+        buf[n] = *b;
+        n += 1;
+    }
+    buf[n] = 0x00;
+    n += 1;
+    for _ in 0..STACK_CAP + 1 {
+        buf[n] = 0x41;
+        buf[n + 1] = 0x01;
+        n += 2;
+    }
+    buf[n] = 0x0B;
+    n + 1
+}
+
+/// The Nia guard cases (part of `wasmfuzz`): every bad module must end in a
+/// "[nia] parse error" or "[nia] TRAP" line, and a good module run after a TRAP
+/// must still run normally.
+fn guard_cases() {
+    crate::kprintln!("[fuzz] nia guard: bad apps that used to crash the kernel");
+    let mut flood = [0u8; 600];
+    let fl = flood_module(&mut flood);
+    let bad: [(&str, &[u8]); 6] = [
+        ("guard: 17 functions", &WASM_BAD_17FUNCS),
+        ("guard: code count differs", &WASM_BAD_NOCODE),
+        ("guard: branch out of the function", &WASM_BAD_BROUT),
+        ("guard: 33 nested blocks", &WASM_BAD_DEEP),
+        ("guard: 257 values", &flood[..fl]),
+        ("guard: add on an empty stack, last instruction", &WASM_BAD_EMPTYADD),
+    ];
+    for (name, bytes) in bad.iter() {
+        run_app(name, bytes, CAP_ALL);
+    }
+
+    // Depth: 16 functions deep, print at the deepest level, measured.
+    // SAFETY: single-threaded; reset the per-level record.
+    unsafe { *addr_of_mut!(NIA_SP_AT) = [0; MAX_CALL_DEPTH + 1] };
+    crate::kprintln!("[fuzz] stack before the depth-16 app:");
+    stack_report();
+    run_app("guard: 16 functions deep, print at the bottom", &WASM_DEPTH16, CAP_ALL);
+    crate::kprintln!("[fuzz] stack after the depth-16 app:");
+    stack_report();
+    // SAFETY: read the record written by invoke_wasm.
+    let at = unsafe { *addr_of_mut!(NIA_SP_AT) };
+    let (bottom, top) = shell_stack();
+    let (first, deepest) = (at[1], at[MAX_CALL_DEPTH]);
+    if first != 0 && deepest != 0 && first > deepest {
+        crate::kprintln!(
+            "[fuzz] nia stack: {} bytes per call level, depth {} at {} KiB below the top, {} KiB left above the stack bottom",
+            (first - deepest) / (MAX_CALL_DEPTH - 1),
+            MAX_CALL_DEPTH,
+            top.saturating_sub(deepest) / 1024,
+            deepest.saturating_sub(bottom) / 1024
+        );
+    } else {
+        crate::kprintln!("[fuzz] nia stack: depth {} was not reached", MAX_CALL_DEPTH);
+    }
+
+    // Unbounded recursion must TRAP, and the next app must run normally.
+    run_app("guard: endless recursion", &WASM_BAD_RECURSE, CAP_ALL);
+    run_app("guard: 16 deep again, after the TRAP", &WASM_DEPTH16, CAP_ALL);
 }
 
 /// Roll a WASM dice app `n` times — each run draws from the capability-gated RNG
@@ -2132,10 +2326,14 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
         import_host: [HOST_UNKNOWN; MAX_IMPORTS],
         import_type: [0; MAX_IMPORTS],
         nfuncs: 0,
+        ntypes: 0,
         import_count: 0,
         run_index: usize::MAX,
         caps,
+        depth: Cell::new(0),
     };
+    // Code bodies seen (section 10). Must equal the function count (section 3).
+    let mut ncode = 0usize;
     let mut c = 8;
     while c < m.len() {
         let id = m[c];
@@ -2152,16 +2350,18 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
             1 => {
                 let (cnt, a) = uleb(m, c);
                 c += a;
+                if cnt > MAX_TYPES {
+                    return Err("too many types (Nia holds 16)");
+                }
                 for i in 0..cnt {
                     c += 1;
                     let (np, a) = uleb(m, c);
                     c += a + np;
                     let (nr, a) = uleb(m, c);
                     c += a + nr;
-                    if i < MAX_TYPES {
-                        md.types[i] = (np, nr);
-                    }
+                    md.types[i] = (np, nr);
                 }
+                md.ntypes = cnt;
             }
             2 => {
                 let (cnt, a) = uleb(m, c);
@@ -2181,7 +2381,13 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
                     let (desc, a) = uleb(m, c);
                     c += a;
                     if kind == 0 {
-                        if md.import_count < MAX_IMPORTS {
+                        if md.import_count >= MAX_IMPORTS {
+                            return Err("too many imported functions (Nia holds 8)");
+                        }
+                        if desc >= md.ntypes {
+                            return Err("import has a bad type index");
+                        }
+                        {
                             md.import_host[md.import_count] = match name {
                                 b"print" => HOST_PRINT,
                                 b"putc" => HOST_PUTC,
@@ -2209,12 +2415,16 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
             3 => {
                 let (cnt, a) = uleb(m, c);
                 c += a;
+                if cnt > MAX_FUNCS {
+                    return Err("too many functions (Nia holds 16)");
+                }
                 for i in 0..cnt {
                     let (ti, a) = uleb(m, c);
                     c += a;
-                    if i < MAX_FUNCS {
-                        md.func_type[i] = ti;
+                    if ti >= md.ntypes {
+                        return Err("function has a bad type index");
                     }
+                    md.func_type[i] = ti;
                 }
                 md.nfuncs = cnt;
             }
@@ -2241,15 +2451,17 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
             10 => {
                 let (cnt, a) = uleb(m, c);
                 c += a;
+                if cnt > MAX_FUNCS {
+                    return Err("too many functions (Nia holds 16)");
+                }
                 for i in 0..cnt {
                     let (bsz, a) = uleb(m, c);
                     c += a;
-                    if i < MAX_FUNCS {
-                        md.code_off[i] = c;
-                        md.code_len[i] = bsz;
-                    }
+                    md.code_off[i] = c;
+                    md.code_len[i] = bsz;
                     c += bsz;
                 }
+                ncode = cnt;
             }
             6 => {
                 // global section: per global -> value type, mutability, then a
@@ -2340,6 +2552,9 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
         }
         c = end;
     }
+    if ncode != md.nfuncs {
+        return Err("code count differs from function count");
+    }
     if md.run_index == usize::MAX {
         return Err("no exported 'run'");
     }
@@ -2358,6 +2573,7 @@ impl<'a> Module<'a> {
                 return Err("capability denied");
             }
             let v = caller.pop_i64();
+            caller.check()?;
             let mut buf = [0u8; 24];
             let n = fmt_i64(v, &mut buf);
             crate::kprintln!("    [wasm app] print64({})", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
@@ -2365,11 +2581,15 @@ impl<'a> Module<'a> {
         }
 
         let ti = if fidx < MAX_IMPORTS { self.import_type[fidx] } else { 0 };
+        if ti >= MAX_TYPES {
+            return Err("bad type index");
+        }
         let (np, nr) = self.types[ti];
         let mut a = [0i32; 8];
         for k in (0..np.min(8)).rev() {
             a[k] = caller.pop();
         }
+        caller.check()?; // never run a host function on missing arguments
 
         let (req, name): (u32, &str) = match host {
             HOST_PRINT => (CAP_PRINT, "print"),
@@ -2500,6 +2720,19 @@ impl<'a> Module<'a> {
         if fidx < self.import_count {
             return self.host_call(fidx, caller);
         }
+        // Nia guard: one exit point for the depth count, so a TRAP, an early
+        // return and a normal return all bring it back down.
+        let d = self.depth.get();
+        if d >= MAX_CALL_DEPTH {
+            return Err("call depth limit (16 functions deep)");
+        }
+        self.depth.set(d + 1);
+        let r = self.invoke_wasm(fidx, caller, d + 1);
+        self.depth.set(d);
+        r
+    }
+
+    fn invoke_wasm(&self, fidx: usize, caller: &mut Stack, depth: usize) -> Result<(), &'static str> {
         let li = fidx - self.import_count;
         if li >= self.nfuncs {
             return Err("bad function index");
@@ -2519,6 +2752,7 @@ impl<'a> Module<'a> {
         for k in (0..nparams).rev() {
             locals[k] = caller.pop_i64();
         }
+        caller.check()?;
         let (co, cl) = (self.code_off[li], self.code_len[li]);
         if co + cl > self.bytes.len() {
             return Err("truncated code body");
@@ -2540,7 +2774,15 @@ impl<'a> Module<'a> {
         }
         let code = &body[c..];
         let mut st = Stack::new();
+        // For `wasmfuzz`'s stack measurement: where this level's frames sit.
+        note_sp(depth, &st as *const Stack as usize);
         self.run_body(code, &mut locals, &mut st)?;
+        // Before the results are handed back: the last instruction may have
+        // popped an empty stack, and there must be a value for every result.
+        st.check()?;
+        if st.sp < nresults {
+            return Err("value stack underflow at return");
+        }
         for k in 0..nresults {
             let v = st.d[st.sp - nresults + k];
             caller.push_i64(v); // full-width move (i32 cells are already sign-extended)
@@ -2557,11 +2799,18 @@ impl<'a> Module<'a> {
             if pc >= code.len() {
                 return Err("code ran off end (missing end opcode)");
             }
+            st.check()?;
             let op = code[pc];
             match op {
                 0x00 => return Err("unreachable"),
                 0x01 => pc += 1,
                 0x02 | 0x03 | 0x04 => {
+                    if pc + 1 >= code.len() {
+                        return Err("code ran off end (block type)");
+                    }
+                    if cp >= CTRL_CAP {
+                        return Err("blocks nested too deep (Nia holds 32)");
+                    }
                     let bt = code[pc + 1];
                     let arity = if bt == 0x40 { 0 } else { 1 };
                     let body_start = pc + 2;
@@ -2579,6 +2828,9 @@ impl<'a> Module<'a> {
                     }
                 }
                 0x05 => {
+                    if cp == 0 {
+                        return Err("else outside a block");
+                    }
                     pc = ctrl[cp - 1].cont_pc - 1;
                 }
                 0x0B => {
@@ -2590,12 +2842,12 @@ impl<'a> Module<'a> {
                 }
                 0x0C => {
                     let (l, _) = uleb(code, pc + 1);
-                    branch(l, &mut ctrl, &mut cp, st, &mut pc);
+                    branch(l, &mut ctrl, &mut cp, st, &mut pc)?;
                 }
                 0x0D => {
                     let (l, a) = uleb(code, pc + 1);
                     if st.pop() != 0 {
-                        branch(l, &mut ctrl, &mut cp, st, &mut pc);
+                        branch(l, &mut ctrl, &mut cp, st, &mut pc)?;
                     } else {
                         pc = pc + 1 + a;
                     }
@@ -2620,7 +2872,7 @@ impl<'a> Module<'a> {
                     if !found {
                         chosen = deflt;
                     }
-                    branch(chosen, &mut ctrl, &mut cp, st, &mut pc);
+                    branch(chosen, &mut ctrl, &mut cp, st, &mut pc)?;
                 }
                 0x0F => return Ok(()),
                 0x10 => {
@@ -3025,9 +3277,24 @@ impl<'a> Module<'a> {
     }
 }
 
-fn branch(l: usize, ctrl: &mut [Ctrl], cp: &mut usize, st: &mut Stack, pc: &mut usize) {
+fn branch(
+    l: usize,
+    ctrl: &mut [Ctrl],
+    cp: &mut usize,
+    st: &mut Stack,
+    pc: &mut usize,
+) -> Result<(), &'static str> {
+    // Nia guard: label l must name an open block. (A br to the function's own
+    // outer label is legal WASM, but Nia keeps no Ctrl for it; refuse it.)
+    if l >= *cp {
+        return Err("branch out of the function");
+    }
     let target = *cp - 1 - l;
     let arity = ctrl[target].arity;
+    st.check()?;
+    if st.sp < arity || arity > 4 {
+        return Err("value stack underflow at branch");
+    }
     let mut tmp = [0i64; 4];
     for k in 0..arity {
         tmp[k] = st.d[st.sp - arity + k];
@@ -3042,4 +3309,5 @@ fn branch(l: usize, ctrl: &mut [Ctrl], cp: &mut usize, st: &mut Stack, pc: &mut 
         *cp = target;
     }
     *pc = ctrl[target].cont_pc;
+    Ok(())
 }

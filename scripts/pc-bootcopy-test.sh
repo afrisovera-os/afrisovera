@@ -44,6 +44,10 @@
 # bootcopy remove must say partition 2 (start 43008); check-bootcopy.py finds the EFI partition by its type GUID, must
 # say it checked GPT entry 2, and proves every sector outside it (the recovery partition among them) unchanged after
 # the copy and after the way back.
+# BOOTCOPY_KIND=recfirst4k (scripts/pc-bootcopy-recfirst4k-test.sh, 11 Nov 2026): the nvme4k kind with the recovery
+# partition first (make-disk-image.py gpt-esp-recfirst-4k: 400 MiB in 4096-byte blocks, GPT entry 1 a 20 MiB recovery
+# partition at block 256, entry 2 the 260 MiB EFI partition at block 5376). Every line must say nvme partition 2
+# (start 5376), both image checks must name GPT entry 2, and the recovery partition must be byte-identical afterwards.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T="${TMPDIR:-/tmp}"
@@ -52,10 +56,12 @@ FILE_RE='\\EFI\\afrisovera\\afrisovera\.efi'
 KIND="${BOOTCOPY_KIND:-sata}"
 ESPK=gpt-esp-fsinfo; STARTL=2048; FREE=100776 # the Windows-like disk's kind, its EFI partition's first block, free KiB
 PNO=1 # the EFI partition's GPT entry number
-if [ "$KIND" = nvme4k ]; then
+FOURK=0; { [ "$KIND" = nvme4k ] || [ "$KIND" = recfirst4k ]; } && FOURK=1 # an NVMe disk of 4096-byte blocks
+if [ "$FOURK" = 1 ]; then
     LS=lsnvme; RUNS=' \(on\)'
     NAME=nvme; PORT=6590; UP=" NVME 4K"; NARMS=20 # DEV as for ide
     ESPK=gpt-esp-fsinfo-4k; STARTL=256; FREE=265524
+    [ "$KIND" = recfirst4k ] && { ESPK=gpt-esp-recfirst-4k; STARTL=5376; PNO=2; PORT=7010; UP=" RECOVERY FIRST NVME 4K"; }
 elif [ "$KIND" = ide ]; then
     LS=lside; RUNS=' and flushed once \(on\)'
     NAME=ide1; PORT=6390; UP=" IDE"; NARMS=20 # DEV is set once the work folder exists (the NvVars disk lives there)
@@ -181,7 +187,7 @@ check: every sector outside the EFI partition is as it was before bootcopy
 harness: bootcopy removal check PASSED"
 
 WRONG=nvme
-if [ "$KIND" = nvme ] || [ "$KIND" = nvme4k ]; then
+if [ "$KIND" = nvme ] || [ "$FOURK" = 1 ]; then
     WRONG="sata port 2"
     L1="${L1//sata port 2/nvme}"; L2="${L2//sata port 2/nvme}"; L3="${L3//sata port 2/nvme}"; L4="${L4//sata port 2/nvme}"
     L2="${L2/afrisovera>
@@ -194,8 +200,10 @@ nvme: controller 00:04.0 BAR0 0xfebd0000, NVMe 1.4, ready
   big copies (installdisk, bootcopy): 296 run(s) in one command, 4724 sector(s), each read back (on)
 afrisovera>
 check:}"
-    if [ "$KIND" = nvme4k ]; then # the same samples as a 4 KiB-block disk says them (its EFI partition at block 256)
+    if [ "$FOURK" = 1 ]; then # the same samples as a 4 KiB-block disk says them (its EFI partition at block 256)
         K4_SED='s/(start 2048)/(start 256)/; s/100776 KiB free/265524 KiB free/; s/98415 KiB free/263160 KiB free/; s/2361 KiB of/2364 KiB of/; s/LBA 2048-206847, 100 MiB/LBA 256-66815, 260 MiB/; s/512-byte clusters/4096-byte clusters/; s/327680 blocks of 512 B (160 MiB)/102400 blocks of 4096 B (400 MiB)/'
+        # recovery first: the EFI partition is GPT entry 2 at block 5376 (blocks 5376-71935)
+        [ "$KIND" = recfirst4k ] && K4_SED="$K4_SED"'; s/partition 1 (start 256)/partition 2 (start 5376)/; s/nvme partition 1/nvme partition 2/; s/GPT entry 1, LBA 256-66815/GPT entry 2, LBA 5376-71935/; s/GPT entry 1 (start 256)/GPT entry 2 (start 5376)/'
         L1="$(printf '%s\n' "$L1" | sed "$K4_SED")"; L2="$(printf '%s\n' "$L2" | sed "$K4_SED")"
         L3="$(printf '%s\n' "$L3" | sed "$K4_SED")"; L4="$(printf '%s\n' "$L4" | sed "$K4_SED")"
     fi
@@ -256,15 +264,16 @@ selftest() {
     arm panic red "$(printf '%s\nKERNEL PANIC at esp.rs' "$L1")" "$L2" "$L3" "$L4"
     arm empty red "" "" "" ""
     arm no-runs red "$L1" "$(printf '%s\n' "$L2" | grep -v 'big copies')" "$L3" "$L4"
-    if [ "$KIND" = nvme4k ]; then # the partition named in 512-byte sectors on a 4 KiB disk
+    if [ "$FOURK" = 1 ]; then # the partition named in 512-byte sectors on a 4 KiB disk
         NARMS=$((NARMS + 1))
-        arm counted-in-512 red "$(printf '%s\n' "$L1" | sed 's/(start 256)/(start 2048)/')" "$L2" "$L3" "$L4"
+        arm counted-in-512 red "$(printf '%s\n' "$L1" | sed "s/(start $STARTL)/(start $((STARTL * 8)))/")" "$L2" "$L3" "$L4"
     fi
-    if [ "$KIND" = recfirst ]; then # entry 1 (the recovery partition) taken for the EFI partition, the checker
-        NARMS=$((NARMS + 4))         # looking at the wrong partition, or a sector outside the EFI partition changed
-        arm copy-to-entry-1 red "$(printf '%s\n' "$L1" | sed 's/partition 2 (start 43008)/partition 1 (start 2048)/')" "$L2" "$L3" "$L4"
-        arm removed-from-entry-1 red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | sed 's/out of sata port 2 partition 2,/out of sata port 2 partition 1,/')"
-        arm checked-entry-1 red "$L1" "$(printf '%s\n' "$L2" | sed 's/GPT entry 2 (start 43008)/GPT entry 1 (start 2048)/')" "$L3" "$L4"
+    if [ "$PNO" = 2 ]; then # entry 1 (the recovery partition) taken for the EFI partition, the checker
+        NARMS=$((NARMS + 4)) # looking at the wrong partition, or a sector outside the EFI partition changed
+        local E1=2048; [ "$FOURK" = 1 ] && E1=256 # where the recovery partition (GPT entry 1) starts
+        arm copy-to-entry-1 red "$(printf '%s\n' "$L1" | sed "s/partition 2 (start $STARTL)/partition 1 (start $E1)/")" "$L2" "$L3" "$L4"
+        arm removed-from-entry-1 red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | sed "s/out of $NAME partition 2,/out of $NAME partition 1,/")"
+        arm checked-entry-1 red "$L1" "$(printf '%s\n' "$L2" | sed "s/GPT entry 2 (start $STARTL)/GPT entry 1 (start $E1)/")" "$L3" "$L4"
         arm recovery-changed red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | grep -v 'every sector outside')"
     fi
     rm -rf "$D"
@@ -297,7 +306,7 @@ for k in gpt gpt-esp-fsinfo; do
     "$PY" scripts/lib/make-disk-image.py "$kk" "$W/$k.img" || { echo "PC BOOTCOPY${UP} TEST FAILED (harness: could not make $k.img)"; exit 1; }
 done
 cp "$W/gpt-esp-fsinfo.img" "$W/orig.img"
-if [ "$KIND" = ide ] || [ "$KIND" = nvme ] || [ "$KIND" = nvme4k ]; then
+if [ "$KIND" = ide ] || [ "$KIND" = nvme ] || [ "$FOURK" = 1 ]; then
     mkdir -p "$W/nvvars"
     NV="$W/nvvars"; command -v cygpath > /dev/null && NV="$(cygpath -m "$NV")"
     DEV=(-device piix3-ide,id=pide -drive "file=fat:rw:$NV,if=none,format=raw,id=nv" -device ide-hd,drive=nv,bus=pide.0,unit=0
@@ -305,12 +314,12 @@ if [ "$KIND" = ide ] || [ "$KIND" = nvme ] || [ "$KIND" = nvme4k ]; then
     # NVMe kind: the NvVars disk first (lowest PCI slot), then the Windows-like disk on NVMe, the blank GPT on SATA
     [ "$KIND" = nvme ] && DEV=(-device piix3-ide,id=pide -drive "file=fat:rw:$NV,if=none,format=raw,id=nv"
         -device ide-hd,drive=nv,bus=pide.0,unit=0 -device nvme,serial=afri02,drive=sb -device ide-hd,drive=sd,bus=ide.2)
-    [ "$KIND" = nvme4k ] && DEV=(-device piix3-ide,id=pide -drive "file=fat:rw:$NV,if=none,format=raw,id=nv"
+    [ "$FOURK" = 1 ] && DEV=(-device piix3-ide,id=pide -drive "file=fat:rw:$NV,if=none,format=raw,id=nv"
         -device ide-hd,drive=nv,bus=pide.0,unit=0
         -device nvme,serial=afri02,drive=sb,logical_block_size=4096,physical_block_size=4096 -device ide-hd,drive=sd,bus=ide.2)
 fi
 # the blank GPT disk: NVMe, except in the NVMe kind (it is on SATA port 2 there, in DEV)
-SD=(-device nvme,serial=afri01,drive=sd); { [ "$KIND" = nvme ] || [ "$KIND" = nvme4k ]; } && SD=()
+SD=(-device nvme,serial=afri01,drive=sd); { [ "$KIND" = nvme ] || [ "$FOURK" = 1 ]; } && SD=()
 cp "$PC_EFI" "$W/kernel.efi"
 
 boot() { # boot <serial port> <log> <commands (| between)>

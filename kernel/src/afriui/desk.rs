@@ -1306,7 +1306,25 @@ fn settings_seg_x(a: usize) -> i32 {
 // ---------------------------------------------------------------------------------------
 // The frame.
 // ---------------------------------------------------------------------------------------
+/// The time the desktop draws and checks, pinned while `desk verify` runs: its settle and its full redraw then
+/// read one instant, so a minute or a second that turns between them is not a damage error. (uptime ticks, RTC)
+static mut PINNED: Option<(u64, u64)> = None;
+/// The uptime ticks the desktop uses (pinned during `desk verify`).
+pub(super) fn now_ticks() -> u64 {
+    // SAFETY: mainline only.
+    match unsafe { PINNED } {
+        Some((t, _)) => t,
+        None => crate::sched::ticks(),
+    }
+}
 fn clock_secs() -> u64 {
+    // SAFETY: mainline only.
+    if let Some((_, c)) = unsafe { PINNED } {
+        return c;
+    }
+    rtc_secs()
+}
+fn rtc_secs() -> u64 {
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: the PL031 data register, as `date` reads it.
@@ -1419,15 +1437,20 @@ fn settle(before: Snap) {
     }
     let moving = motion_tick();
     want |= moving;
-    let t = crate::sched::ticks();
+    let t = now_ticks();
     if s.toast_until != 0 && t >= s.toast_until {
         s.toast_until = 0;
         want = true; // the toast's box, from the snapshots
     }
     if t / 100 != LAST_CHECK.swap(t / 100, Ordering::Relaxed) {
         // once a second: what changes with time alone
-        if clock_secs() / 60 != s.last_minute {
-            damage(clock_box()); // the clock at the Spine's foot or the bar's end
+        let minute = clock_secs() / 60;
+        if minute != s.last_minute {
+            // the clock at the Spine's foot or the bar's end. Only here is last_minute set, with the damage that
+            // redraws it: paint used to set it whenever it drew the bar, even under a clip that left the clock
+            // out, and then the new minute never reached the screen
+            damage(clock_box());
+            s.last_minute = minute;
             want = true;
         }
         // the uptime line in About and Settings and under the Circle
@@ -1542,32 +1565,28 @@ pub fn command(rest: &str) {
             }
         }
         "verify" => {
-            // the rows as the partial frames left them, against a full redraw (section 15). The
-            // uptime shown changes with the second, and the clock with the real-time clock's minute
-            // (not in step with the uptime's second), so a check either turned under is not a damage
-            // error: it is taken again (at most 3 times)
+            // the rows as the partial frames left them, against a full redraw (section 15). The time is pinned
+            // from the settle to the full redraw, so both draw the same clock, uptime and toast; and the
+            // once-a-second check runs at once, so what turned since the last one is damaged first
             let ch = crate::canvas::height();
-            let mut differ = 0;
+            // SAFETY: mainline only; unpinned below.
+            unsafe { PINNED = Some((crate::sched::ticks(), rtc_secs())) };
+            LAST_CHECK.store(u64::MAX, Ordering::Relaxed);
+            settle(snap());
+            // SAFETY: mainline only.
+            let rows = unsafe { &mut *core::ptr::addr_of_mut!(ROWS) };
+            row_hashes(rows);
+            paint::draw();
+            // SAFETY: as above.
+            unsafe { PINNED = None };
+            // SAFETY: mainline only.
+            let now = unsafe { &mut *core::ptr::addr_of_mut!(ROWS_NOW) };
+            row_hashes(now);
+            let differ = (0..ch).filter(|&y| now[y] != rows[y]).count();
+            // the first rows that differ, so a miss can be found
             let mut first = [usize::MAX; 4];
-            for _ in 0..3 {
-                let (sec, min) = (crate::sched::ticks() / 100, clock_secs() / 60);
-                settle(snap());
-                // SAFETY: mainline only.
-                let rows = unsafe { &mut *core::ptr::addr_of_mut!(ROWS) };
-                row_hashes(rows);
-                paint::draw();
-                // SAFETY: mainline only.
-                let now = unsafe { &mut *core::ptr::addr_of_mut!(ROWS_NOW) };
-                row_hashes(now);
-                differ = (0..ch).filter(|&y| now[y] != rows[y]).count();
-                // the first rows that differ, so a miss can be found
-                first = [usize::MAX; 4];
-                for (k, y) in (0..ch).filter(|&y| now[y] != rows[y]).take(4).enumerate() {
-                    first[k] = y;
-                }
-                if crate::sched::ticks() / 100 == sec && clock_secs() / 60 == min {
-                    break;
-                }
+            for (k, y) in (0..ch).filter(|&y| now[y] != rows[y]).take(4).enumerate() {
+                first[k] = y;
             }
             // SAFETY: scalar read.
             let parts = unsafe { paint::PART_US.2 };

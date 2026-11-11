@@ -424,7 +424,6 @@ fn spine() {
         l.u(h12).s(b":").two(mm);
         under.s(if hh < 12 { b"am" } else { b"pm" });
     }
-    s.last_minute = secs / 60;
     rect(8, H() - 30, body - 16, 1, LINE);
     text(mid - text_w(l.get(), 1) / 2, H() - 23, l.get(), GOLD, 1);
     text(mid - text_w(under.get(), 1) / 2, H() - 12, under.get(), DIM, 1);
@@ -487,7 +486,6 @@ fn bar() {
         l.u(h12).s(b":").two(mm);
         under.s(if hh < 12 { b"am" } else { b"pm" });
     }
-    s.last_minute = secs / 60;
     let (cx, cy, cw, _) = clock_box();
     let mid = cx + cw / 2;
     rect(cx, cy + WEAVE + 8, 1, 36, LINE);
@@ -806,7 +804,7 @@ fn settings_app(a: usize, x: i32, y: i32, w: i32, _h: i32) {
     l.u(crate::cores_online() as u64).s(b" core(s), ").u(crate::ram_mib()).s(b" MiB memory");
     label(y + 220, l.get());
     let mut l = Line::new();
-    l.s(b"Booted ").u(crate::config::boots() as u64).s(b" time(s), up ").u(crate::sched::ticks() / 100).s(b" s");
+    l.s(b"Booted ").u(crate::config::boots() as u64).s(b" time(s), up ").u(now_ticks() / 100).s(b" s");
     text(x + 14, y + 234, l.get(), DIM, 1);
     note_uptime(a, y + 234);
     let _ = (w, a);
@@ -851,7 +849,7 @@ fn about_app(x: i32, y: i32, w: i32, h: i32) {
     rows[0].1.s(b"Mansa microkernel, Rust");
     rows[1].1.s(b"Tonga, Sovereign UI");
     rows[2].1.s(arch).s(b", ").u(crate::cores_online() as u64).s(b" core(s)");
-    rows[3].1.u((crate::frame::total_frames() * 4 / 1024) as u64).s(b" MiB, up ").u(crate::sched::ticks() / 100).s(b" s");
+    rows[3].1.u((crate::frame::total_frames() * 4 / 1024) as u64).s(b" MiB, up ").u(now_ticks() / 100).s(b" s");
     for (k, v) in rows.iter() {
         if yy + face::LINE_H > y + h {
             break;
@@ -929,7 +927,7 @@ fn launcher() {
     let x0 = text(ix + 14, iy + 10, b"This device", GOLD_DEEP, 1);
     text(x0 + 10, iy + 10, l.get(), TEXT, 1);
     let mut l = Line::new();
-    l.s(b"Up ").u(crate::sched::ticks() / 100).s(b" s.  Super or Esc closes the Circle.");
+    l.s(b"Up ").u(now_ticks() / 100).s(b" s.  Super or Esc closes the Circle.");
     text(ix + 14, iy + 26, l.get(), DIM, 1);
 }
 
@@ -952,11 +950,10 @@ fn notes_panel() {
     }
 }
 
-/// The toast's box while it shows (shadow included), else None. The model uses it for damage.
+/// The toast's box while it shows (shadow included), else None. Paint follows the model: the toast shows while it
+/// is set, and `settle` clears it when its time runs out and damages its box, so two draws with no settle between
+/// them (as `desk verify` makes) never disagree about it.
 pub(super) fn toast_box() -> Option<Rect> {
-    if crate::sched::ticks() >= st().toast_until {
-        return None;
-    }
     toast_place()
 }
 

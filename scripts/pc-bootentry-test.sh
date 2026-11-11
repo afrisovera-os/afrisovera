@@ -34,6 +34,10 @@
 # partition as GPT entry 1 and the EFI partition as entry 2 at sector 43008, as some OEM Windows disks have it
 # (make-disk-image.py gpt-esp-recfirst). bootcopy, bootentry and the entry's HD() node must say partition 2, start
 # 43008 and the EFI partition's own GUID (...af001), never entry 1 or the recovery partition's start.
+# BOOTENTRY_KIND=recfirst4k (scripts/pc-bootentry-recfirst4k-test.sh, 11 Nov 2026): the nvme4k boots with the recovery
+# partition first (make-disk-image.py gpt-esp-recfirst-4k: recovery at block 256, the EFI partition as GPT entry 2 at
+# block 5376, 66560 blocks). bootcopy, bootentry and the entry's HD() node must say nvme partition 2, start 5376 and
+# entry 2's own GUID, never entry 1, the recovery partition's start 256, or the start counted in 512-byte sectors.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T="${TMPDIR:-/tmp}"
@@ -43,8 +47,10 @@ KIND="${BOOTENTRY_KIND:-sata}"
 # the Windows-like disk: its name, its EFI partition's first block and length (in the disk's own blocks), its image
 # kind, and the byte where the GPT entry array starts (block 2)
 NAME="sata port 2"; STARTL=2048; BLOCKS=204800; ESPK=gpt-esp-fsinfo; GOFF=1024; PORT=5410; UP=""; PNO=1
-if [ "$KIND" = nvme4k ]; then
+FOURK=0; { [ "$KIND" = nvme4k ] || [ "$KIND" = recfirst4k ]; } && FOURK=1 # an NVMe disk of 4096-byte blocks
+if [ "$FOURK" = 1 ]; then
     NAME=nvme; STARTL=256; BLOCKS=66560; ESPK=gpt-esp-fsinfo-4k; GOFF=8192; PORT=6630; UP=" NVME 4K"
+    [ "$KIND" = recfirst4k ] && { STARTL=5376; ESPK=gpt-esp-recfirst-4k; GOFF=8320; PORT=7030; UP=" RECOVERY FIRST NVME 4K"; PNO=2; }
 elif [ "$KIND" = recfirst ]; then # the EFI partition is GPT entry 2; its entry starts 128 bytes into the array
     STARTL=43008; ESPK=gpt-esp-recfirst; GOFF=1152; PORT=6950; UP=" RECOVERY FIRST"; PNO=2
 fi
@@ -123,7 +129,7 @@ grade() { # grade <boot1 log> ... <boot5 log>
 }
 
 ESPG="00000000-0000-0000-0000-0000000af000"
-[ "$KIND" = recfirst ] && ESPG="00000000-0000-0000-0000-0000000af001" # GPT entry 2's unique GUID
+{ [ "$KIND" = recfirst ] || [ "$KIND" = recfirst4k ]; } && ESPG="00000000-0000-0000-0000-0000000af001" # GPT entry 2's unique GUID
 L1="afrisovera> bootentries
 bootentries: the firmware's boot entries, as read at power-on (nothing is changed)
   BootOrder: 0001 0002 0003 0004 0000
@@ -191,8 +197,9 @@ bootentries: the firmware's boot entries, as read again after bootentry changed 
   5 entries; the next free number is Boot0005
   AfriSovera's own entry: none yet (adding one will ask for the owner's word)
 afrisovera>"
-if [ "$KIND" = nvme4k ]; then # the same samples as the 4 KiB-block NVMe disk says them
+if [ "$FOURK" = 1 ]; then # the same samples as the 4 KiB-block NVMe disk says them
     K4_SED='s/sata port 2 partition 1/nvme partition 1/g; s/(start 2048, 204800 blocks)/(start 256, 66560 blocks)/; s/,start 2048)/,start 256)/; s/98415 KiB free/263160 KiB free/'
+    [ "$KIND" = recfirst4k ] && K4_SED="$K4_SED"'; s/nvme partition 1/nvme partition 2/g; s/(start 256, 66560 blocks)/(start 5376, 66560 blocks)/; s/HD(1,GPT,/HD(2,GPT,/; s/,start 256)/,start 5376)/'
     L1="$(printf '%s\n' "$L1" | sed "$K4_SED")"; L2="$(printf '%s\n' "$L2" | sed "$K4_SED")"; L3="$(printf '%s\n' "$L3" | sed "$K4_SED")"
     L4="$(printf '%s\n' "$L4" | sed "$K4_SED")"; L5="$(printf '%s\n' "$L5" | sed "$K4_SED")"
 elif [ "$KIND" = recfirst ]; then # the same samples with the EFI partition as GPT entry 2 at sector 43008
@@ -205,6 +212,7 @@ selftest() {
     local D pass=0 bad=0 N=19
     [ "$KIND" = nvme4k ] && N=21
     [ "$KIND" = recfirst ] && N=22
+    [ "$KIND" = recfirst4k ] && N=25
     D="$(mktemp -d "$T/pc-bootentry-selftest.XXXXXX")" || return 1
     arm() { # arm <name> <expect> <b1> .. <b5>
         local got
@@ -234,9 +242,15 @@ selftest() {
     arm firmware-refused red "$L1" "$L2" "$(printf '%s\nbootentry: the firmware refused to write Boot0005 (status 0x8000000000000008) -- nothing changed' "$L3")" "$L4" "$L5"
     arm panic red "$(printf '%s\nKERNEL PANIC at bootent.rs' "$L1")" "$L2" "$L3" "$L4" "$L5"
     arm empty red "" "" "" "" ""
-    if [ "$KIND" = nvme4k ]; then # the partition counted in 512-byte sectors on a 4 KiB-block disk
-        arm counted-in-512 red "$L1" "$(printf '%s\n' "$L2" | sed 's/(start 256, 66560 blocks)/(start 2048, 532480 blocks)/')" "$L3" "$L4" "$L5"
-        arm hd-in-512 red "$L1" "$L2" "$(printf '%s\n' "$L3" | sed 's/,start 256)/,start 2048)/')" "$L4" "$L5"
+    if [ "$FOURK" = 1 ]; then # the partition counted in 512-byte sectors on a 4 KiB-block disk
+        arm counted-in-512 red "$L1" "$(printf '%s\n' "$L2" | sed "s/(start $STARTL, 66560 blocks)/(start $((STARTL*8)), 532480 blocks)/")" "$L3" "$L4" "$L5"
+        arm hd-in-512 red "$L1" "$L2" "$(printf '%s\n' "$L3" | sed "s/,start $STARTL)/,start $((STARTL*8)))/")" "$L4" "$L5"
+    fi
+    if [ "$KIND" = recfirst4k ]; then # entry 1 (the recovery partition at block 256) taken for the EFI partition
+        arm copy-to-entry-1 red "$L1" "$(printf '%s\n' "$L2" | sed 's/^bootcopy: copied to nvme partition 2/bootcopy: copied to nvme partition 1/')" "$L3" "$L4" "$L5"
+        arm numbered-1 red "$L1" "$(printf '%s\n' "$L2" | sed 's/-> nvme partition 2 (/-> nvme partition 1 (/')" "$L3" "$L4" "$L5"
+        arm hd-entry-1 red "$L1" "$L2" "$(printf '%s\n' "$L3" | sed 's/HD(2,GPT,/HD(1,GPT,/')" "$L4" "$L5"
+        arm hd-recovery-start red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | sed 's/,start 5376)/,start 256)/')" "$L5"
     fi
     if [ "$KIND" = recfirst ]; then # entry 1 (the recovery partition) taken for the EFI partition
         arm copy-to-entry-1 red "$L1" "$(printf '%s\n' "$L2" | sed 's/^bootcopy: copied to sata port 2 partition 2/bootcopy: copied to sata port 2 partition 1/')" "$L3" "$L4" "$L5"
@@ -249,6 +263,7 @@ selftest() {
 }
 
 WHERE=""; [ "$KIND" = nvme4k ] && WHERE=", Windows disk on 4 KiB-block NVMe"; [ "$KIND" = recfirst ] && WHERE=", a recovery partition before the EFI partition"
+[ "$KIND" = recfirst4k ] && WHERE=", a recovery partition before the EFI partition on 4 KiB-block NVMe"
 echo "== PC firmware boot entry for AfriSovera, added and taken out$WHERE (PC track step 5) =="
 if ! selftest; then echo "PC BOOTENTRY${UP} TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
 [ "${1:-}" = "--selftest" ] && { echo "PC BOOTENTRY SELFTEST ONLY -- no measurement taken"; exit 0; }
@@ -290,7 +305,7 @@ cp "$PC_EFI" "$W/stick/EFI/BOOT/BOOTX64.EFI"
 
 # the blank GPT disk on NVMe and the Windows-like one on SATA port 2; the other way round, in 4 KiB blocks, for nvme4k
 DEV=(-device nvme,serial=afri01,drive=sd -device ide-hd,drive=sb,bus=ide.2)
-[ "$KIND" = nvme4k ] && DEV=(-device nvme,serial=afri02,drive=sb,logical_block_size=4096,physical_block_size=4096
+[ "$FOURK" = 1 ] && DEV=(-device nvme,serial=afri02,drive=sb,logical_block_size=4096,physical_block_size=4096
     -device ide-hd,drive=sd,bus=ide.2)
 boot() { # boot <serial port> <log> <commands (| between)>
     local sp=$1 log=$2 cmds=$3

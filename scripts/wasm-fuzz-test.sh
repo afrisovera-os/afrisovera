@@ -20,7 +20,7 @@ python3 scripts/shell-demo.py 4622 4623 "${TMPDIR:-/tmp}/wasm-fuzz.png" "wasmfuz
 kill "$QPID" 2>/dev/null
 wait "$QPID" 2>/dev/null
 
-grep -aiE "fuzz|parse error|TRAP|no exported|survived|heap:" "$OUT" | sed 's/^/  /' | head -20
+grep -aiE "fuzz|parse error|TRAP|no exported|survived|heap:|stack|print\(16\)" "$OUT" | sed 's/^/  /' | head -60
 
 grep -aq "KERNEL PANIC" "$OUT" \
     && { echo "WASM-FUZZ TEST FAILED (a malformed module PANICKED the kernel)"; exit 1; }
@@ -28,4 +28,22 @@ grep -aq "fuzz] survived" "$OUT" \
     || { echo "WASM-FUZZ TEST FAILED (fuzz run did not complete)"; exit 1; }
 grep -aq "heap:" "$OUT" \
     || { echo "WASM-FUZZ TEST FAILED (shell unresponsive after malformed modules)"; exit 1; }
+# Nia guard (claude/nia-guard): each bad app ends in its own error line, the
+# depth-16 app runs to the bottom and returns, endless recursion TRAPs, and the
+# same depth-16 app still runs after that TRAP (the depth count was reset).
+need() {
+    local n
+    n=$(grep -ac -- "$1" "$OUT")
+    [ "$n" -ge "$2" ] || { echo "WASM-FUZZ TEST FAILED (nia guard: wanted $2 x '$1', got $n)"; exit 1; }
+}
+need "parse error: too many functions" 1
+need "parse error: code count differs from function count" 1
+need "TRAP: branch out of the function" 1
+need "TRAP: blocks nested too deep" 1
+need "TRAP: value stack overflow or underflow" 2
+need "TRAP: call depth limit" 1
+need "print(16)" 2
+need "nia stack: .* bytes per call level" 1
+awk '/=== guard: 16 deep again, after the TRAP ===/{f=1} f&&/returned cleanly/{ok=1} END{exit !ok}' "$OUT" \
+    || { echo "WASM-FUZZ TEST FAILED (nia guard: the app after the recursion TRAP did not run normally)"; exit 1; }
 echo "WASM-FUZZ TEST PASSED  (malformed modules rejected; no panic; shell still alive)"
