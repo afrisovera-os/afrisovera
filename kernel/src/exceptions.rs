@@ -96,6 +96,20 @@ extern "C" fn rust_sync_handler() -> ! {
         asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack));
         asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
     }
+    // F7: a fault ON a guard page while SP itself was still above the guard (a store below SP). That store may
+    // sit inside a print holding the console lock, so this case reports through the lock-free emergency path.
+    if let Some(which) = crate::paging::guard_of(far as usize) {
+        crate::uart::emergency_print(format_args!(
+            "\n[mansa] SYNC EXCEPTION  ESR={:#018x}  ELR={:#018x}  FAR={:#018x}\n[mansa] STACK OVERFLOW: {} stack (the fault address is in its guard)\n[mansa] halting.\n",
+            esr,
+            elr,
+            far,
+            which
+        ));
+        loop {
+            crate::cpu::wfi();
+        }
+    }
     crate::kprintln!(
         "[mansa] SYNC EXCEPTION  ESR={:#018x}  ELR={:#018x}  FAR={:#018x}",
         esr,
@@ -103,6 +117,35 @@ extern "C" fn rust_sync_handler() -> ! {
         far
     );
     crate::kprintln!("[mansa] halting.");
+    loop {
+        crate::cpu::wfi();
+    }
+}
+
+/// F7: reached from `sync_el1h` on the per-core EMERGENCY stack when SP was inside (or within 4 KiB above)
+/// a stack guard, i.e. the stack ran out and the next push faulted. `which` 0 = boot stack, 1 = secondary.
+#[no_mangle]
+extern "C" fn rust_stack_overflow(which: u64) -> ! {
+    let (esr, elr, far): (u64, u64, u64);
+    // SAFETY: reading fault syndrome registers.
+    unsafe {
+        asm!("mrs {}, esr_el1", out(reg) esr, options(nomem, nostack));
+        asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack));
+        asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
+    }
+    let g = crate::paging::guards()[if which == 0 { 0 } else { 1 }];
+    // Not kprintln!: the overflow may have hit inside a print that holds the console lock (stackguard,
+    // Actions 42924832878: the report spun on that lock and the machine hung silently).
+    crate::uart::emergency_print(format_args!(
+        "\n[mansa] STACK OVERFLOW: {} stack ran into its guard {:#x}..{:#x}  ESR={:#018x}  ELR={:#018x}  FAR={:#018x}\n",
+        g.0,
+        g.1,
+        g.2,
+        esr,
+        elr,
+        far
+    ));
+    crate::uart::emergency_print(format_args!("[mansa] halting (reported from the emergency stack).\n"));
     loop {
         crate::cpu::wfi();
     }
@@ -165,7 +208,36 @@ vector_table:
 
 sync_el1t:
 sync_el1h:
+    // F7: before anything is pushed, is SP in a stack guard (or within 4 KiB above one, too little to run
+    // a handler)? Then a push would fault again forever, silently: switch to that core's emergency stack
+    // and report. x0 is parked in TPIDR_EL1 for the compare: NOTHING else in this kernel reads or writes
+    // TPIDR_EL1 (grep it before ever using it elsewhere). No store goes through the old SP on any path
+    // here: the overflow branches load the emergency SP before the first push.
+    msr tpidr_el1, x0
+    ldr x0, =__boot_guard_lo
+    cmp sp, x0
+    b.lo 1f
+    ldr x0, =__boot_guard_hi
+    add x0, x0, #0x1000
+    cmp sp, x0
+    b.lo 3f
+1:  ldr x0, =__sec_guard_lo
+    cmp sp, x0
+    b.lo 2f
+    ldr x0, =__sec_guard_hi
+    add x0, x0, #0x1000
+    cmp sp, x0
+    b.lo 4f
+2:  mrs x0, tpidr_el1
     bl  rust_sync_handler
+3:  ldr x0, =__emerg_top0
+    mov sp, x0
+    mov x0, #0
+    bl  rust_stack_overflow
+4:  ldr x0, =__emerg_top1
+    mov sp, x0
+    mov x0, #1
+    bl  rust_stack_overflow
 
 unhandled_entry:
     bl  rust_unhandled

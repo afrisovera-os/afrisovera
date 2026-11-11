@@ -61,7 +61,7 @@ unsafe fn desk_key(code: u8, ext: bool) -> Option<u32> {
         (0x48, true) if SUPER => KEY_SUPER_UP,
         (0x50, true) if SUPER => KEY_SUPER_DOWN,
         (0x01, false) if !ALT && !SUPER => KEY_ESC,
-        // the keyboard walk (sovereign-ui.md 14): arrows and Enter while the Circle is open,
+        // the keyboard walk (afriui.md 14): arrows and Enter while the Circle is open,
         // Super+1..4 for the Spine's apps
         (0x48, true) if !ALT && !SUPER && walking() => KEY_UP,
         (0x50, true) if !ALT && !SUPER && walking() => KEY_DOWN,

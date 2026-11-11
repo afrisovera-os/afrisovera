@@ -310,7 +310,9 @@ unsafe fn build_address_space(idx: usize, mmio: bool) -> Option<u64> {
 
     // L1: [0] devices (EL1), [1] DRAM (EL1) — so the kernel stays mapped; [2] → L2.
     l1.add(0).write(paging::device_block(0x0000_0000));
-    l1.add(1).write(paging::normal_block_el1(0x4000_0000));
+    // F7: the kernel's own L1[1] (its DRAM; a table since the stack guards split it), so the boot-stack
+    // guards stay in force while this address space is live. EL1-only, like the block it replaced.
+    l1.add(1).write(paging::kernel_l1_entry(1));
     l1.add(2).write(l2 as u64 | paging::TABLE_DESC);
 
     // L2 (covers VA 0x8000_0000..0xBFFF_FFFF): [0] code, [1] stack.

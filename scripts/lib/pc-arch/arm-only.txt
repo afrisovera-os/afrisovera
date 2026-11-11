@@ -47,7 +47,7 @@ frame-bounds   -- virt DRAM at 0x40000000 from the blueprint; PC RAM starts at 0
 heap           -- the arena must sit in the image QEMU's -kernel loads at 0x40000000 (ARM virt)
 #
 # The phone's desktop (added 10 Nov 2026, Sovereign UI): since then the PC draws its own desktop
-# (kernel/src/sovereign/desk.rs, docs/design/sovereign-ui.md) and pc-desk / pc-desktop grade it;
+# (kernel/src/afriui/desk.rs, docs/design/afriui.md) and pc-desk / pc-desktop grade it;
 # desk-test.sh grades the phone's 8 Nov desktop (kernel/src/desk.rs) by its pixels and places.
 desk           (the phone's desktop, kernel/src/desk.rs; the PC's is graded by pc-desk)
 #
@@ -55,3 +55,5 @@ desk           (the phone's desktop, kernel/src/desk.rs; the PC's is graded by p
 # kernel has the hardened DRBG but no mesh module yet; these leave the list when the PC port lands.
 mesh-kernel    -- `mesh selftest` / `mesh id`: the mesh module is in the ARM kernel only
 mesh-phase0    -- two ARM machines over virtio-net + scripts/mesh-bridge.py
+stackwater     -- `stack`: paint high-water of the ARM boot and secondary stacks (kernel/src/stackwater.rs)
+stackguard     -- `stack guards` / `stack overflow-test`: the ARM boot-stack guards (paging::init L2K/L3S)

@@ -115,7 +115,7 @@ pub fn pointer_area() -> (i32, i32) {
     }
 }
 
-/// `screen ui`, `screen ui 1..4|auto`: the desktop's UI scale (section 13 of sovereign-ui.md).
+/// `screen ui`, `screen ui 1..4|auto`: the desktop's UI scale (section 13 of afriui.md).
 fn ui_command(arg: &str) {
     if !ON.load(Ordering::Relaxed) {
         crate::kprintln!("screen: no GOP framebuffer, so the desktop has no screen to fill (serial console only)");

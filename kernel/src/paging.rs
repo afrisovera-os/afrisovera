@@ -39,6 +39,59 @@ static mut L1: Table = Table { entries: [0; 512] };
 #[cfg(feature = "board-raspi")]
 static mut L2: Table = Table { entries: [0; 512] };
 
+// F7 (docs/design-f7-stack-guard.md): the 1 GiB block holding the kernel's stack area is split into 2 MiB
+// blocks (L2K), and the 2 MiB region holding the stack area into 4 KiB pages (L3S), so the two 64 KiB guard
+// ranges below the boot and secondary stacks can be left UNMAPPED. Every other address keeps the attributes
+// the 1 GiB block gave it.
+#[cfg(not(feature = "board-raspi"))]
+static mut L2K: Table = Table { entries: [0; 512] };
+#[cfg(not(feature = "board-raspi"))]
+static mut L3S: Table = Table { entries: [0; 512] };
+
+extern "C" {
+    static __stack_area: u8;
+    static __boot_guard_lo: u8;
+    static __boot_guard_hi: u8;
+    static __sec_guard_lo: u8;
+    static __sec_guard_hi: u8;
+}
+
+const TWO_MIB: u64 = 0x20_0000;
+const FOUR_KIB: u64 = 0x1000;
+/// Level-3 **page** descriptor low bits (`0b11`; at level 3 `0b01` is reserved/invalid).
+const PAGE_DESC: u64 = 0b11;
+
+/// The two guard ranges `[lo, hi)`: (name, lo, hi). Read from the linker script's symbols.
+pub fn guards() -> [(&'static str, usize, usize); 2] {
+    [
+        ("boot", addr_of!(__boot_guard_lo) as usize, addr_of!(__boot_guard_hi) as usize),
+        ("secondary", addr_of!(__sec_guard_lo) as usize, addr_of!(__sec_guard_hi) as usize),
+    ]
+}
+
+/// Which guard `addr` falls in, if any.
+pub fn guard_of(addr: usize) -> Option<&'static str> {
+    guards().iter().find(|g| addr >= g.1 && addr < g.2).map(|g| g.0)
+}
+
+/// True when the MMU translates `va` for an EL1 read (AT S1E1R; PAR_EL1.F clear). With the MMU off every
+/// address "translates", so call this only after `init`.
+pub fn translates(va: usize) -> bool {
+    let par: u64;
+    // SAFETY: address translation probe; changes only PAR_EL1.
+    unsafe {
+        asm!("at s1e1r, {va}", "isb", "mrs {par}, par_el1", va = in(reg) va, par = out(reg) par, options(nostack));
+    }
+    par & 1 == 0
+}
+
+/// The descriptor the kernel's own L1 holds at `i`. EL0 address spaces copy it for the kernel's DRAM block
+/// (process.rs), so they share the guards instead of re-mapping the whole gibibyte as one block.
+pub fn kernel_l1_entry(i: usize) -> u64 {
+    // SAFETY: L1 is written once in `init` before any process is built; this only reads it.
+    unsafe { (*addr_of!(L1)).entries[i] }
+}
+
 // --- Descriptor / register bit fields -------------------------------------
 const DESC_VALID: u64 = 0b01; // level-1/2 *block* descriptor (bits[1:0]=0b01)
 const DESC_AF: u64 = 1 << 10; // Access Flag (fault if 0)
@@ -196,6 +249,34 @@ pub fn init() {
                     pa | DESC_AF | ATTR_IDX_DEVICE | DESC_VALID
                 };
             }
+
+            // F7: punch the two stack guards out of the Normal window. The stack area is 2 MiB aligned and
+            // fits one 2 MiB region (linker ASSERT), so one L2 + one L3 table cover it.
+            let area = addr_of!(__stack_area) as u64;
+            let blk = (area / ONE_GIB) as usize;
+            if NORMAL.contains(blk) && blk < MAPPED_BLOCKS {
+                // Every new entry keeps EXACTLY the attributes the 1 GiB block gave (architect condition 1):
+                // they are taken from that block's own descriptor, not restated here. Only the output address
+                // and the descriptor type change.
+                const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+                let normal = l1.entries[blk] & !ADDR_MASK & !0b11;
+                let l2 = &mut *core::ptr::addr_of_mut!(L2K);
+                let l3 = &mut *core::ptr::addr_of_mut!(L3S);
+                let gib = (blk as u64) * ONE_GIB;
+                for i in 0..512 {
+                    l2.entries[i] = (gib + (i as u64) * TWO_MIB) | normal | DESC_VALID; // 2 MiB block
+                }
+                for p in 0..512 {
+                    let pa = area + (p as u64) * FOUR_KIB;
+                    l3.entries[p] = if guard_of(pa as usize).is_some() {
+                        0 // invalid: any access faults
+                    } else {
+                        pa | normal | PAGE_DESC
+                    };
+                }
+                l2.entries[((area - gib) / TWO_MIB) as usize] = (addr_of!(L3S) as u64) | TABLE_DESC;
+                l1.entries[blk] = (addr_of!(L2K) as u64) | TABLE_DESC;
+            }
         }
 
         // --- Raspberry Pi (BCM2837): first GiB is RAM (Normal) except the
@@ -340,6 +421,16 @@ pub fn describe() {
         "                 Device elsewhere below {:#010x}; above that: unmapped (faults)",
         MAPPED_BLOCKS * (ONE_GIB as usize)
     );
+    #[cfg(not(feature = "board-raspi"))]
+    for (name, lo, hi) in guards() {
+        crate::kprintln!(
+            "  stack guard    {} {:#010x}..{:#010x} ({} KiB, unmapped 4 KiB pages)",
+            name,
+            lo,
+            hi,
+            (hi - lo) / 1024
+        );
+    }
 }
 
 fn case_ok(pass: &mut u32, total: &mut u32, ok: bool, what: &str) {

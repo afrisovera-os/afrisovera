@@ -42,6 +42,7 @@ mod process;
 mod rng;
 mod sched;
 mod shell;
+mod stackwater;
 mod store;
 mod timer;
 mod tonga;
@@ -713,6 +714,8 @@ fn psci_cpu_on(target: u64, entry: u64) -> i64 {
 #[cfg(not(feature = "board-raspi"))]
 fn bring_up_secondary() {
     let entry = _start_secondary as *const () as usize as u64;
+    // F7: paint core 1's stack (and push it past the caches) before core 1 starts on it.
+    stackwater::paint_secondary();
     let ret = psci_cpu_on(1, entry);
     if ret != 0 {
         kprintln!("[mansa] SMP: no secondary core (PSCI CPU_ON -> {}); running single-core", ret);
@@ -837,6 +840,8 @@ pub extern "C" fn kernel_main(dtb: u64) -> ! {
     //    atomics work.
     paging::init();
     kprintln!("[mansa] MMU enabled — identity map live (device + DRAM)");
+    // F7 measure-first: paint the unused boot stack so `stack` can report its high-water mark.
+    stackwater::paint_boot();
 
     // Parse the device tree the firmware handed us (x0) to discover the machine
     // instead of trusting only the compile-time board map. QEMU's ELF boot passes

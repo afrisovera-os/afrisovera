@@ -352,6 +352,16 @@ pub fn console_unlock(prev: u64) {
     crate::cpu::irq_restore(prev);
 }
 
+/// Last-words output for a fatal path that may have interrupted a print (F7: a stack overflow can fault
+/// INSIDE `kprintln!`, while this core holds `CONSOLE_LOCK`, so taking the lock again would spin forever).
+/// Takes the lock over without waiting and writes straight to the UART (no framebuffer tee, whose state may
+/// be half-updated). Only for paths that halt the machine right after: the lock is never given back.
+pub fn emergency_print(args: core::fmt::Arguments) {
+    let _ = crate::cpu::irq_save();
+    CONSOLE_LOCK.store(1, Ordering::Release);
+    let _ = Uart.write_fmt(args);
+}
+
 /// Write a byte string straight to the UART under the console lock (no
 /// framebuffer tee). Used by the secondary core once it is MMU-on, so its
 /// messages serialize against the primary's `kprintln!` without routing through

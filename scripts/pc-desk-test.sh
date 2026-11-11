@@ -2,7 +2,7 @@
 # The AfriSovera desktop on the PC, driven by a USB mouse and keyboard (8 Nov 2026,
 # docs/design/desktop.md section 6).
 #
-# Since 10 Nov 2026 the PC desktop is the Sovereign UI (docs/design/sovereign-ui.md): the Spine
+# Since 10 Nov 2026 the PC desktop is the Sovereign UI (docs/design/afriui.md): the Spine
 # down the left edge instead of a top bar and dock, cut corners, each app's woven cloth on the
 # focused window's lintel. The phone keeps the 8 Nov desktop (scripts/desk-test.sh).
 # Section 13: the desktop fills the screen at its own resolution. Section 14 (slice 2): windows
@@ -37,7 +37,7 @@ cd "$(dirname "$0")/.."
 T="${TMPDIR:-/tmp}"
 
 # The desktop's layout for the screen asked for, as kernel/src/pc/canvas.rs (setup) and
-# kernel/src/sovereign/desk.rs (home) work it out. Sets DW DH SC, and the homes of Files (FX FY),
+# kernel/src/afriui/desk.rs (home) work it out. Sets DW DH SC, and the homes of Files (FX FY),
 # Terminal (TX TY) and Settings (SX SY). QEMU's own screen mode is 1280x800.
 layout() {
     local scr="${PC_DESK_SCREEN:-1280x800}" sw sh s spine=44 cx cy
@@ -161,7 +161,7 @@ grade() { # grade <serial> <pixels>
     fi
     printf '%s\n' "$S" | grep -aqE '^\[desk\] perf: [0-9]+x[0-9]+ at UI scale [0-9]x; draw [0-9]+ us \(worst [0-9]+ us\)' ||
         _f "desk perf did not report the draw and copy times"
-    # slice 3 (sovereign-ui.md 15): the partial frames left exactly what a full redraw draws
+    # slice 3 (afriui.md 15): the partial frames left exactly what a full redraw draws
     printf '%s\n' "$S" | grep -aqE '^\[desk\] verify: 0 of [0-9]+ rows differ after a full redraw \([1-9][0-9]* partial frame' ||
         _f "desk verify did not find the desktop as a full redraw draws it after partial frames (or none were partial)"
     if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi

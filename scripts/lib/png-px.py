@@ -11,7 +11,7 @@ places it, so the point is mapped the same way. Prints "error=<why>" when it can
 Used by scripts/desk-test.sh and scripts/pc-desk-test.sh.
 
     png-px.py <png> --desk <S> <point> ...   (10 Nov 2026) the PC desktop fills the screen at
-                                     its own resolution (docs/design/sovereign-ui.md section 13):
+                                     its own resolution (docs/design/afriui.md section 13):
                                      the points are desktop pixels at UI scale S, the desktop
                                      being the screen's size over S (at most 1920x1200), centred
 """

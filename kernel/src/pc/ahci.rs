@@ -107,6 +107,10 @@ static mut MULTIW: u8 = 0;
 static mut RSTATS: (u64, u64, u64, u64) = (0, 0, 0, 0);
 /// Writes: sectors written, multi-block commands, single-block ones.
 static mut WSTATS: (u64, u64, u64) = (0, 0, 0);
+/// Big copies (table_write_run): 0 = not tried, 1 = on, 2 = off (one sector at a time, as table_write).
+static mut TRUN: u8 = 0;
+/// Big copies sent in one command: runs, sectors.
+static mut TSTATS: (u64, u64) = (0, 0);
 
 fn hba(off: u64) -> u32 {
     // SAFETY: ABAR is mapped uncached by init before any caller runs.
@@ -750,6 +754,50 @@ pub fn table_write(p: u32, n: u64, data: &[u8; 512]) -> bool {
     ok
 }
 
+/// Write `data` (1 to 16 whole 512-byte sectors) from sector `n` of the disk on port `p` whoever owns
+/// it: ONE WRITE DMA EXT, then ONE READ DMA EXT and compared, so installdisk and bootcopy do not send a
+/// command for every sector. WB carries the run and RA the read back (the storage disk's gathered
+/// writes go out first and its read-ahead is dropped). A run refused or read back different is written
+/// again one sector at a time (table_write) and runs stay off until power-off, with one line; a disk
+/// with sectors bigger than 512 bytes always goes one sector at a time. The same callers and the same
+/// rule as table_write.
+pub fn table_write_run(p: u32, n: u64, data: &[u8]) -> bool {
+    let c = data.len() / 512;
+    if c == 0 || c * 512 != data.len() || c * 512 > RA_BYTES {
+        return false;
+    }
+    let Some(cap) = (0..32).filter_map(raw_disk).find(|d| d.0 == p).map(|d| d.1) else { return false };
+    let single = || data.chunks_exact(512).enumerate().all(|(j, s)| table_write(p, n + j as u64, s.try_into().unwrap()));
+    // SAFETY: single core, kernel/shell context, one command in flight; WB and RA are ours while
+    // no write is gathered (flush) and the read-ahead is dropped.
+    unsafe {
+        if c == 1 || TRUN == 2 || per(p) > 1 {
+            return single();
+        }
+        if n.saturating_add(c as u64) > cap || !flush() {
+            return false;
+        }
+        RA_N = 0;
+        let (wb, rb) = (addr_of_mut!(WB.0) as *mut u8, addr_of_mut!(RA.0) as *mut u8);
+        core::slice::from_raw_parts_mut(wb, data.len()).copy_from_slice(data);
+        let ok = xfer(p, ATA_WRITE_DMA_EXT, n, c as u32, wb as u64, true)
+            && xfer(p, ATA_READ_DMA_EXT, n, c as u32, rb as u64, false)
+            && core::slice::from_raw_parts(rb, data.len()) == data;
+        if !ok {
+            crate::kprintln!(
+                "[ahci] port {}: {} sectors written in one command were refused or read back different, so big copies go one sector at a time from now on",
+                p, c
+            );
+            TRUN = 2;
+            return single();
+        }
+        TRUN = 1;
+        TSTATS.0 += 1;
+        TSTATS.1 += c as u64;
+        true
+    }
+}
+
 /// `lsahci`: the controller and every disk on it.
 pub fn list() {
     // SAFETY: scalar reads of boot-time state.
@@ -792,5 +840,13 @@ pub fn list() {
         if let Some((p, a, l)) = part().filter(|x| x.2 > 0) {
             crate::kprintln!("  storage: port {}, AfriSovera's partition, sectors {}-{} ({} MiB); nothing outside it is written", p, a, a + l - 1, l / 2048);
         }
+    }
+    // SAFETY: scalar reads.
+    let (tr, t) = unsafe { (TRUN, TSTATS) };
+    if tr != 0 {
+        crate::kprintln!(
+            "  big copies (installdisk, bootcopy): {} run(s) in one command, {} sector(s), each read back ({})",
+            t.0, t.1, if tr == 1 { "on" } else { "off" }
+        );
     }
 }

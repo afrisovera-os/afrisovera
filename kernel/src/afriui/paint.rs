@@ -1,10 +1,13 @@
-//! The Sovereign UI's paint (docs/design/sovereign-ui.md section 14): the theme (palette,
+//! The Sovereign UI's paint (docs/design/afriui.md section 14): the theme (palette,
 //! cloths, cut-corner primitives, text, icons) and every drawing function of the PC desktop.
 //! It reads the model in desk.rs (`use super::*`: the window state, geometry and app data) and
 //! never changes it, except for its own frame count and timing; the model never draws. When the
-//! phone moves over, it keeps the model and gets its paint here (sovereign-ui.md section 9).
+//! phone moves over, it keeps the model and gets its paint here (afriui.md section 9).
 
 use super::*;
+
+#[path = "face.rs"]
+mod face; // the Sovereign face (afriui.md section 16)
 
 const NIGHT: u32 = 0x10_0C_0A; // the Spine: warm black, not grey
 
@@ -64,7 +67,7 @@ const CLOTH: [[u32; 3]; 4] = [[OCHRE, NIGHT, GOLD], [GREEN, NIGHT, GOLD], [INDIG
 /// window's bottom-right cut corner stays cut: (x, y, w, h, cut). Mainline only.
 static mut CLIP: Option<(i32, i32, i32, i32, i32)> = None;
 
-/// The damaged box being redrawn (sovereign-ui.md section 15): every fill is clipped to it.
+/// The damaged box being redrawn (afriui.md section 15): every fill is clipped to it.
 /// The whole screen when a full frame is drawn. Mainline only.
 static mut DCLIP: Rect = (0, 0, i32::MAX / 2, i32::MAX / 2);
 
@@ -105,7 +108,7 @@ fn rect(x: i32, y: i32, w: i32, h: i32, c: u32) {
 }
 
 /// How far row j of a shape h rows high is inset on the left and on the right, for corners
-/// cut at 45 degrees: tl, tr, br, bl pixels (sovereign-ui.md section 3).
+/// cut at 45 degrees: tl, tr, br, bl pixels (afriui.md section 3).
 fn cut_inset(j: i32, h: i32, tl: i32, tr: i32, br: i32, bl: i32) -> (i32, i32) {
     let up = |c: i32| if j < c { c - j } else { 0 };
     let down = |c: i32| if h - 1 - j < c { c - (h - 1 - j) } else { 0 };
@@ -188,116 +191,63 @@ fn lerp(a: u32, b: u32, t: i32) -> u32 {
     (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
-/// The glyph for a byte: lower case from the PC font table on both kernels (the desktop
-/// only; the ARM text console keeps its capitals), the rest from the shared font.
-fn glyph(c: u8) -> [u8; 8] {
-    if let Some(g) = crate::font_lower::glyph(c) {
-        return g;
-    }
-    if let Some(g) = punct(c) {
-        return g;
-    }
-    crate::font::glyph(c)
-}
-
-/// Punctuation the shared font lacks (it draws a block for them), in its style: 5 pixels
-/// wide in bits 7..3, 7 rows. The Terminal shows real shell output, which uses all of these.
-fn punct(c: u8) -> Option<[u8; 8]> {
-    Some(match c {
-        b';' => [0, 0b01100000, 0b01100000, 0, 0b01100000, 0b00100000, 0b01000000, 0],
-        b'?' => [0b01110000, 0b10001000, 0b00001000, 0b00110000, 0b00100000, 0, 0b00100000, 0],
-        b'"' => [0b01010000, 0b01010000, 0b01010000, 0, 0, 0, 0, 0],
-        b'#' => [0b01010000, 0b01010000, 0b11111000, 0b01010000, 0b11111000, 0b01010000, 0b01010000, 0],
-        b'@' => [0b01110000, 0b10001000, 0b10111000, 0b10101000, 0b10111000, 0b10000000, 0b01110000, 0],
-        b'%' => [0b11000000, 0b11001000, 0b00010000, 0b00100000, 0b01000000, 0b10011000, 0b00011000, 0],
-        b'&' => [0b01100000, 0b10010000, 0b10100000, 0b01000000, 0b10101000, 0b10010000, 0b01101000, 0],
-        b'$' => [0b00100000, 0b01111000, 0b10100000, 0b01110000, 0b00101000, 0b11110000, 0b00100000, 0],
-        b'|' => [0b00100000, 0b00100000, 0b00100000, 0b00100000, 0b00100000, 0b00100000, 0b00100000, 0],
-        b'\\' => [0b10000000, 0b10000000, 0b01000000, 0b00100000, 0b00010000, 0b00001000, 0b00001000, 0],
-        b'{' => [0b00110000, 0b01000000, 0b01000000, 0b10000000, 0b01000000, 0b01000000, 0b00110000, 0],
-        b'}' => [0b01100000, 0b00010000, 0b00010000, 0b00001000, 0b00010000, 0b00010000, 0b01100000, 0],
-        b'~' => [0, 0, 0b01000000, 0b10101000, 0b00010000, 0, 0, 0],
-        b'^' => [0b00100000, 0b01010000, 0b10001000, 0, 0, 0, 0, 0],
-        b'`' => [0b01000000, 0b00100000, 0, 0, 0, 0, 0, 0],
-        _ => return None,
-    })
-}
-
-fn ink(g: &[u8; 8]) -> Option<(i32, i32)> {
-    let (mut l, mut r) = (8, -1);
-    for &bits in g.iter() {
-        for col in 0..8 {
+/// One glyph of the Sovereign face (face.rs) at (x, y), `scale` pixels a dot: each row's runs
+/// of ink are one fill each (fewer calls than a fill per dot).
+fn glyph_at(x: i32, y: i32, rows: &[u8; 12], w: i32, c: u32, scale: i32) {
+    for (r, &bits) in rows.iter().enumerate() {
+        if bits == 0 {
+            continue;
+        }
+        let mut col = 0;
+        while col < w {
             if (bits >> (7 - col)) & 1 == 1 {
-                l = l.min(col);
-                r = r.max(col);
+                let start = col;
+                while col < w && (bits >> (7 - col)) & 1 == 1 {
+                    col += 1;
+                }
+                rect(x + start * scale, y + r as i32 * scale, (col - start) * scale, scale, c);
+            } else {
+                col += 1;
             }
         }
     }
-    if r < l {
-        None
-    } else {
-        Some((l, r))
-    }
 }
 
-/// Proportional text (as framebuffer::draw_string) with lower case; returns the end x.
+/// Proportional text in the Sovereign face (afriui.md section 16): each glyph advances
+/// by its own width plus one pixel. (x0, y0) is the top of the capitals; descenders hang
+/// below the baseline (face::LINE_H rows in all). Returns the end x.
 fn text(x0: i32, y0: i32, s: &[u8], c: u32, scale: i32) -> i32 {
     // a line wholly above or below the box being redrawn: only its width is needed
     // SAFETY: mainline only.
     let (_, dy, _, dh) = unsafe { DCLIP };
-    if !s.is_empty() && (y0 >= dy + dh || y0 + 8 * scale <= dy) {
+    if !s.is_empty() && (y0 >= dy + dh || y0 + face::LINE_H * scale <= dy) {
         return x0 + text_w(s, scale) + scale;
     }
     let mut x = x0;
     for &b in s {
-        if b == b' ' {
-            x += 4 * scale;
-            continue;
-        }
-        let g = glyph(b);
-        let Some((l, r)) = ink(&g) else {
-            x += 4 * scale;
-            continue;
-        };
-        for (row, bits) in g.iter().enumerate() {
-            for col in l..=r {
-                if (bits >> (7 - col)) & 1 == 1 {
-                    rect(x + (col - l) * scale, y0 + row as i32 * scale, scale, scale, c);
-                }
-            }
-        }
-        x += (r - l + 2) * scale;
+        let (w, rows) = face::glyph(b);
+        glyph_at(x, y0, rows, w, c, scale);
+        x += (w + 1) * scale;
     }
     x
 }
 
 fn text_w(s: &[u8], scale: i32) -> i32 {
-    let mut w = 0;
-    for &b in s {
-        w += match if b == b' ' { None } else { ink(&glyph(b)) } {
-            Some((l, r)) => (r - l + 2) * scale,
-            None => 4 * scale,
-        };
-    }
-    (w - scale).max(0)
+    let w: i32 = s.iter().map(|&b| face::glyph(b).0 + 1).sum();
+    ((w - 1) * scale).max(0)
 }
 
-/// Monospace text (the Terminal), clipped to `cols` characters of 6 px.
+/// Monospace text (the Terminal, the file preview), clipped to `cols` cells of 6 px: every
+/// glyph of the face is at most 5 wide, centred in its cell, so the columns stay aligned.
 fn mono(x: i32, y: i32, s: &[u8], c: u32, cols: usize) {
     // SAFETY: mainline only.
     let (_, dy, _, dh) = unsafe { DCLIP };
-    if y >= dy + dh || y + 8 <= dy {
+    if y >= dy + dh || y + face::LINE_H <= dy {
         return; // a line outside the box being redrawn
     }
     for (i, &b) in s.iter().take(cols).enumerate() {
-        let g = glyph(b);
-        for (row, bits) in g.iter().enumerate() {
-            for col in 0..6 {
-                if (bits >> (7 - col)) & 1 == 1 {
-                    rect(x + i as i32 * 6 + col, y + row as i32, 1, 1, c);
-                }
-            }
-        }
+        let (w, rows) = face::glyph(b);
+        glyph_at(x + i as i32 * 6 + (5 - w) / 2, y, rows, w, c, 1);
     }
 }
 
@@ -389,7 +339,7 @@ fn wallpaper() {
     }
     if st().wallpaper {
         // mud cloth (bogolanfini): a grid of small marks, a dot and a chevron in turn, one
-        // shade above the soil, so they are felt more than seen (sovereign-ui.md section 6);
+        // shade above the soil, so they are felt more than seen (afriui.md section 6);
         // only the marks near the clip (a partial frame) are visited
         let (jy0, ix0) = (((y0 - 12 - 4) / 24).max(0), ((cx0 - sw - 12 - 4) / 24).max(0));
         let (mut y, mut j) = (12 + jy0 * 24, jy0);
@@ -485,7 +435,7 @@ fn spine() {
     rect(gx + 8, gy + 12, 10, 2, bc);
     rect(gx + 11, gy + 15, 4, 2, bc);
     if s.unread > 0 {
-        chip(gx + 17, gy + 2, 10, 10, 2, RED);
+        chip(gx + 17, gy + 2, 10, 11, 2, RED);
         let mut t = [0u8; 20];
         text(gx + 20, gy + 3, num(s.unread as u64, &mut t), TEXT, 1);
     }
@@ -540,7 +490,7 @@ fn window(a: usize) {
     let isz = if s.touch { 16 } else { 12 };
     icon(Some(APPS[a]), x + 12, y + band + (th - band - isz) / 2, isz);
     let ts = if s.touch { 2 } else { 1 };
-    text(x + 12 + isz + 8, y + band + (th - band - 8 * ts) / 2, APPS[a].name().as_bytes(), if focus { TEXT } else { DIM }, ts);
+    text(x + 12 + isz + 8, y + band + (th - band - face::CAP * ts) / 2, APPS[a].name().as_bytes(), if focus { TEXT } else { DIM }, ts);
     // buttons: minimise (pointer only) and close, cut-corner chips
     let (cl, mn) = title_buttons(a);
     let hot = s.hover_close == Some(a);
@@ -641,7 +591,7 @@ fn files_app(a: usize, x: i32, y: i32, w: i32, h: i32) {
                     // wrapped at the pane's width, at a space when there is one
                     let mut rest = line;
                     loop {
-                        if yy + 10 > y + h {
+                        if yy + face::LINE_H > y + h {
                             break 'lines;
                         }
                         let mut cut = rest.len().min(cols);
@@ -653,7 +603,7 @@ fn files_app(a: usize, x: i32, y: i32, w: i32, h: i32) {
                             }
                         }
                         mono(px + 10, yy, &rest[..cut], TEXT, cols);
-                        yy += 11;
+                        yy += 13;
                         rest = &rest[cut..];
                         if rest.is_empty() {
                             break;
@@ -674,7 +624,7 @@ fn files_app(a: usize, x: i32, y: i32, w: i32, h: i32) {
 fn terminal_app(x: i32, y: i32, w: i32, h: i32) {
     rect(x, y, w, h, TERM_BG);
     let cols = ((w - 16) / 6).max(1) as usize;
-    let rows = ((h - 12) / 11).max(1) as usize;
+    let rows = ((h - 12) / 13).max(1) as usize;
     // the newest lines that are not desktop log lines, bottom up
     let mut shown = [0usize; TL];
     let mut n = 0;
@@ -689,7 +639,7 @@ fn terminal_app(x: i32, y: i32, w: i32, h: i32) {
     }
     for j in 0..n {
         let line = term_line(shown[j]);
-        let yy = y + 6 + (n - 1 - j) as i32 * 11;
+        let yy = y + 6 + (n - 1 - j) as i32 * 13;
         let prompt = line.starts_with(b"afrisovera>");
         if prompt {
             mono(x + 8, yy, &line[..11], GOLD, cols);
@@ -700,7 +650,7 @@ fn terminal_app(x: i32, y: i32, w: i32, h: i32) {
         if j == 0 {
             // the cursor after the line being typed
             let cx = x + 8 + (line.len().min(cols) as i32) * 6;
-            rect(cx + 1, yy, 5, 8, GOLD);
+            rect(cx + 1, yy, 5, face::CAP, GOLD);
         }
     }
 }
@@ -765,20 +715,29 @@ fn settings_app(a: usize, x: i32, y: i32, w: i32, _h: i32) {
     let mut l = Line::new();
     l.s(b"Booted ").u(crate::config::boots() as u64).s(b" time(s), up ").u(crate::sched::ticks() / 100).s(b" s");
     text(x + 14, y + 212, l.get(), DIM, 1);
+    note_uptime(a, y + 212);
     let _ = (w, a);
 }
 
 /// The line where Settings or About shows the uptime (it changes every second), as a box on
-/// the desktop; the model damages only that line once a second (sovereign-ui.md section 15).
+/// the desktop; the model damages only that line once a second (afriui.md section 15).
+/// Each app records where it last drew its uptime line, as rows below its window's top
+/// (architect's note N6: the place comes from the drawing, not a copy of its layout); -1 until
+/// the app has been drawn, and then the whole window is the line's box.
+static mut UPTIME_DY: [i32; NAPPS] = [-1; NAPPS];
+
+fn note_uptime(a: usize, line_y: i32) {
+    // SAFETY: mainline only.
+    unsafe { UPTIME_DY[a] = line_y - win_rect(a).1 };
+}
+
 pub(super) fn uptime_box(a: usize) -> Rect {
-    let (x, y, w, h) = win_rect(a);
-    let th = title_h();
-    let (bx, by, bw, bh) = (x + 1, y + th + 1, w - 2, h - th - 2);
-    if APPS[a] == App::Settings {
-        return (bx, by + 212, bw, 9);
+    let (x, y, w, _) = win_rect(a);
+    // SAFETY: mainline only.
+    match unsafe { UPTIME_DY[a] } {
+        dy if dy >= 0 => (x + 1, y + dy - 1, w - 2, face::LINE_H + 2),
+        _ => win_box(a),
     }
-    let mh = (bh * 38 / 100).max(40);
-    (bx, by + 16 + mh + 14 + 22 + 18 + 10 + 3 * 14, bw, 9)
 }
 
 fn about_app(x: i32, y: i32, w: i32, h: i32) {
@@ -801,11 +760,14 @@ fn about_app(x: i32, y: i32, w: i32, h: i32) {
     rows[2].1.s(arch).s(b", ").u(crate::cores_online() as u64).s(b" core(s)");
     rows[3].1.u((crate::frame::total_frames() * 4 / 1024) as u64).s(b" MiB, up ").u(crate::sched::ticks() / 100).s(b" s");
     for (k, v) in rows.iter() {
-        if yy + 10 > y + h {
+        if yy + face::LINE_H > y + h {
             break;
         }
         text(x + 30, yy, k, DIM, 1);
         text(x + 100, yy, v.get(), TEXT, 1);
+        if *k == b"Memory" {
+            note_uptime(App::About as usize, yy); // the uptime is on this row
+        }
         yy += 14;
     }
 }
@@ -947,7 +909,7 @@ fn touches(a: Rect, b: Rect) -> bool {
     a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
 }
 
-/// Redraw only the damaged boxes (sovereign-ui.md section 15): each box on its own, every fill
+/// Redraw only the damaged boxes (afriui.md section 15): each box on its own, every fill
 /// clipped to it, and whatever does not touch it skipped whole.
 pub(super) fn draw_damage(boxes: &[Rect]) {
     let s = st();

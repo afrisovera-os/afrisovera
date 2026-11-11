@@ -797,12 +797,13 @@ impl Disk {
         }
     }
 
-    /// `data` (whole 512-byte sectors, at most RUN) from sector `n` on: one command, read back and
-    /// one cache flush on an IDE-mode disk (installdisk, bootcopy); other disks one sector at a time
-    /// as `write`.
+    /// `data` (whole 512-byte sectors, at most RUN) from sector `n` on: one command and read back on
+    /// a SATA disk (AHCI or IDE mode, the IDE one also one cache flush) (installdisk, bootcopy); other
+    /// disks one sector at a time as `write`.
     pub(crate) fn write_run(self, n: u64, data: &[u8]) -> bool {
         match self {
             Disk::Ide(k) => crate::ide::table_write_run(k, n, data),
+            Disk::Sata(p) => crate::ahci::table_write_run(p, n, data),
             _ => data.chunks_exact(512).enumerate().all(|(j, s)| self.write(n + j as u64, s.try_into().unwrap())),
         }
     }

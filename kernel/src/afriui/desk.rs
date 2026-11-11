@@ -1,7 +1,7 @@
-//! The AfriSovera desktop in the Sovereign UI (docs/design/sovereign-ui.md, 10 Nov 2026).
+//! The AfriSovera desktop in the Sovereign UI (docs/design/afriui.md, 10 Nov 2026).
 //!
 //! The PC builds this file; the phone still builds kernel/src/desk.rs (the 8 Nov desktop), so
-//! the ARM image stays byte-identical until the phone moves over (sovereign-ui.md section 9).
+//! the ARM image stays byte-identical until the phone moves over (afriui.md section 9).
 //! Behaviour (input ring, windows, focus, `desk` commands, the apps' data) is the same as
 //! desk.rs; the look is new: the Spine down the left edge (monument button, app tiles with
 //! beads, status and clock), cut corners instead of round ones, each app's woven cloth as its
@@ -17,10 +17,10 @@ use crate::framebuffer as fb;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 #[path = "paint.rs"]
-mod paint; // the theme and every drawing function (sovereign-ui.md section 14)
+mod paint; // the theme and every drawing function (afriui.md section 14)
 
 // ---------------------------------------------------------------------------------------
-// Damage (sovereign-ui.md section 15): a change repaints only what it touches.
+// Damage (afriui.md section 15): a change repaints only what it touches.
 // ---------------------------------------------------------------------------------------
 /// A box on the desktop: (x, y, w, h).
 type Rect = (i32, i32, i32, i32);
@@ -221,7 +221,7 @@ fn row_hashes(out: &mut [u64]) {
 }
 
 /// The desktop's size in logical pixels: the PC canvas (kernel/src/pc/canvas.rs), the screen's
-/// own size over the UI scale (sovereign-ui.md section 13), read at every use so `screen ui`
+/// own size over the UI scale (afriui.md section 13), read at every use so `screen ui`
 /// re-lays the desktop out.
 #[allow(non_snake_case)]
 fn W() -> i32 {
@@ -233,7 +233,7 @@ fn H() -> i32 {
 }
 
 // ---------------------------------------------------------------------------------------
-// Palette: Earth and Night (sovereign-ui.md section 4). Every colour on screen comes from
+// Palette: Earth and Night (afriui.md section 4). Every colour on screen comes from
 // this table.
 // ---------------------------------------------------------------------------------------
 
@@ -283,7 +283,7 @@ struct Win {
 }
 const WIN0: Win = Win { open: false, min: false, x: 0, y: 0, w: 0, h: 0 };
 
-/// Default pointer-profile windows (sovereign-ui.md section 14): each app's centre as an offset
+/// Default pointer-profile windows (afriui.md section 14): each app's centre as an offset
 /// from the middle of the free space right of the Spine, and its size: a cascade round the
 /// middle at any screen size, every lintel on the screen.
 const HOME: [(i32, i32, i32, i32); NAPPS] = [(-150, -70, 372, 250), (40, 50, 410, 260), (-70, -30, 380, 300), (110, -20, 330, 300)];
@@ -389,7 +389,7 @@ pub const KEY_SUPER_LEFT: u32 = 5;
 pub const KEY_SUPER_RIGHT: u32 = 6;
 pub const KEY_SUPER_UP: u32 = 7;
 pub const KEY_SUPER_DOWN: u32 = 8;
-/// The keyboard walk (sovereign-ui.md section 14): arrows and Enter while the Circle is open,
+/// The keyboard walk (afriui.md section 14): arrows and Enter while the Circle is open,
 /// Super+1..4 for the Spine's apps (KEY_SUPER_1 + n).
 pub const KEY_UP: u32 = 9;
 pub const KEY_DOWN: u32 = 10;
@@ -1163,7 +1163,7 @@ pub fn idle() {
 }
 
 /// The canvas changed size (`screen ui N`): keep every window's lintel on the screen and
-/// redraw (sovereign-ui.md section 13).
+/// redraw (afriui.md section 13).
 pub fn relayout() {
     let s = st();
     for a in 0..NAPPS {
@@ -1324,7 +1324,7 @@ pub fn command(rest: &str) {
             return;
         }
         "perf" => {
-            // how long the desktop takes on this machine (the 2012 laptop target, sovereign-ui.md 8)
+            // how long the desktop takes on this machine (the 2012 laptop target, afriui.md 8)
             // SAFETY: scalar reads.
             let (dl, dw) = unsafe { paint::DRAW_US };
             // SAFETY: scalar reads.

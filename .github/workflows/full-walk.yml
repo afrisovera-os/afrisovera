@@ -108,6 +108,9 @@ jobs:
           rc=$?
           set -e
           tail -25 walk.out
+          # The team's ARM baseline: md5 of the ARM image as built here. The debug image embeds the build path,
+          # so compare it only with other walks of this public repo (same runner path), never with a PC build.
+          if [ "$ARCH" = arm ]; then md5sum target/mansa-kernel.img target/aarch64-unknown-none/debug/mansa-kernel 2> /dev/null | sed 's/^/ARM md5: /' || true; fi
           want=$(tr ',' '\n' <<< "$SUITES" | grep -c .)
           ran=$(wc -l < results.tsv 2>/dev/null || echo 0)
           bad=$(awk -F'\t' '$2 != "PASS"' results.tsv 2>/dev/null | wc -l)

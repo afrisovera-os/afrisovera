@@ -140,7 +140,7 @@ monument. No easing curves that need floating point. A Settings switch turns all
 ## 9. Phone later
 
 The phone keeps the 8 Nov desktop for now: the ARM kernel image must stay byte-identical until the architect agrees.
-The PC builds the new desktop from `kernel/src/sovereign/desk.rs`, a copy of `kernel/src/desk.rs` with the new look;
+The PC builds the new desktop from `kernel/src/afriui/desk.rs`, a copy of `kernel/src/desk.rs` with the new look;
 the phone still builds `kernel/src/desk.rs`. When the phone moves over (touch profile: the Spine becomes a bottom bar
 in portrait, tiles 44 px), the two files become one again and the old one is removed. Until then a behaviour fix in
 one file must be made in both.
@@ -201,8 +201,8 @@ not sit as a 640x480 box in a dark frame.
   Left and Up back), the chosen app gets a gold cut frame, and Enter opens it; Esc closes the Circle as before. On
   the Spine, Super+1 to Super+4 open, focus or restore its apps in order (Files, Terminal, Settings, About), as a
   click on the tile does. `desk key up|down|left|right|enter|super-1..4` script the same keys.
-- **Model and paint apart** (architect's review): `kernel/src/sovereign/desk.rs` keeps the model (state, the input
-  ring, windows and focus, hit-testing geometry, the `desk` commands); `kernel/src/sovereign/paint.rs` holds the
+- **Model and paint apart** (architect's review): `kernel/src/afriui/desk.rs` keeps the model (state, the input
+  ring, windows and focus, hit-testing geometry, the `desk` commands); `kernel/src/afriui/paint.rs` holds the
   theme (palette, cloths, cut-corner primitives, text, icons) and every drawing function. Paint reads the model;
   the model never draws. When the phone moves over, it keeps this model and gets a phone paint (or the same one with
   the touch profile), instead of a third copy of the desktop.
@@ -227,3 +227,21 @@ about 64 ms in QEMU for 960x540, far more pixels than changed.
 - **Checked, not trusted:** `desk verify` hashes every row of the desktop as the boxes left it, redraws everything,
   and counts the rows that differ; pc-desk requires 0 after its mouse and keyboard walk. `desk perf` counts full and
   partial frames and times them apart.
+
+## 16. Slice 4 (10 Nov 2026): the Sovereign face
+
+The owner noticed the odd letters of the old 8x8 font (the lower-case "g" in Settings, tails that sit on the line).
+Gemini and the architect both named it the weakest part of the look. Slice 4 gives the PC desktop its own bitmap
+face, drawn by us, glyph by glyph (no other font copied), in `kernel/src/afriui/face.rs`:
+
+- **A cell of 8 x 16, drawn on a 5-pixel-wide, 12-row grid inside it:** capitals and figures 9 rows tall, the
+  small letters 6 rows tall (x-height), real descenders of 3 rows (g, j, p, q, y and the comma hang below the
+  line), ascenders as tall as the capitals. The rest of the cell is left for accents later.
+- **The look:** plain, open shapes at one-pixel strokes, so it stays sharp at 1x and doubles cleanly at 2x; the
+  round letters cut their corners at 45 degrees, as the windows do; a single-storey "g" with an open tail; the
+  zero is slashed so it never reads as O.
+- **Proportional for the desktop, fixed for the Terminal:** text advances by each glyph's own width plus one
+  pixel; the Terminal keeps 6-pixel cells (every glyph fits 5 wide), so its columns stay aligned.
+- **Line heights follow:** the Terminal and the file preview step 13 pixels a line (was 11); the lintel centres the
+  9-row capitals. The text console and the phone keep the old font (shared files, ARM image).
+- The 95 printable ASCII characters only; other bytes draw as "?".

@@ -22244,6 +22244,19 @@ pub(crate) fn exec(line: &str) { pc_intercept!(line);
                 crate::kprintln!("[mesh] usage: mesh id | mesh forget | mesh selftest | mesh listen [port] [secs] | mesh send <ip>[:port] <text>");
             }
         }
+        #[cfg(not(feature = "pc"))]
+        "stack" => {
+            // F7: `stack` = the boot and secondary stacks: size, deepest use since boot (paint high-water),
+            // free. `stack guards` = the MMU's answer for each guard. `stack overflow-test` = deliberately
+            // run the boot stack out (halts the machine when the guard works).
+            match rest.trim() {
+                "guards" => {
+                    crate::stackwater::check_guards();
+                }
+                "overflow-test" => crate::stackwater::overflow_test(),
+                _ => crate::stackwater::report(),
+            }
+        }
         "rng" => {
             // The generator's state: HMAC_DRBG boot KAT, strong sources and their health, reseeds, and
             // `rng secret` = one fail-closed draw (what the mesh uses for keys and ephemerals).

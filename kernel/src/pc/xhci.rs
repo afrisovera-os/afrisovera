@@ -626,7 +626,7 @@ fn desk_key(k: u8, alt: bool, sup: bool) -> Option<u32> {
         0x51 if sup => KEY_SUPER_DOWN,
         0x52 if sup => KEY_SUPER_UP,
         0x29 if !alt && !sup => KEY_ESC,
-        // the keyboard walk (sovereign-ui.md 14): arrows and Enter while the Circle is open,
+        // the keyboard walk (afriui.md 14): arrows and Enter while the Circle is open,
         // Super+1..4 for the Spine's apps
         0x52 if !alt && !sup && walking() => KEY_UP,
         0x51 if !alt && !sup && walking() => KEY_DOWN,
@@ -3996,7 +3996,7 @@ unsafe fn tablet_report(r: &[u8]) {
         return;
     }
     TREPORTS += 1;
-    let (w, h) = crate::screen::pointer_area(); // the desktop canvas while it is shown (sovereign-ui.md 13)
+    let (w, h) = crate::screen::pointer_area(); // the desktop canvas while it is shown (afriui.md 13)
     let (x, y) = (scale(r, a.x, w), scale(r, a.y, h));
     let mut buttons = 0u8;
     for k in 0..a.nbtn.min(3) {
@@ -4087,7 +4087,7 @@ unsafe fn mouse_report(buttons: u8, dx: i32, dy: i32) {
             crate::screen::wm_moved();
         }
     }
-    let (w, h) = crate::screen::pointer_area(); // the desktop canvas while it is shown (sovereign-ui.md 13)
+    let (w, h) = crate::screen::pointer_area(); // the desktop canvas while it is shown (afriui.md 13)
     let (x, y) = ((MX + dx).clamp(0, w - 1), (MY + dy).clamp(0, h - 1));
     if (x, y) != (MX, MY) {
         if let Some(id) = DRAG {

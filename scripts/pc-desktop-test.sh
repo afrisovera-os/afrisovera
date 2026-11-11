@@ -3,7 +3,7 @@
 #
 # Boots the PC kernel with a USB keyboard and mouse. scripts/lib/usb-steps.py types `desk` on
 # the keyboard (since 9 Nov 2026, field item F8: `desk` alone opens it, as `gui` does) (the PC desktop: since 10 Nov 2026 the Sovereign UI,
-# docs/design/sovereign-ui.md, its Spine down the left edge), moves the pointer from 320,240 onto
+# docs/design/afriui.md, its Spine down the left edge), moves the pointer from 320,240 onto
 # the Spine's Files tile (20,68), clicks, and types
 # `lsusb`. Since 8 Nov 2026 (docs/design/desktop.md) a dock click opens that app's window on
 # the desktop instead of running a command on the text console. Graded: the Files window

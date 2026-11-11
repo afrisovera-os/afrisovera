@@ -27,6 +27,8 @@
 # clusters that follow each other on disk into one run of up to 16 sectors). The primary master is an empty FAT disk only so
 # the firmware's NvVars file lands there: piix3-ide sits on a lower PCI slot than the boot stick's AHCI controller, so
 # without it OVMF wrote NvVars into the Windows EFI partition at every boot (the first Actions run, 10 Nov).
+# Since 11 Nov 2026 the SATA (AHCI) kind's boot 2 runs lsahci too: ahci.rs table_write_run sends each run as one write
+# and one read back, and lsahci must count it as big copies.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T="${TMPDIR:-/tmp}"
@@ -34,9 +36,11 @@ T="${TMPDIR:-/tmp}"
 FILE_RE='\\EFI\\afrisovera\\afrisovera\.efi'
 KIND="${BOOTCOPY_KIND:-sata}"
 if [ "$KIND" = ide ]; then
+    LS=lside; RUNS=' and flushed once \(on\)'
     NAME=ide1; PORT=6390; UP=" IDE"; NARMS=20 # DEV is set once the work folder exists (the NvVars disk lives there)
 else
-    NAME="sata port 2"; DEV=(-device ide-hd,drive=sb,bus=ide.2); PORT=5390; UP=""; NARMS=19
+    LS=lsahci; RUNS=' \(on\)'
+    NAME="sata port 2"; DEV=(-device ide-hd,drive=sb,bus=ide.2); PORT=5390; UP=""; NARMS=20
 fi
 grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     local fail=0 A B C D
@@ -72,10 +76,9 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     in_blk "$B2" "bootcopy: $NAME partition 1 already holds \\\\EFI\\\\afrisovera -- nothing to copy \(bootcopy remove takes it out\)" ||
         _f "boot 2: a second bootcopy did not refuse"
     printf '%s\n' "$B" | grep -aqx 'harness: bootcopy image check PASSED' || _f "boot 2: the image check did not pass"
-    if [ "$KIND" = ide ]; then # the copy goes in runs of several sectors, one command and one cache flush each
-        in_blk "$(blk "$B" lside)" '  big copies \(installdisk, bootcopy\): [1-9][0-9]* run\(s\) in one command, [1-9][0-9]* sector\(s\), each read back and flushed once \(on\)' ||
-            _f "boot 2: bootcopy did not write the file in runs of several sectors (lside)"
-    fi
+    # the copy goes in runs of several sectors, one command and one read back each (IDE mode: one cache flush too)
+    in_blk "$(blk "$B" $LS)" '  big copies \(installdisk, bootcopy\): [1-9][0-9]* run\(s\) in one command, [1-9][0-9]* sector\(s\), each read back'"$RUNS" ||
+        _f "boot 2: bootcopy did not write the file in runs of several sectors ($LS)"
     in_blk "$(blk "$C" 'bootcopy remove')" "bootcopy remove: $NAME partition 1 \(start 2048\): \\\\EFI\\\\afrisovera \($kb KiB\) would be taken out; nothing else in the partition changes" ||
         _f "boot 3: bootcopy remove did not say what goes"
     in_blk "$(blk "$C" 'bootcopy remove')" 'bootcopy remove: nothing written yet. To do it, type exactly: bootcopy remove yes [0-9a-f]{4}' ||
@@ -152,6 +155,15 @@ ide: controller 00:04.0, interface 0x80
   big copies (installdisk, bootcopy): 296 run(s) in one command, 4724 sector(s), each read back and flushed once (on)
 afrisovera>
 check:}"
+else
+    L2="${L2/afrisovera>
+check:/afrisovera> lsahci
+ahci: controller 00:1f.2 ABAR 0xfebd5000, AHCI 1.0, ports implemented 0x3f
+  port 0: 1048576 sectors (512 MiB)  (other data, read-only to us)
+  port 2: 327680 sectors (160 MiB)  (other data, read-only to us)
+  big copies (installdisk, bootcopy): 296 run(s) in one command, 4724 sector(s), each read back (on)
+afrisovera>
+check:}"
 fi
 
 selftest() {
@@ -185,7 +197,7 @@ selftest() {
     arm removal-check-failed red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | grep -v 'removal check PASSED')"
     arm panic red "$(printf '%s\nKERNEL PANIC at esp.rs' "$L1")" "$L2" "$L3" "$L4"
     arm empty red "" "" "" ""
-    [ "$KIND" = ide ] && arm no-runs red "$L1" "$(printf '%s\n' "$L2" | grep -v 'big copies')" "$L3" "$L4"
+    arm no-runs red "$L1" "$(printf '%s\n' "$L2" | grep -v 'big copies')" "$L3" "$L4"
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
     [ "$bad" -eq 0 ] && [ "$pass" -eq "$NARMS" ]
@@ -244,7 +256,7 @@ echo "  --- boot 1: bootcopy (plan + code), a wrong code, bootcopy remove (nothi
 boot "$PORT" "$W/boot1.log" 'bootcopy|bootcopy yes zzzz|bootcopy remove'
 C1="$(code "$W/boot1.log" bootcopy)"
 echo "  --- boot 2: bootcopy yes ${C1:-(no code)}, bootplan, bootcopy again; then the image is checked ---"
-B2CMDS="bootcopy yes ${C1:-none}|bootplan|bootcopy"; [ "$KIND" = ide ] && B2CMDS="$B2CMDS|lside"
+B2CMDS="bootcopy yes ${C1:-none}|bootplan|bootcopy|$LS"
 boot "$((PORT+4))" "$W/boot2.log" "$B2CMDS"
 "$PY" scripts/lib/check-bootcopy.py copied "$W/orig.img" "$W/gpt-esp-fsinfo.img" "$W/kernel.efi" >> "$W/boot2.log" 2>&1
 cp "$W/gpt-esp-fsinfo.img" "$W/mid.img"

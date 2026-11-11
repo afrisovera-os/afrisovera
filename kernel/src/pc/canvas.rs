@@ -1,9 +1,9 @@
-//! The desktop's canvas on the PC (10 Nov 2026, docs/design/sovereign-ui.md section 13, field
+//! The desktop's canvas on the PC (10 Nov 2026, docs/design/afriui.md section 13, field
 //! item F9): a buffer the size of the screen, so the Sovereign desktop fills a laptop's screen
 //! at its own resolution instead of sitting as a 640x480 box in a dark frame.
 //!
 //! The text console keeps the shared 640x480 framebuffer (framebuffer.rs, the phone's too);
-//! only the desktop (kernel/src/sovereign/desk.rs, PC only) draws here, and screen.rs copies
+//! only the desktop (kernel/src/afriui/desk.rs, PC only) draws here, and screen.rs copies
 //! this canvas to the screen while the desktop is shown. The canvas is the screen's size
 //! divided by a whole-number UI scale, so the 8x8 font stays sharp: scale = min(width / 800,
 //! height / 500), from 1 to 4 (1366x768 at 1x, 1920x1080 at 2x as 960x540).

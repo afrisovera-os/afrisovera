@@ -94,7 +94,7 @@ mod store;
 #[path = "../tonga.rs"]
 mod tonga;
 
-#[path = "../sovereign/desk.rs"] // the Sovereign UI (docs/design/sovereign-ui.md); the phone keeps ../desk.rs
+#[path = "../afriui/desk.rs"] // the Sovereign UI (docs/design/afriui.md); the phone keeps ../desk.rs
 mod desk;
 #[allow(dead_code)]
 #[path = "../uart_ns16550.rs"]
@@ -152,7 +152,7 @@ mod nic;
 mod xhci;
 mod ps2;
 mod screen;
-mod canvas; // the desktop at the screen's own resolution (docs/design/sovereign-ui.md section 13)
+mod canvas; // the desktop at the screen's own resolution (docs/design/afriui.md section 13)
 mod conback;
 mod helpview;
 mod font_lower;

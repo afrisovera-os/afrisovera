@@ -20,8 +20,10 @@ on:
 permissions:
   contents: read
 
+# a newer push to the same branch cancels the older PUSH run, so a burst of pushes costs one run; a run someone
+# started on purpose ("Run workflow" / gh workflow run) is never cancelled by a later push
 concurrency:
-  group: quick-${{ github.ref }}
+  group: quick-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'push' }}
   cancel-in-progress: true
 
 env:
