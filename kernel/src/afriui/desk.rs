@@ -1,9 +1,9 @@
 //! The AfriSovera desktop in the Sovereign UI (docs/design/afriui.md, 10 Nov 2026).
 //!
-//! The PC builds this file; the phone still builds kernel/src/desk.rs (the 8 Nov desktop), so
-//! the ARM image stays byte-identical until the phone moves over (afriui.md section 9).
-//! Behaviour (input ring, windows, focus, `desk` commands, the apps' data) is the same as
-//! desk.rs; the look is new: the Spine down the left edge (monument button, app tiles with
+//! Both kernels build this file: the PC through pc/canvas.rs, the phone (since 11 Nov, step P2 of
+//! afriui-phone-plan.md) through afriui/arm_canvas.rs, which draws straight into ramfb. The 8 Nov
+//! desktop (kernel/src/desk.rs) is gone. Behaviour (input ring, windows, focus, `desk` commands,
+//! the apps' data) is the 8 Nov desktop's; the look is new: the Spine down the left edge (monument button, app tiles with
 //! beads, status and clock), cut corners instead of round ones, each app's woven cloth as its
 //! focus mark, the Circle launcher, and the mud-cloth wallpaper.
 //!
@@ -1337,13 +1337,14 @@ pub fn command(rest: &str) {
         }
         "verify" => {
             // the rows as the partial frames left them, against a full redraw (section 15). The
-            // uptime shown changes with the second, so a check the second turned under is not a
-            // damage error: it is taken again (at most 3 times)
+            // uptime shown changes with the second, and the clock with the real-time clock's minute
+            // (not in step with the uptime's second), so a check either turned under is not a damage
+            // error: it is taken again (at most 3 times)
             let ch = crate::canvas::height();
             let mut differ = 0;
             let mut first = [usize::MAX; 4];
             for _ in 0..3 {
-                let sec = crate::sched::ticks() / 100;
+                let (sec, min) = (crate::sched::ticks() / 100, clock_secs() / 60);
                 settle(snap());
                 // SAFETY: mainline only.
                 let rows = unsafe { &mut *core::ptr::addr_of_mut!(ROWS) };
@@ -1358,7 +1359,7 @@ pub fn command(rest: &str) {
                 for (k, y) in (0..ch).filter(|&y| now[y] != rows[y]).take(4).enumerate() {
                     first[k] = y;
                 }
-                if crate::sched::ticks() / 100 == sec {
+                if crate::sched::ticks() / 100 == sec && clock_secs() / 60 == min {
                     break;
                 }
             }

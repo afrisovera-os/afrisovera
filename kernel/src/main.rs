@@ -46,7 +46,10 @@ mod stackwater;
 mod store;
 mod timer;
 mod tonga;
+#[path = "afriui/desk.rs"] // the Sovereign UI, the same desktop as the PC's (docs/design/afriui-phone-plan.md P2)
 mod desk;
+#[path = "afriui/arm_canvas.rs"]
+mod canvas; // the desktop draws straight into the ramfb framebuffer
 #[path = "pc/font_lower.rs"]
 mod font_lower;
 mod uart;

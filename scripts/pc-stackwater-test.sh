@@ -6,7 +6,7 @@
 # 595 KiB (docs/evidence-f7-stackwater.log) and the PC shares shell.rs. This suite boots the PC kernel under
 # OVMF, runs the commands known to be deepest on ARM, and prints:
 #   - `stack`: the memory-map region holding the firmware's stack and how deep the boot path went on it, then the
-#     kernel's own 1 MiB stack (F8 step 2) the shell runs on: its use, and where RSP is;
+#     kernel's own stack (F8 step 2; 2 MiB since the pc-report fix) the shell runs on: its use, and where RSP is;
 #   - the largest stack frames in mansa-pc.efi (llvm-objdump; `sub rsp, imm` plus `mov eax, imm` + `__chkstk`).
 # Graded: the region was found and painted, no OVERRUN, every `stack` ran with RSP INSIDE the kernel stack (step 1
 # ran 486 KB below the firmware's region and this suite, then grading only the paint, passed: Actions 42929267991),
@@ -105,7 +105,7 @@ if not where:
 for w in where:
     if not w.startswith("inside the kernel stack"):
         bad.append("a shell command ran with RSP %s" % w.strip())
-ks = [(int(u), int(p)) for u, p in re.findall(r"\[stack\] pc kernel stack 0x[0-9a-f]+\.\.0x[0-9a-f]+ size=1024 KiB used=(\d+) B \((\d+)%\)", t)]
+ks = [(int(u), int(p)) for u, p in re.findall(r"\[stack\] pc kernel stack 0x[0-9a-f]+\.\.0x[0-9a-f]+ size=2048 KiB used=(\d+) B \((\d+)%\)", t)]
 if not ks:
     bad.append("no kernel-stack line (the PC is not on a stack of its own)")
 elif max(p for u, p in ks) >= 80:
@@ -119,6 +119,6 @@ if bad:
     for b in bad:
         print("  - " + b)
     sys.exit(1)
-print("PC STACKWATER TEST PASSED  (boot path %d B on the firmware's %s KiB; shell on the kernel stack, deepest %d B of 1 MiB)"
+print("PC STACKWATER TEST PASSED  (boot path %d B on the firmware's %s KiB; shell on the kernel stack, deepest %d B of 2 MiB)"
       % (max(uses), r.group(6), max(u for u, p in ks)))
 PY

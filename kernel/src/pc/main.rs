@@ -95,7 +95,7 @@ mod store;
 #[path = "../tonga.rs"]
 mod tonga;
 
-#[path = "../afriui/desk.rs"] // the Sovereign UI (docs/design/afriui.md); the phone keeps ../desk.rs
+#[path = "../afriui/desk.rs"] // the Sovereign UI (docs/design/afriui.md); the phone builds it too
 mod desk;
 #[allow(dead_code)]
 #[path = "../uart_ns16550.rs"]

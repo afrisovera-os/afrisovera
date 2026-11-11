@@ -6,6 +6,7 @@ damaged, and an old-style MBR disk. Plain Python, no tools needed.
     make-disk-image.py gpt-damaged OUT  # the same, one entry byte changed + backup header gone
     make-disk-image.py mbr OUT          # 32 MiB: FAT32 + Linux
     make-disk-image.py mbr-room OUT     # 64 MiB: one FAT32, 47 MiB free after it (installplan)
+    make-disk-image.py mbr-windows OUT  # 64 MiB: Windows installed for a legacy BIOS (System Reserved + C:, NTFS)
     make-disk-image.py blank OUT        # 16 MiB of zeros (installplan)
     make-disk-image.py gpt-esp OUT        # 160 MiB Windows-like GPT, a real FAT32 EFI partition (bootplan)
     make-disk-image.py gpt-esp-full OUT   # the same, the EFI partition with 64 KiB free
@@ -36,7 +37,7 @@ PARTS = [  # (type, first, last, name)
 ]
 
 
-def gpt(damaged, parts=None, mib=64):
+def gpt(damaged, parts=None, mib=64, gid=0xAF000):
     parts = parts or PARTS
     n = mib * 1024 * 1024 // S
     img = bytearray(n * S)
@@ -48,7 +49,7 @@ def gpt(damaged, parts=None, mib=64):
     for i, (t, a, b, name) in enumerate(parts):
         e = 128 * i
         ents[e:e + 16] = t
-        ents[e + 16:e + 32] = uuid.UUID(int=0xAF000 + i).bytes_le
+        ents[e + 16:e + 32] = uuid.UUID(int=gid + i).bytes_le
         struct.pack_into("<QQQ", ents, e + 32, a, b, 0)
         nm = name.encode("utf-16-le")
         ents[e + 56:e + 56 + len(nm)] = nm
@@ -61,7 +62,7 @@ def gpt(damaged, parts=None, mib=64):
         h[0:8] = b"EFI PART"
         struct.pack_into("<II", h, 8, 0x00010000, 92)
         struct.pack_into("<QQQQ", h, 24, me, alt, first, last)
-        h[56:72] = uuid.UUID(int=0xAF5_0000).bytes_le
+        h[56:72] = uuid.UUID(int=0xAF5_0000 if gid == 0xAF000 else gid << 8).bytes_le  # the disk GUID
         struct.pack_into("<QIII", h, 72, elba, 128, 128, ecrc)
         struct.pack_into("<I", h, 16, zlib.crc32(bytes(h)))
         return h
@@ -90,6 +91,24 @@ def mbr_room():
     img = bytearray(n * S)
     struct.pack_into("<4xB3xII", img, 446, 0x0C, 2048, 32768)
     img[510:512] = b"\x55\xaa"
+    return img
+
+
+def mbr_windows():
+    """A disk Windows was installed on for a legacy BIOS: boot code, a disk signature, an active 50 MiB System
+    Reserved partition and C: after it, both NTFS (type 0x07). No EFI partition: the other disk of a two-disk PC whose
+    old Windows disk was kept (11 Nov 2026)."""
+    n = 64 * 1024 * 1024 // S
+    img = bytearray(n * S)
+    img[0:24] = b"\x33\xc0\x8e\xd0\xbc\x00\x7cMBR boot code stand-in"[:24]
+    struct.pack_into("<I", img, 440, 0x1E5A4B07)
+    struct.pack_into("<B3xB3xII", img, 446, 0x80, 0x07, 2048, 102400)
+    struct.pack_into("<B3xB3xII", img, 446 + 16, 0x00, 0x07, 104448, n - 104448)
+    img[510:512] = b"\x55\xaa"
+    for a in (2048, 104448):
+        o = a * S
+        img[o:o + 11] = b"\xeb\x52\x90NTFS    "
+        img[o + 510:o + 512] = b"\x55\xaa"
     return img
 
 
@@ -140,7 +159,7 @@ def fat_dirent(short, attr, clus, size=0):
     return bytes(e)
 
 
-def fat32(img, start, length, free_kib=None, dirty=False, fsinfo=False):
+def fat32(img, start, length, free_kib=None, dirty=False, fsinfo=False, vendor=("Microsoft", b"MICROS~1   ")):
     """A FAT32 (one 512-byte sector per cluster) in the partition at sector `start`, holding
     EFI/Microsoft/Boot/bootmgfw.efi and EFI/Boot/bootx64.efi (small stand-in files); "Microsoft"
     has a long name, as Windows writes it."""
@@ -199,7 +218,7 @@ def fat32(img, start, length, free_kib=None, dirty=False, fsinfo=False):
     dotdot = b"..         "
     put(2, fat_dirent(b"NO NAME    ", 0x08, 0) + fat_dirent(b"EFI        ", 0x10, 3))
     put(3, fat_dirent(dot, 0x10, 3) + fat_dirent(dotdot, 0x10, 0)
-        + lfn_entries("Microsoft", b"MICROS~1   ") + fat_dirent(b"MICROS~1   ", 0x10, 4)
+        + lfn_entries(vendor[0], vendor[1]) + fat_dirent(vendor[1], 0x10, 4)
         + fat_dirent(b"BOOT       ", 0x10, 6))
     put(4, fat_dirent(dot, 0x10, 4) + fat_dirent(dotdot, 0x10, 3) + fat_dirent(b"BOOT       ", 0x10, 5))
     put(5, fat_dirent(dot, 0x10, 5) + fat_dirent(dotdot, 0x10, 4) + fat_dirent(b"BOOTMGFWEFI", 0x20, 7, 8 * S))
@@ -214,6 +233,14 @@ def gpt_esp(free_kib=None, dirty=False, fsinfo=False):
     return img
 
 
+def gpt_esp_linux():
+    """A second EFI partition as a Linux install makes it (EFI/ubuntu, no Microsoft folder), on a disk with its own
+    partition and disk GUIDs: the other EFI partition of a two-system PC (11 Nov 2026)."""
+    img = gpt(False, ESP_PARTS, 160, gid=0xB1000)
+    fat32(img, 2048, 206848 - 2048, fsinfo=True, vendor=("ubuntu", b"UBUNTU     "))
+    return img
+
+
 def gpt_esp_4k(free_kib=None, dirty=False):
     global S
     S = 4096  # every sector number below counts in 4 KiB blocks; FAT32 sectors are 4096 bytes too
@@ -224,11 +251,12 @@ def gpt_esp_4k(free_kib=None, dirty=False):
 
 def main():
     kind, out = sys.argv[1], sys.argv[2]
-    img = {"gpt": lambda: gpt(False), "gpt-damaged": lambda: gpt(True), "mbr": mbr, "mbr-room": mbr_room,
+    img = {"gpt": lambda: gpt(False), "gpt-damaged": lambda: gpt(True), "mbr": mbr, "mbr-room": mbr_room, "mbr-windows": mbr_windows,
            "blank": lambda: bytearray(16 * 1024 * 1024), "gpt-esp": gpt_esp,
            "gpt-esp-full": lambda: gpt_esp(free_kib=64), "gpt-esp-dirty": lambda: gpt_esp(dirty=True),
            "gpt-esp-fsinfo": lambda: gpt_esp(fsinfo=True), "gpt-esp-fsinfo-4k": gpt_esp_4k,
-           "gpt-esp-full-4k": lambda: gpt_esp_4k(free_kib=64), "gpt-esp-dirty-4k": lambda: gpt_esp_4k(dirty=True)}[kind]()
+           "gpt-esp-full-4k": lambda: gpt_esp_4k(free_kib=64), "gpt-esp-dirty-4k": lambda: gpt_esp_4k(dirty=True),
+           "gpt-esp-linux": gpt_esp_linux}[kind]()
     with open(out, "wb") as f:
         f.write(img)
 

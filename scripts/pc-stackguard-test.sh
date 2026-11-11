@@ -53,7 +53,7 @@ tr -d '\r' < "$W/boot.log" | grep -aE 'overflow-test depth' | tail -2 | sed 's/^
 import re, sys
 t = open(sys.argv[1], "rb").read().decode("utf-8", "replace").replace("\r", "")
 bad = []
-if not re.search(r"\[pc\] kernel stack: 1024 KiB at 0x[0-9a-f]+\.\.0x[0-9a-f]+, guard 0x[0-9a-f]+\.\.0x[0-9a-f]+ unmapped", t):
+if not re.search(r"\[pc\] kernel stack: (?:\d+) KiB at 0x[0-9a-f]+\.\.0x[0-9a-f]+, guard 0x[0-9a-f]+\.\.0x[0-9a-f]+ unmapped", t):
     bad.append("the boot did not report the kernel stack with its guard unmapped")
 if not re.search(r"\[stack\] pc guard 0x[0-9a-f]+\.\.0x[0-9a-f]+: 0 of 16 pages mapped, stack above it mapped -> OK", t):
     bad.append("`stack guards`: the guard is not an unmapped hole under a mapped stack")
@@ -64,7 +64,7 @@ if not m:
 # the measure; the measure is how close to the stack's bottom the last progress line got.
 depths = [int(x) for x in re.findall(r"overflow-test depth (\d+)", t)]
 rsps = [int(x, 16) for x in re.findall(r"overflow-test depth \d+ rsp (0x[0-9a-f]+)", t)]
-ks = re.search(r"\[pc\] kernel stack: 1024 KiB at (0x[0-9a-f]+)\.\.", t)
+ks = re.search(r"\[pc\] kernel stack: (?:\d+) KiB at (0x[0-9a-f]+)\.\.", t)
 if not rsps or not ks:
     bad.append("no dive progress lines, or no kernel-stack line to measure them against")
 elif min(rsps) - int(ks.group(1), 16) > 64 * 1024:

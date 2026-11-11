@@ -95,8 +95,10 @@ fn low_water() -> u64 {
 
 /// Guard below the kernel stack (unmapped by mmu::guard).
 pub const GUARD: usize = 64 << 10;
-/// The kernel stack (the ARM size; shell::exec alone measured about 610 KB on this kernel).
-pub const STACK: usize = 1 << 20;
+/// The kernel stack. shell::exec's debug frame is 590 KiB (llvm-objdump, `__chkstk` of 0x93a48), and `report`
+/// calls exec again from inside exec, so two frames nest: 1.18 MiB, past the first 1 MiB (pc-report hit the
+/// guard on the public walk, Actions 42958601929). 2 MiB holds that with room; shrinking exec is the real fix.
+pub const STACK: usize = 2 << 20;
 
 #[repr(C, align(4096))]
 struct Area([u8; GUARD + STACK]);

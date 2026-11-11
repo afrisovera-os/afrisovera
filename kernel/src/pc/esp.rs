@@ -561,6 +561,17 @@ fn scan(on: bool) -> (Option<Spot>, Option<Spot>) {
 pub fn plan() {
     let (chosen, there) = scan(true);
     let already = there.is_some();
+    // a PC can have more than one EFI system partition (Windows on one disk, Linux on another): say which one
+    // the boot file goes to, so bootcopy's target is never a guess (11 Nov 2026)
+    if let (Some(s), None) = (chosen, there) {
+        crate::kprintln!(
+            "bootplan: the boot file would go to {} partition {} (start {}){}; no other EFI partition is changed",
+            gpt::label_str(&s.label),
+            s.ent,
+            s.a,
+            if s.windows { ", the one Windows starts from" } else { "" }
+        );
+    }
     match crate::bootent::numbers() {
         None => crate::kprintln!("  boot entry: the firmware's boot entries were not read at power-on -- none can be planned"),
         Some((_, Some(n), _)) => {

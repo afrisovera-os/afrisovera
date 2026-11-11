@@ -11,7 +11,13 @@
 
 use crate::font;
 use crate::fwcfg;
-use core::ptr::addr_of_mut; #[cfg(not(target_arch = "aarch64"))] pub fn pixels() -> *const u32 { core::ptr::addr_of!(FB) as *const u32 }
+use core::ptr::addr_of_mut;
+
+/// The framebuffer's pixels, WIDTH to a row (the PC's screen copy reads them; the phone's
+/// desktop canvas is this buffer, kernel/src/afriui/arm_canvas.rs).
+pub fn pixels() -> *const u32 {
+    core::ptr::addr_of!(FB) as *const u32
+}
 
 pub const WIDTH: usize = 640;
 pub const HEIGHT: usize = 480;
