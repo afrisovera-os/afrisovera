@@ -126,7 +126,10 @@ higher resolutions. No outline font until the framebuffer is bigger than 640x480
 ## 7. Motion (later slice)
 
 At most 3 frames (about 60 ms) for anything: a window unfolds from its lintel downward, the Circle grows from the
-monument. No easing curves that need floating point. A Settings switch turns all motion off; tests run with it off.
+monument. No easing curves that need floating point. A Settings switch turns all motion off. Motion is on by default,
+and the tests run with it on (slice 6, section 17): every `desk` command typed in the shell, except `tap` and `drag`,
+first shows a running motion's last frame, so a script only ever sees final frames, which are the same with motion
+on or off; the suite `pc-deskmotion` tests the motion itself.
 
 ## 8. Speed budget and how we keep it
 
@@ -245,3 +248,57 @@ face, drawn by us, glyph by glyph (no other font copied), in `kernel/src/afriui/
 - **Line heights follow:** the Terminal and the file preview step 13 pixels a line (was 11); the lintel centres the
   9-row capitals. The text console and the phone keep the old font (shared files, ARM image).
 - The 95 printable ASCII characters only; other bytes draw as "?".
+
+## 17. Slice 6, motion (11 Nov 2026) [law 0]
+
+The last item of section 10 not built yet (slice 2 left it out). Section 7 is the rule: at most 3 frames, about
+60 ms, no floating point, a Settings switch turns it off.
+
+**What moves (only these two):**
+- **A window unfolds from its lintel downward** when it opens or is restored from the Spine: frame 1 shows the lintel
+  and the top third of the body, frame 2 two thirds, frame 3 the whole window. The body is clipped, not scaled, so
+  each frame is the same drawing code with a shorter clip. Close and minimise stay instant (going away should never
+  make you wait).
+- **The Circle grows from its Spine button:** frames 1 and 2 draw the ring's outer cut-square at one third and two
+  thirds of its size, centred on its final place, with no tiles; frame 3 is today's Circle. Closing it is instant.
+
+**How it is built:**
+- The model (`desk.rs`) gets one `Anim { what, app, start, step }` in `St`, set by `open`, `activate` (restore) and
+  the launcher; paint (`paint.rs`) reads `step` to clip the window body or size the ring. One motion at a time: a new
+  one finishes the old at once.
+- Frames are driven by time from `idle()` (mainline, as today), each frame 2 ticks (20 ms) after the last. A late
+  frame is skipped, never queued: if 6 ticks have passed, the final frame is drawn. Each frame damages only the
+  window's or the Circle's box (slice 3), so a frame costs at most one window's redraw.
+- **The off switch:** Settings has a fourth row "Motion" under the clock row, and `desk motion on|off` for scripts.
+  Off means frame 3 at once, exactly the behaviour before slice 6.
+- **Tests stay deterministic without changing every suite:** every `desk` command from the shell, except `tap` and
+  `drag`, shows a running motion's last frame first (`tap` and `drag` are input, as a click is: they only release a
+  hold). So the existing suites see only final frames, motion on or off. A close, a minimise, an input-profile switch,
+  `screen ui` and `clear` also finish a motion; a new motion finishes the old one (one at a time).
+- **No log line per frame:** frames are drawn from `idle()` while the shell waits, so a log line would land after
+  the prompt in every suite. `desk motion` reports instead: on or off, how many motions have run, and the last two
+  with the tick of each frame (0 = skipped) and `early` when something finished them.
+- **`desk motion hold <1|2> <app|circle>`** (test only, marked so in `desk help`): starts that motion and stops its
+  frame clock at that frame. The next `desk` command, any input event or `desk motion off` releases it. It changes
+  nothing else: the same model and the same damage.
+- **Suite `pc-deskmotion`** (PC at 640x480, UI scale 1, two boots; selftest 14/14): motion on by default; About's
+  frames at least 2 ticks apart, frame 3 drawn; a held Files finished by the next command; a tap on the Settings tile
+  while the Circle is held at frame 1 opens Settings (input uses the final geometry) and ends the Circle's motion
+  early; the Settings row turns motion off and an open then runs none; `desk verify` 0 rows after every case;
+  `desk perf` names the slowest motion frame. A screenshot with Files held at frame 1 over About: below Files' first
+  third, About's body; above it, Files' body; left of About, not Files.
+- **Speed:** `desk perf` reports the slowest frame the motion clock drew. Budget: under 16 ms a frame at 1920x1080
+  (one window box). Not gated: QEMU is not a real machine, so the owner's HP gives the real number. If a real machine
+  is slower, the skip rule keeps the motion at about 60 ms.
+
+**The architect's answers** (`ARCHITECT_REVIEWS.md`, "AfriUI slice 6, motion, plan gate"): the ARM image may move
+once, with the P2 proof; default on; `hold` may ship, on the conditions above. The questions as asked:
+1. **The ARM image moves once more** (`afriui/desk.rs` and `paint.rs` are shared since P2). Same proof as P2:
+   the cloud runner like-for-like md5 and llvm-size, the `desk` suite and a full ARM walk before the merge.
+2. **Default on or off?** I propose **on** (the blueprint wants the desktop to feel alive, and the off switch is one
+   tap away), with the test rule above so no suite depends on it. Off by default is the safe alternative.
+3. **`desk motion hold <step>`** is a test-only command in the shipped kernel (like `desk verify`). OK, or behind
+   the selftest build only?
+
+Size: about 150 lines in `desk.rs` and `paint.rs`, a Settings row, one new suite. One branch, one Actions run at the
+end (minutes rule), the cloud runner for the rest.

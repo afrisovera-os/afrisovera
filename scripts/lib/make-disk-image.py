@@ -16,6 +16,16 @@ damaged, and an old-style MBR disk. Plain Python, no tools needed.
                                              # (Windows' size on 4 KiB disks: FAT32 needs 65525 clusters)
     make-disk-image.py gpt-esp-full-4k OUT   # gpt-esp-fsinfo-4k with 64 KiB free (bootplan, nvme4k)
     make-disk-image.py gpt-esp-dirty-4k OUT  # gpt-esp-fsinfo-4k not closed cleanly (bootplan, nvme4k)
+    make-disk-image.py gpt-esp-linux OUT     # a second EFI partition as Linux makes it (EFI/ubuntu, its own GUIDs)
+    make-disk-image.py gpt-esp-dual OUT      # gpt-esp-fsinfo with EFI/ubuntu/grubx64.efi beside Microsoft and BOOT
+                                             # (Windows and Ubuntu sharing one EFI partition, pc-twoesp-dual)
+    make-disk-image.py gpt-esp-dual-4k OUT   # gpt-esp-fsinfo-4k with EFI/ubuntu beside Microsoft and BOOT
+                                             # (the shared partition on a 4 KiB-block NVMe disk, pc-twoesp-dual4k)
+    make-disk-image.py gpt-esp-dual-full-4k OUT  # gpt-esp-dual-4k with 64 KiB free (pc-twoesp-full4k)
+    make-disk-image.py gpt-esp-recfirst OUT  # gpt-esp-fsinfo with a 20 MiB recovery partition as GPT entry 1, the EFI
+                                             # partition as entry 2 at sector 43008 (some OEM disks, pc-bootentry-recfirst)
+    make-disk-image.py gpt-esp-recfirst-4k OUT  # gpt-esp-fsinfo-4k with a 20 MiB recovery partition as GPT entry 1, the
+                                                # EFI partition as entry 2 at block 5376 (pc-bootplan-recfirst4k)
 """
 import struct
 import sys
@@ -120,11 +130,27 @@ ESP_PARTS = [  # 160 MiB: a 100 MiB EFI partition as Windows makes it
 ]
 
 
+ESP_PARTS_REC = [  # 160 MiB: a recovery partition BEFORE the EFI partition, as some OEM Windows disks have it
+    (g("DE94BBA4-06D1-4D40-A16A-BFD50179D6AC"), 2048, 43007, "Recovery"),
+    (g("C12A7328-F81F-11D2-BA4B-00A0C93EC93B"), 43008, 247807, "EFI system partition"),
+    (g("E3C9E316-0B5C-4DB8-817D-F92DF00215AE"), 247808, 280575, "Microsoft reserved partition"),
+    (g("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"), 280576, 325631, "Basic data partition"),
+]
+
+
 ESP_PARTS_4K = [  # 400 MiB in 4096-byte blocks: a 260 MiB EFI partition as Windows makes it on a 4 KiB disk
     (g("C12A7328-F81F-11D2-BA4B-00A0C93EC93B"), 256, 66815, "EFI system partition"),
     (g("E3C9E316-0B5C-4DB8-817D-F92DF00215AE"), 66816, 70911, "Microsoft reserved partition"),
     (g("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"), 70912, 91391, "Basic data partition"),
     (g("DE94BBA4-06D1-4D40-A16A-BFD50179D6AC"), 92160, 102143, "Recovery"),
+]
+
+
+ESP_PARTS_REC_4K = [  # 400 MiB in 4096-byte blocks: the recovery partition BEFORE a 260 MiB EFI partition
+    (g("DE94BBA4-06D1-4D40-A16A-BFD50179D6AC"), 256, 5375, "Recovery"),
+    (g("C12A7328-F81F-11D2-BA4B-00A0C93EC93B"), 5376, 71935, "EFI system partition"),
+    (g("E3C9E316-0B5C-4DB8-817D-F92DF00215AE"), 71936, 76031, "Microsoft reserved partition"),
+    (g("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"), 76032, 96511, "Basic data partition"),
 ]
 
 
@@ -159,10 +185,12 @@ def fat_dirent(short, attr, clus, size=0):
     return bytes(e)
 
 
-def fat32(img, start, length, free_kib=None, dirty=False, fsinfo=False, vendor=("Microsoft", b"MICROS~1   ")):
+def fat32(img, start, length, free_kib=None, dirty=False, fsinfo=False, vendor=("Microsoft", b"MICROS~1   "),
+          ubuntu=False):
     """A FAT32 (one 512-byte sector per cluster) in the partition at sector `start`, holding
     EFI/Microsoft/Boot/bootmgfw.efi and EFI/Boot/bootx64.efi (small stand-in files); "Microsoft"
-    has a long name, as Windows writes it."""
+    has a long name, as Windows writes it. ubuntu=True adds EFI/ubuntu/grubx64.efi after BOOT, as an Ubuntu
+    installed after Windows leaves it (clusters 19 and 20-27)."""
     rsvd, fsz = 32, 1
     while True:
         cl = length - rsvd - 2 * fsz
@@ -196,14 +224,21 @@ def fat32(img, start, length, free_kib=None, dirty=False, fsinfo=False, vendor=(
         for c in range(a, b):
             fat[c] = c + 1
         fat[b] = 0x0FFFFFFF
+    used = 19
+    if ubuntu:
+        fat[19] = 0x0FFFFFFF
+        for c in range(20, 27):
+            fat[c] = c + 1
+        fat[27] = 0x0FFFFFFF
+        used = 28
     if free_kib is not None:
-        for c in range(19, cl + 2 - free_kib * 1024 // S):
+        for c in range(used, cl + 2 - free_kib * 1024 // S):
             fat[c] = 0x0FFFFFFF  # one-cluster "files" filling the partition (in no folder)
     raw = b"".join(struct.pack("<I", v) for v in fat)
     if fsinfo:  # FSInfo (sector 1) with the true free count, as Windows keeps it (bootcopy)
         fi = bytearray(S)
         struct.pack_into("<I", fi, 0, 0x41615252)
-        struct.pack_into("<IIII", fi, 484, 0x61417272, fat[2:].count(0), 19, 0)
+        struct.pack_into("<IIII", fi, 484, 0x61417272, fat[2:].count(0), used, 0)
         struct.pack_into("<I", fi, 508, 0xAA550000)
         img[(start + 1) * S:(start + 2) * S] = fi
     for k in range(2):
@@ -219,17 +254,32 @@ def fat32(img, start, length, free_kib=None, dirty=False, fsinfo=False, vendor=(
     put(2, fat_dirent(b"NO NAME    ", 0x08, 0) + fat_dirent(b"EFI        ", 0x10, 3))
     put(3, fat_dirent(dot, 0x10, 3) + fat_dirent(dotdot, 0x10, 0)
         + lfn_entries(vendor[0], vendor[1]) + fat_dirent(vendor[1], 0x10, 4)
-        + fat_dirent(b"BOOT       ", 0x10, 6))
+        + fat_dirent(b"BOOT       ", 0x10, 6)
+        + (lfn_entries("ubuntu", b"UBUNTU     ") + fat_dirent(b"UBUNTU     ", 0x10, 19) if ubuntu else b""))
     put(4, fat_dirent(dot, 0x10, 4) + fat_dirent(dotdot, 0x10, 3) + fat_dirent(b"BOOT       ", 0x10, 5))
     put(5, fat_dirent(dot, 0x10, 5) + fat_dirent(dotdot, 0x10, 4) + fat_dirent(b"BOOTMGFWEFI", 0x20, 7, 8 * S))
     put(6, fat_dirent(dot, 0x10, 6) + fat_dirent(dotdot, 0x10, 3) + fat_dirent(b"BOOTX64 EFI", 0x20, 15, 4 * S))
     put(7, b"MZ stand-in for bootmgfw.efi".ljust(8 * S, bytes(1)))
     put(15, b"MZ stand-in for bootx64.efi".ljust(4 * S, bytes(1)))
+    if ubuntu:
+        put(19, fat_dirent(dot, 0x10, 19) + fat_dirent(dotdot, 0x10, 3) + fat_dirent(b"GRUBX64 EFI", 0x20, 20, 8 * S))
+        put(20, b"MZ stand-in for grubx64.efi".ljust(8 * S, bytes(1)))
 
 
-def gpt_esp(free_kib=None, dirty=False, fsinfo=False):
+def gpt_esp(free_kib=None, dirty=False, fsinfo=False, ubuntu=False):
     img = gpt(False, ESP_PARTS, 160)
-    fat32(img, 2048, 206848 - 2048, free_kib, dirty, fsinfo)
+    fat32(img, 2048, 206848 - 2048, free_kib, dirty, fsinfo, ubuntu=ubuntu)
+    return img
+
+
+def gpt_esp_recfirst():
+    """gpt-esp-fsinfo with the EFI partition as GPT entry 2 (unique GUID ...af001), after a recovery partition with
+    an NTFS boot sector: bootplan, bootcopy and bootentry must say partition 2 and HD(2, start 43008) (11 Nov 2026)."""
+    img = gpt(False, ESP_PARTS_REC, 160)
+    o = 2048 * S
+    img[o:o + 11] = b"\xeb\x52\x90NTFS    "
+    img[o + 510:o + 512] = b"\x55\xaa"
+    fat32(img, 43008, 247808 - 43008, fsinfo=True)
     return img
 
 
@@ -241,11 +291,24 @@ def gpt_esp_linux():
     return img
 
 
-def gpt_esp_4k(free_kib=None, dirty=False):
+def gpt_esp_4k(free_kib=None, dirty=False, ubuntu=False):
     global S
     S = 4096  # every sector number below counts in 4 KiB blocks; FAT32 sectors are 4096 bytes too
     img = gpt(False, ESP_PARTS_4K, 400)
-    fat32(img, 256, 66816 - 256, free_kib, dirty, fsinfo=True)
+    fat32(img, 256, 66816 - 256, free_kib, dirty, fsinfo=True, ubuntu=ubuntu)
+    return img
+
+
+def gpt_esp_recfirst_4k():
+    """gpt-esp-recfirst on a disk of 4096-byte blocks: the recovery partition (NTFS boot sector) at block 256, the
+    260 MiB EFI partition as GPT entry 2 at block 5376, the same FAT32 as gpt-esp-fsinfo-4k (11 Nov 2026)."""
+    global S
+    S = 4096
+    img = gpt(False, ESP_PARTS_REC_4K, 400)
+    o = 256 * S
+    img[o:o + 11] = b"\xeb\x52\x90NTFS    "
+    img[o + 510:o + 512] = b"\x55\xaa"
+    fat32(img, 5376, 71936 - 5376, fsinfo=True)
     return img
 
 
@@ -256,7 +319,11 @@ def main():
            "gpt-esp-full": lambda: gpt_esp(free_kib=64), "gpt-esp-dirty": lambda: gpt_esp(dirty=True),
            "gpt-esp-fsinfo": lambda: gpt_esp(fsinfo=True), "gpt-esp-fsinfo-4k": gpt_esp_4k,
            "gpt-esp-full-4k": lambda: gpt_esp_4k(free_kib=64), "gpt-esp-dirty-4k": lambda: gpt_esp_4k(dirty=True),
-           "gpt-esp-linux": gpt_esp_linux}[kind]()
+           "gpt-esp-linux": gpt_esp_linux, "gpt-esp-dual": lambda: gpt_esp(fsinfo=True, ubuntu=True),
+           "gpt-esp-dual-full": lambda: gpt_esp(free_kib=64, fsinfo=True, ubuntu=True),
+           "gpt-esp-dual-4k": lambda: gpt_esp_4k(ubuntu=True),
+           "gpt-esp-dual-full-4k": lambda: gpt_esp_4k(free_kib=64, ubuntu=True),
+           "gpt-esp-recfirst": gpt_esp_recfirst, "gpt-esp-recfirst-4k": gpt_esp_recfirst_4k}[kind]()
     with open(out, "wb") as f:
         f.write(img)
 

@@ -38,6 +38,12 @@
 # block 256 and 260 MiB long (Windows' size on 4 KiB disks, since FAT32 needs 65525 clusters), its FAT32 in 4096-byte
 # sectors and clusters; the copy goes in whole device blocks (nvme.rs table_write_run). check-bootcopy.py finds the
 # block size from the image.
+# BOOTCOPY_KIND=recfirst (scripts/pc-bootcopy-recfirst-test.sh, 11 Nov 2026): the SATA kind with a Windows-like disk
+# whose recovery partition comes BEFORE the EFI partition, as some OEM disks have it (make-disk-image.py
+# gpt-esp-recfirst: GPT entry 1 a 20 MiB recovery partition, entry 2 the EFI partition at sector 43008). bootcopy and
+# bootcopy remove must say partition 2 (start 43008); check-bootcopy.py finds the EFI partition by its type GUID, must
+# say it checked GPT entry 2, and proves every sector outside it (the recovery partition among them) unchanged after
+# the copy and after the way back.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T="${TMPDIR:-/tmp}"
@@ -45,6 +51,7 @@ T="${TMPDIR:-/tmp}"
 FILE_RE='\\EFI\\afrisovera\\afrisovera\.efi'
 KIND="${BOOTCOPY_KIND:-sata}"
 ESPK=gpt-esp-fsinfo; STARTL=2048; FREE=100776 # the Windows-like disk's kind, its EFI partition's first block, free KiB
+PNO=1 # the EFI partition's GPT entry number
 if [ "$KIND" = nvme4k ]; then
     LS=lsnvme; RUNS=' \(on\)'
     NAME=nvme; PORT=6590; UP=" NVME 4K"; NARMS=20 # DEV as for ide
@@ -58,6 +65,7 @@ elif [ "$KIND" = nvme ]; then
 else
     LS=lsahci; RUNS=' \(on\)'
     NAME="sata port 2"; DEV=(-device ide-hd,drive=sb,bus=ide.2); PORT=5390; UP=""; NARMS=20
+    [ "$KIND" = recfirst ] && { ESPK=gpt-esp-recfirst; STARTL=43008; PNO=2; PORT=6980; UP=" RECOVERY FIRST"; }
 fi
 grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     local fail=0 A B C D
@@ -68,8 +76,8 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     blk() { printf '%s\n' "$1" | awk -v c="afrisovera> $2" '$0==c{on=1;next} /^afrisovera>/{on=0} on'; }
     in_blk() { printf '%s\n' "$1" | grep -aqxE "$2"; }
     local kb
-    kb="$(printf '%s\n' "$A" | sed -nE "s/^bootcopy: AfriSovera's boot file \(([0-9]+) KiB\) -> $NAME partition 1 \(start $STARTL\)$FILE_RE$/\1/p" | head -1)"
-    [ -n "$kb" ] || _f "boot 1: bootcopy did not name the boot file's size and $NAME partition 1 (start $STARTL)"
+    kb="$(printf '%s\n' "$A" | sed -nE "s/^bootcopy: AfriSovera's boot file \(([0-9]+) KiB\) -> $NAME partition $PNO \(start $STARTL\)$FILE_RE$/\1/p" | head -1)"
+    [ -n "$kb" ] || _f "boot 1: bootcopy did not name the boot file's size and $NAME partition $PNO (start $STARTL)"
     in_blk "$A" "  it takes [1-9][0-9]* KiB of the $FREE KiB free; nothing already in the partition is moved or changed; no boot entry is added yet" ||
         _f "boot 1: bootcopy did not say the room it takes and that nothing else changes"
     in_blk "$(blk "$A" bootcopy)" 'bootcopy: nothing written yet. To do it, type exactly: bootcopy yes [0-9a-f]{4}' ||
@@ -82,7 +90,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     local B1 BP B2
     B1="$(printf '%s\n' "$B" | awk '/^afrisovera> bootcopy yes /{on=1;next} /^afrisovera>/{on=0} on')"
     BP="$(blk "$B" bootplan)"; B2="$(blk "$B" bootcopy)"
-    in_blk "$B1" "bootcopy: copied to $NAME partition 1$FILE_RE, read back the same \($kb KiB, both FAT copies equal, [0-9]+ KiB free now\)" ||
+    in_blk "$B1" "bootcopy: copied to $NAME partition $PNO$FILE_RE, read back the same \($kb KiB, both FAT copies equal, [0-9]+ KiB free now\)" ||
         _f "boot 2: the copy was not read back the same ($kb KiB)"
     in_blk "$B1" 'bootcopy: no boot entry was added -- the PC starts exactly as before; bootcopy remove takes the file out again' ||
         _f "boot 2: bootcopy did not say no boot entry was added"
@@ -90,13 +98,19 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     in_blk "$BP" "  \\\\EFI\\\\afrisovera is already there \($kb KiB\) -- nothing to copy" || _f "boot 2: bootplan did not find the copied file"
     in_blk "$BP" "  boot entry: AfriSovera's file is there but no entry points at it yet -- adding one will ask for the owner's word" ||
         _f "boot 2: bootplan did not say the file has no boot entry yet"
-    in_blk "$B2" "bootcopy: $NAME partition 1 already holds \\\\EFI\\\\afrisovera -- nothing to copy \(bootcopy remove takes it out\)" ||
+    in_blk "$B2" "bootcopy: $NAME partition $PNO already holds \\\\EFI\\\\afrisovera -- nothing to copy \(bootcopy remove takes it out\)" ||
         _f "boot 2: a second bootcopy did not refuse"
     printf '%s\n' "$B" | grep -aqx 'harness: bootcopy image check PASSED' || _f "boot 2: the image check did not pass"
+    printf '%s\n' "$B" | grep -aqxE "check: the EFI system partition is GPT entry $PNO \(start $STARTL\)" ||
+        _f "boot 2: the image check did not check GPT entry $PNO (start $STARTL)"
+    printf '%s\n' "$D" | grep -aqxE "check: the EFI system partition is GPT entry $PNO \(start $STARTL\)" ||
+        _f "boot 4: the removal check did not check GPT entry $PNO (start $STARTL)"
+    printf '%s\n' "$D" | grep -aqx 'check: every sector outside the EFI partition is as it was before bootcopy' ||
+        _f "boot 4: the removal check did not find everything outside the EFI partition as before bootcopy"
     # the copy goes in runs of several sectors, one command and one read back each (IDE mode: one cache flush too)
     in_blk "$(blk "$B" $LS)" '  big copies \(installdisk, bootcopy\): [1-9][0-9]* run\(s\) in one command, [1-9][0-9]* sector\(s\), each read back'"$RUNS" ||
         _f "boot 2: bootcopy did not write the file in runs of several sectors ($LS)"
-    in_blk "$(blk "$C" 'bootcopy remove')" "bootcopy remove: $NAME partition 1 \(start $STARTL\): \\\\EFI\\\\afrisovera \($kb KiB\) would be taken out; nothing else in the partition changes" ||
+    in_blk "$(blk "$C" 'bootcopy remove')" "bootcopy remove: $NAME partition $PNO \(start $STARTL\): \\\\EFI\\\\afrisovera \($kb KiB\) would be taken out; nothing else in the partition changes" ||
         _f "boot 3: bootcopy remove did not say what goes"
     in_blk "$(blk "$C" 'bootcopy remove')" 'bootcopy remove: nothing written yet. To do it, type exactly: bootcopy remove yes [0-9a-f]{4}' ||
         _f "boot 3: bootcopy remove did not give the code"
@@ -105,7 +119,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     printf '%s\n' "$C" | grep -aqx 'harness: disk images unchanged' || _f "boot 3: a disk image changed (or the check is missing)"
     local D1
     D1="$(printf '%s\n' "$D" | awk '/^afrisovera> bootcopy remove yes /{on=1;next} /^afrisovera>/{on=0} on')"
-    in_blk "$D1" "bootcopy remove: \\\\EFI\\\\afrisovera taken out of $NAME partition 1, read back \(both FAT copies equal, $FREE KiB free again\)" ||
+    in_blk "$D1" "bootcopy remove: \\\\EFI\\\\afrisovera taken out of $NAME partition $PNO, read back \(both FAT copies equal, $FREE KiB free again\)" ||
         _f "boot 4: the removal was not read back with $FREE KiB free again"
     in_blk "$(blk "$D" bootplan)" "  plan: AfriSovera's boot file would be copied to $FILE_RE \([1-9][0-9]* KiB of the $FREE KiB free\); nothing else in this partition changes" ||
         _f "boot 4: bootplan does not plan the copy again"
@@ -144,6 +158,7 @@ bootplan: a plan only -- nothing was written; adding it will ask for the owner's
 afrisovera> bootcopy
 bootcopy: sata port 2 partition 1 already holds \\EFI\\afrisovera -- nothing to copy (bootcopy remove takes it out)
 afrisovera>
+check: the EFI system partition is GPT entry 1 (start 2048)
 check: both FAT copies equal
 harness: bootcopy image check PASSED"
 L3="afrisovera> bootcopy remove
@@ -161,6 +176,8 @@ afrisovera> bootplan
 bootplan: AfriSovera's boot file is 2360 KiB (kept at power-on)
   plan: AfriSovera's boot file would be copied to \\EFI\\afrisovera\\afrisovera.efi (2361 KiB of the 100776 KiB free); nothing else in this partition changes
 afrisovera>
+check: the EFI system partition is GPT entry 1 (start 2048)
+check: every sector outside the EFI partition is as it was before bootcopy
 harness: bootcopy removal check PASSED"
 
 WRONG=nvme
@@ -192,6 +209,11 @@ ide: controller 00:04.0, interface 0x80
 afrisovera>
 check:}"
 else
+    if [ "$KIND" = recfirst ]; then # the same samples with the EFI partition as GPT entry 2 at sector 43008
+        RF_SED='s/partition 1 (start 2048)/partition 2 (start 43008)/; s/sata port 2 partition 1/sata port 2 partition 2/; s/GPT entry 1, LBA 2048-206847/GPT entry 2, LBA 43008-247807/; s/GPT entry 1 (start 2048)/GPT entry 2 (start 43008)/'
+        L1="$(printf '%s\n' "$L1" | sed "$RF_SED")"; L2="$(printf '%s\n' "$L2" | sed "$RF_SED")"
+        L3="$(printf '%s\n' "$L3" | sed "$RF_SED")"; L4="$(printf '%s\n' "$L4" | sed "$RF_SED")"
+    fi
     L2="${L2/afrisovera>
 check:/afrisovera> lsahci
 ahci: controller 00:1f.2 ABAR 0xfebd5000, AHCI 1.0, ports implemented 0x3f
@@ -216,7 +238,7 @@ selftest() {
     echo "  --- grader selftest (no QEMU) ---"
     arm model-green green "$L1" "$L2" "$L3" "$L4"
     arm crlf green "$(crlf "$L1")" "$(crlf "$L2")" "$(crlf "$L3")" "$(crlf "$L4")"
-    arm wrong-partition red "$(printf '%s\n' "$L1" | sed "s/$NAME partition 1 (start $STARTL)/$WRONG partition 1 (start $STARTL)/")" "$L2" "$L3" "$L4"
+    arm wrong-partition red "$(printf '%s\n' "$L1" | sed "s/$NAME partition $PNO (start $STARTL)/$WRONG partition $PNO (start $STARTL)/")" "$L2" "$L3" "$L4"
     arm no-code red "$(printf '%s\n' "$L1" | grep -v 'type exactly: bootcopy yes')" "$L2" "$L3" "$L4"
     arm wrong-code-taken red "$(printf '%s\n' "$L1" | grep -v 'that code does not fit')" "$L2" "$L3" "$L4"
     arm boot1-wrote red "$(printf '%s\n' "$L1" | sed 's/disk images unchanged/disk images CHANGED/')" "$L2" "$L3" "$L4"
@@ -237,6 +259,13 @@ selftest() {
     if [ "$KIND" = nvme4k ]; then # the partition named in 512-byte sectors on a 4 KiB disk
         NARMS=$((NARMS + 1))
         arm counted-in-512 red "$(printf '%s\n' "$L1" | sed 's/(start 256)/(start 2048)/')" "$L2" "$L3" "$L4"
+    fi
+    if [ "$KIND" = recfirst ]; then # entry 1 (the recovery partition) taken for the EFI partition, the checker
+        NARMS=$((NARMS + 4))         # looking at the wrong partition, or a sector outside the EFI partition changed
+        arm copy-to-entry-1 red "$(printf '%s\n' "$L1" | sed 's/partition 2 (start 43008)/partition 1 (start 2048)/')" "$L2" "$L3" "$L4"
+        arm removed-from-entry-1 red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | sed 's/out of sata port 2 partition 2,/out of sata port 2 partition 1,/')"
+        arm checked-entry-1 red "$L1" "$(printf '%s\n' "$L2" | sed 's/GPT entry 2 (start 43008)/GPT entry 1 (start 2048)/')" "$L3" "$L4"
+        arm recovery-changed red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | grep -v 'every sector outside')"
     fi
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"

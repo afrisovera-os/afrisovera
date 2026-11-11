@@ -4,8 +4,9 @@
     check-bootcopy.py copied  ORIG NOW BOOTFILE   # after bootcopy
     check-bootcopy.py removed ORIG MID NOW        # after bootcopy remove (MID: the image after bootcopy)
 
-The EFI system partition is GPT entry 1, where make-disk-image.py's gpt-esp kinds put it (sector 2048; block
-256 in gpt-esp-fsinfo-4k). The block size (512 or 4096) is found from where the GPT header sits. Prints
+The EFI system partition is the first GPT entry with the EFI type GUID: entry 1 in make-disk-image.py's gpt-esp
+kinds (sector 2048; block 256 in gpt-esp-fsinfo-4k), entry 2 in gpt-esp-recfirst (sector 43008, after a recovery
+partition; since 11 Nov 2026). The block size (512 or 4096) is found from where the GPT header sits. Prints
 "check: ..." lines and, last, "harness: bootcopy image check PASSED" / "harness: bootcopy removal
 check PASSED", or "harness: ... FAILED: <why>". Exit 0 only when it passed.
 """
@@ -17,7 +18,9 @@ import sys
 import tempfile
 
 S = 512  # the disk's block size; FAT sectors are this size too (set by geometry() from the image)
-START = 2048  # the EFI partition's first block (GPT entry 1)
+START = 2048  # the EFI partition's first block
+ENT = 1  # its GPT entry number
+ESP_TYPE = bytes.fromhex("28732ac11ff8d211ba4b00a0c93ec93b")  # C12A7328-F81F-11D2-BA4B-00A0C93EC93B on disk
 EOC = 0x0FFFFFF8
 
 
@@ -26,14 +29,19 @@ class Bad(Exception):
 
 
 def geometry(img):
-    """S and START from the image: the GPT header at block 1 (byte 512 or 4096), entry 1's first block."""
-    global S, START
+    """S, START and ENT from the image: the GPT header at block 1 (byte 512 or 4096), then the first entry whose
+    type is the EFI system partition's."""
+    global S, START, ENT
     for bs in (512, 4096):
         if img[bs:bs + 8] == b"EFI PART":
             S = bs
-            elba = struct.unpack_from("<Q", img, bs + 72)[0]
-            START = struct.unpack_from("<Q", img, elba * bs + 32)[0]
-            return
+            elba, n, esz = struct.unpack_from("<QII", img, bs + 72)
+            for k in range(n):
+                o = elba * bs + k * esz
+                if img[o:o + 16] == ESP_TYPE:
+                    ENT, START = k + 1, struct.unpack_from("<Q", img, o + 32)[0]
+                    return
+            raise Bad("no GPT entry has the EFI system partition's type")
     raise Bad("no GPT header at block 1 (512 or 4096 bytes)")
 
 
@@ -225,6 +233,10 @@ def check_removed(orig, mid, now):
         if fat(now, g, k) != F0:
             raise Bad("FAT copy %d is not as it was before bootcopy" % (k + 1))
     print("check: both FAT copies are byte for byte as before bootcopy")
+    for n in changed(orig, now):
+        if not (START <= n < g["end"]):
+            raise Bad("sector %d outside the EFI partition is not as it was before bootcopy" % n)
+    print("check: every sector outside the EFI partition is as it was before bootcopy")
     if now[g["fsi"] * S:(g["fsi"] + 1) * S] != orig[g["fsi"] * S:(g["fsi"] + 1) * S]:
         raise Bad("FSInfo is not as it was before bootcopy")
     print("check: FSInfo as before bootcopy")
@@ -262,6 +274,7 @@ def main():
     rd = lambda p: open(p, "rb").read()
     try:
         geometry(rd(sys.argv[2]))
+        print("check: the EFI system partition is GPT entry %d (start %d)" % (ENT, START))
         if mode == "copied":
             check_copied(rd(sys.argv[2]), rd(sys.argv[3]), rd(sys.argv[4]))
         else:

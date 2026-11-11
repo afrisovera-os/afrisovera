@@ -860,6 +860,7 @@ extern "sysv64" fn shell_on_kernel_stack() -> ! {
     }
     // a second core, when the machine has one (the ARM boot's bring_up_secondary)
     smp::bring_up();
+    screen::pat_check(); // D1c: WC only when every running core's PAT has it
     vfs::seed();
     vfs::write("hello.wasm", nia::hello_wasm());
     vfs::write("sum.wasm", nia::sum_wasm());

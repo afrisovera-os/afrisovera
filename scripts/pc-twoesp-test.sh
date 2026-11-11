@@ -29,6 +29,15 @@
 #                     found FIRST, and the GPT Windows disk on port 4 as in sata. bootplan must call port 2 an old MBR
 #                     disk at every boot and never plan, copy or point an entry there, and its image must stay byte
 #                     for byte as it was.
+#   dual (added 11 Nov, the wrapper scripts/pc-twoesp-dual-test.sh): ONE EFI partition shared by Windows and Ubuntu, as
+#                     an Ubuntu installed after Windows leaves it (make-disk-image.py gpt-esp-dual: \EFI holds
+#                     Microsoft, BOOT, ubuntu with ubuntu\grubx64.efi) on SATA port 4, a blank disk on port 2 and a
+#                     blank GPT disk on NVMe. bootplan must list all three folders and copy beside them; the harness
+#                     also checks that the Microsoft, BOOT and ubuntu files and their FAT entries (clusters 4-27) are
+#                     byte for byte as they were after boot 3 and after boot 5.
+#   dual4k (added 11 Nov, the wrapper scripts/pc-twoesp-dual4k-test.sh): the same shared partition on an NVMe namespace
+#                     of 4096-byte blocks (make-disk-image.py gpt-esp-dual-4k, EFI partition at block 256, 260 MiB) and
+#                     a blank disk on SATA port 2; the same checks as dual, the files kept counted in 4 KiB clusters.
 #   scripts/pc-twoesp-test.sh              # grader selftest, then the five QEMU boots
 #   scripts/pc-twoesp-test.sh --selftest   # grader selftest only
 set -uo pipefail
@@ -40,10 +49,15 @@ KIND="${TWOESP_KIND:-nvme4k}"
 # the Windows disk: its name, its EFI partition's first block, length and last block (in the disk's own blocks), its
 # size in MiB, its block size; the Linux disk's name
 NAME=nvme; STARTL=256; BLOCKS=66560; LASTL=66815; MIB=260; BS=4096; OTHER="sata port 2"; PORT=6810; UP=" NVME 4K"
-if [ "$KIND" = sata ] || [ "$KIND" = mbr ]; then
+if [ "$KIND" = sata ] || [ "$KIND" = mbr ] || [ "$KIND" = dual ]; then
     NAME="sata port 4"; STARTL=2048; BLOCKS=204800; LASTL=206847; MIB=100; BS=512; PORT=6830; UP=" SATA"
 fi
 [ "$KIND" = mbr ] && { PORT=6850; UP=" SATA, an old MBR Windows disk on port 2"; }
+[ "$KIND" = dual ] && { PORT=6870; UP=" SATA, sharing one EFI partition with Ubuntu"; }
+[ "$KIND" = dual4k ] && { PORT=6910; UP=" NVME 4K, sharing one EFI partition with Ubuntu"; }
+SHARED=; { [ "$KIND" = dual ] || [ "$KIND" = dual4k ]; } && SHARED=1   # Windows and Ubuntu in one EFI partition
+HOLDS="Microsoft, BOOT"; [ -n "$SHARED" ] && HOLDS="Microsoft, BOOT, ubuntu"   # what \EFI holds before the copy
+KEPT="harness: $NAME Microsoft, BOOT and ubuntu files byte-identical (clusters 4-27 and their FAT entries)"
 MBRL="bootplan: $OTHER: an old MBR disk (boot entries are planned on GPT disks only)"
 WING="00000000-0000-0000-0000-0000000af000"   # the Windows EFI partition's GUID (make-disk-image.py)
 LING="00000000-0000-0000-0000-0000000b1000"   # the Linux one's
@@ -64,10 +78,12 @@ grade() { # grade <boot1 log> .. <boot5 log>
     # boot 1: both partitions seen, the Windows one chosen
     in_blk "$W1" "bootplan: $NAME: EFI system partition \(GPT entry 1, LBA $STARTL-$LASTL, $MIB MiB\)" ||
         _f "boot 1: bootplan did not list the Windows EFI partition on $NAME"
-    in_blk "$W1" '  \\EFI holds: Microsoft, BOOT' || _f "boot 1: bootplan did not see Microsoft in $NAME's EFI partition"
+    in_blk "$W1" "  \\\\EFI holds: $HOLDS" || _f "boot 1: bootplan did not see $HOLDS in $NAME's EFI partition"
     if [ "$KIND" = mbr ]; then # the old Windows disk is named as such, and no EFI partition is found on it
         printf '%s\n' "$P1" | grep -aqxF "$MBRL" || _f "boot 1: bootplan did not call $OTHER an old MBR disk"
         [ -z "$L1" ] || _f "boot 1: bootplan found an EFI partition on the MBR disk ($OTHER)"
+    elif [ -n "$SHARED" ]; then # one EFI partition only: the blank disk has none
+        [ -z "$L1" ] || _f "boot 1: bootplan found an EFI partition on the blank disk ($OTHER)"
     else
     in_blk "$L1" "bootplan: $OTHER: EFI system partition \(GPT entry 1, LBA 2048-206847, 100 MiB\)" ||
         _f "boot 1: bootplan did not list the second EFI partition on $OTHER"
@@ -94,10 +110,13 @@ grade() { # grade <boot1 log> .. <boot5 log>
         _f "boot 3: the entry does not point at the Windows EFI partition ($WING, start $STARTL)"
     if printf '%s\n' "$C" | grep -aq "HD(1,GPT,$LING"; then _f "boot 3: an entry points at the Linux EFI partition"; fi
     P3="$(blk "$C" bootplan)"; W3="$(part "$P3" "$NAME")"; L3="$(part "$P3" "$OTHER")"
-    in_blk "$W3" '  \\EFI holds: Microsoft, BOOT, afrisovera' || _f "boot 3: bootplan does not list afrisovera in $NAME's EFI partition"
+    in_blk "$W3" "  \\\\EFI holds: $HOLDS, afrisovera" || _f "boot 3: bootplan does not list $HOLDS, afrisovera in $NAME's EFI partition"
     if [ "$KIND" = mbr ]; then
         printf '%s\n' "$P3" | grep -aqxF "$MBRL" || _f "boot 3: bootplan did not call $OTHER an old MBR disk"
         [ -z "$L3" ] || _f "boot 3: bootplan found an EFI partition on the MBR disk ($OTHER)"
+    elif [ -n "$SHARED" ]; then
+        [ -z "$L3" ] || _f "boot 3: bootplan found an EFI partition on the blank disk ($OTHER)"
+        printf '%s\n' "$C" | grep -aqxF "$KEPT" || _f "boot 3: the Microsoft, BOOT or ubuntu files (or their FAT entries) in $NAME's EFI partition changed"
     else
     in_blk "$L3" '  \\EFI holds: ubuntu, BOOT' || _f "boot 3: $OTHER's EFI partition does not hold just ubuntu and BOOT"
     if printf '%s\n' "$L3" | grep -aq 'afrisovera is already there'; then _f "boot 3: the file is in $OTHER's EFI partition too"; fi
@@ -128,11 +147,14 @@ grade() { # grade <boot1 log> .. <boot5 log>
     in_blk "$EE" "  BootOrder: ${ORDER0:-none}" || _f "boot 5: BootOrder is not back to ${ORDER0:-(unknown)}"
     if printf '%s\n' "$EE" | grep -aq '"AfriSovera"'; then _f "boot 5: bootentries still lists an AfriSovera entry"; fi
     P5="$(blk "$E" bootplan)"; W5="$(part "$P5" "$NAME")"; L5="$(part "$P5" "$OTHER")"
-    in_blk "$W5" '  \\EFI holds: Microsoft, BOOT' || _f "boot 5: $NAME's EFI partition does not hold just Microsoft and BOOT again"
+    in_blk "$W5" "  \\\\EFI holds: $HOLDS" || _f "boot 5: $NAME's EFI partition does not hold just $HOLDS again"
     in_blk "$W5" "  FAT32, [0-9]+-byte clusters, ${FREE1:-none} KiB free" || _f "boot 5: $NAME's EFI partition does not have its boot 1 free space back"
     if [ "$KIND" = mbr ]; then
         printf '%s\n' "$P5" | grep -aqxF "$MBRL" || _f "boot 5: bootplan did not call $OTHER an old MBR disk"
         [ -z "$L5" ] || _f "boot 5: bootplan found an EFI partition on the MBR disk ($OTHER)"
+    elif [ -n "$SHARED" ]; then
+        [ -z "$L5" ] || _f "boot 5: bootplan found an EFI partition on the blank disk ($OTHER)"
+        printf '%s\n' "$E" | grep -aqxF "$KEPT" || _f "after the way back the Microsoft, BOOT or ubuntu files (or their FAT entries) in $NAME's EFI partition changed"
     else
     in_blk "$L5" '  \\EFI holds: ubuntu, BOOT' || _f "boot 5: $OTHER's EFI partition does not hold just ubuntu and BOOT"
     fi
@@ -229,7 +251,7 @@ bootplan: a plan only -- nothing was written; adding it will ask for the owner's
 afrisovera>
 harness: sata port 2 image byte-identical to a fresh copy
 harness: nvme image changed only inside its EFI partition"
-if [ "$KIND" = sata ] || [ "$KIND" = mbr ]; then # port 2 is listed first, Windows on port 4 after it
+if [ "$KIND" = sata ] || [ "$KIND" = mbr ] || [ "$KIND" = dual ]; then # port 2 is listed first, Windows on port 4 after it
     S_SED='s/^bootplan: nvme: EFI system partition \(GPT entry 1, LBA 256-66815, 260 MiB\)$/bootplan: sata port 4: EFI system partition (GPT entry 1, LBA 2048-206847, 100 MiB)/
 s/nvme partition 1 \(start 256\)/sata port 4 partition 1 (start 2048)/g; s/nvme partition 1/sata port 4 partition 1/g
 s/\(start 256, 66560 blocks\)/(start 2048, 204800 blocks)/; s/,start 256\)/,start 2048)/; s/^harness: nvme image/harness: sata port 4 image/'
@@ -241,9 +263,17 @@ if [ "$KIND" = mbr ]; then # port 2's EFI partition block becomes the one line b
 $MBRL"
     M1="$(printf '%s\n' "$M1" | sed "$M_SED")"; M3="$(printf '%s\n' "$M3" | sed "$M_SED")"; M5="$(printf '%s\n' "$M5" | sed "$M_SED")"
 fi
+if [ -n "$SHARED" ]; then # no EFI partition on port 2; ubuntu sits beside Microsoft and BOOT; the files-kept line
+    D_SED='/^bootplan: sata port 2: EFI system partition/,/^  plan:/d
+s/^  \\EFI holds: Microsoft, BOOT$/  \\EFI holds: Microsoft, BOOT, ubuntu/
+s/^  \\EFI holds: Microsoft, BOOT, afrisovera$/  \\EFI holds: Microsoft, BOOT, ubuntu, afrisovera/'
+    M1="$(printf '%s\n' "$M1" | sed "$D_SED")"; M3="$(printf '%s\n%s' "$M3" "$KEPT" | sed "$D_SED")"
+    M5="$(printf '%s\n%s' "$M5" "$KEPT" | sed "$D_SED")"
+fi
 
 selftest() {
     local D pass=0 bad=0 N=24
+    [ -n "$SHARED" ] && N=25
     D="$(mktemp -d "$T/pc-twoesp-selftest.XXXXXX")" || return 1
     arm() { # arm <name> <expect> <b1> <b2> <b3> [<b4> <b5>] (boots 4 and 5 default to the model ones)
         local got
@@ -264,12 +294,15 @@ selftest() {
     arm removed-from-linux red "$M1" "$M2" "$M3" "$M4" "$(printf '%s\n' "$M5" | sed "s/taken out of $NAME partition 1/taken out of $OTHER partition 1/")"
     arm free-not-back red "$M1" "$M2" "$M3" "$M4" "$(printf '%s\n' "$M5" | sed 's/265524 KiB free again/265520 KiB free again/; s/clusters, 265524 KiB free$/clusters, 265520 KiB free/')"
     arm bootorder-not-back red "$M1" "$M2" "$M3" "$M4" "$(printf '%s\n' "$M5" | sed 's/^  BootOrder: 0001 0002 0003 0004 0000$/  BootOrder: 0001 0002 0003 0004 0000 0005/')"
-    arm file-still-there red "$M1" "$M2" "$M3" "$M4" "$(printf '%s\n' "$M5" | sed 's/holds: Microsoft, BOOT$/holds: Microsoft, BOOT, afrisovera/')"
+    arm file-still-there red "$M1" "$M2" "$M3" "$M4" "$(printf '%s\n' "$M5" | sed "s/holds: $HOLDS\$/holds: $HOLDS, afrisovera/")"
     arm linux-changed-on-way-back red "$M1" "$M2" "$M3" "$M4" "$(printf '%s\n' "$M5" | sed 's/byte-identical to a fresh copy/CHANGED (first difference at byte 4096)/')"
     arm no-boot5 red "$M1" "$M2" "$M3" "$M4" ""
     if [ "$KIND" = mbr ]; then
     arm mbr-unseen red "$(printf '%s\n' "$M1" | grep -vxF "$MBRL")" "$M2" "$M3"
     arm mbr-unseen-boot5 red "$M1" "$M2" "$M3" "$M4" "$(printf '%s\n' "$M5" | grep -vxF "$MBRL")"
+    elif [ -n "$SHARED" ]; then
+    arm ubuntu-unseen red "$(printf '%s\n' "$M1" | sed 's/holds: Microsoft, BOOT, ubuntu$/holds: Microsoft, BOOT/')" "$M2" "$M3"
+    arm ubuntu-gone-boot5 red "$M1" "$M2" "$M3" "$M4" "$(printf '%s\n' "$M5" | sed 's/holds: Microsoft, BOOT, ubuntu$/holds: Microsoft, BOOT/')"
     else
     arm second-esp-unseen red "$(printf '%s\n' "$M1" | grep -v "^bootplan: $OTHER: EFI")" "$M2" "$M3"
     arm ubuntu-unseen red "$(printf '%s\n' "$M1" | sed 's/holds: ubuntu, BOOT/holds: BOOT/')" "$M2" "$M3"
@@ -281,6 +314,9 @@ selftest() {
     arm entry-to-linux-guid red "$M1" "$M2" "$(printf '%s\n' "$M3" | sed "s/HD(1,GPT,$WING/HD(1,GPT,$LING/")"
     if [ "$KIND" = mbr ]; then # an EFI partition "found" on the MBR disk at boot 3
     arm mbr-esp-found red "$M1" "$M2" "$(printf '%s\n' "$M3" | sed "s/^bootplan: sata port 2: an old MBR disk.*$/bootplan: sata port 2: EFI system partition (GPT entry 1, LBA 2048-206847, 100 MiB)/")"
+    elif [ -n "$SHARED" ]; then # the files beside ours changed, after boot 3 or after the way back
+    arm ubuntu-files-changed red "$M1" "$M2" "$(printf '%s\n' "$M3" | sed 's/files byte-identical (clusters 4-27.*$/files CHANGED (cluster 20)/')"
+    arm ubuntu-files-changed-boot5 red "$M1" "$M2" "$M3" "$M4" "$(printf '%s\n' "$M5" | sed 's/files byte-identical (clusters 4-27.*$/files CHANGED (FAT 1 entries 0-27)/')"
     else
     arm file-in-linux-too red "$M1" "$M2" "$(printf '%s\n' "$M3" | sed 's/holds: ubuntu, BOOT$/holds: ubuntu, BOOT, afrisovera/')"
     fi
@@ -323,8 +359,8 @@ done
 [ -n "$OVMF" ] && [ -r "$VARS" ] || { echo "PC TWOESP${UP} TEST FAILED (harness: no x86-64 UEFI firmware with a variable store file)"; exit 1; }
 
 W="$(mktemp -d "$T/pc-twoesp.XXXXXX")"
-WINK=gpt-esp-fsinfo-4k; [ "$KIND" = nvme4k ] || WINK=gpt-esp-fsinfo
-OTHK=gpt-esp-linux; [ "$KIND" = mbr ] && OTHK=mbr-windows   # the other disk (linux.img even when it is the MBR one)
+WINK=gpt-esp-fsinfo-4k; [ "$KIND" = nvme4k ] || WINK=gpt-esp-fsinfo; [ "$KIND" = dual4k ] && WINK=gpt-esp-dual-4k
+OTHK=gpt-esp-linux; [ "$KIND" = mbr ] && OTHK=mbr-windows; [ "$KIND" = dual ] && { WINK=gpt-esp-dual; OTHK=blank; }; [ "$KIND" = dual4k ] && OTHK=blank   # the other disk (linux.img even when it is the MBR one)
 mk() { "$PY" scripts/lib/make-disk-image.py "$1" "$2" || { echo "PC TWOESP${UP} TEST FAILED (harness: could not make $2)"; exit 1; }; }
 mk "$WINK" "$W/win.img"; mk "$OTHK" "$W/linux.img"; mk gpt "$W/blank.img"
 cp "$W/win.img" "$W/win.fresh"; cp "$W/linux.img" "$W/linux.fresh"
@@ -332,7 +368,7 @@ cp "$VARS" "$W/vars.fd"
 mkdir -p "$W/stick/EFI/BOOT"
 cp "$PC_EFI" "$W/stick/EFI/BOOT/BOOTX64.EFI"
 
-if [ "$KIND" = sata ] || [ "$KIND" = mbr ]; then
+if [ "$KIND" = sata ] || [ "$KIND" = mbr ] || [ "$KIND" = dual ]; then
     DEV=(-drive "file=$(winpath "$W/blank.img"),if=none,format=raw,id=dn" -device nvme,serial=afri01,drive=dn
         -drive "file=$(winpath "$W/linux.img"),if=none,format=raw,id=dl" -device ide-hd,drive=dl,bus=ide.2
         -drive "file=$(winpath "$W/win.img"),if=none,format=raw,id=dw" -device ide-hd,drive=dw,bus=ide.4)
@@ -392,7 +428,22 @@ elif first_diff(x, xf, lo, hi) is None:
     print("harness: %s image unchanged (nothing was copied)" % name)
 else:
     print("harness: %s image changed only inside its EFI partition" % name)
-' "$OTHER" "$NAME" "$BS" "$STARTL" "$BLOCKS" "$W" >> "$1" 2>&1
+if sys.argv[7] in ("dual", "dual4k"):  # the files beside ours: clusters 4-27 (one block each) and their FAT entries, every FAT
+    import struct
+    p = a * bs
+    rsvd, nf, fsz = struct.unpack_from("<H", xf, p + 14)[0], xf[p + 16], struct.unpack_from("<I", xf, p + 36)[0]
+    bad = None
+    for k in range(nf):
+        f = p + (rsvd + k * fsz) * bs
+        if bad is None and x[f:f + 28 * 4] != xf[f:f + 28 * 4]:
+            bad = "FAT %d entries 0-27" % (k + 1)
+    d0 = p + (rsvd + nf * fsz) * bs
+    for c in range(4, 28):
+        o = d0 + (c - 2) * bs
+        if bad is None and x[o:o + bs] != xf[o:o + bs]:
+            bad = "cluster %d" % c
+    print("harness: %s Microsoft, BOOT and ubuntu files %s" % (name, "byte-identical (clusters 4-27 and their FAT entries)" if bad is None else "CHANGED (%s)" % bad))
+' "$OTHER" "$NAME" "$BS" "$STARTL" "$BLOCKS" "$W" "$KIND" >> "$1" 2>&1
 }
 compare "$W/boot3.log"
 rcode() { tr -d '\r' < "$1" | sed -nE "s/^$2 remove: nothing written yet\. To do it, type exactly: $2 remove yes ([0-9a-f]{4})$/\1/p" | head -1; }

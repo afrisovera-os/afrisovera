@@ -539,6 +539,27 @@ fn power_net(px: i32, py: i32, nx: i32, ny: i32) {
 }
 
 fn window(a: usize) {
+    // motion (afriui.md section 17): while it unfolds, the window is clipped to its lintel and
+    // a third of its body per frame; what lies below (wallpaper, lower windows) is already drawn
+    if let Some(rows) = unfold_rows(a) {
+        let (x, y, w, _) = win_rect(a);
+        // SAFETY: mainline only; restored right after.
+        let keep = unsafe { DCLIP };
+        let (x0, y0) = (keep.0.max(x), keep.1.max(y));
+        let (x1, y1) = ((keep.0 + keep.2).min(x + w + 4), (keep.1 + keep.3).min(y + rows));
+        if x1 > x0 && y1 > y0 {
+            // SAFETY: as above.
+            unsafe { DCLIP = (x0, y0, x1 - x0, y1 - y0) };
+            window_whole(a);
+        }
+        // SAFETY: as above.
+        unsafe { DCLIP = keep };
+        return;
+    }
+    window_whole(a);
+}
+
+fn window_whole(a: usize) {
     let s = st();
     let (x, y, w, h) = win_rect(a);
     let th = title_h();
@@ -758,8 +779,10 @@ fn settings_app(a: usize, x: i32, y: i32, w: i32, _h: i32) {
     switch(x + w - 50, y + rows[1], s.wallpaper);
     label(y + rows[2] + 3, b"24-hour clock");
     switch(x + w - 50, y + rows[2], s.clock24);
+    label(y + rows[3] + 3, b"Motion");
+    switch(x + w - 50, y + rows[3], s.motion);
 
-    head(y + 142, b"Network");
+    head(y + 164, b"Network");
     let ip = crate::virtio::dhcp_ip();
     let mut l = Line::new();
     if !crate::virtio::net_present() {
@@ -767,7 +790,7 @@ fn settings_app(a: usize, x: i32, y: i32, w: i32, _h: i32) {
     } else if ip == [0u8; 4] {
         l.s(b"Link up, no address yet");
     } else {
-        rect(x + 14, y + 161, 5, 5, GREEN);
+        rect(x + 14, y + 183, 5, 5, GREEN);
         l.s(b"   Connected  ");
         for (k, o) in ip.iter().enumerate() {
             if k > 0 {
@@ -776,16 +799,16 @@ fn settings_app(a: usize, x: i32, y: i32, w: i32, _h: i32) {
             l.u(*o as u64);
         }
     }
-    label(y + 158, l.get());
+    label(y + 180, l.get());
 
-    head(y + 182, b"System");
+    head(y + 204, b"System");
     let mut l = Line::new();
     l.u(crate::cores_online() as u64).s(b" core(s), ").u(crate::ram_mib()).s(b" MiB memory");
-    label(y + 198, l.get());
+    label(y + 220, l.get());
     let mut l = Line::new();
     l.s(b"Booted ").u(crate::config::boots() as u64).s(b" time(s), up ").u(crate::sched::ticks() / 100).s(b" s");
-    text(x + 14, y + 212, l.get(), DIM, 1);
-    note_uptime(a, y + 212);
+    text(x + 14, y + 234, l.get(), DIM, 1);
+    note_uptime(a, y + 234);
     let _ = (w, a);
 }
 
@@ -847,6 +870,16 @@ fn about_app(x: i32, y: i32, w: i32, h: i32) {
 fn launcher() {
     let s = st();
     let (lx, ly, lw, lh) = launcher_box();
+    if let Some(step) = grow_step() {
+        // motion: the octagon at a third, then two thirds, of its size, centred where it will
+        // stand; no tiles yet (taps already hit the final ones)
+        let (gw, gh) = (lw * step / 3, lh * step / 3);
+        let (gx, gy) = (lx + (lw - gw) / 2, ly + (lh - gh) / 2);
+        let k = gw * 29 / 100;
+        cut(gx, gy, gw, gh, k, k, k, k, 0x16_11_0E);
+        cut_frame(gx, gy, gw, gh, k, k, k, k, GOLD_DARK);
+        return;
+    }
     let k = lw * 29 / 100; // a regular octagon cuts about 29% off each corner
     cut(lx + 4, ly + 4, lw, lh, k, k, k, k, SHADOW);
     cut(lx, ly, lw, lh, k, k, k, k, 0x16_11_0E);

@@ -27,6 +27,14 @@
 # kernel drives one NVMe controller, so the refusals take two boots: boot 2 the same disk with 64 KiB free
 # (gpt-esp-full-4k) and the MBR disk on SATA port 4; boot 3 the same disk not closed cleanly (gpt-esp-dirty-4k). The
 # NvVars folder disk sits on piix3-ide ahead of the NVMe controller, as in pc-bootcopy-nvme4k.
+# BOOTPLAN_KIND=recfirst (scripts/pc-bootplan-recfirst-test.sh, 11 Nov 2026): the same two boots, but boot 1's
+# Windows-like disk has a recovery partition BEFORE the EFI partition, as some OEM disks have it (make-disk-image.py
+# gpt-esp-recfirst): bootplan must find the EFI partition as GPT entry 2 (LBA 43008-247807) and plan the entry as
+# sata port 2 partition 2 (start 43008), the number bootcopy and bootentry use on that disk (pc-bootentry-recfirst).
+# BOOTPLAN_KIND=recfirst4k (scripts/pc-bootplan-recfirst4k-test.sh, 11 Nov 2026): the three nvme4k boots, but boot 1's
+# disk in 4096-byte blocks has the recovery partition BEFORE the EFI partition (make-disk-image.py gpt-esp-recfirst-4k):
+# bootplan must find the EFI partition as GPT entry 2 (LBA 5376-71935, 260 MiB) and plan the entry as nvme partition 2
+# (start 5376), counted in the disk's own 4 KiB blocks. Boots 2 and 3 are the same as nvme4k.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T="${TMPDIR:-/tmp}"
@@ -35,14 +43,20 @@ FILE_RE='\\EFI\\afrisovera\\afrisovera\.efi'
 KIND="${BOOTPLAN_KIND:-sata}"
 # UNF: the disk whose EFI partition is not formatted; then the Windows-like disk's EFI partition, cluster size, free
 # KiB and first block, as bootplan names them
-UNF=nvme; ESPL="2048-206847, 100 MiB"; CLB=512; FREE=100776; STARTL=2048; NARMS=19
+UNF=nvme; ESPL="2048-206847, 100 MiB"; CLB=512; FREE=100776; STARTL=2048; NARMS=19; ENT=1; FOURK=""
 if [ "$KIND" = ide ]; then
     DN2=ide1; DN3=ide2; DN4=ide3; PORT=6380; UP=" IDE"
-elif [ "$KIND" = nvme4k ]; then # DN3, the disk not closed cleanly, is graded in boot 3
-    DN2=nvme; DN3=nvme; DN4="sata port 4"; PORT=6680; UP=" NVME 4K"; NARMS=23
+elif [ "$KIND" = nvme4k ] || [ "$KIND" = recfirst4k ]; then # DN3, the disk not closed cleanly, is graded in boot 3
+    DN2=nvme; DN3=nvme; DN4="sata port 4"; PORT=6680; UP=" NVME 4K"; NARMS=23; FOURK=1
     UNF="sata port 2"; ESPL="256-66815, 260 MiB"; CLB=4096; FREE=265524; STARTL=256
+    if [ "$KIND" = recfirst4k ]; then # boot 1's EFI partition is GPT entry 2; boots 2 and 3 are the same as nvme4k
+        ENT=2; ESPL="5376-71935, 260 MiB"; STARTL=5376; PORT=7000; UP=" RECOVERY FIRST NVME 4K"; NARMS=26
+    fi
 else
     DN2="sata port 2"; DN3="sata port 3"; DN4="sata port 4"; PORT=5380; UP=""
+    if [ "$KIND" = recfirst ]; then # boot 1's EFI partition is GPT entry 2; boot 2 is the same as sata
+        ENT=2; ESPL="43008-247807, 100 MiB"; STARTL=43008; PORT=6970; UP=" RECOVERY FIRST"; NARMS=22
+    fi
 fi
 grade() { # grade <boot1 log> <boot2 log> [<boot3 log>, nvme4k only]
     local fail=0 A B C=""
@@ -50,7 +64,7 @@ grade() { # grade <boot1 log> <boot2 log> [<boot3 log>, nvme4k only]
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    if [ "$KIND" = nvme4k ]; then
+    if [ -n "$FOURK" ]; then
         [ -s "${3:-}" ] || { echo "  FAIL: missing boot 3 log"; return 1; }
         C="$(tr -d '\r' < "$3" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     fi
@@ -66,16 +80,16 @@ grade() { # grade <boot1 log> <boot2 log> [<boot3 log>, nvme4k only]
         _f "boot 1: bootplan did not give the boot file's size"
     N1="$(disk "$AP" "$DN2")"
     in_blk "$(disk "$AP" "$UNF")" '  it holds no file system we know' || _f "boot 1: the unformatted EFI partition on $UNF was not passed over"
-    in_blk "$N1" "bootplan: $DN2: EFI system partition \\(GPT entry 1, LBA $ESPL\\)" ||
-        _f "boot 1: the $DN2 disk's EFI partition was not found as GPT entry 1, LBA $ESPL"
+    in_blk "$N1" "bootplan: $DN2: EFI system partition \\(GPT entry $ENT, LBA $ESPL\\)" ||
+        _f "boot 1: the $DN2 disk's EFI partition was not found as GPT entry $ENT, LBA $ESPL"
     in_blk "$N1" "  FAT32, $CLB-byte clusters, $FREE KiB free" || _f "boot 1: the EFI partition's free room was not $FREE KiB in $CLB-byte clusters"
     in_blk "$N1" '  \\EFI holds: Microsoft, BOOT' || _f "boot 1: \\EFI's folders (Microsoft by its long name, BOOT) were not listed"
     in_blk "$N1" "  plan: AfriSovera's boot file would be copied to $FILE_RE \([1-9][0-9]* KiB of the $FREE KiB free\); nothing else in this partition changes" ||
         _f "boot 1: the boot file was not planned into the EFI partition"
     local num free
-    num="$(printf '%s\n' "$AP" | sed -nE 's/^  boot entry: (Boot[0-9A-F]{4}) "AfriSovera" -> '"$DN2"' partition 1 \(start '"$STARTL"'\)\\EFI\\afrisovera\\afrisovera\.efi would be added at the END of BootOrder$/\1/p')"
+    num="$(printf '%s\n' "$AP" | sed -nE 's/^  boot entry: (Boot[0-9A-F]{4}) "AfriSovera" -> '"$DN2"' partition '"$ENT"' \(start '"$STARTL"'\)\\EFI\\afrisovera\\afrisovera\.efi would be added at the END of BootOrder$/\1/p')"
     free="$(printf '%s\n' "$AE" | sed -nE 's/^  [0-9]+ entries; the next free number is (Boot[0-9A-F]{4})$/\1/p')"
-    if [ -z "$num" ]; then _f "boot 1: no boot entry was planned at the end of BootOrder for $DN2 partition 1"
+    if [ -z "$num" ]; then _f "boot 1: no boot entry was planned at the end of BootOrder for $DN2 partition $ENT"
     elif [ "$num" != "$free" ]; then _f "boot 1: the planned entry $num is not the next free number bootentries gives (${free:-none})"; fi
     in_blk "$AP" "  the PC keeps starting \".+\" first; AfriSovera is picked from the firmware's boot menu" ||
         _f "boot 1: bootplan did not say the PC keeps its first choice"
@@ -150,8 +164,11 @@ bootplan: ide0: an old MBR disk (boot entries are planned on GPT disks only)"
     B1="${B1//sata port 2/$DN2}"; B1="${B1//"$M0"/$M1}"
     B2="${B2//sata port 4/$DN4}"; B2="${B2//sata port 3/$DN3}"; B2="${B2//sata port 2/$DN2}"; B2="${B2//"$M0"/$M1}"
 fi
+if [ "$KIND" = recfirst ]; then # boot 1's Windows-like disk with the EFI partition as GPT entry 2 at sector 43008
+    B1="$(printf '%s\n' "$B1" | sed 's/^bootplan: sata port 2: EFI system partition (GPT entry 1, LBA 2048-206847, 100 MiB)$/bootplan: sata port 2: EFI system partition (GPT entry 2, LBA 43008-247807, 100 MiB)/; s/-> sata port 2 partition 1 (start 2048)/-> sata port 2 partition 2 (start 43008)/')"
+fi
 B3=""
-if [ "$KIND" = nvme4k ]; then # the 4 KiB-block Windows-like disk on NVMe, the unformatted one on SATA port 2
+if [ -n "$FOURK" ]; then # the 4 KiB-block Windows-like disk on NVMe, the unformatted one on SATA port 2
     P0="bootplan: AfriSovera's boot file is 2353 KiB (kept at power-on)
 bootplan: nvme: EFI system partition (GPT entry 1, LBA 256-66815, 260 MiB)"
     U2="bootplan: sata port 0: an old MBR disk (boot entries are planned on GPT disks only)
@@ -195,6 +212,9 @@ $U2
 $I0
   boot entry: none planned -- no EFI system partition with room
 $PE"
+    if [ "$KIND" = recfirst4k ]; then # only boot 1's disk differs: the EFI partition as GPT entry 2 at block 5376
+        B1="$(printf '%s\n' "$B1" | sed 's/^bootplan: nvme: EFI system partition (GPT entry 1, LBA 256-66815, 260 MiB)$/bootplan: nvme: EFI system partition (GPT entry 2, LBA 5376-71935, 260 MiB)/; s/-> nvme partition 1 (start 256)/-> nvme partition 2 (start 5376)/')"
+    fi
 fi
 
 selftest() {
@@ -211,7 +231,7 @@ selftest() {
     arm model-green green "$B1" "$B2"
     arm crlf green "$(printf '%s\n' "$B1" | sed 's/$/\r/')" "$(printf '%s\n' "$B2" | sed 's/$/\r/')" "$(printf '%s\n' "$B3" | sed 's/$/\r/')"
     arm no-file-size red "$(printf '%s\n' "$B1" | grep -v 'boot file is')" "$B2"
-    arm wrong-esp red "$(printf '%s\n' "$B1" | sed "s/GPT entry 1, LBA $ESPL/GPT entry 2, LBA 206848-239615, 16 MiB/")" "$B2"
+    arm wrong-esp red "$(printf '%s\n' "$B1" | sed "s/GPT entry $ENT, LBA $ESPL/GPT entry 3, LBA 206848-239615, 16 MiB/")" "$B2"
     arm wrong-free red "$(printf '%s\n' "$B1" | sed "s/$FREE KiB free\$/$((FREE - 1)) KiB free/")" "$B2"
     arm no-long-name red "$(printf '%s\n' "$B1" | sed 's/holds: Microsoft, BOOT/holds: MICROS~1, BOOT/')" "$B2"
     arm no-file-plan red "$(printf '%s\n' "$B1" | grep -v 'would be copied')" "$B2"
@@ -227,18 +247,31 @@ selftest() {
     arm image-changed red "$B1" "$(printf '%s\n' "$B2" | sed 's/disk images unchanged/disk images CHANGED/')"
     arm panic red "$(printf '%s\nKERNEL PANIC at esp.rs' "$B1")" "$B2"
     arm empty red "" "" ""
-    if [ "$KIND" = nvme4k ]; then # the partition counted in 512-byte sectors on a 4 KiB disk; boot 3 going wrong
-        arm entry-counted-in-512 red "$(printf '%s\n' "$B1" | sed 's/(start 256)/(start 2048)/')" "$B2"
-        arm esp-counted-in-512 red "$(printf '%s\n' "$B1" | sed 's/LBA 256-66815, 260 MiB/LBA 2048-534527, 260 MiB/')" "$B2"
+    if [ -n "$FOURK" ]; then # the partition counted in 512-byte sectors on a 4 KiB disk; boot 3 going wrong
+        local e0="${ESPL%%-*}" e1="${ESPL#*-}"; e1="${e1%%,*}"
+        arm entry-counted-in-512 red "$(printf '%s\n' "$B1" | sed "s/(start $STARTL)/(start $((STARTL * 8)))/")" "$B2"
+        arm esp-counted-in-512 red "$(printf '%s\n' "$B1" | sed "s/LBA $e0-$e1, 260 MiB/LBA $((e0 * 8))-$((e1 * 8 + 7)), 260 MiB/")" "$B2"
         arm boot3-image-changed red "$B1" "$B2" "$(printf '%s\n' "$B3" | sed 's/disk images unchanged/disk images CHANGED/')"
         arm boot3-entry-planned red "$B1" "$B2" "$(printf '%s\n' "$B3" | grep -v 'none planned')"
+    fi
+    if [ "$KIND" = recfirst4k ]; then # the recovery partition (entry 1, blocks 256-5375) taken for the EFI partition
+        arm esp-as-entry-1 red "$(printf '%s\n' "$B1" | sed 's/(GPT entry 2, LBA 5376-71935, 260 MiB)/(GPT entry 1, LBA 256-5375, 20 MiB)/')" "$B2"
+        arm entry-numbered-1 red "$(printf '%s\n' "$B1" | sed 's/-> nvme partition 2 (start 5376)/-> nvme partition 1 (start 5376)/')" "$B2"
+        arm entry-start-256 red "$(printf '%s\n' "$B1" | sed 's/-> nvme partition 2 (start 5376)/-> nvme partition 2 (start 256)/')" "$B2"
+    fi
+    if [ "$KIND" = recfirst ]; then # the recovery partition (entry 1) taken for the EFI partition
+        arm esp-as-entry-1 red "$(printf '%s\n' "$B1" | sed 's/(GPT entry 2, LBA 43008-247807, 100 MiB)/(GPT entry 1, LBA 2048-43007, 20 MiB)/')" "$B2"
+        arm entry-numbered-1 red "$(printf '%s\n' "$B1" | sed 's/-> sata port 2 partition 2 (start 43008)/-> sata port 2 partition 1 (start 43008)/')" "$B2"
+        arm entry-start-2048 red "$(printf '%s\n' "$B1" | sed 's/-> sata port 2 partition 2 (start 43008)/-> sata port 2 partition 2 (start 2048)/')" "$B2"
     fi
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
     [ "$bad" -eq 0 ] && [ "$pass" -eq "$NARMS" ]
 }
 
-WHERE=""; [ "$KIND" = ide ] && WHERE=", disks in IDE mode"; [ "$KIND" = nvme4k ] && WHERE=", NVMe disk of 4096-byte blocks"
+WHERE=""; [ "$KIND" = ide ] && WHERE=", disks in IDE mode"; [ -n "$FOURK" ] && WHERE=", NVMe disk of 4096-byte blocks"
+[ "$KIND" = recfirst ] && WHERE=", a recovery partition before the EFI partition"
+[ "$KIND" = recfirst4k ] && WHERE=", a recovery partition before the EFI partition on an NVMe disk of 4096-byte blocks"
 echo "== PC boot plan next to Windows, read only$WHERE (PC track step 5) =="
 if ! selftest; then echo "PC BOOTPLAN${UP} TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
 [ "${1:-}" = "--selftest" ] && { echo "PC BOOTPLAN${UP} SELFTEST ONLY -- no measurement taken"; exit 0; }
@@ -258,19 +291,21 @@ chmod +x scripts/lib/pc-arch/qemu-system-aarch64 2> /dev/null || true
 PATH="$PWD/scripts/lib/pc-arch:$PATH"
 
 W="$(mktemp -d "$T/pc-bootplan.XXXXXX")"
-IMGS=(gpt gpt-esp gpt-esp-full gpt-esp-dirty mbr)
-[ "$KIND" = nvme4k ] && IMGS=(gpt gpt-esp-fsinfo-4k gpt-esp-full-4k gpt-esp-dirty-4k mbr)
+IMGS=(gpt gpt-esp gpt-esp-full gpt-esp-dirty mbr); ESPK=gpt-esp
+[ "$KIND" = recfirst ] && { IMGS=(gpt gpt-esp-recfirst gpt-esp-full gpt-esp-dirty mbr); ESPK=gpt-esp-recfirst; }
+[ -n "$FOURK" ] && { IMGS=(gpt gpt-esp-fsinfo-4k gpt-esp-full-4k gpt-esp-dirty-4k mbr); ESPK=gpt-esp-fsinfo-4k; }
+[ "$KIND" = recfirst4k ] && { IMGS=(gpt gpt-esp-recfirst-4k gpt-esp-full-4k gpt-esp-dirty-4k mbr); ESPK=gpt-esp-recfirst-4k; }
 for k in "${IMGS[@]}"; do
     "$PY" scripts/lib/make-disk-image.py "$k" "$W/$k.img" || { echo "PC BOOTPLAN${UP} TEST FAILED (harness: could not make $k.img)"; exit 1; }
 done
 (cd "$W" && md5sum "${IMGS[@]/%/.img}" > before.md5)
 PRE=(); NVOPT="" # nvme4k: the NvVars folder disk ahead of the NVMe controller, and the NVMe namespace in 4096-byte blocks
-if [ "$KIND" = ide ] || [ "$KIND" = nvme4k ]; then # piix3-ide: ide0 is the NvVars folder disk, then ide1, ide2, ide3 in this order
+if [ "$KIND" = ide ] || [ -n "$FOURK" ]; then # piix3-ide: ide0 is the NvVars folder disk, then ide1, ide2, ide3 in this order
     mkdir -p "$W/nvvars"
     NV="$W/nvvars"; command -v cygpath > /dev/null && NV="$(cygpath -m "$NV")"
     NVD=(-device piix3-ide,id=pide -drive "file=fat:rw:$NV,if=none,format=raw,id=nv" -device ide-hd,drive=nv,bus=pide.0,unit=0)
     AT2=bus=pide.0,unit=1; AT3=bus=pide.1,unit=0; AT4=bus=pide.1,unit=1
-    if [ "$KIND" = nvme4k ]; then
+    if [ -n "$FOURK" ]; then
         PRE=("${NVD[@]}"); NVD=(); NVOPT=",logical_block_size=4096,physical_block_size=4096"
         AT2=bus=ide.2; AT4=bus=ide.4
     fi
@@ -291,9 +326,9 @@ boot() { # boot <serial port> <log> <nvme image> <commands (| between)> <extra q
     if (cd "$W" && md5sum -c --quiet before.md5 > /dev/null 2>&1); then printf '\nharness: disk images unchanged\n' >> "$log"
     else printf '\nharness: disk images CHANGED\n' >> "$log"; fi
 }
-if [ "$KIND" = nvme4k ]; then
+if [ -n "$FOURK" ]; then
     echo "  --- boot 1: Windows-like FAT32 EFI partition on NVMe in 4096-byte blocks, unformatted one on $UNF: bootentries, bootplan ---"
-    boot "$PORT" "$W/boot1.log" "$W/gpt-esp-fsinfo-4k.img" 'bootentries|bootplan' \
+    boot "$PORT" "$W/boot1.log" "$W/$ESPK.img" 'bootentries|bootplan' \
         -drive "file=$W/gpt.img,if=none,format=raw,id=sb" -device "ide-hd,drive=sb,$AT2"
     echo "  --- boot 2: the same NVMe disk with 64 KiB free, unformatted EFI partition on $UNF, MBR on $DN4 ---"
     boot "$((PORT+4))" "$W/boot2.log" "$W/gpt-esp-full-4k.img" 'bootplan' \
@@ -305,7 +340,7 @@ if [ "$KIND" = nvme4k ]; then
 else
     echo "  --- boot 1: unformatted EFI partition on NVMe, Windows-like FAT32 EFI partition on $DN2: bootentries, bootplan ---"
     boot "$PORT" "$W/boot1.log" "$W/gpt.img" 'bootentries|bootplan' "${NVD[@]}" \
-        -drive "file=$W/gpt-esp.img,if=none,format=raw,id=sb" -device "ide-hd,drive=sb,$AT2"
+        -drive "file=$W/$ESPK.img,if=none,format=raw,id=sb" -device "ide-hd,drive=sb,$AT2"
     echo "  --- boot 2: unformatted EFI partition on NVMe, full / not-closed EFI partitions on $DN2 / $DN3, MBR on $DN4 ---"
     boot "$((PORT+4))" "$W/boot2.log" "$W/gpt.img" 'bootplan' "${NVD[@]}" \
         -drive "file=$W/gpt-esp-full.img,if=none,format=raw,id=sb" -device "ide-hd,drive=sb,$AT2" \

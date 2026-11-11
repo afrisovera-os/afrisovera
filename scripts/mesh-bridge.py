@@ -204,8 +204,9 @@ def main():
                 hlen = (fr[t + 12] >> 4) * 4
                 dlen = 14 + total - t - hlen
                 sport, dport = struct.unpack(">HH", fr[t:t + 4])
-                say("bridge: %s->%s TCP %d->%d flags %#04x %d byte(s)"
-                    % (w.name, to.name, sport, dport, fr[t + 13], dlen))
+                seq = struct.unpack(">I", fr[t + 4:t + 8])[0]
+                say("bridge: %s->%s TCP %d->%d flags %#04x %d byte(s) seq %d"
+                    % (w.name, to.name, sport, dport, fr[t + 13], dlen, seq))
     say("bridge: time limit; %d frame(s) A->B, %d B->A" % (carried["A"], carried["B"]))
     return 0
 

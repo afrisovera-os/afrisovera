@@ -18,7 +18,9 @@
 #   2. A: "bundle SEALED ... 256 bytes, bucket 0" and B: "bundle OPENED from <A's key> (256 bytes sealed ...)"
 #      carrying exactly the text A was given;
 #   3. A: "peer CLOSED the link after the bundle" and "send done: delivered"; B: "listen done: bundle opened";
-#   4. no "link FAILED" on either side.
+#   4. no "link FAILED" on either side;
+#   5. (F6) every data segment crosses the wire ONCE: no (direction, ports, seq, length) with data seen twice on
+#      the bridge. A debug-build X25519 used to outlast the 300 ms RTO, so each handshake message was resent.
 set -uo pipefail
 
 BIN="target/aarch64-unknown-none/debug/mansa-kernel"
@@ -105,6 +107,18 @@ need("listen done: bundle opened" in b, "B: listen did not report an opened bund
 need("link FAILED" not in a and "link FAILED" not in b, "a 'link FAILED' line was printed")
 need(re.search(r"A->B TCP \d+->4401 flags 0x02", br), "bridge: no SYN from A to B:4401 on the wire")
 need(re.search(r"B->A TCP 4401->\d+ flags 0x12", br), "bridge: no SYN/ACK from B on the wire")
+# F6: a resent data segment shows on the bridge as the same direction, ports, seq and length twice.
+segs = re.findall(r"bridge: (A->B|B->A) TCP (\d+)->(\d+) flags 0x[0-9a-f]+ (\d+) byte\(s\) seq (\d+)", br)
+need(segs, "bridge: no frame lines with a seq (old bridge?)")
+seen = {}
+for s in segs:
+    if int(s[3]) > 0:
+        seen[s] = seen.get(s, 0) + 1
+dups = sorted((k, n) for k, n in seen.items() if n > 1)
+print("mesh-phase0: %d data segment(s) on the wire, %d sent more than once" % (len(seen), len(dups)))
+for (d, sp, dp, ln, sq), n in dups:
+    print("  resent: %s %s->%s %s byte(s) seq %s, %d times" % (d, sp, dp, ln, sq, n))
+need(not dups, "%d data segment(s) were sent more than once (F6: a handshake step outlasted the RTO)" % len(dups))
 if bad:
     print("MESH-PHASE0 TEST FAILED")
     for x in bad:

@@ -221,10 +221,7 @@ pub fn command(arg: &str) {
                 Some(_) => wc_line(),
                 None => crate::kprintln!("screen: could not change the screen's pages (out of table frames)"),
             }
-            let n = crate::smp::flushes_done() - before;
-            if n > 0 {
-                crate::kprintln!("screen: core 1 drained its buffers and reloaded its page tables ({} IPI)", n);
-            }
+            core1_line(before);
             return;
         }
         other => {
@@ -545,6 +542,41 @@ pub fn info() {
 }
 
 /// `screen` and `screen wc on|off`: how the screen's pages are cached (PAT write-combining).
+/// After a change of the screen's type: what core 1 did (architect's D1a). Silent when only
+/// one core runs.
+fn core1_line(before: u32) {
+    let n = crate::smp::flushes_done() - before;
+    if !crate::mmu::others_flushed() {
+        crate::kprintln!("screen: core 1 did not answer; reboot to be sure");
+    } else if n > 0 {
+        crate::kprintln!("screen: core 1 drained its buffers and reloaded its page tables ({} IPI)", n);
+    }
+}
+
+/// Once core 1 is online (from main, after smp::bring_up): the screen was mapped WC while only
+/// the boot core ran; if core 1's PAT entry 4 did not read back as WC, map the screen uncached
+/// so no core sees its pages as WB (architect's D1c).
+pub fn pat_check() {
+    if !ON.load(Ordering::Relaxed) || crate::mmu::pat_all_cores() {
+        return;
+    }
+    let (_, _, base, len) = crate::mmu::wc_state();
+    if crate::mmu::cache_type(base) != "WC" {
+        return;
+    }
+    // core 1 must take the shootdown IPI: wait (up to 0.2 s) for its scheduler
+    let (t0, hz) = (crate::timer::cycles(), crate::timer::hz().max(1));
+    while !crate::smp::can_flush_others() && crate::timer::cycles() - t0 < hz / 5 {
+        core::hint::spin_loop();
+    }
+    let before = crate::smp::flushes_done();
+    match crate::mmu::map_screen(base, len, false) {
+        Some(_) => wc_line(),
+        None => crate::kprintln!("screen: could not change the screen's pages (out of table frames)"),
+    }
+    core1_line(before);
+}
+
 fn wc_line() {
     let (pat, cores, base, len) = crate::mmu::wc_state();
     let (first, last) = (crate::mmu::cache_type(base), crate::mmu::cache_type(base + len.max(4096) - 4096));
@@ -555,6 +587,12 @@ fn wc_line() {
             "screen: write-combining {}, PAT entry 4 = WC on {} core(s); the screen's {} KiB at {:#x}: first page {}, last page {}",
             if pat && first == "WC" { "on" } else { "off" }, cores, len / 1024, base, first, last
         );
+        if pat && !crate::mmu::pat_all_cores() {
+            crate::kprintln!(
+                "screen: PAT entry 4 is WC on only {} of {} cores, so the screen stays uncached",
+                cores, crate::smp::cores_running()
+            );
+        }
     }
 }
 

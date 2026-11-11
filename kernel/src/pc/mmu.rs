@@ -355,6 +355,19 @@ static PAT_CORES: AtomicU64 = AtomicU64::new(0);
 /// The framebuffer range now mapped WC (base, length), and its 4 KiB pages counted.
 static WC_BASE: AtomicU64 = AtomicU64::new(0);
 static WC_LEN: AtomicU64 = AtomicU64::new(0);
+/// Whether the other core answered the last `map_screen`'s shootdown (true when none runs).
+static FLUSH_OK: AtomicBool = AtomicBool::new(true);
+
+/// PAT entry 4 reads back as WC on every core now running (architect's D1c): only then is the
+/// screen mapped WC, so a core whose PAT write failed never sees the screen's pages as WB.
+pub fn pat_all_cores() -> bool {
+    PAT_ON.load(Ordering::Relaxed) && PAT_CORES.load(Ordering::Relaxed) >= crate::smp::cores_running()
+}
+
+/// Whether the other core answered the last change of the screen's type (D1a).
+pub fn others_flushed() -> bool {
+    FLUSH_OK.load(Ordering::Relaxed)
+}
 
 /// CPUID.1:EDX bit 16: the CPU has the page attribute table.
 pub fn pat_present() -> bool {
@@ -404,8 +417,10 @@ pub fn wc_fence() {
 /// Map the GOP framebuffer [pa, pa + len) write-combining (PAT entry 4): 2 MiB pages wholly
 /// inside it get the PAT bit, an edge page shared with anything else is split into 4 KiB
 /// entries (`split_2m`) and only the framebuffer's get it, so nothing else is ever WC. Without
-/// PAT (or with `wc` false) it is mapped uncached (PWT|PCD, entry 3), as before D1. Returns the
-/// 4 KiB pages now WC (0 when uncached); None when out of table frames.
+/// PAT, without WC in every running core's PAT (D1c), or with `wc` false, it is mapped uncached
+/// (PWT|PCD, entry 3), as before D1. Returns the 4 KiB pages now WC (0 when uncached); None when
+/// out of table frames. Even then the entries already changed are flushed here and on the other
+/// core (D1b); `others_flushed` says whether the other core answered (D1a).
 ///
 /// The architect's D1 conditions, as built:
 /// 1. A framebuffer below 4 GiB (QEMU's 0x80000000, most laptops) is already in `init`'s 1:1 map
@@ -417,7 +432,9 @@ pub fn wc_fence() {
 ///    interrupt; after the change this asks every other core by IPI to drain its WC buffers,
 ///    write back its caches and reload CR3 (`smp::flush_others`), so no core keeps the old type.
 /// 4. Before any change of type: sfence and WBINVD on this core (dirty WB lines or full WC
-///    buffers must not outlive the old type; `screen wc off` is covered by this).
+///    buffers must not outlive the old type; `screen wc off` is covered by this). Interrupts are
+///    off on this core from the sfence to the CR3 reload (D1b), so the timer's `present` cannot
+///    write the screen while its type is half changed, whatever the old type was.
 /// 5. Nothing in the kernel reads the framebuffer back (checked by grep, 11 Nov 2026: screen.rs
 ///    and main.rs's boot trail only write it); a read from WC memory is uncached and slow, so
 ///    keep it that way.
@@ -425,43 +442,58 @@ pub fn map_screen(pa: u64, len: u64, wc: bool) -> Option<u64> {
     if !map_mmio(pa, len) {
         return None; // pages above the 1:1 map get their entries first (uncached)
     }
-    wc_fence();
-    // SAFETY: writes back and invalidates this core's caches; no other effect.
-    unsafe { asm!("wbinvd", options(nostack)) };
-    let wc = wc && PAT_ON.load(Ordering::Relaxed);
+    let wc = wc && pat_all_cores();
     let (lo, hi) = (pa & !0xFFF, (pa + len + 0xFFF) & !0xFFF);
     // a WC page: the PAT bit set and PWT/PCD clear selects entry 4; uncached: PWT|PCD (entry 3)
     let set = |e: u64, pat: u64| if wc { (e & !(PWT | PCD)) | pat } else { (e & !pat) | PWT | PCD };
-    let mut pages = 0;
-    let mut big = lo & !(PAGE_2M - 1);
-    while big < hi {
-        let e = entry(big, 2, false)?;
-        if *e & PRESENT == 0 {
-            return None;
-        }
-        let whole = big >= lo && big + PAGE_2M <= hi;
-        if *e & HUGE != 0 && whole {
-            *e = set(*e, PAT_2M);
-            pages += 512;
-        } else {
-            if *e & HUGE != 0 {
-                let pt = split_2m(*e, big)?; // the edge page: same types, then only the screen's change
-                *e = pt | PRESENT | WRITE;
+    let rewrite = || -> Option<u64> {
+        let mut pages = 0;
+        let mut big = lo & !(PAGE_2M - 1);
+        while big < hi {
+            let e = entry(big, 2, false)?;
+            if *e & PRESENT == 0 {
+                return None;
             }
-            let t = table(*e & ADDR);
-            for (i, slot) in t.iter_mut().enumerate() {
-                let p = big + (i as u64) * 4096;
-                if p >= lo && p < hi && *slot & PRESENT != 0 {
-                    *slot = set(*slot, PAT_4K);
-                    pages += 1;
+            let whole = big >= lo && big + PAGE_2M <= hi;
+            if *e & HUGE != 0 && whole {
+                *e = set(*e, PAT_2M);
+                pages += 512;
+            } else {
+                if *e & HUGE != 0 {
+                    let pt = split_2m(*e, big)?; // the edge page: same types, then only the screen's change
+                    *e = pt | PRESENT | WRITE;
+                }
+                let t = table(*e & ADDR);
+                for (i, slot) in t.iter_mut().enumerate() {
+                    let p = big + (i as u64) * 4096;
+                    if p >= lo && p < hi && *slot & PRESENT != 0 {
+                        *slot = set(*slot, PAT_4K);
+                        pages += 1;
+                    }
                 }
             }
+            big += PAGE_2M;
         }
-        big += PAGE_2M;
+        Some(pages)
+    };
+    let flags: u64;
+    // SAFETY: saves RFLAGS and masks interrupts on this core until the CR3 reload below (D1b).
+    unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem)) };
+    wc_fence();
+    // SAFETY: writes back and invalidates this core's caches; no other effect.
+    unsafe { asm!("wbinvd", options(nostack)) };
+    let done = rewrite();
+    // SAFETY: drops every cached translation of the pages changed, also when `rewrite` stopped
+    // half way (out of table frames), then restores interrupts as they were.
+    unsafe {
+        asm!("mov {t}, cr3", "mov cr3, {t}", t = out(reg) _, options(nostack));
+        if flags & (1 << 9) != 0 {
+            asm!("sti", options(nomem, nostack));
+        }
     }
-    // SAFETY: drops every cached translation of the pages just changed.
-    unsafe { asm!("mov {t}, cr3", "mov cr3, {t}", t = out(reg) _, options(nostack)) };
-    crate::smp::flush_others(); // condition 3 (a no-op at boot, before core 1 runs)
+    // condition 3 (true at boot, before core 1 runs); D1a: remember whether core 1 answered
+    FLUSH_OK.store(crate::smp::flush_others(), Ordering::Relaxed);
+    let pages = done?;
     WC_BASE.store(lo, Ordering::Relaxed);
     WC_LEN.store(hi - lo, Ordering::Relaxed);
     Some(if wc { pages } else { 0 })

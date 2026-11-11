@@ -3151,6 +3151,12 @@ pub fn net_tcp_serve_with(port: u16, wait_ms: u64, conns: u32, mut handler: Opti
                                 // does nothing and the echo below is unchanged.
                                 let mut close_after = false;
                                 if let Some(h) = handler.as_deref_mut() {
+                                    // F6 (docs/design-f6-handshake-resend.md): acknowledge the bytes
+                                    // BEFORE the handler runs. A handler (the mesh handshake) can take
+                                    // longer than the peer's 300 ms RTO, and with the reply as the only
+                                    // ACK the peer resent its message every time. Handler paths only:
+                                    // the echo below keeps its one-segment-per-exchange shape.
+                                    send_tcp_segment(base, &peer_ip, port, peer_port, our_seq, our_ack, 0x10, &[]);
                                     let input = core::slice::from_raw_parts(addr_of!(TCP_ECHO_BUF) as *const u8, n).to_vec();
                                     let mut out = alloc::vec::Vec::new();
                                     close_after = !h(&input, &mut out);
@@ -3168,8 +3174,8 @@ pub fn net_tcp_serve_with(port: u16, wait_ms: u64, conns: u32, mut handler: Opti
                                     }
                                     n = out.len();
                                     if n == 0 {
-                                        // Nothing to say: acknowledge their bytes and carry on (or close).
-                                        send_tcp_segment(base, &peer_ip, port, peer_port, our_seq, our_ack, 0x10, &[]);
+                                        // Nothing to say: their bytes were acknowledged above; carry on
+                                        // (or close).
                                         exchanges += 1;
                                         if close_after {
                                             break;

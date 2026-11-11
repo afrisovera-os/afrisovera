@@ -382,13 +382,20 @@ pub fn flush_others() -> bool {
     FLUSH_DONE.load(Ordering::Acquire) >= want
 }
 
+/// Cores running now: the boot core, plus core 1 once it is online (after its `pat_init`).
+pub fn cores_running() -> u64 {
+    1 + UP.load(Ordering::Acquire) as u64
+}
+
 /// Shootdowns core 1 has done (`screen wc on|off` reports it).
 pub fn flushes_done() -> u32 {
     FLUSH_DONE.load(Ordering::Acquire)
 }
 
 /// An inter-processor interrupt on core 1: a TLB shootdown, a message to answer, or a plain
-/// signal to report.
+/// signal to report. IPIs merge: one interrupt can carry a shootdown and a signal, and after a
+/// shootdown with no mail this returns without counting the signal, so IPIS is not a count of
+/// IPIs sent; never build a counter on it (architect's D1d).
 pub fn ipi() {
     let asked = FLUSH_ASKED.load(Ordering::Acquire);
     if FLUSH_DONE.load(Ordering::Relaxed) < asked {

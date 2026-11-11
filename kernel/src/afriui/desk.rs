@@ -327,6 +327,7 @@ struct State {
     dock_clicks: u64,
     welcomed: bool,
     sel: usize, // the app chosen in the Circle by the keyboard walk
+    motion: bool, // motion on (afriui.md section 7 and 17); Settings and `desk motion` switch it
 }
 
 static mut S: State = State {
@@ -355,12 +356,173 @@ static mut S: State = State {
     dock_clicks: 0,
     welcomed: false,
     sel: 0,
+    motion: true,
 };
 
 /// SAFETY: the desktop state is touched only in mainline context (shell commands and
 /// `idle`); interrupt handlers reach it only through the atomic event ring below.
 fn st() -> &'static mut State {
     unsafe { &mut *core::ptr::addr_of_mut!(S) }
+}
+
+// ---------------------------------------------------------------------------------------
+// Motion (afriui.md sections 7 and 17): a window unfolds from its lintel, the Circle grows.
+// At most 3 frames, 2 ticks (20 ms) apart, driven by time from `idle()` (mainline); a late
+// frame is skipped, never queued. The model is final at once (hit-testing, `desk list`);
+// only paint reads the step, to clip a window's rows or size the Circle.
+// ---------------------------------------------------------------------------------------
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Motion {
+    Unfold(usize),
+    Grow,
+}
+
+/// What a motion did: its kind, the tick each frame was drawn at (0: skipped), and whether a
+/// command, a close or a new motion finished it early. For `desk motion`.
+#[derive(Clone, Copy)]
+struct MotionLog {
+    what: Motion,
+    ticks: [u64; 3],
+    early: bool,
+}
+
+/// The running motion: what, the tick it started, the frame now shown (1 or 2; frame 3 is the
+/// window or Circle as it is, so the motion ends there). Mainline only.
+static mut ANIM: Option<(Motion, u64, u8)> = None;
+/// `desk motion hold`: the frame clock stops at this step until any next desk command, any
+/// input event or `desk motion off` (0: no hold). Test only.
+static mut HOLD: u8 = 0;
+/// The last two motions (index 0 the newest) and how many have run since boot.
+static mut MLOG: [Option<MotionLog>; 2] = [None, None];
+static mut MOTIONS: u64 = 0;
+/// The slowest frame the motion clock drew, in microseconds, and how many it drew (`desk perf`).
+static mut MOTION_US: (u64, u64) = (0, 0);
+
+fn anim() -> Option<(Motion, u64, u8)> {
+    // SAFETY: mainline only.
+    unsafe { ANIM }
+}
+
+/// The boxes a motion's frames touch (slice 3's damage: everything under them is repainted).
+fn motion_damage(m: Motion) {
+    match m {
+        Motion::Unfold(a) => damage(win_box(a)),
+        Motion::Grow => {
+            damage(grow(launcher_box(), 4));
+            damage(grow(circle_info_box(), 4));
+        }
+    }
+}
+
+/// Start a motion (motion on): the one running finishes first (one at a time).
+fn start_motion(m: Motion) {
+    finish_motion();
+    if !st().motion {
+        return;
+    }
+    let t = crate::sched::ticks();
+    // SAFETY: mainline only.
+    unsafe {
+        ANIM = Some((m, t, 1));
+        MLOG[1] = MLOG[0];
+        MLOG[0] = Some(MotionLog { what: m, ticks: [t, 0, 0], early: false });
+        MOTIONS += 1;
+    }
+    motion_damage(m);
+    DIRTY.store(true, Ordering::Relaxed);
+}
+
+/// Show the final frame now: a new motion, a close, a minimise, a mode switch or a shell
+/// command comes first.
+fn finish_motion() {
+    // SAFETY: mainline only.
+    unsafe {
+        HOLD = 0;
+        if let Some((m, _, _)) = ANIM.take() {
+            if let Some(l) = MLOG[0].as_mut() {
+                l.early = true;
+            }
+            motion_damage(m);
+            DIRTY.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The frame clock, from `settle`: the step time says, the last one ends the motion. True
+/// when a frame is due.
+fn motion_tick() -> bool {
+    let Some((m, t0, step)) = anim() else { return false };
+    let s = st();
+    let gone = match m {
+        Motion::Unfold(a) => !s.wins[a].open || s.wins[a].min,
+        Motion::Grow => !s.launcher,
+    };
+    if gone {
+        // SAFETY: mainline only.
+        unsafe { ANIM = None };
+        return false;
+    }
+    // SAFETY: mainline only.
+    let hold = unsafe { HOLD };
+    let t = crate::sched::ticks();
+    let mut due = (1 + t.saturating_sub(t0) / 2).min(3) as u8; // frame k is due 2(k-1) ticks in
+    if hold != 0 {
+        due = due.min(hold);
+    }
+    if due <= step {
+        return false;
+    }
+    // SAFETY: mainline only.
+    unsafe {
+        if let Some(l) = MLOG[0].as_mut() {
+            l.ticks[due as usize - 1] = t;
+        }
+        ANIM = if due == 3 { None } else { Some((m, t0, due)) };
+    }
+    motion_damage(m);
+    true
+}
+
+/// For paint: the rows of window a shown now (its lintel and a third of its body per frame),
+/// or None when it is not moving.
+pub(super) fn unfold_rows(a: usize) -> Option<i32> {
+    match anim() {
+        Some((Motion::Unfold(w), _, step)) if w == a => {
+            let (_, _, _, h) = win_rect(a);
+            let th = title_h();
+            Some(th + (h - th) * step as i32 / 3)
+        }
+        _ => None,
+    }
+}
+
+/// For paint: the Circle's frame (1 or 2 of 3) while it grows.
+pub(super) fn grow_step() -> Option<i32> {
+    match anim() {
+        Some((Motion::Grow, _, step)) => Some(step as i32),
+        _ => None,
+    }
+}
+
+/// `desk motion` reports whole motions: a running one (not held) first runs to its end by its
+/// own clock, as `idle()` would draw it (at most 4 ticks, waited for up to 10). The shell does
+/// not call `idle()` while it reads a typed command, so without this a report could come
+/// between two frames.
+fn run_out_motion() {
+    let Some((_, t0, _)) = anim() else { return };
+    // bounded by the cycle counter too (0.2 s), in case the timer tick does not advance here
+    let (c0, hz) = (crate::timer::cycles(), crate::timer::hz().max(1));
+    while anim().is_some() && crate::sched::ticks() < t0 + 10 && crate::timer::cycles().wrapping_sub(c0) < hz / 5 {
+        settle(snap());
+        crate::canvas::flush();
+        core::hint::spin_loop();
+    }
+}
+
+/// Open the Circle (a Spine tap, Super, `desk launcher`): it grows from its button.
+fn open_circle() {
+    st().launcher = true;
+    start_motion(Motion::Grow);
 }
 
 static SHOWN: AtomicBool = AtomicBool::new(false);
@@ -769,6 +931,7 @@ fn raise(a: usize) {
 
 fn open(a: usize) {
     let s = st();
+    let appears = !s.wins[a].open || s.wins[a].min; // opened or restored: it unfolds
     if !s.wins[a].open {
         let (x, y, w, h) = home(a);
         s.wins[a] = Win { open: true, min: false, x, y, w, h };
@@ -778,15 +941,20 @@ fn open(a: usize) {
     }
     s.wins[a].min = false;
     raise(a);
+    if appears {
+        start_motion(Motion::Unfold(a));
+    }
 }
 
 fn close(a: usize) {
+    finish_motion();
     st().wins[a].open = false;
     st().wins[a].min = false;
     z_remove(a);
 }
 
 fn minimise(a: usize) {
+    finish_motion();
     if st().wins[a].open {
         st().wins[a].min = true;
         z_remove(a);
@@ -893,7 +1061,7 @@ fn down(px: i32, py: i32) {
             if inside(px, py, hit) {
                 s.dock_clicks += 1;
                 if i == 0 {
-                    s.launcher = true;
+                    open_circle();
                     crate::kprintln!("[desk] launcher open");
                 } else {
                     activate(i - 1);
@@ -974,7 +1142,11 @@ fn key(k: u32) {
     DIRTY.store(true, Ordering::Relaxed);
     match k {
         KEY_SUPER => {
-            s.launcher = !s.launcher;
+            if s.launcher {
+                s.launcher = false;
+            } else {
+                open_circle();
+            }
             s.notes_open = false;
             crate::kprintln!("[desk] launcher {}", if s.launcher { "open" } else { "closed" });
         }
@@ -1062,13 +1234,19 @@ fn body_click(a: usize, bx: i32, by: i32) {
                         0 => set_touch(bx >= settings_seg_x(a) + 64),
                         1 => s.wallpaper = !s.wallpaper,
                         2 => s.clock24 = !s.clock24,
+                        3 => set_motion(!s.motion),
                         _ => {}
                     }
-                    if k == 1 || k == 2 {
+                    if k == 1 || k == 2 || k == 3 {
+                        let on = match k {
+                            1 => s.wallpaper,
+                            2 => s.clock24,
+                            _ => s.motion,
+                        };
                         crate::kprintln!(
                             "[desk] settings: {} {}",
-                            if k == 1 { "wallpaper" } else { "24-hour clock" },
-                            if (k == 1 && s.wallpaper) || (k == 2 && s.clock24) { "on" } else { "off" }
+                            ["", "wallpaper", "24-hour clock", "motion"][k],
+                            if on { "on" } else { "off" }
                         );
                     }
                 }
@@ -1078,9 +1256,18 @@ fn body_click(a: usize, bx: i32, by: i32) {
     }
 }
 
+/// Motion on or off (Settings, `desk motion on|off`); off shows every final frame at once.
+fn set_motion(on: bool) {
+    if !on {
+        finish_motion();
+    }
+    st().motion = on;
+}
+
 fn set_touch(on: bool) {
     let s = st();
     if s.touch != on {
+        finish_motion();
         s.touch = on;
         s.drag = None;
         crate::kprintln!("[desk] input profile: {}", if on { "touch" } else { "pointer" });
@@ -1107,9 +1294,9 @@ fn files_split(a: usize) -> i32 {
     (w * 46 / 100).max(150)
 }
 
-/// Settings: the y of each interactive row in the body (profile, wallpaper, clock).
-fn settings_rows() -> [i32; 3] {
-    [40, 92, 114]
+/// Settings: the y of each interactive row in the body (profile, wallpaper, clock, motion).
+fn settings_rows() -> [i32; 4] {
+    [40, 92, 114, 136]
 }
 fn settings_seg_x(a: usize) -> i32 {
     let (_, _, w, _) = win_rect(a);
@@ -1152,6 +1339,7 @@ pub fn show() {
 
 /// `clear`: the text console comes back.
 pub fn hide() {
+    finish_motion();
     st().shown = false;
     st().drag = None;
     SHOWN.store(false, Ordering::Relaxed);
@@ -1172,6 +1360,8 @@ pub fn idle() {
         }
         let v = EVQ[h].load(Ordering::Relaxed);
         EV_HEAD.store((h + 1) % RING, Ordering::Release);
+        // SAFETY: mainline only. Any input releases `desk motion hold` (the clock runs on).
+        unsafe { HOLD = 0 };
         let (kind, x, y) = (v >> 28, ((v >> 14) & 0x3FFF) as i32, (v & 0x3FFF) as i32);
         if kind == EV_MOVE {
             moved = Some((x, y)); // consecutive moves collapse into the last
@@ -1203,6 +1393,7 @@ pub fn idle() {
 /// The canvas changed size (`screen ui N`): keep every window's lintel on the screen and
 /// redraw (afriui.md section 13).
 pub fn relayout() {
+    finish_motion();
     let s = st();
     for a in 0..NAPPS {
         let w = &mut s.wins[a];
@@ -1226,6 +1417,8 @@ fn settle(before: Snap) {
         damage(win_box(App::Terminal as usize)); // new shell text
         want = true;
     }
+    let moving = motion_tick();
+    want |= moving;
     let t = crate::sched::ticks();
     if s.toast_until != 0 && t >= s.toast_until {
         s.toast_until = 0;
@@ -1272,7 +1465,13 @@ fn settle(before: Snap) {
     if want && before != after && !diff(&before, &after) {
         FULL.store(true, Ordering::Relaxed);
     }
+    let t0 = crate::timer::cycles();
     frame(want);
+    if moving {
+        let us = crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / crate::timer::hz().max(1);
+        // SAFETY: mainline only.
+        unsafe { MOTION_US = (MOTION_US.0.max(us), MOTION_US.1 + 1) };
+    }
 }
 
 fn redraw_now() {
@@ -1292,6 +1491,13 @@ pub fn command(rest: &str) {
     let verb = it.next().unwrap_or("list");
     let arg = it.next().unwrap_or("");
     let num_arg = |s: Option<&str>| s.and_then(|v| v.parse::<i32>().ok());
+    // every desk command releases a hold, and all but tap and drag (input, as a click would be)
+    // show a running motion's final frame first, so a script sees only final frames
+    // SAFETY: mainline only.
+    unsafe { HOLD = 0 };
+    if verb != "tap" && verb != "drag" && verb != "motion" {
+        finish_motion();
+    }
     let s = st();
     match verb {
         "open" | "close" | "min" | "focus" => match App::from(arg) {
@@ -1382,6 +1588,9 @@ pub fn command(rest: &str) {
             // SAFETY: scalar reads.
             let (pl, pw, pn) = unsafe { paint::PART_US };
             let (cl, cw, n, rows) = crate::canvas::copy_perf();
+            // SAFETY: scalar reads.
+            let (mw, mn) = unsafe { MOTION_US };
+            crate::kprintln!("[desk] perf: the slowest motion frame {} us over {} motion frame(s)", mw, mn);
             crate::kprintln!(
                 "[desk] perf: {}x{} at UI scale {}x; draw {} us (worst {} us) over {} frame(s); partial {} us (worst {} us) over {} frame(s); copy to the screen {} us (worst {} us) over {} copies, the last {} row(s)",
                 W(), H(), crate::canvas::scale(), dl, dw, s.frames - pn, pl, pw, pn, cl, cw, n, rows
@@ -1406,6 +1615,61 @@ pub fn command(rest: &str) {
                 crate::kprintln!("[desk] moved {} to {},{}", APPS[a].id(), w.x, w.y);
             }
             _ => crate::kprintln!("desk: move <open app> <dx> <dy>"),
+        },
+        "motion" => match arg {
+            "on" | "off" => {
+                set_motion(arg == "on");
+                crate::kprintln!("[desk] motion {}", arg);
+            }
+            "hold" => {
+                // test only: start a motion and stop its frame clock at a step (1 or 2)
+                let step = num_arg(it.next()).unwrap_or(0);
+                let what = it.next().unwrap_or("");
+                if !(1..=2).contains(&step) || !(what == "circle" || App::from(what).is_some()) || !s.motion {
+                    crate::kprintln!("desk: motion hold <1|2> <app|circle> (test only; motion must be on)");
+                    return;
+                }
+                finish_motion();
+                if what == "circle" {
+                    s.notes_open = false;
+                    open_circle();
+                    crate::kprintln!("[desk] launcher open");
+                } else if let Some(a) = App::from(what) {
+                    let a = a as usize;
+                    if s.wins[a].open && !s.wins[a].min {
+                        minimise(a); // so it appears again, and unfolds
+                    }
+                    let was = s.wins[a].open;
+                    open(a);
+                    log(if was { b"focus " } else { b"open " }, a);
+                }
+                // SAFETY: mainline only.
+                unsafe { HOLD = step as u8 };
+                crate::kprintln!("[desk] motion: {} held at {}/3", if what == "circle" { "grow circle" } else { "unfold window" }, step);
+            }
+            _ => {
+                run_out_motion();
+                // SAFETY: mainline only; copies.
+                let (n, logs) = unsafe { (MOTIONS, MLOG) };
+                crate::kprintln!("[desk] motion {}; {} motion(s) run", if s.motion { "on" } else { "off" }, n);
+                // each recorded motion: its frames' ticks (0 = skipped), and whether it was cut short
+                for (k, m) in logs.iter().enumerate() {
+                    let Some(m) = m else { continue };
+                    let mut l = Line::new();
+                    match m.what {
+                        Motion::Unfold(a) => l.s(b"unfold ").s(APPS[a].id().as_bytes()),
+                        Motion::Grow => l.s(b"grow circle"),
+                    };
+                    l.s(b" ticks");
+                    for &t in m.ticks.iter() {
+                        l.s(b" ").u(t);
+                    }
+                    if m.early {
+                        l.s(b" early");
+                    }
+                    crate::kprintln!("[desk] motion {}: {}", if k == 0 { "last" } else { "before" }, core::str::from_utf8(l.get()).unwrap_or("?"));
+                }
+            }
         },
         "next" => key(KEY_ALT_TAB),
         "launcher" => key(KEY_SUPER),
@@ -1502,7 +1766,8 @@ pub fn command(rest: &str) {
         _ => {
             crate::kprintln!("desk: open|close|min|focus <app>, next, launcher, key <name>, tap <x> <y>,");
             crate::kprintln!("      drag <x> <y> <dx> <dy>, mode pointer|touch, notify <text>, notes, perf, verify, select <file>,");
-            crate::kprintln!("      move <app> <dx> <dy>, list");
+            crate::kprintln!("      move <app> <dx> <dy>, motion [on|off], list");
+            crate::kprintln!("      motion hold <1|2> <app|circle> (test only: stops a motion at a frame until the next command or input)");
             return;
         }
     }

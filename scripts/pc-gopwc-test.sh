@@ -41,6 +41,9 @@ grade() { # grade <serial> <pixels>
     got="$(printf '%s\n' "$P" | sed -n 's/^20,250=//p' | head -1)"
     [ "$got" = 100C0A ] || _f "the desktop's Spine is ${got:-missing} on the screenshot, not its night #100C0A"
     if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
+    # D1a and D1c: on QEMU core 1 always answers and both cores' PAT has WC
+    if printf '%s\n' "$S" | grep -aq '^screen: core 1 did not answer'; then _f "core 1 did not answer a shootdown"; fi
+    if printf '%s\n' "$S" | grep -aq '^screen: PAT entry 4 is WC on only'; then _f "a core's PAT has no WC, so the screen fell back to uncached"; fi
     return "$fail"
 }
 
@@ -85,10 +88,12 @@ selftest() {
 ' "$GREEN" | grep -v 'reloaded its page tables')" "$GPX"
     arm screen-broken red "$GREEN" "20,250=000000"
     arm stale-rows red "$(printf '%s\n' "$GREEN" | sed 's/verify: 0 of/verify: 5 of/')" "$GPX"
+    arm core1-silent red "$(printf '%s\n' "$GREEN" | sed '0,/^screen: core 1 drained.*/s//screen: core 1 did not answer; reboot to be sure/')" "$GPX"
+    arm pat-one-core red "$(printf '%s\n' "$GREEN" | sed '0,/^afrisovera> screen wc off$/s//screen: PAT entry 4 is WC on only 1 of 2 cores, so the screen stays uncached\n&/')" "$GPX"
     arm empty red "" ""
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 11 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 13 ]
 }
 
 echo "== the screen's pages write-combining (PAT entry 4 on every core) =="
