@@ -124,6 +124,13 @@ pub fn load_gdt() {
     // written here, before anything can use them.
     unsafe {
         TSS.rsp0 = core::ptr::addr_of!(TRAP_STACK) as u64 + core::mem::size_of::<TrapStack>() as u64;
+        // F8: IST 1 = the #DF stack (gate 8 uses it): a kernel-stack overrun faults with RSP in the guard, where
+        // no frame can be pushed; the CPU then raises #DF on this stack instead, so it can still be reported.
+        // (The TSS is packed: the whole array is assigned, never a reference into it.)
+        let df_top = (core::ptr::addr_of!(crate::stackinfo::DF_STACK) as u64
+            + core::mem::size_of::<crate::stackinfo::DfStack>() as u64)
+            & !15;
+        TSS._ist = [df_top, 0, 0, 0, 0, 0, 0];
         let base = core::ptr::addr_of!(TSS) as u64;
         let limit = (core::mem::size_of::<Tss>() - 1) as u64;
         GDT[5] = (limit & 0xFFFF)
@@ -399,6 +406,9 @@ pub fn load_idt() {
         set_gate(COM1_VECTOR as usize, t[35]);
         set_gate(crate::smp::IPI_VECTOR as usize, t[36]);
         set_gate(PS2_VECTOR as usize, t[37]);
+        // F8: the double fault runs on IST 1 (TSS._ist[0], set in the GDT/TSS set-up), never on the stack that
+        // overflowed.
+        IDT[8].ist = 1;
         let p = DescPtr {
             limit: (core::mem::size_of::<[Gate; 256]>() - 1) as u16,
             base: core::ptr::addr_of!(IDT) as u64,
@@ -465,6 +475,22 @@ extern "sysv64" fn pc_trap(f: &mut TrapFrame) {
         SYSCALL_VECTOR => crate::user::syscall(f),
         // a page fault the kernel's own tables can serve (the demand window): retry
         14 if crate::mmu::page_fault(cr2(), f.error) => {}
+        // F8: the kernel stack ran into its guard. Usually a #DF (the #PF frame could not be pushed with RSP in
+        // the guard; gate 8 runs on IST 1), sometimes the #PF itself (RSP above the guard, a store below it).
+        // Reported lock-free: the fault may have landed inside a print that holds PRINT_LOCK.
+        8 | 14 if f.cs & 3 == 0 && crate::stackinfo::in_guard(cr2()) => {
+            let (lo, hi) = crate::stackinfo::guard();
+            crate::uart::emergency_print(format_args!(
+                "\n[pc] STACK OVERFLOW: kernel stack ran into its guard {:#x}..{:#x} (vector {} {}, CR2 {:#x}, RIP {:#x}) -- halted\n",
+                lo,
+                hi,
+                f.vector,
+                NAMES[f.vector as usize],
+                cr2(),
+                f.rip
+            ));
+            halt_forever();
+        }
         // any other fault raised by a ring-3 program stops that program, not the machine
         v if f.cs & 3 == 3 && crate::proc::active() => crate::proc::fault(f, v, cr2()),
         v if f.cs & 3 == 3 => crate::user::fault(v, f.error, f.rip, cr2()),

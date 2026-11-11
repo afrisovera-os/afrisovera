@@ -36,6 +36,7 @@ mod user;
 mod qemu;
 mod shims;
 mod smp;
+mod stackinfo;
 use shims::{frame, paging};
 
 // Shared with the ARM kernel, unchanged.
@@ -322,6 +323,7 @@ pub fn early_write(text: &str) {
             }
         }
     }
+    mmu::wc_fence(); // the screen may be write-combining by now (D1): drain this core's buffers
     EARLY_BUSY.store(false, Ordering::Release);
 }
 
@@ -351,6 +353,7 @@ fn early_off(clear: bool) {
     if let (true, Some(s)) = (clear, s) {
         s.fill(0, EARLY_TOP, s.w, s.h - EARLY_TOP.min(s.h), EARLY_BG);
     }
+    mmu::wc_fence();
     EARLY_BUSY.store(false, Ordering::Release);
 }
 
@@ -373,6 +376,8 @@ fn screen(u: &uefi::Uefi) -> Option<Screen> {
 
 #[no_mangle]
 extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> uefi::Status {
+    // F8 measure-first: the PC runs on the firmware's stack; remember where it started.
+    stackinfo::note_entry();
     uart::init();
     let u = uefi::Uefi { image, st };
     // The screen FIRST, before anything that could stop on a real machine: the title, then
@@ -441,6 +446,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     let (mut n, mut usable, mut big, mut big_at) = (0usize, 0u64, 0u64, 0u64);
     for d in map.entries() {
         n += 1;
+        stackinfo::note_region(d.phys_start, d.pages, d.ty);
         if uefi::usable_after_exit(d.ty) {
             usable += d.pages * 4096;
             // the highest free page below 1 MiB: where a second core's start-up code goes.
@@ -546,6 +552,8 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
             cpu::halt_forever();
         }
     }
+    // F8: the firmware region under the stack is ours to scribble on only now (its page tables are retired).
+    stackinfo::paint();
     if let (Some((b, len)), Some(s)) = (early_fb, &scr) {
         if mmu::map_mmio(b, len) {
             early_resume(s);
@@ -759,6 +767,12 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
 /// on COM1. The set-up mirrors the ARM boot's last steps before `shell::run` (the device
 /// registry, the in-RAM filesystem and its seeded apps, the config, the app hashes).
 fn start_shell() -> ! {
+    // F8 (docs/design-f8-pc-kernel-stack.md): everything from here on runs on the kernel's own 1 MiB stack with an
+    // unmapped guard below it, not on the firmware's 128 KiB (the shell ran 486 KB below that region).
+    stackinfo::run_on_kernel_stack(shell_on_kernel_stack)
+}
+
+extern "sysv64" fn shell_on_kernel_stack() -> ! {
     asili::register("16550-uart", asili::Class::Console, board::UART_BASE as u64, true);
     asili::register("fw-cfg", asili::Class::Firmware, board::FWCFG_BASE as u64, qemu::fw_cfg_read(0, &mut [0u8; 4]));
     asili::register("local-apic", asili::Class::Interrupt, 0, true);

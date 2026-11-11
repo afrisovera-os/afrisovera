@@ -88,8 +88,9 @@ pub fn attach(base: u64, w: usize, h: usize, stride: usize, bgr: bool) {
         crate::kprintln!("[pc] screen: GOP mode {}x{} is smaller than the {}x{} console -- serial only", w, h, W, H);
         return;
     }
-    // a real machine may put the framebuffer above the 4 GiB the kernel maps 1:1
-    if !crate::mmu::map_mmio(base, (stride * h * 4) as u64) {
+    // a real machine may put the framebuffer above the 4 GiB the kernel maps 1:1; its pages
+    // are mapped write-combining where the CPU has PAT (mmu::map_screen), else uncached
+    if crate::mmu::map_screen(base, (stride * h * 4) as u64, true).is_none() {
         crate::kprintln!("[pc] screen: could not map the GOP framebuffer at {:#x} -- serial only", base);
         return;
     }
@@ -201,6 +202,31 @@ pub fn command(arg: &str) {
             ui_command(a[2..].trim());
             return;
         }
+        "wc on" | "wc off" => {
+            // write-combining for the screen's pages, on or off (a real machine that misbehaves)
+            if !ON.load(Ordering::Relaxed) {
+                crate::kprintln!("screen: no GOP framebuffer");
+                return;
+            }
+            // SAFETY: GOP is set at attach; scalar reads.
+            let g = unsafe { GOP };
+            let on = arg.trim() == "wc on";
+            // architect's D1 condition 3: never change a type another core cannot be told about
+            if !crate::smp::can_flush_others() {
+                crate::kprintln!("screen: core 1 is still starting and cannot reload its page tables; try again");
+                return;
+            }
+            let before = crate::smp::flushes_done();
+            match crate::mmu::map_screen(g.base, (g.stride * g.h * 4) as u64, on) {
+                Some(_) => wc_line(),
+                None => crate::kprintln!("screen: could not change the screen's pages (out of table frames)"),
+            }
+            let n = crate::smp::flushes_done() - before;
+            if n > 0 {
+                crate::kprintln!("screen: core 1 drained its buffers and reloaded its page tables ({} IPI)", n);
+            }
+            return;
+        }
         other => {
             crate::kprintln!("screen: unknown mode {}; use: screen whole | screen fit | screen fill", other);
             return;
@@ -264,10 +290,17 @@ pub fn clear(rgb: u32) {
             }
         }
     }
+    crate::mmu::wc_fence();
 }
 
-/// Copy the whole shared framebuffer to the screen now.
+/// Copy the whole shared framebuffer to the screen now. Ends with `sfence`, so a
+/// write-combined frame is out of the CPU's buffers when it returns (`flush` comes here too).
 pub fn present() {
+    present_now();
+    crate::mmu::wc_fence();
+}
+
+fn present_now() {
     if !ON.load(Ordering::Relaxed) {
         return;
     }
@@ -367,10 +400,13 @@ static mut LAST_PTR: Option<(usize, usize)> = None;
 static mut COPY_US: (u64, u64) = (0, 0);
 
 /// (last, worst) desktop copy time in microseconds, and the redraw count, for `desk perf`.
-pub fn copy_perf() -> (u64, u64, u64) {
+pub fn copy_perf() -> (u64, u64, u64, u64) {
     // SAFETY: scalar reads.
-    unsafe { (COPY_US.0, COPY_US.1, PRESENTS) }
+    unsafe { (COPY_US.0, COPY_US.1, PRESENTS, COPY_ROWS) }
 }
+
+/// Canvas rows the last desktop copy moved to the screen (`desk perf`).
+static mut COPY_ROWS: u64 = 0;
 
 /// `present` while the desktop is shown: its canvas (kernel/src/pc/canvas.rs), the screen's
 /// own size over a whole-number UI scale, centred (it fills the screen but for the few pixels
@@ -384,24 +420,30 @@ unsafe fn present_canvas(g: Gop) {
     let (vw, vh) = (dw / s, dh / s); // the canvas pixels that fit
     let (ox, oy) = ((g.w - vw * s) / 2, (g.h - vh * s) / 2);
     let ptr = crate::xhci::pointer();
-    let mut spans: [(usize, usize); 3] = [(0, 0); 3];
+    // the rows drawn (up to canvas::NSPAN spans, architect's N4) and the pointer's old and new rows
+    let mut drawn = [(0, 0); crate::canvas::NSPAN];
+    let n = crate::canvas::take_damage(&mut drawn);
+    let mut spans: [(usize, usize); crate::canvas::NSPAN + 2] = [(0, 0); crate::canvas::NSPAN + 2];
     if FULL.swap(false, Ordering::Relaxed) {
-        let _ = crate::canvas::take_damage();
         spans[0] = (0, vh);
     } else {
-        if let Some(d) = crate::canvas::take_damage() {
-            spans[0] = d;
-        }
+        spans[..n].copy_from_slice(&drawn[..n]);
         if let Some((_, y)) = LAST_PTR {
-            spans[1] = (y, y + ARROW.len());
+            spans[n] = (y, y + ARROW.len());
         }
         if let Some((_, y)) = ptr {
-            spans[2] = (y, y + ARROW.len());
+            spans[n + 1] = (y, y + ARROW.len());
         }
     }
+    let mut rows = 0;
     for &(a, b) in spans.iter() {
-        copy_rows(g, (ox, oy, vw, s, cw), a, b.min(vh));
+        let b = b.min(vh);
+        if b > a {
+            copy_rows(g, (ox, oy, vw, s, cw), a, b);
+            rows += (b - a) as u64;
+        }
     }
+    COPY_ROWS = rows;
     LAST_PTR = ptr;
     if let Some((px, py)) = ptr {
         let dst = g.base as *mut u32;
@@ -497,6 +539,21 @@ pub fn info() {
         crate::kprintln!(
             "screen: GOP {}x{} (stride {}, {}) at {:#x}; console {}x{} as {}x{} at {},{} ({}); {} redraws",
             g.w, g.h, g.stride, if g.bgr { "BGR" } else { "RGB" }, g.base, W, H, dw, dh, ox, oy, mode_name(m), n
+        );
+    }
+    wc_line();
+}
+
+/// `screen` and `screen wc on|off`: how the screen's pages are cached (PAT write-combining).
+fn wc_line() {
+    let (pat, cores, base, len) = crate::mmu::wc_state();
+    let (first, last) = (crate::mmu::cache_type(base), crate::mmu::cache_type(base + len.max(4096) - 4096));
+    if !crate::mmu::pat_present() {
+        crate::kprintln!("screen: write-combining off, this CPU has no PAT; the screen's pages are {}", first);
+    } else {
+        crate::kprintln!(
+            "screen: write-combining {}, PAT entry 4 = WC on {} core(s); the screen's {} KiB at {:#x}: first page {}, last page {}",
+            if pat && first == "WC" { "on" } else { "off" }, cores, len / 1024, base, first, last
         );
     }
 }

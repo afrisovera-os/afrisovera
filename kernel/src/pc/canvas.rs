@@ -74,18 +74,63 @@ pub fn pixels() -> *const u32 {
     addr_of_mut!(BUF) as *const u32
 }
 
-/// The rows drawn since the screen last copied the canvas (architect's review, 10 Nov 2026:
-/// copy only what changed): [DMG_TOP, DMG_BOT), empty when DMG_TOP >= DMG_BOT. Mainline only.
-static DMG_TOP: AtomicUsize = AtomicUsize::new(usize::MAX);
-static DMG_BOT: AtomicUsize = AtomicUsize::new(0);
+/// The rows drawn since the screen last copied the canvas, as up to NSPAN separate spans
+/// [top, bottom) (architect's notes, 10 Nov 2026: copy only what changed; N4: boxes far apart
+/// must not copy every row between them). Spans that overlap or nearly touch merge; a span
+/// past NSPAN merges into the one nearest it. Mainline only (the desktop draws, then copies).
+pub const NSPAN: usize = 8;
+static mut SPANS: [(usize, usize); NSPAN] = [(0, 0); NSPAN];
+static mut NSPANS: usize = 0;
 
-/// The rows drawn since the last call, if any (screen.rs copies just those).
-pub fn take_damage() -> Option<(usize, usize)> {
-    let (t, b) = (DMG_TOP.swap(usize::MAX, Ordering::Relaxed), DMG_BOT.swap(0, Ordering::Relaxed));
-    if t < b {
-        Some((t, b.min(height())))
-    } else {
-        None
+/// Rows y0..y1 were drawn.
+fn add_span(y0: usize, y1: usize) {
+    // SAFETY: mainline only.
+    unsafe {
+        let s = &mut *core::ptr::addr_of_mut!(SPANS);
+        let (mut a, mut b) = (y0, y1);
+        // fold in every span this one overlaps or nearly touches (4 rows), as often as it grows
+        let mut k = 0;
+        while k < NSPANS {
+            let (t, u) = s[k];
+            if a <= u + 4 && t <= b + 4 {
+                a = a.min(t);
+                b = b.max(u);
+                NSPANS -= 1;
+                s[k] = s[NSPANS];
+                k = 0;
+                continue;
+            }
+            k += 1;
+        }
+        if NSPANS < NSPAN {
+            s[NSPANS] = (a, b);
+            NSPANS += 1;
+            return;
+        }
+        // full: join the nearest span
+        let gap = |t: usize, u: usize| if b < t { t - b } else { a.saturating_sub(u) };
+        let mut best = 0;
+        for k in 1..NSPANS {
+            if gap(s[k].0, s[k].1) < gap(s[best].0, s[best].1) {
+                best = k;
+            }
+        }
+        s[best] = (s[best].0.min(a), s[best].1.max(b));
+    }
+}
+
+/// The rows drawn since the last call: fills `out` with up to NSPAN spans, returns how many
+/// (screen.rs copies just those).
+pub fn take_damage(out: &mut [(usize, usize); NSPAN]) -> usize {
+    let h = height();
+    // SAFETY: mainline only.
+    unsafe {
+        let n = core::mem::replace(&mut *core::ptr::addr_of_mut!(NSPANS), 0);
+        for (k, o) in out.iter_mut().enumerate().take(n) {
+            let (t, u) = (*core::ptr::addr_of!(SPANS))[k];
+            *o = (t.min(h), u.min(h));
+        }
+        n
     }
 }
 
@@ -96,8 +141,7 @@ pub fn fill_rect(x0: usize, y0: usize, w: usize, h: usize, rgb: u32) {
     if x0 >= x1 || y0 >= y1 {
         return;
     }
-    DMG_TOP.fetch_min(y0, Ordering::Relaxed);
-    DMG_BOT.fetch_max(y1, Ordering::Relaxed);
+    add_span(y0, y1);
     // SAFETY: indices are inside width() x height() <= MAX_W x MAX_H; single writer (mainline).
     unsafe {
         let p = addr_of_mut!(BUF) as *mut u32;
@@ -105,4 +149,25 @@ pub fn fill_rect(x0: usize, y0: usize, w: usize, h: usize, rgb: u32) {
             core::slice::from_raw_parts_mut(p.add(y * cw + x0), x1 - x0).fill(rgb);
         }
     }
+}
+
+// The desktop's whole boundary to the screen (docs/design/afriui-phone-plan.md, step P1): the
+// Sovereign model and paint call only `crate::canvas::*`, so the phone can give them its own
+// canvas (P2) without either naming a PC module.
+
+/// Something was drawn: the screen copies it at the next flush.
+pub fn mark() {
+    crate::screen::mark();
+}
+
+/// Copy what changed to the screen (mainline, from desk::idle).
+pub fn flush() {
+    crate::screen::flush();
+}
+
+/// (last, worst) copy to the screen in microseconds, and the copy count (`desk perf`).
+/// (last, worst) copy to the screen in microseconds, the copy count, and the rows the last
+/// copy moved (`desk perf`).
+pub fn copy_perf() -> (u64, u64, u64, u64) {
+    crate::screen::copy_perf()
 }

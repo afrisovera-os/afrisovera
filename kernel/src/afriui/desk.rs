@@ -123,7 +123,7 @@ fn snap() -> Snap {
         notes: s.notes_open,
         unread: s.unread,
         nnotes: s.nnotes,
-        toast: paint::toast_box(),
+        toast: paint::toast_place(), // set, not yet timed out: its expiry must damage it
         hover: s.hover_close,
         files_sel: s.files_sel,
         touch: s.touch,
@@ -598,23 +598,48 @@ fn tile() -> i32 {
         TILE_P
     }
 }
-/// The Spine's width (its woven edge included): windows live right of it.
+/// A phone held upright (touch profile, taller than wide): the Spine lies down as a bar along
+/// the bottom (afriui-phone-plan.md step P1).
+fn lying() -> bool {
+    st().touch && H() > W()
+}
+
+/// The Spine's width (its woven edge included): windows live right of it. 0 when it lies down.
 fn spine_w() -> i32 {
-    if st().touch {
+    if lying() {
+        0
+    } else if st().touch {
         SPINE_T
     } else {
         SPINE_P
     }
 }
 
-/// The Spine (x, y, w, h): the whole left edge.
+/// The bar's height when the Spine lies down along the bottom, else 0.
+fn bar_h() -> i32 {
+    if lying() {
+        SPINE_T
+    } else {
+        0
+    }
+}
+
+/// The Spine (x, y, w, h): the whole left edge, or the bottom bar when it lies down.
 fn dock_box() -> (i32, i32, i32, i32) {
+    if lying() {
+        return (0, H() - bar_h(), W(), bar_h());
+    }
     (0, 0, spine_w(), H())
 }
 
 /// Tile i of the Spine (0 = the Circle button, 1.. = the apps): (x, y, size).
 fn dock_tile(i: usize) -> (i32, i32, i32) {
     let s = tile();
+    if lying() {
+        // in a row along the bar, a gap after the Circle button
+        let y = H() - bar_h() + WEAVE + (bar_h() - WEAVE - s) / 2;
+        return (8 + i as i32 * (s + 10) + if i > 0 { 12 } else { 0 }, y, s);
+    }
     let body = spine_w() - WEAVE;
     let x = (body - s) / 2;
     if i == 0 {
@@ -629,7 +654,7 @@ fn win_rect(a: usize) -> (i32, i32, i32, i32) {
     let s = st();
     if s.touch {
         let sw = spine_w();
-        return (sw, TOP, W() - sw, H() - TOP);
+        return (sw, TOP, W() - sw, H() - TOP - bar_h());
     }
     let w = s.wins[a];
     (w.x, w.y, w.w, w.h)
@@ -658,9 +683,9 @@ fn inside(px: i32, py: i32, r: (i32, i32, i32, i32)) -> bool {
 
 /// The Circle: an octagon (x, y, size, size) centred in the space right of the Spine.
 fn launcher_box() -> (i32, i32, i32, i32) {
-    let sw = spine_w();
-    let size = if st().touch { 340 } else { 300 }.min(H() - 90).min(W() - sw - 16);
-    (sw + (W() - sw - size) / 2, (H() - size - 56) / 2, size, size)
+    let (sw, fh) = (spine_w(), H() - bar_h()); // the free space right of the Spine or above the bar
+    let size = if st().touch { 340 } else { 300 }.min(fh - 90).min(W() - sw - 16);
+    (sw + (W() - sw - size) / 2, (fh - size - 56) / 2, size, size)
 }
 
 /// The strip under the Circle: this device, and how to close.
@@ -687,14 +712,25 @@ fn launcher_tile(i: usize) -> (i32, i32, i32) {
 
 /// The notification list opens beside the Spine, at its foot (by the bell).
 fn notes_box() -> (i32, i32, i32, i32) {
-    let w = 280;
+    let w = 280.min(W() - spine_w() - 12);
     let h = 30 + 18 * NNOTE as i32;
-    (spine_w() + 6, H() - h - 8, w, h)
+    (spine_w() + 6, H() - bar_h() - h - 8, w, h)
 }
 
 /// The bell at the Spine's foot, above the clock.
 fn bell_box() -> (i32, i32, i32, i32) {
+    if lying() {
+        return (W() - 104, H() - bar_h() + WEAVE, 40, bar_h() - WEAVE); // left of the clock
+    }
     (0, H() - 52, spine_w() - WEAVE, 22)
+}
+
+/// The clock's place: the Spine's foot, or the bar's right end when it lies down.
+fn clock_box() -> (i32, i32, i32, i32) {
+    if lying() {
+        return (W() - 60, H() - bar_h(), 60, bar_h());
+    }
+    (0, H() - 34, spine_w(), 34)
 }
 /// The Circle button at the top of the Spine.
 fn brand_box() -> (i32, i32, i32, i32) {
@@ -852,7 +888,9 @@ fn down(px: i32, py: i32) {
         }
         for i in 0..=NAPPS {
             let (_, ty, ts) = dock_tile(i);
-            if inside(px, py, (0, ty - 4, spine_w() - WEAVE, ts + 8)) {
+            let (tx, _, _) = dock_tile(i);
+            let hit = if lying() { (tx - 4, ty - 4, ts + 8, ts + 8) } else { (0, ty - 4, spine_w() - WEAVE, ts + 8) };
+            if inside(px, py, hit) {
                 s.dock_clicks += 1;
                 if i == 0 {
                     s.launcher = true;
@@ -1159,7 +1197,7 @@ pub fn idle() {
     settle(before);
     WALK.store(st().launcher, Ordering::Relaxed);
     // the copy to the screen happens here, in mainline, never in the timer interrupt
-    crate::screen::flush();
+    crate::canvas::flush();
 }
 
 /// The canvas changed size (`screen ui N`): keep every window's lintel on the screen and
@@ -1196,7 +1234,7 @@ fn settle(before: Snap) {
     if t / 100 != LAST_CHECK.swap(t / 100, Ordering::Relaxed) {
         // once a second: what changes with time alone
         if clock_secs() / 60 != s.last_minute {
-            damage((0, H() - 34, spine_w(), 34)); // the clock at the Spine's foot
+            damage(clock_box()); // the clock at the Spine's foot or the bar's end
             want = true;
         }
         // the uptime line in About and Settings and under the Circle
@@ -1303,6 +1341,7 @@ pub fn command(rest: &str) {
             // damage error: it is taken again (at most 3 times)
             let ch = crate::canvas::height();
             let mut differ = 0;
+            let mut first = [usize::MAX; 4];
             for _ in 0..3 {
                 let sec = crate::sched::ticks() / 100;
                 settle(snap());
@@ -1314,6 +1353,11 @@ pub fn command(rest: &str) {
                 let now = unsafe { &mut *core::ptr::addr_of_mut!(ROWS_NOW) };
                 row_hashes(now);
                 differ = (0..ch).filter(|&y| now[y] != rows[y]).count();
+                // the first rows that differ, so a miss can be found
+                first = [usize::MAX; 4];
+                for (k, y) in (0..ch).filter(|&y| now[y] != rows[y]).take(4).enumerate() {
+                    first[k] = y;
+                }
                 if crate::sched::ticks() / 100 == sec {
                     break;
                 }
@@ -1321,6 +1365,13 @@ pub fn command(rest: &str) {
             // SAFETY: scalar read.
             let parts = unsafe { paint::PART_US.2 };
             crate::kprintln!("[desk] verify: {} of {} rows differ after a full redraw ({} partial frame(s) drawn before it)", differ, ch, parts);
+            if differ > 0 {
+                let mut l = Line::new();
+                for &y in first.iter().filter(|&&y| y != usize::MAX) {
+                    l.s(b" ").u(y as u64);
+                }
+                crate::kprintln!("[desk] verify: the first rows that differ:{}", core::str::from_utf8(l.get()).unwrap_or(""));
+            }
             return;
         }
         "perf" => {
@@ -1329,10 +1380,10 @@ pub fn command(rest: &str) {
             let (dl, dw) = unsafe { paint::DRAW_US };
             // SAFETY: scalar reads.
             let (pl, pw, pn) = unsafe { paint::PART_US };
-            let (cl, cw, n) = crate::screen::copy_perf();
+            let (cl, cw, n, rows) = crate::canvas::copy_perf();
             crate::kprintln!(
-                "[desk] perf: {}x{} at UI scale {}x; draw {} us (worst {} us) over {} frame(s); partial {} us (worst {} us) over {} frame(s); copy to the screen {} us (worst {} us) over {} copies",
-                W(), H(), crate::canvas::scale(), dl, dw, s.frames - pn, pl, pw, pn, cl, cw, n
+                "[desk] perf: {}x{} at UI scale {}x; draw {} us (worst {} us) over {} frame(s); partial {} us (worst {} us) over {} frame(s); copy to the screen {} us (worst {} us) over {} copies, the last {} row(s)",
+                W(), H(), crate::canvas::scale(), dl, dw, s.frames - pn, pl, pw, pn, cl, cw, n, rows
             );
             return;
         }

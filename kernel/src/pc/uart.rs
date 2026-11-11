@@ -368,6 +368,15 @@ pub fn _print(args: core::fmt::Arguments) {
     }
 }
 
+/// Last words from a fatal path that may have interrupted a print holding PRINT_LOCK (F8: a kernel-stack
+/// overrun can fault inside `kprintln!`). Takes the lock over without waiting and writes COM1 only (the screen's
+/// state may be half-updated). Only for paths that halt right after: the lock is never given back.
+pub fn emergency_print(args: core::fmt::Arguments) {
+    crate::cpu::cli();
+    PRINT_LOCK.store(true, Ordering::Release);
+    let _ = Com1.write_fmt(args);
+}
+
 /// Everywhere a print goes, with the print lock already held: helpview.rs's lines.
 pub fn tee_str(s: &str) {
     let _ = Tee.write_str(s);

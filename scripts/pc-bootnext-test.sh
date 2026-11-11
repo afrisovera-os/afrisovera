@@ -20,9 +20,20 @@
 #   Boot 6: power-on: the PC started its usual first choice again; no BootNext.
 #   scripts/pc-bootnext-test.sh              # grader selftest, then the six QEMU boots
 #   scripts/pc-bootnext-test.sh --selftest   # grader selftest only
+# BOOTNEXT_KIND=nvme4k (scripts/pc-bootnext-nvme4k-test.sh, 11 Nov 2026): the same six boots with the Windows-like disk
+# on an NVMe namespace of 4096-byte blocks, as many laptop SSDs have (make-disk-image.py gpt-esp-fsinfo-4k: the EFI
+# partition at block 256, 260 MiB, FAT32 in 4 KiB sectors) and the blank GPT disk on SATA port 2. Boot 5 must show the
+# firmware starting AfriSovera through HD(1,GPT,...,start 256), counted in the disk's own 4 KiB blocks.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T="${TMPDIR:-/tmp}"
+KIND="${BOOTNEXT_KIND:-sata}"
+# the Windows-like disk: its name, its EFI partition's first block (in the disk's own blocks), its image kind, the
+# byte where the GPT entry array starts (block 2), the first serial port and the name in the PASSED/FAILED line
+NAME="sata port 2"; STARTL=2048; ESPK=gpt-esp-fsinfo; GOFF=1024; PORT=5430; UP=""
+if [ "$KIND" = nvme4k ]; then
+    NAME=nvme; STARTL=256; ESPK=gpt-esp-fsinfo-4k; GOFF=8192; PORT=6650; UP=" NVME 4K"
+fi
 
 FILE_RE='\\EFI\\afrisovera\\afrisovera\.efi'
 grade() { # grade <boot1 log> ... <boot6 log>
@@ -37,7 +48,7 @@ grade() { # grade <boot1 log> ... <boot6 log>
     local NUM N4 G FIRST=""
     in_blk "$(blk "$A" bootnext)" 'bootnext: AfriSovera has no boot entry \(bootentry adds it first\) -- nothing written' ||
         _f "boot 1: bootnext was not refused without AfriSovera's entry"
-    printf '%s\n' "$(pblk "$B" 'bootcopy yes ')" | grep -aqE '^bootcopy: copied to sata port 2 partition 1.*read back the same' ||
+    printf '%s\n' "$(pblk "$B" 'bootcopy yes ')" | grep -aqE "^bootcopy: copied to $NAME partition 1.*read back the same" ||
         _f "boot 2: bootcopy did not copy the boot file"
     NUM="$(printf '%s\n' "$(pblk "$C" 'bootentry yes ')" | sed -nE 's/^bootentry: (Boot[0-9A-F]{4}) "AfriSovera" added at the END of BootOrder and read back.*/\1/p' | head -1)"
     [ -n "$NUM" ] || _f "boot 3: bootentry did not add AfriSovera's entry"
@@ -67,7 +78,7 @@ grade() { # grade <boot1 log> ... <boot6 log>
     # boot 5: the firmware started AfriSovera's own entry
     local EE; EE="$(blk "$E" bootentries)"
     in_blk "$EE" "bootentries: the firmware's boot entries, as read at power-on \(nothing is changed\)" || _f "boot 5: bootentries did not read at power-on"
-    in_blk "$EE" "  $NUM  active  \"AfriSovera\"  HD\(1,GPT,$G,start 2048\)/$FILE_RE  <- started this time" ||
+    in_blk "$EE" "  $NUM  active  \"AfriSovera\"  HD\(1,GPT,$G,start $STARTL\)/$FILE_RE  <- started this time" ||
         _f "boot 5: the firmware did not start $NUM \"AfriSovera\" from the EFI partition"
     if printf '%s\n' "$EE" | grep -aq '^  BootNext:'; then _f "boot 5: BootNext is still there after the firmware used it"; fi
     # boot 6: back to the usual first choice
@@ -131,9 +142,15 @@ bootentries: the firmware's boot entries, as read at power-on (nothing is change
   Boot0005  active  \"AfriSovera\"  HD(1,GPT,$ESPG,start 2048)/\\EFI\\afrisovera\\afrisovera.efi
   AfriSovera's own entry: Boot0005
 afrisovera>"
+if [ "$KIND" = nvme4k ]; then # the same samples as the 4 KiB-block NVMe disk says them
+    K4_SED='s/sata port 2 partition 1/nvme partition 1/g; s/,start 2048)/,start 256)/; s/98415 KiB free/263160 KiB free/'
+    L1="$(printf '%s\n' "$L1" | sed "$K4_SED")"; L2="$(printf '%s\n' "$L2" | sed "$K4_SED")"; L3="$(printf '%s\n' "$L3" | sed "$K4_SED")"
+    L4="$(printf '%s\n' "$L4" | sed "$K4_SED")"; L5="$(printf '%s\n' "$L5" | sed "$K4_SED")"; L6="$(printf '%s\n' "$L6" | sed "$K4_SED")"
+fi
 
 selftest() {
-    local D pass=0 bad=0
+    local D pass=0 bad=0 N=21
+    [ "$KIND" = nvme4k ] && N=23
     D="$(mktemp -d "$T/pc-bootnext-selftest.XXXXXX")" || return 1
     arm() { # arm <name> <expect> <b1> .. <b6>
         local got
@@ -166,26 +183,30 @@ selftest() {
     arm firmware-refused red "$L1" "$L2" "$L3" "$(printf '%s\nbootnext: BootNext could not be written (status 0x8000000000000008) -- bootentries shows what is there' "$L4")" "$L5" "$L6"
     arm panic red "$(printf '%s\nKERNEL PANIC at bootent.rs' "$L1")" "$L2" "$L3" "$L4" "$L5" "$L6"
     arm empty red "" "" "" "" "" ""
+    if [ "$KIND" = nvme4k ]; then # the partition counted in 512-byte sectors on a 4 KiB-block disk, or the wrong disk
+        arm hd-in-512 red "$L1" "$L2" "$L3" "$L4" "$(printf '%s\n' "$L5" | sed 's/,start 256)/,start 2048)/')" "$L6"
+        arm copied-to-sata red "$L1" "$(printf '%s\n' "$L2" | sed 's/nvme partition 1/sata port 2 partition 1/')" "$L3" "$L4" "$L5" "$L6"
+    fi
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 21 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq "$N" ]
 }
 
-echo "== PC firmware starts AfriSovera once from its own boot entry (BootNext) (PC track step 5) =="
-if ! selftest; then echo "PC BOOTNEXT TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC BOOTNEXT SELFTEST ONLY -- no measurement taken"; exit 0; }
+echo "== PC firmware starts AfriSovera once from its own boot entry (BootNext)${UP:+, Windows disk on 4 KiB-block NVMe} (PC track step 5) =="
+if ! selftest; then echo "PC BOOTNEXT${UP} TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC BOOTNEXT${UP} SELFTEST ONLY -- no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }
 done
-command -v qemu-system-x86_64 > /dev/null || { echo "PC BOOTNEXT TEST FAILED (harness: qemu-system-x86_64 not on PATH)"; exit 1; }
+command -v qemu-system-x86_64 > /dev/null || { echo "PC BOOTNEXT${UP} TEST FAILED (harness: qemu-system-x86_64 not on PATH)"; exit 1; }
 PY=python3; command -v python3 > /dev/null || PY=python
 winpath() { if command -v cygpath > /dev/null; then cygpath -m "$1"; else printf '%s' "$1"; fi; }
 
 echo "  --- build ---"
 cargo build -p mansa-kernel --bin mansa-pc --features pc --target x86_64-unknown-uefi 2>&1 | tail -2
 PC_EFI="${PC_EFI:-$PWD/target/x86_64-unknown-uefi/debug/mansa-pc.efi}"
-[ -r "$PC_EFI" ] || { echo "PC BOOTNEXT TEST FAILED (harness: $PC_EFI was not built)"; exit 1; }
+[ -r "$PC_EFI" ] || { echo "PC BOOTNEXT${UP} TEST FAILED (harness: $PC_EFI was not built)"; exit 1; }
 export AFRISH_BOOT_QUIET="${AFRISH_BOOT_QUIET:-40}"
 export AFRISH_CMD_QUIET="${AFRISH_CMD_QUIET:-120}" AFRISH_CMD_CEILING="${AFRISH_CMD_CEILING:-180}"
 
@@ -199,16 +220,22 @@ done
 for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd; do
     if [ -z "$OVMF" ] && [ -r "$f" ] && [ -r "${f/CODE/VARS}" ]; then OVMF="$f"; VARS="${f/CODE/VARS}"; fi
 done
-[ -n "$OVMF" ] && [ -r "$VARS" ] || { echo "PC BOOTNEXT TEST FAILED (harness: no x86-64 UEFI firmware with a variable store file)"; exit 1; }
+[ -n "$OVMF" ] && [ -r "$VARS" ] || { echo "PC BOOTNEXT${UP} TEST FAILED (harness: no x86-64 UEFI firmware with a variable store file)"; exit 1; }
 
 W="$(mktemp -d "$T/pc-bootnext.XXXXXX")"
 for k in gpt gpt-esp-fsinfo; do
-    "$PY" scripts/lib/make-disk-image.py "$k" "$W/$k.img" || { echo "PC BOOTNEXT TEST FAILED (harness: could not make $k.img)"; exit 1; }
+    kk=$k; [ "$k" = gpt-esp-fsinfo ] && kk=$ESPK # the Windows-like disk (in 4 KiB blocks for nvme4k)
+    "$PY" scripts/lib/make-disk-image.py "$kk" "$W/$k.img" || { echo "PC BOOTNEXT${UP} TEST FAILED (harness: could not make $k.img)"; exit 1; }
 done
 cp "$VARS" "$W/vars.fd"
 mkdir -p "$W/stick/EFI/BOOT"
 cp "$PC_EFI" "$W/stick/EFI/BOOT/BOOTX64.EFI"
 
+# the blank GPT disk on NVMe and the Windows-like one on SATA port 2; the other way round, in 4 KiB blocks, for nvme4k.
+# The bootindex order stays stick 0, blank disk 1, Windows-like disk 2 either way.
+DEV=(-device nvme,serial=afri01,drive=sd,bootindex=1 -device ide-hd,drive=sb,bus=ide.2,bootindex=2)
+[ "$KIND" = nvme4k ] && DEV=(-device ide-hd,drive=sd,bus=ide.2,bootindex=1
+    -device nvme,serial=afri02,drive=sb,logical_block_size=4096,physical_block_size=4096,bootindex=2)
 boot() { # boot <serial port> <log> <commands (| between)>
     local sp=$1 log=$2 cmds=$3
     local IFS='|'; set -f; local -a C=($cmds); set +f; unset IFS
@@ -216,8 +243,8 @@ boot() { # boot <serial port> <log> <commands (| between)>
         -drive "if=pflash,format=raw,unit=0,readonly=on,file=$(winpath "$OVMF")" \
         -drive "if=pflash,format=raw,unit=1,file=$(winpath "$W/vars.fd")" \
         -drive "if=none,format=raw,id=stk,file=fat:rw:$(winpath "$W/stick")" -device ide-hd,drive=stk,bus=ide.0,bootindex=0 \
-        -drive "file=$(winpath "$W/gpt.img"),if=none,format=raw,id=sd" -device nvme,serial=afri01,drive=sd,bootindex=1 \
-        -drive "file=$(winpath "$W/gpt-esp-fsinfo.img"),if=none,format=raw,id=sb" -device ide-hd,drive=sb,bus=ide.2,bootindex=2 \
+        -drive "file=$(winpath "$W/gpt.img"),if=none,format=raw,id=sd" \
+        -drive "file=$(winpath "$W/gpt-esp-fsinfo.img"),if=none,format=raw,id=sb" "${DEV[@]}" \
         -serial "tcp:127.0.0.1:$sp,server,nowait" -qmp "tcp:127.0.0.1:$((sp+1)),server,nowait" &
     local q=$!
     AFRISH_BOOT_GRACE="${AFRISH_BOOT_GRACE:-10}" "$PY" scripts/shell-demo.py "$sp" "$((sp+1))" "$W/shot.png" "${C[@]}" > "$log" 2>&1
@@ -227,35 +254,35 @@ boot() { # boot <serial port> <log> <commands (| between)>
 code() { tr -d '\r' < "$1" | sed -nE "s/^$2: nothing written yet\. To do it, type exactly: $2 yes ([0-9a-f]{4})$/\1/p" | head -1; }
 
 echo "  --- boot 1: bootnext (no entry yet), bootcopy (its code) ---"
-boot 5430 "$W/boot1.log" 'bootnext|bootcopy'
+boot "$PORT" "$W/boot1.log" 'bootnext|bootcopy'
 C1="$(code "$W/boot1.log" bootcopy)"
 echo "  --- boot 2: bootcopy yes ${C1:-(no code)}, bootentry (its code) ---"
-boot 5434 "$W/boot2.log" "bootcopy yes ${C1:-none}|bootentry"
+boot $((PORT+4)) "$W/boot2.log" "bootcopy yes ${C1:-none}|bootentry"
 C2="$(code "$W/boot2.log" bootentry)"
 echo "  --- boot 3: bootentry yes ${C2:-(no code)}, bootnext (its code), a wrong code ---"
-boot 5438 "$W/boot3.log" "bootentry yes ${C2:-none}|bootnext|bootnext yes zzzz"
+boot $((PORT+8)) "$W/boot3.log" "bootentry yes ${C2:-none}|bootnext|bootnext yes zzzz"
 C3="$(code "$W/boot3.log" bootnext)"
 echo "  --- boot 4: bootnext yes ${C3:-(no code)}, bootentries, bootnext again ---"
-boot 5442 "$W/boot4.log" "bootnext yes ${C3:-none}|bootentries|bootnext"
+boot $((PORT+12)) "$W/boot4.log" "bootnext yes ${C3:-none}|bootentries|bootnext"
 echo "  --- boot 5: power-on -- bootentries (which entry did the firmware start?) ---"
-boot 5446 "$W/boot5.log" 'bootentries'
+boot $((PORT+16)) "$W/boot5.log" 'bootentries'
 printf '\n' >> "$W/boot5.log"   # the log ends at the shell's prompt, with no newline
 "$PY" -c '
 import sys, uuid
 d = open(sys.argv[1], "rb").read()
-print("harness: EFI partition GUID %s" % uuid.UUID(bytes_le=d[1024 + 16:1024 + 32]))
-' "$W/gpt-esp-fsinfo.img" >> "$W/boot5.log" 2>&1
+print("harness: EFI partition GUID %s" % uuid.UUID(bytes_le=d[int(sys.argv[2]) + 16:int(sys.argv[2]) + 32]))
+' "$W/gpt-esp-fsinfo.img" "$GOFF" >> "$W/boot5.log" 2>&1
 echo "  --- boot 6: power-on again -- bootentries ---"
-boot 5450 "$W/boot6.log" 'bootentries'
+boot $((PORT+20)) "$W/boot6.log" 'bootentries'
 cat "$W"/boot[1-6].log | tr -d '\r' |
     grep -aE '^afrisovera> boot|^bootnext|^bootentry: Boot|^bootcopy: (copied|nothing)|^  (BootOrder|BootNext|Boot[0-9A-F]{4}  |AfriSovera|the firmware deletes)|^harness|^\[pc\] boot entries' | sed 's/^/  | /'
 
 echo "  --- grading ---"
 if grade "$W/boot1.log" "$W/boot2.log" "$W/boot3.log" "$W/boot4.log" "$W/boot5.log" "$W/boot6.log"; then
     rm -rf "$W"
-    echo "PC BOOTNEXT TEST PASSED"
+    echo "PC BOOTNEXT${UP} TEST PASSED"
     exit 0
 fi
 echo "  logs kept in $W"
-echo "PC BOOTNEXT TEST FAILED"
+echo "PC BOOTNEXT${UP} TEST FAILED"
 exit 1

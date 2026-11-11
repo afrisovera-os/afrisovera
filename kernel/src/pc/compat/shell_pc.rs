@@ -190,6 +190,14 @@ pub fn intercept(line: &str) -> bool {
         "bootentries" => crate::bootent::list(),
         // the firmware that started AfriSovera: vendor, UEFI version, Secure Boot (nothing is changed)
         "fwinfo" => crate::fwinfo::show(),
+        // F8: where the PC's stack is (the firmware's, so far) and how deep it has been used (paint high-water)
+        "stack" => match _rest {
+            "guards" => {
+                crate::stackinfo::check_guards();
+            }
+            "overflow-test" => crate::stackinfo::overflow_test(),
+            _ => crate::stackinfo::report(),
+        },
         // the PC's network chips, Wi-Fi named with the driver it needs; or one chip by its id (nothing is changed)
         "wifi" => {
             if _rest.is_empty() {

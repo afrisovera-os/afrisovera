@@ -29,15 +29,32 @@
 # without it OVMF wrote NvVars into the Windows EFI partition at every boot (the first Actions run, 10 Nov).
 # Since 11 Nov 2026 the SATA (AHCI) kind's boot 2 runs lsahci too: ahci.rs table_write_run sends each run as one write
 # and one read back, and lsahci must count it as big copies.
+# BOOTCOPY_KIND=nvme (scripts/pc-bootcopy-nvme-test.sh, 11 Nov 2026): the Windows-like disk is the NVMe disk (most
+# laptops sold today) and the unformatted GPT disk moves to SATA port 2; boot 2 runs lsnvme, which must count the copy
+# as big copies (nvme.rs table_write_run: one Write and one Read back per run). The same empty FAT NvVars disk as the
+# IDE kind sits on piix3-ide ahead of the NVMe controller, so the firmware never writes NvVars into the Windows disk.
+# BOOTCOPY_KIND=nvme4k (scripts/pc-bootcopy-nvme4k-test.sh, 11 Nov 2026): the NVMe kind with 4096-byte blocks, as many
+# laptop SSDs have. The Windows-like disk is make-disk-image.py's gpt-esp-fsinfo-4k: 400 MiB, the EFI partition at
+# block 256 and 260 MiB long (Windows' size on 4 KiB disks, since FAT32 needs 65525 clusters), its FAT32 in 4096-byte
+# sectors and clusters; the copy goes in whole device blocks (nvme.rs table_write_run). check-bootcopy.py finds the
+# block size from the image.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T="${TMPDIR:-/tmp}"
 
 FILE_RE='\\EFI\\afrisovera\\afrisovera\.efi'
 KIND="${BOOTCOPY_KIND:-sata}"
-if [ "$KIND" = ide ]; then
+ESPK=gpt-esp-fsinfo; STARTL=2048; FREE=100776 # the Windows-like disk's kind, its EFI partition's first block, free KiB
+if [ "$KIND" = nvme4k ]; then
+    LS=lsnvme; RUNS=' \(on\)'
+    NAME=nvme; PORT=6590; UP=" NVME 4K"; NARMS=20 # DEV as for ide
+    ESPK=gpt-esp-fsinfo-4k; STARTL=256; FREE=265524
+elif [ "$KIND" = ide ]; then
     LS=lside; RUNS=' and flushed once \(on\)'
     NAME=ide1; PORT=6390; UP=" IDE"; NARMS=20 # DEV is set once the work folder exists (the NvVars disk lives there)
+elif [ "$KIND" = nvme ]; then
+    LS=lsnvme; RUNS=' \(on\)'
+    NAME=nvme; PORT=6490; UP=" NVME"; NARMS=20 # DEV as for ide
 else
     LS=lsahci; RUNS=' \(on\)'
     NAME="sata port 2"; DEV=(-device ide-hd,drive=sb,bus=ide.2); PORT=5390; UP=""; NARMS=20
@@ -51,9 +68,9 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     blk() { printf '%s\n' "$1" | awk -v c="afrisovera> $2" '$0==c{on=1;next} /^afrisovera>/{on=0} on'; }
     in_blk() { printf '%s\n' "$1" | grep -aqxE "$2"; }
     local kb
-    kb="$(printf '%s\n' "$A" | sed -nE "s/^bootcopy: AfriSovera's boot file \(([0-9]+) KiB\) -> $NAME partition 1 \(start 2048\)$FILE_RE$/\1/p" | head -1)"
-    [ -n "$kb" ] || _f "boot 1: bootcopy did not name the boot file's size and $NAME partition 1 (start 2048)"
-    in_blk "$A" "  it takes [1-9][0-9]* KiB of the 100776 KiB free; nothing already in the partition is moved or changed; no boot entry is added yet" ||
+    kb="$(printf '%s\n' "$A" | sed -nE "s/^bootcopy: AfriSovera's boot file \(([0-9]+) KiB\) -> $NAME partition 1 \(start $STARTL\)$FILE_RE$/\1/p" | head -1)"
+    [ -n "$kb" ] || _f "boot 1: bootcopy did not name the boot file's size and $NAME partition 1 (start $STARTL)"
+    in_blk "$A" "  it takes [1-9][0-9]* KiB of the $FREE KiB free; nothing already in the partition is moved or changed; no boot entry is added yet" ||
         _f "boot 1: bootcopy did not say the room it takes and that nothing else changes"
     in_blk "$(blk "$A" bootcopy)" 'bootcopy: nothing written yet. To do it, type exactly: bootcopy yes [0-9a-f]{4}' ||
         _f "boot 1: bootcopy did not give the code"
@@ -79,7 +96,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     # the copy goes in runs of several sectors, one command and one read back each (IDE mode: one cache flush too)
     in_blk "$(blk "$B" $LS)" '  big copies \(installdisk, bootcopy\): [1-9][0-9]* run\(s\) in one command, [1-9][0-9]* sector\(s\), each read back'"$RUNS" ||
         _f "boot 2: bootcopy did not write the file in runs of several sectors ($LS)"
-    in_blk "$(blk "$C" 'bootcopy remove')" "bootcopy remove: $NAME partition 1 \(start 2048\): \\\\EFI\\\\afrisovera \($kb KiB\) would be taken out; nothing else in the partition changes" ||
+    in_blk "$(blk "$C" 'bootcopy remove')" "bootcopy remove: $NAME partition 1 \(start $STARTL\): \\\\EFI\\\\afrisovera \($kb KiB\) would be taken out; nothing else in the partition changes" ||
         _f "boot 3: bootcopy remove did not say what goes"
     in_blk "$(blk "$C" 'bootcopy remove')" 'bootcopy remove: nothing written yet. To do it, type exactly: bootcopy remove yes [0-9a-f]{4}' ||
         _f "boot 3: bootcopy remove did not give the code"
@@ -88,9 +105,9 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     printf '%s\n' "$C" | grep -aqx 'harness: disk images unchanged' || _f "boot 3: a disk image changed (or the check is missing)"
     local D1
     D1="$(printf '%s\n' "$D" | awk '/^afrisovera> bootcopy remove yes /{on=1;next} /^afrisovera>/{on=0} on')"
-    in_blk "$D1" "bootcopy remove: \\\\EFI\\\\afrisovera taken out of $NAME partition 1, read back \(both FAT copies equal, 100776 KiB free again\)" ||
-        _f "boot 4: the removal was not read back with 100776 KiB free again"
-    in_blk "$(blk "$D" bootplan)" "  plan: AfriSovera's boot file would be copied to $FILE_RE \([1-9][0-9]* KiB of the 100776 KiB free\); nothing else in this partition changes" ||
+    in_blk "$D1" "bootcopy remove: \\\\EFI\\\\afrisovera taken out of $NAME partition 1, read back \(both FAT copies equal, $FREE KiB free again\)" ||
+        _f "boot 4: the removal was not read back with $FREE KiB free again"
+    in_blk "$(blk "$D" bootplan)" "  plan: AfriSovera's boot file would be copied to $FILE_RE \([1-9][0-9]* KiB of the $FREE KiB free\); nothing else in this partition changes" ||
         _f "boot 4: bootplan does not plan the copy again"
     printf '%s\n' "$D" | grep -aqx 'harness: bootcopy removal check PASSED' || _f "boot 4: the removal check did not pass"
     if printf '%s\n%s\n%s\n%s\n' "$A" "$B" "$C" "$D" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci|ide)\] .*(failed|timed out)|FAILED'; then
@@ -146,7 +163,26 @@ bootplan: AfriSovera's boot file is 2360 KiB (kept at power-on)
 afrisovera>
 harness: bootcopy removal check PASSED"
 
-if [ "$KIND" = ide ]; then
+WRONG=nvme
+if [ "$KIND" = nvme ] || [ "$KIND" = nvme4k ]; then
+    WRONG="sata port 2"
+    L1="${L1//sata port 2/nvme}"; L2="${L2//sata port 2/nvme}"; L3="${L3//sata port 2/nvme}"; L4="${L4//sata port 2/nvme}"
+    L2="${L2/afrisovera>
+check:/afrisovera> lsnvme
+nvme: controller 00:04.0 BAR0 0xfebd0000, NVMe 1.4, ready
+  namespace 1: 327680 blocks of 512 B (160 MiB)  (other data, read-only to us)
+  model: QEMU NVMe Ctrl
+  reads: 12010 sector(s), 11240 from the read-ahead, 770 multi-block command(s), 0 single (on)
+  writes: 0 sector(s), 0 multi-block command(s), 0 single (not checked yet)
+  big copies (installdisk, bootcopy): 296 run(s) in one command, 4724 sector(s), each read back (on)
+afrisovera>
+check:}"
+    if [ "$KIND" = nvme4k ]; then # the same samples as a 4 KiB-block disk says them (its EFI partition at block 256)
+        K4_SED='s/(start 2048)/(start 256)/; s/100776 KiB free/265524 KiB free/; s/98415 KiB free/263160 KiB free/; s/2361 KiB of/2364 KiB of/; s/LBA 2048-206847, 100 MiB/LBA 256-66815, 260 MiB/; s/512-byte clusters/4096-byte clusters/; s/327680 blocks of 512 B (160 MiB)/102400 blocks of 4096 B (400 MiB)/'
+        L1="$(printf '%s\n' "$L1" | sed "$K4_SED")"; L2="$(printf '%s\n' "$L2" | sed "$K4_SED")"
+        L3="$(printf '%s\n' "$L3" | sed "$K4_SED")"; L4="$(printf '%s\n' "$L4" | sed "$K4_SED")"
+    fi
+elif [ "$KIND" = ide ]; then
     L1="${L1//sata port 2/ide1}"; L2="${L2//sata port 2/ide1}"; L3="${L3//sata port 2/ide1}"; L4="${L4//sata port 2/ide1}"
     L2="${L2/afrisovera>
 check:/afrisovera> lside
@@ -180,7 +216,7 @@ selftest() {
     echo "  --- grader selftest (no QEMU) ---"
     arm model-green green "$L1" "$L2" "$L3" "$L4"
     arm crlf green "$(crlf "$L1")" "$(crlf "$L2")" "$(crlf "$L3")" "$(crlf "$L4")"
-    arm wrong-partition red "$(printf '%s\n' "$L1" | sed "s/$NAME partition 1 (start 2048)/nvme partition 1 (start 2048)/")" "$L2" "$L3" "$L4"
+    arm wrong-partition red "$(printf '%s\n' "$L1" | sed "s/$NAME partition 1 (start $STARTL)/$WRONG partition 1 (start $STARTL)/")" "$L2" "$L3" "$L4"
     arm no-code red "$(printf '%s\n' "$L1" | grep -v 'type exactly: bootcopy yes')" "$L2" "$L3" "$L4"
     arm wrong-code-taken red "$(printf '%s\n' "$L1" | grep -v 'that code does not fit')" "$L2" "$L3" "$L4"
     arm boot1-wrote red "$(printf '%s\n' "$L1" | sed 's/disk images unchanged/disk images CHANGED/')" "$L2" "$L3" "$L4"
@@ -192,12 +228,16 @@ selftest() {
     arm image-check-failed red "$L1" "$(printf '%s\n' "$L2" | sed 's/image check PASSED/image check FAILED: sector 9 outside the EFI partition changed/')" "$L3" "$L4"
     arm remove-no-code red "$L1" "$L2" "$(printf '%s\n' "$L3" | grep -v 'type exactly')" "$L4"
     arm boot3-wrote red "$L1" "$L2" "$(printf '%s\n' "$L3" | sed 's/disk images unchanged/disk images CHANGED/')" "$L4"
-    arm not-freed red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | sed 's/100776 KiB free again/100775 KiB free again/')"
+    arm not-freed red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | sed "s/$FREE KiB free again/$((FREE - 1)) KiB free again/")"
     arm no-replan red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | grep -v 'would be copied')"
     arm removal-check-failed red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | grep -v 'removal check PASSED')"
     arm panic red "$(printf '%s\nKERNEL PANIC at esp.rs' "$L1")" "$L2" "$L3" "$L4"
     arm empty red "" "" "" ""
     arm no-runs red "$L1" "$(printf '%s\n' "$L2" | grep -v 'big copies')" "$L3" "$L4"
+    if [ "$KIND" = nvme4k ]; then # the partition named in 512-byte sectors on a 4 KiB disk
+        NARMS=$((NARMS + 1))
+        arm counted-in-512 red "$(printf '%s\n' "$L1" | sed 's/(start 256)/(start 2048)/')" "$L2" "$L3" "$L4"
+    fi
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
     [ "$bad" -eq 0 ] && [ "$pass" -eq "$NARMS" ]
@@ -224,15 +264,24 @@ PATH="$PWD/scripts/lib/pc-arch:$PATH"
 
 W="$(mktemp -d "$T/pc-bootcopy.XXXXXX")"
 for k in gpt gpt-esp-fsinfo; do
-    "$PY" scripts/lib/make-disk-image.py "$k" "$W/$k.img" || { echo "PC BOOTCOPY${UP} TEST FAILED (harness: could not make $k.img)"; exit 1; }
+    kk=$k; [ "$k" = gpt-esp-fsinfo ] && kk=$ESPK # the Windows-like disk (in 4 KiB blocks for nvme4k)
+    "$PY" scripts/lib/make-disk-image.py "$kk" "$W/$k.img" || { echo "PC BOOTCOPY${UP} TEST FAILED (harness: could not make $k.img)"; exit 1; }
 done
 cp "$W/gpt-esp-fsinfo.img" "$W/orig.img"
-if [ "$KIND" = ide ]; then
+if [ "$KIND" = ide ] || [ "$KIND" = nvme ] || [ "$KIND" = nvme4k ]; then
     mkdir -p "$W/nvvars"
     NV="$W/nvvars"; command -v cygpath > /dev/null && NV="$(cygpath -m "$NV")"
     DEV=(-device piix3-ide,id=pide -drive "file=fat:rw:$NV,if=none,format=raw,id=nv" -device ide-hd,drive=nv,bus=pide.0,unit=0
          -device ide-hd,drive=sb,bus=pide.0,unit=1)
+    # NVMe kind: the NvVars disk first (lowest PCI slot), then the Windows-like disk on NVMe, the blank GPT on SATA
+    [ "$KIND" = nvme ] && DEV=(-device piix3-ide,id=pide -drive "file=fat:rw:$NV,if=none,format=raw,id=nv"
+        -device ide-hd,drive=nv,bus=pide.0,unit=0 -device nvme,serial=afri02,drive=sb -device ide-hd,drive=sd,bus=ide.2)
+    [ "$KIND" = nvme4k ] && DEV=(-device piix3-ide,id=pide -drive "file=fat:rw:$NV,if=none,format=raw,id=nv"
+        -device ide-hd,drive=nv,bus=pide.0,unit=0
+        -device nvme,serial=afri02,drive=sb,logical_block_size=4096,physical_block_size=4096 -device ide-hd,drive=sd,bus=ide.2)
 fi
+# the blank GPT disk: NVMe, except in the NVMe kind (it is on SATA port 2 there, in DEV)
+SD=(-device nvme,serial=afri01,drive=sd); { [ "$KIND" = nvme ] || [ "$KIND" = nvme4k ]; } && SD=()
 cp "$PC_EFI" "$W/kernel.efi"
 
 boot() { # boot <serial port> <log> <commands (| between)>
@@ -240,7 +289,7 @@ boot() { # boot <serial port> <log> <commands (| between)>
     (cd "$W" && md5sum gpt.img gpt-esp-fsinfo.img > before.md5)
     local IFS='|'; set -f; local -a C=($cmds); set +f; unset IFS
     qemu-system-aarch64 -M virt -m 256M -display none \
-        -drive "file=$W/gpt.img,if=none,format=raw,id=sd" -device nvme,serial=afri01,drive=sd \
+        -drive "file=$W/gpt.img,if=none,format=raw,id=sd" "${SD[@]}" \
         -drive "file=$W/gpt-esp-fsinfo.img,if=none,format=raw,id=sb" "${DEV[@]}" \
         -serial "tcp:127.0.0.1:$sp,server,nowait" -qmp "tcp:127.0.0.1:$((sp+1)),server,nowait" &
     local q=$!
@@ -266,7 +315,7 @@ C3="$(code "$W/boot3.log" 'bootcopy remove')"
 echo "  --- boot 4: bootcopy remove yes ${C3:-(no code)}, bootplan; then the image is checked ---"
 boot "$((PORT+12))" "$W/boot4.log" "bootcopy remove yes ${C3:-none}|bootplan"
 "$PY" scripts/lib/check-bootcopy.py removed "$W/orig.img" "$W/mid.img" "$W/gpt-esp-fsinfo.img" >> "$W/boot4.log" 2>&1
-cat "$W"/boot[1-4].log | tr -d '\r' | grep -aE '^afrisovera> boot|^bootcopy|^bootplan: (sata|ide)|^  (it takes|\\EFI|plan|boot entry|big copies)|^(check|harness):' | sed 's/^/  | /'
+cat "$W"/boot[1-4].log | tr -d '\r' | grep -aE '^afrisovera> boot|^bootcopy|^bootplan: (sata|ide|nvme)|^  (it takes|\\EFI|plan|boot entry|big copies)|^(check|harness):' | sed 's/^/  | /'
 
 echo "  --- grading ---"
 if grade "$W/boot1.log" "$W/boot2.log" "$W/boot3.log" "$W/boot4.log"; then

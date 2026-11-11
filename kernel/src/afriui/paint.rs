@@ -379,6 +379,9 @@ fn wallpaper() {
 /// network, power, the bell and the clock; a woven edge on its right (section 6).
 fn spine() {
     let s = st();
+    if lying() {
+        return bar();
+    }
     let body = spine_w() - WEAVE;
     rect(0, 0, body, H(), NIGHT);
     weave_v(body, 0, H(), 2, &KENTE);
@@ -439,15 +442,82 @@ fn spine() {
         let mut t = [0u8; 20];
         text(gx + 20, gy + 3, num(s.unread as u64, &mut t), TEXT, 1);
     }
+    power_net(mid - 11, H() - 78, mid - 10, H() - 100);
+}
+
+/// The Spine lying down as a bar along the bottom (a phone held upright, afriui-phone-plan.md
+/// P1): the woven edge on top, the Circle button and the apps in a row with their beads along
+/// the bottom edge, then network, power, the bell and the clock at the right end.
+fn bar() {
+    let s = st();
+    let top = H() - bar_h();
+    rect(0, top, W(), bar_h(), NIGHT);
+    weave(0, top, W(), 2, &KENTE, &|_| (0, 0));
+    let (tx, ty, ts) = dock_tile(0);
+    if s.launcher {
+        chip(tx - 2, ty - 2, ts + 4, ts + 4, 5, GOLD_DEEP);
+    }
+    icon(None, tx, ty, ts);
+    let (t1, _, _) = dock_tile(1);
+    rect((tx + ts + t1) / 2, ty + 6, 1, ts - 12, LINE);
+    let foc = focused();
+    for i in 1..=NAPPS {
+        let (tx, ty, ts) = dock_tile(i);
+        let a = i - 1;
+        if foc == Some(a) {
+            chip(tx - 2, ty - 2, ts + 4, ts + 4, 5, SURFACE2);
+        }
+        icon(Some(APPS[a]), tx, ty, ts);
+        let w = s.wins[a];
+        if w.open {
+            let focus = foc == Some(a);
+            let bw = if focus { ts - 8 } else if w.min { 4 } else { 10 };
+            chip(tx + (ts - bw) / 2, H() - 4, bw, 3, 1, if focus { GOLD } else { GOLD_DEEP });
+        }
+    }
+    // the clock at the right end, hours and minutes over UTC (or am/pm)
+    let secs = clock_secs();
+    let (hh, mm) = ((secs / 3600) % 24, (secs / 60) % 60);
+    let (mut l, mut under) = (Line::new(), Line::new());
+    if s.clock24 {
+        l.two(hh).s(b":").two(mm);
+        under.s(b"UTC");
+    } else {
+        let h12 = if hh % 12 == 0 { 12 } else { hh % 12 };
+        l.u(h12).s(b":").two(mm);
+        under.s(if hh < 12 { b"am" } else { b"pm" });
+    }
+    s.last_minute = secs / 60;
+    let (cx, cy, cw, _) = clock_box();
+    let mid = cx + cw / 2;
+    rect(cx, cy + WEAVE + 8, 1, 36, LINE);
+    text(mid - text_w(l.get(), 1) / 2, cy + WEAVE + 10, l.get(), GOLD, 1);
+    text(mid - text_w(under.get(), 1) / 2, cy + WEAVE + 23, under.get(), DIM, 1);
+    // the bell with its count, left of the clock
+    let (bx, by, bw, bh) = bell_box();
+    let (gx, gy) = (bx + bw / 2 - 13, by + bh / 2 - 11);
+    let bc = if s.notes_open { GOLD } else { TEXT };
+    rect(gx + 9, gy + 6, 8, 7, bc);
+    rect(gx + 8, gy + 12, 10, 2, bc);
+    rect(gx + 11, gy + 15, 4, 2, bc);
+    if s.unread > 0 {
+        chip(gx + 17, gy + 2, 10, 11, 2, RED);
+        let mut t = [0u8; 20];
+        text(gx + 20, gy + 3, num(s.unread as u64, &mut t), TEXT, 1);
+    }
+    let mid_y = top + WEAVE + (bar_h() - WEAVE) / 2;
+    power_net(W() - 150, mid_y - 6, W() - 190, mid_y - 6);
+}
+
+/// The power glyph at (px, py) and the network glyph at (nx, ny), on the Spine or the bar.
+fn power_net(px: i32, py: i32, nx: i32, ny: i32) {
     // power: no battery driver yet, so a plug and "AC" (no fake levels)
-    let (px, py) = (mid - 11, H() - 78);
     rect(px, py + 3, 7, 6, TEXT);
     rect(px + 1, py, 1, 3, TEXT);
     rect(px + 5, py, 1, 3, TEXT);
     rect(px + 3, py + 9, 1, 3, TEXT);
     text(px + 10, py + 2, b"AC", DIM, 1);
     // network: a link glyph, gold with a lease, dim without, crossed without a device
-    let (nx, ny) = (mid - 10, H() - 100);
     let (present, ip) = (crate::virtio::net_present(), crate::virtio::dhcp_ip());
     let c = if !present {
         LINE
@@ -851,8 +921,18 @@ fn notes_panel() {
 
 /// The toast's box while it shows (shadow included), else None. The model uses it for damage.
 pub(super) fn toast_box() -> Option<Rect> {
+    if crate::sched::ticks() >= st().toast_until {
+        return None;
+    }
+    toast_place()
+}
+
+/// The toast's box while it is set, whether or not its time has run out yet: the model's
+/// snapshot uses this, so a toast that expires between two snapshots still damages its box
+/// (a partial frame for something else could otherwise leave a strip of it on the screen).
+pub(super) fn toast_place() -> Option<Rect> {
     let s = st();
-    if s.nnotes == 0 || s.notes_open || crate::sched::ticks() >= s.toast_until {
+    if s.nnotes == 0 || s.notes_open || s.toast_until == 0 {
         return None;
     }
     let i = (s.nnotes - 1) % NNOTE;
@@ -860,7 +940,7 @@ pub(super) fn toast_box() -> Option<Rect> {
     // pointer: the top right corner; touch: a snackbar at the foot, never over a lintel
     // (design review D2)
     let sw = spine_w();
-    let (x, y) = if s.touch { (sw + (W() - sw - w) / 2, H() - 46) } else { (W() - w - 10, TOP + 10) };
+    let (x, y) = if s.touch { (sw + (W() - sw - w) / 2, H() - bar_h() - 46) } else { (W() - w - 10, TOP + 10) };
     Some((x, y, w + 3, 28 + 3))
 }
 
@@ -897,7 +977,7 @@ pub(super) fn draw() {
     let us = crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / crate::timer::hz().max(1);
     // SAFETY: mainline only.
     unsafe { DRAW_US = (us, DRAW_US.1.max(us)) };
-    crate::screen::mark();
+    crate::canvas::mark();
 }
 
 /// The last and the worst whole-desktop draw, in microseconds (`desk perf`).
@@ -943,5 +1023,5 @@ pub(super) fn draw_damage(boxes: &[Rect]) {
     let us = crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / crate::timer::hz().max(1);
     // SAFETY: mainline only.
     unsafe { PART_US = (us, PART_US.1.max(us), PART_US.2 + 1) };
-    crate::screen::mark();
+    crate::canvas::mark();
 }

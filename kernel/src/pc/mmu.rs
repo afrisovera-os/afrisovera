@@ -150,6 +150,7 @@ pub fn init(top: u64) -> Option<(u64, usize)> {
     }
     let before = frame::used_frames();
     NX_ON.store(nx_here(), Ordering::Relaxed);
+    pat_init(); // PAT entry 4 = WC on the bootstrap core (the screen's pages use it)
     ROOT.store(frame::alloc()? as u64, Ordering::Relaxed);
     let mut pa = 0;
     while pa < top {
@@ -161,6 +162,46 @@ pub fn init(top: u64) -> Option<(u64, usize)> {
     // framebuffer, APIC), exactly as the firmware's did, so execution continues unchanged.
     unsafe { asm!("mov cr3, {}", in(reg) root(), options(nostack)) };
     Some((top, frame::used_frames() - before))
+}
+
+/// F8: leave [lo, hi) (4 KiB aligned) NOT PRESENT in the kernel's 1:1 map: each 2 MiB page that covers it is
+/// split into a page table of 4 KiB entries with the same flags and memory type (`split_2m`, PAT bit included), the
+/// pages in [lo, hi) are left out, and CR3 is reloaded. Other cores' TLBs are not flushed: it runs at boot, before
+/// core 1 starts. Ring-3 spaces copy the kernel's PML4 entries (`new_space`), so they share the guard. False when out
+/// of table frames (nothing is changed then) or when [lo, hi) is not under a 2 MiB page of the 1:1 map.
+pub fn guard(lo: u64, hi: u64) -> bool {
+    let mut big = lo & !(PAGE_2M - 1);
+    while big < hi {
+        let Some(e) = entry(big, 2, false) else { return false };
+        if *e & PRESENT == 0 || *e & HUGE == 0 {
+            return false;
+        }
+        let Some(pt) = split_2m(*e, big) else { return false };
+        for (i, slot) in table(pt).iter_mut().enumerate() {
+            let pa = big + (i as u64) * 4096;
+            if pa >= lo && pa < hi {
+                *slot = 0;
+            }
+        }
+        *e = pt | PRESENT | WRITE;
+        big += PAGE_2M;
+    }
+    // SAFETY: reloading CR3 drops every cached translation of the pages just split.
+    unsafe { asm!("mov {t}, cr3", "mov cr3, {t}", t = out(reg) _, options(nostack)) };
+    true
+}
+
+/// Split the 2 MiB page entry `e` (the block at `big`) into a new page table of 512 4 KiB entries with the same
+/// P/W/U/PWT/PCD/NX bits, and the PAT bit moved from bit 12 (2 MiB entry) to bit 7 (4 KiB entry), so a split never
+/// changes a page's memory type. The one split for `guard` and `map_screen` (architect's D1 condition 2). Returns
+/// the table's physical address; the caller points `e` at it. None when out of table frames.
+fn split_2m(e: u64, big: u64) -> Option<u64> {
+    let flags = e & (PRESENT | WRITE | USER | PWT | PCD | NX) | if e & PAT_2M != 0 { PAT_4K } else { 0 };
+    let pt = frame::alloc()? as u64;
+    for (i, slot) in table(pt).iter_mut().enumerate() {
+        *slot = (big + (i as u64) * 4096) | flags;
+    }
+    Some(pt)
 }
 
 /// Map device registers at [pa, pa + len) 1:1, uncached, in 2 MiB pages: for a PCI BAR the
@@ -294,4 +335,171 @@ pub fn user_mapped_in(root: u64, va: u64) -> bool {
 pub fn switch_to(root: u64) {
     // SAFETY: every space made by `new_space` maps the kernel exactly as the kernel's does.
     unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
+}
+
+// ---------------------------------------------------------------------------------------
+// Write-combining for the screen (11 Nov 2026, the OS lead's D1, architect's plan review):
+// PAT entry 4 becomes WC on every core, and only the GOP framebuffer's pages use it.
+// ---------------------------------------------------------------------------------------
+const PAT_MSR: u32 = 0x277;
+/// The PAT bit of a 2 MiB page entry (bit 7 there is the page-size bit).
+const PAT_2M: u64 = 1 << 12;
+/// The PAT bit of a 4 KiB page entry.
+const PAT_4K: u64 = 1 << 7;
+/// PAT memory type write-combining, and where entry 4 sits in the MSR.
+const WC: u64 = 0x01;
+const PAT4_SHIFT: u32 = 32;
+static PAT_ON: AtomicBool = AtomicBool::new(false);
+/// Cores whose PAT entry 4 read back as WC after `pat_init`.
+static PAT_CORES: AtomicU64 = AtomicU64::new(0);
+/// The framebuffer range now mapped WC (base, length), and its 4 KiB pages counted.
+static WC_BASE: AtomicU64 = AtomicU64::new(0);
+static WC_LEN: AtomicU64 = AtomicU64::new(0);
+
+/// CPUID.1:EDX bit 16: the CPU has the page attribute table.
+pub fn pat_present() -> bool {
+    // SAFETY: CPUID leaf 1 exists on every x86-64 CPU.
+    unsafe { core::arch::x86_64::__cpuid(1).edx & (1 << 16) != 0 }
+}
+
+/// On this core: PAT entry 4 = WC, entries 0-3 (the PWT/PCD types every other mapping uses)
+/// left at their power-on values. The SDM's sequence for changing memory types: interrupts
+/// off, caches off (CR0.CD), WBINVD, write the MSR, WBINVD, flush the TLB, caches back on.
+/// Runs on the bootstrap core in `init` and on each further core before it uses the tables.
+pub fn pat_init() {
+    if !pat_present() {
+        return;
+    }
+    // SAFETY: the documented PAT update sequence; interrupts are restored as they were.
+    unsafe {
+        let flags: u64;
+        asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem));
+        let cr0: u64;
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
+        asm!("mov cr0, {}", in(reg) (cr0 | 1 << 30) & !(1u64 << 29), options(nostack)); // CD on, NW off
+        asm!("wbinvd", options(nostack));
+        let pat = crate::cpu::rdmsr(PAT_MSR);
+        crate::cpu::wrmsr(PAT_MSR, (pat & !(0xFF << PAT4_SHIFT)) | WC << PAT4_SHIFT);
+        asm!("wbinvd", options(nostack));
+        asm!("mov {t}, cr3", "mov cr3, {t}", t = out(reg) _, options(nostack));
+        asm!("mov cr0, {}", in(reg) cr0, options(nostack));
+        if flags & (1 << 9) != 0 {
+            asm!("sti", options(nomem, nostack));
+        }
+        if (crate::cpu::rdmsr(PAT_MSR) >> PAT4_SHIFT) & 0xFF == WC {
+            PAT_ON.store(true, Ordering::Relaxed);
+            PAT_CORES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// `sfence`: drain this core's write-combining buffers. Every writer of the screen ends with it
+/// (screen::present, screen::clear, the boot trail), so each frame reaches the screen whole
+/// (architect's D1 condition 4).
+pub fn wc_fence() {
+    // SAFETY: a store fence has no other effect.
+    unsafe { asm!("sfence", options(nostack, preserves_flags)) };
+}
+
+/// Map the GOP framebuffer [pa, pa + len) write-combining (PAT entry 4): 2 MiB pages wholly
+/// inside it get the PAT bit, an edge page shared with anything else is split into 4 KiB
+/// entries (`split_2m`) and only the framebuffer's get it, so nothing else is ever WC. Without
+/// PAT (or with `wc` false) it is mapped uncached (PWT|PCD, entry 3), as before D1. Returns the
+/// 4 KiB pages now WC (0 when uncached); None when out of table frames.
+///
+/// The architect's D1 conditions, as built:
+/// 1. A framebuffer below 4 GiB (QEMU's 0x80000000, most laptops) is already in `init`'s 1:1 map
+///    as WB 2 MiB pages; `map_mmio` leaves those alone, and the loop below REWRITES them (and
+///    any 4 KiB table a split left there). Only pages above the 1:1 map are new.
+/// 3. Other cores' TLBs: at boot this runs from screen::attach, before smp::bring_up starts
+///    core 1, so no other core holds a translation. At run time (`screen wc on|off`) the caller
+///    first checks `smp::can_flush_others` and refuses while another core cannot take an
+///    interrupt; after the change this asks every other core by IPI to drain its WC buffers,
+///    write back its caches and reload CR3 (`smp::flush_others`), so no core keeps the old type.
+/// 4. Before any change of type: sfence and WBINVD on this core (dirty WB lines or full WC
+///    buffers must not outlive the old type; `screen wc off` is covered by this).
+/// 5. Nothing in the kernel reads the framebuffer back (checked by grep, 11 Nov 2026: screen.rs
+///    and main.rs's boot trail only write it); a read from WC memory is uncached and slow, so
+///    keep it that way.
+pub fn map_screen(pa: u64, len: u64, wc: bool) -> Option<u64> {
+    if !map_mmio(pa, len) {
+        return None; // pages above the 1:1 map get their entries first (uncached)
+    }
+    wc_fence();
+    // SAFETY: writes back and invalidates this core's caches; no other effect.
+    unsafe { asm!("wbinvd", options(nostack)) };
+    let wc = wc && PAT_ON.load(Ordering::Relaxed);
+    let (lo, hi) = (pa & !0xFFF, (pa + len + 0xFFF) & !0xFFF);
+    // a WC page: the PAT bit set and PWT/PCD clear selects entry 4; uncached: PWT|PCD (entry 3)
+    let set = |e: u64, pat: u64| if wc { (e & !(PWT | PCD)) | pat } else { (e & !pat) | PWT | PCD };
+    let mut pages = 0;
+    let mut big = lo & !(PAGE_2M - 1);
+    while big < hi {
+        let e = entry(big, 2, false)?;
+        if *e & PRESENT == 0 {
+            return None;
+        }
+        let whole = big >= lo && big + PAGE_2M <= hi;
+        if *e & HUGE != 0 && whole {
+            *e = set(*e, PAT_2M);
+            pages += 512;
+        } else {
+            if *e & HUGE != 0 {
+                let pt = split_2m(*e, big)?; // the edge page: same types, then only the screen's change
+                *e = pt | PRESENT | WRITE;
+            }
+            let t = table(*e & ADDR);
+            for (i, slot) in t.iter_mut().enumerate() {
+                let p = big + (i as u64) * 4096;
+                if p >= lo && p < hi && *slot & PRESENT != 0 {
+                    *slot = set(*slot, PAT_4K);
+                    pages += 1;
+                }
+            }
+        }
+        big += PAGE_2M;
+    }
+    // SAFETY: drops every cached translation of the pages just changed.
+    unsafe { asm!("mov {t}, cr3", "mov cr3, {t}", t = out(reg) _, options(nostack)) };
+    crate::smp::flush_others(); // condition 3 (a no-op at boot, before core 1 runs)
+    WC_BASE.store(lo, Ordering::Relaxed);
+    WC_LEN.store(hi - lo, Ordering::Relaxed);
+    Some(if wc { pages } else { 0 })
+}
+
+/// The memory type the kernel's tables give `va` (from its entry's PAT/PCD/PWT bits and this
+/// core's PAT MSR): "WB", "WT", "UC-", "UC", "WC", "WP", or "unmapped".
+pub fn cache_type(va: u64) -> &'static str {
+    let mut t = root();
+    let mut l = 4;
+    loop {
+        let e = table(t)[((va >> (12 + 9 * (l - 1))) & 0x1FF) as usize];
+        if e & PRESENT == 0 {
+            return "unmapped";
+        }
+        let leaf = l == 1 || (l == 2 && e & HUGE != 0);
+        if leaf {
+            let pat = if l == 1 { e & PAT_4K != 0 } else { e & PAT_2M != 0 };
+            let idx = (pat as u32) << 2 | ((e & PCD != 0) as u32) << 1 | (e & PWT != 0) as u32;
+            // SAFETY: reading this core's PAT MSR (present on every x86-64 CPU in practice;
+            // without PAT the power-on table is assumed).
+            let msr = if pat_present() { unsafe { crate::cpu::rdmsr(PAT_MSR) } } else { 0x0007_0406_0007_0406 };
+            return match (msr >> (8 * idx)) & 0xFF {
+                0 => "UC",
+                1 => "WC",
+                4 => "WT",
+                5 => "WP",
+                6 => "WB",
+                7 => "UC-",
+                _ => "?",
+            };
+        }
+        t = e & ADDR;
+        l -= 1;
+    }
+}
+
+/// For `screen`: whether the framebuffer is WC, on how many cores, its range.
+pub fn wc_state() -> (bool, u64, u64, u64) {
+    (PAT_ON.load(Ordering::Relaxed), PAT_CORES.load(Ordering::Relaxed), WC_BASE.load(Ordering::Relaxed), WC_LEN.load(Ordering::Relaxed))
 }

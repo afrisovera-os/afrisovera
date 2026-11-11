@@ -23,20 +23,32 @@ T="${TMPDIR:-/tmp}"
 #   and grades that the driver finds AfriSovera's partition and the file on it (real laptops' firmware boots eMMC)
 # INSTALLDISK_KIND=ide (scripts/pc-installdisk-ide-test.sh): the same on a SATA disk in IDE mode (QEMU's piix3-ide,
 #   primary master = ide0); boot 3 starts from it through the firmware's own IDE driver
+# Since 11 Nov 2026 boot 2 of the NVMe, SATA and IDE kinds runs lsnvme, lsahci or lside after installdisk, and the
+#   grader wants the "big copies" line: the boot file went out in runs of several sectors, each one command and read
+#   back (table_write_run in nvme.rs, ahci.rs and ide.rs). The eMMC kind still writes one sector at a time.
+# INSTALLDISK_KIND=nvme4k (scripts/pc-installdisk-nvme4k-test.sh, 11 Nov 2026): the NVMe kind with 4096-byte blocks,
+#   as many laptop SSDs have: the GPT and FAT32 count in 4 KiB blocks, and the big copies go in whole blocks
 KIND="${INSTALLDISK_KIND:-nvme}"
 BOOT3_LINE='harness: boot 3: only the installed disk attached (no USB stick, no boot disk)'
 BOOT3_RE='^harness: boot 3: only the installed disk attached \(no USB stick, no boot disk\)$'
 if [ "$KIND" = sata ]; then
-    CMD=sata2; NAME="sata port 2"; DRV='\[ahci\] port 2:'; DEV=(-device ide-hd,drive=sd,bus=ide.2); PORT=5170; UP=SATA
+    CMD=sata2; NAME="sata port 2"; DRV='\[ahci\] port 2:'; DEV=(-device ide-hd,drive=sd,bus=ide.2); PORT=5170; UP=SATA; LS=lsahci
 elif [ "$KIND" = ide ]; then
-    CMD=ide0; NAME=ide0; DRV='\[ide\] ide0:'; DEV=(-device piix3-ide,id=pide -device ide-hd,drive=sd,bus=pide.0,unit=0); PORT=6170; UP=IDE
+    CMD=ide0; NAME=ide0; DRV='\[ide\] ide0:'; DEV=(-device piix3-ide,id=pide -device ide-hd,drive=sd,bus=pide.0,unit=0); PORT=6170; UP=IDE; LS=lside
 elif [ "$KIND" = emmc ]; then
     CMD=emmc; NAME=emmc; DRV='\[sdhci\] eMMC:'; DEV=(-device sdhci-pci -device emmc,drive=sd); PORT=5270; UP=eMMC
     BOOT3_LINE='harness: boot 3: the installed eMMC attached, started from the stick layout (QEMU firmware has no eMMC driver)'
     BOOT3_RE='^harness: boot 3: the installed eMMC attached, started from the stick layout \(QEMU firmware has no eMMC driver\)$'
+elif [ "$KIND" = nvme4k ]; then
+    CMD=nvme; NAME=nvme; DRV='\[nvme\]'; DEV=(-device nvme,serial=afri01,drive=sd,logical_block_size=4096,physical_block_size=4096)
+    PORT=6270; UP='NVMe, 4 KiB blocks'; LS=lsnvme; BS=4096
 else
-    CMD=nvme; NAME=nvme; DRV='\[nvme\]'; DEV=(-device nvme,serial=afri01,drive=sd); PORT=5070; UP=NVMe
+    CMD=nvme; NAME=nvme; DRV='\[nvme\]'; DEV=(-device nvme,serial=afri01,drive=sd); PORT=5070; UP=NVMe; LS=lsnvme
 fi
+# the disk's block size, and where installdisk puts the two partitions in it (1 MiB, 300 MiB, the rest)
+BS="${BS:-512}"; ESPR='2048-616447'; AFR=616448
+[ "$BS" = 4096 ] && { ESPR='256-77055'; AFR=77056; }
+LS="${LS:-}"; RUNS=' \(on\)'; [ "$KIND" = ide ] && RUNS=' and flushed once \(on\)'
 
 grade() { # grade <boot1 log> <boot2 log> <boot3 log>
     local fail=0 A B C
@@ -56,15 +68,15 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log>
         _f "boot 1: installdisk did not give the code"
     hasA '^installdisk: that code does not fit this disk as it is now -- nothing written$' || _f "boot 1: a wrong code was not refused"
     hasA '^harness: boot 1: the disk image is unchanged$' || _f "boot 1: the disk was written before the code was typed"
-    hasB "^installdisk: $NAME: GPT written \\(EFI system partition LBA 2048-616447, AfriSovera.s partition LBA 616448-[0-9]+\\), boot file [0-9]+ KiB written and read back OK" ||
+    hasB "^installdisk: $NAME: GPT written \\(EFI system partition LBA $ESPR, AfriSovera.s partition LBA $AFR-[0-9]+\\), boot file [0-9]+ KiB written and read back OK" ||
         _f "boot 2: the table and boot file were not written and read back"
     hasB '^installdisk: AfriSovera.s partition formatted \([0-9]+ MiB\); the shell.s files are kept there from now on$' ||
         _f "boot 2: AfriSovera's partition was not formatted and used"
     hasB '^harness: boot 2: GPT ok \(protective MBR, both headers, 2 entries\), FAT32 EFI\\BOOT\\BOOTX64\.EFI is the booted kernel byte for byte$' ||
         _f "boot 2: the harness's own read of the disk image did not find a valid GPT + FAT32 boot file"
-    if [ "$KIND" = ide ]; then # 10 Nov 2026: the big copies go in runs of up to 16 sectors, one cache flush each
-        hasB '^  big copies \(installdisk, bootcopy\): [1-9][0-9]* run\(s\) in one command, [1-9][0-9]* sector\(s\), each read back and flushed once \(on\)$' ||
-            _f "boot 2: installdisk did not write its big copies in runs of several sectors (lside)"
+    if [ "$KIND" != emmc ]; then # 10/11 Nov 2026: the big copies go in runs of up to 16 sectors (IDE: one flush each)
+        hasB '^  big copies \(installdisk, bootcopy\): [1-9][0-9]* run\(s\) in one command, [1-9][0-9]* sector\(s\), each read back'"$RUNS"'$' ||
+            _f "boot 2: installdisk did not write its big copies in runs of several sectors ($LS)"
     fi
     hasC "$BOOT3_RE" || _f "boot 3: the harness did not boot from the installed disk alone"
     hasC '^\[pc\] MANSA-PC BOOT OK$' || _f "boot 3: AfriSovera did not start from the installed disk"
@@ -122,6 +134,14 @@ elif [ "$KIND" = emmc ]; then # the same samples as the eMMC says them
     B2="$(printf '%s\n' "$B2" | sed "$EMMC_SED")"
     B3="$(printf '%s\n' "$B3" | sed "$EMMC_SED")"
 fi
+if [ "$KIND" = nvme4k ]; then # the same samples as a 4 KiB-block NVMe disk says them
+    K4_SED='s/1024 MiB, 512-byte blocks/1024 MiB, 4096-byte blocks/; s/start 2048, 2095104 sectors/start 256, 261888 sectors/; s/LBA 2048-616447/LBA 256-77055/; s/LBA 616448-2095103/LBA 77056-261887/'
+    B1="$(printf '%s\n' "$B1" | sed "$K4_SED")"
+    B2="$(printf '%s\n' "$B2" | sed "$K4_SED")"
+fi
+if [ "$KIND" = nvme ] || [ "$KIND" = nvme4k ] || [ "$KIND" = sata ]; then # lsnvme / lsahci after installdisk in boot 2
+    B2="$(printf '%s\n  big copies (installdisk, bootcopy): 907 run(s) in one command, 14500 sector(s), each read back (on)' "$B2")"
+fi
 
 selftest() {
     local D pass=0 bad=0
@@ -149,10 +169,14 @@ selftest() {
     arm panic red "$B1" "$B2" "$(printf '%s\nKERNEL PANIC' "$B3")"
     arm empty red "" "" ""
     NARMS=14
-    if [ "$KIND" = ide ]; then
-        NARMS=15
-        arm big-copies-off red "$B1" "$(printf '%s
-' "$B2" | sed 's/flushed once (on)/flushed once (off)/')" "$B3"
+    if [ "$KIND" != emmc ]; then
+        NARMS=16
+        arm big-copies-off red "$B1" "$(printf '%s\n' "$B2" | sed 's/ (on)$/ (off)/')" "$B3"
+        arm no-big-copies red "$B1" "$(printf '%s\n' "$B2" | grep -v 'big copies')" "$B3"
+    fi
+    if [ "$KIND" = nvme4k ]; then # the partitions counted in 512-byte sectors on a 4 KiB disk
+        NARMS=$((NARMS + 1))
+        arm counted-in-512 red "$B1" "$(printf '%s\n' "$B2" | sed 's/LBA 256-77055/LBA 2048-616447/; s/LBA 77056-/LBA 616448-/')" "$B3"
     fi
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
@@ -189,16 +213,17 @@ winpath() { if command -v cygpath > /dev/null; then cygpath -m "$1"; else printf
 W="$(mktemp -d "$T/pc-installdisk.XXXXXX")"
 IMG="$W/disk.img"
 # a 1 GiB disk that looks used: an MBR with one NTFS partition from sector 2048, an NTFS boot sector there
-"$PY" - "$IMG" << 'PYEOF'
+"$PY" - "$IMG" "$BS" << 'PYEOF'
 import sys, struct
+bs = int(sys.argv[2]); one = (1 << 20) // bs # blocks in 1 MiB
 f = open(sys.argv[1], "wb")
 f.truncate(1 << 30)
 m = bytearray(512)
-m[446:462] = bytes([0x80, 0, 0, 0, 0x07, 0, 0, 0]) + struct.pack("<II", 2048, (1 << 21) - 2048)
+m[446:462] = bytes([0x80, 0, 0, 0, 0x07, 0, 0, 0]) + struct.pack("<II", one, (1 << 30) // bs - one)
 m[510:512] = b"\x55\xaa"
 f.seek(0); f.write(m)
 n = bytearray(512); n[0:11] = b"\xebR\x90NTFS    "; n[510:512] = b"\x55\xaa"
-f.seek(2048 * 512); f.write(n)
+f.seek(1 << 20); f.write(n)
 f.close()
 PYEOF
 md5() { "$PY" -c "import hashlib,sys; print(hashlib.md5(open(sys.argv[1],'rb').read()).hexdigest())" "$1"; }
@@ -222,17 +247,18 @@ else printf '\nharness: boot 1: the disk image CHANGED\n' >> "$W/boot1.log"; fi
 IC="$(tr -d '\r' < "$W/boot1.log" | grep -aoE "type exactly: installdisk $CMD yes [0-9a-f]{4}\$" | head -1 | awk '{print $NF}')"
 echo "  install code: ${IC:-NONE}"
 echo "  --- boot 2: the code typed, a file written ---"
-B2X=; [ "$KIND" = ide ] && B2X="|lside"
+B2X=; [ -n "$LS" ] && B2X="|$LS"
 boot_shim "$((PORT + 4))" "$W/boot2.log" "installdisk $CMD yes ${IC:-none}$B2X|write notes.txt HELLO-INSTALL-6NOV|sync"
 printf '\n' >> "$W/boot2.log"
-"$PY" - "$IMG" "$PC_EFI" >> "$W/boot2.log" << 'PYEOF'
+"$PY" - "$IMG" "$PC_EFI" "$BS" >> "$W/boot2.log" << 'PYEOF'
 import sys, struct, zlib
 d = open(sys.argv[1], "rb"); efi = open(sys.argv[2], "rb").read()
+BS = int(sys.argv[3]) # the disk's block size: GPT LBAs and FAT sectors count in it
 def sec(n, k=1):
-    d.seek(n * 512); return d.read(512 * k)
+    d.seek(n * BS); return d.read(BS * k)
 def bad(why):
     print("harness: boot 2: the disk image is wrong: " + why); sys.exit(0)
-d.seek(0, 2); blocks = d.tell() // 512
+d.seek(0, 2); blocks = d.tell() // BS
 m = sec(0)
 if m[510:512] != b"\x55\xaa" or m[450] != 0xEE: bad("no protective MBR")
 hs = []
@@ -243,7 +269,7 @@ for lba in (1, blocks - 1):
     hh = bytearray(h[:size]); hh[16:20] = b"\0\0\0\0"
     if zlib.crc32(bytes(hh)) != struct.unpack_from("<I", h, 16)[0]: bad("header CRC at LBA %d" % lba)
     elba, n, esz, ecrc = struct.unpack_from("<QIII", h, 72)
-    arr = sec(elba, n * esz // 512)
+    d.seek(elba * BS); arr = d.read(n * esz)
     if zlib.crc32(arr) != ecrc: bad("entry array CRC for the header at LBA %d" % lba)
     hs.append(arr)
 if hs[0] != hs[1]: bad("the two entry arrays differ")
@@ -256,10 +282,10 @@ start = struct.unpack_from("<Q", used[0], 32)[0]
 b = sec(start)
 bps, spc, rsvd, nf = struct.unpack_from("<HBHB", b, 11)
 fsz, root = struct.unpack_from("<I", b, 36)[0], struct.unpack_from("<I", b, 44)[0]
-if b[82:90] != b"FAT32   " or bps != 512: bad("not FAT32")
+if b[82:90] != b"FAT32   " or bps != BS: bad("not FAT32")
 fat0 = start + rsvd; data0 = fat0 + nf * fsz
 def fat(c):
-    return struct.unpack_from("<I", sec(fat0 + c * 4 // 512), (c * 4) % 512)[0] & 0x0FFFFFFF
+    return struct.unpack_from("<I", sec(fat0 + c * 4 // BS), (c * 4) % BS)[0] & 0x0FFFFFFF
 def chain(c):
     out = []
     while 2 <= c < 0x0FFFFFF8 and len(out) < 100000:
@@ -297,7 +323,7 @@ kill "$q" 2> /dev/null
 wait "$q" 2> /dev/null
 fi
 cat "$W/boot1.log" "$W/boot2.log" "$W/boot3.log" | tr -d '\r' |
-    grep -aE '^afrisovera> (installdisk|cat)|^installdisk|^\[(nvme|ahci|sdhci|ide)\].*AfriSovera|^\[pc\] (own boot|MANSA)|^HELLO|^harness' | sed 's/^/  | /'
+    grep -aE '^afrisovera> (installdisk|cat)|^installdisk|^\[(nvme|ahci|sdhci|ide)\].*AfriSovera|^\[pc\] (own boot|MANSA)|^HELLO|^  big copies|^harness' | sed 's/^/  | /'
 
 echo "  --- grading ---"
 if grade "$W/boot1.log" "$W/boot2.log" "$W/boot3.log"; then

@@ -274,6 +274,7 @@ extern "sysv64" fn ap_main() -> ! {
     // changes to the kernel's table are seen here too)
     // SAFETY: both tables map the kernel 1:1 the same way, so execution continues unchanged.
     unsafe { core::arch::asm!("mov cr3, {}", in(reg) crate::mmu::root(), options(nostack)) };
+    crate::mmu::pat_init(); // the same PAT as core 0 (its screen pages are WC: every core must agree)
     cpu::lapic_enable_here();
     AP_ID.store(cpu::lapic_id(), Ordering::Relaxed);
     UP.store(true, Ordering::Release);
@@ -352,8 +353,52 @@ pub fn core1_tick(f: &mut TrapFrame) {
     }
 }
 
-/// An inter-processor interrupt on core 1: a message to answer, or a plain signal to report.
+/// TLB shootdown for a memory-type change (D1, architect's condition 3): asked / done counts.
+static FLUSH_ASKED: AtomicU32 = AtomicU32::new(0);
+static FLUSH_DONE: AtomicU32 = AtomicU32::new(0);
+
+/// True when every other core can be asked to flush now: no other core runs, or core 1's
+/// scheduler is up (it takes interrupts). False while core 1 is still starting.
+pub fn can_flush_others() -> bool {
+    !UP.load(Ordering::Acquire) || (CORE1_READY.load(Ordering::Acquire) && !on_core1())
+}
+
+/// After a change of memory type in the kernel's tables: ask core 1 by IPI to drain its WC
+/// buffers, write back its caches and reload CR3, and wait (up to 0.2 s) until it has. True
+/// when no other core runs or it answered.
+pub fn flush_others() -> bool {
+    if !UP.load(Ordering::Acquire) {
+        return true;
+    }
+    if !can_flush_others() {
+        return false;
+    }
+    let want = FLUSH_ASKED.fetch_add(1, Ordering::AcqRel) + 1;
+    cpu::send_ipi(AP_ID.load(Ordering::Relaxed), IPI_VECTOR);
+    let (t0, hz) = (crate::timer::cycles(), crate::timer::hz().max(1));
+    while FLUSH_DONE.load(Ordering::Acquire) < want && crate::timer::cycles() - t0 < hz / 5 {
+        core::hint::spin_loop();
+    }
+    FLUSH_DONE.load(Ordering::Acquire) >= want
+}
+
+/// Shootdowns core 1 has done (`screen wc on|off` reports it).
+pub fn flushes_done() -> u32 {
+    FLUSH_DONE.load(Ordering::Acquire)
+}
+
+/// An inter-processor interrupt on core 1: a TLB shootdown, a message to answer, or a plain
+/// signal to report.
 pub fn ipi() {
+    let asked = FLUSH_ASKED.load(Ordering::Acquire);
+    if FLUSH_DONE.load(Ordering::Relaxed) < asked {
+        // SAFETY: drain WC buffers, write back caches, drop every cached translation.
+        unsafe { core::arch::asm!("sfence", "wbinvd", "mov {t}, cr3", "mov cr3, {t}", t = out(reg) _, options(nostack)) };
+        FLUSH_DONE.store(asked, Ordering::Release);
+        if MAIL.load(Ordering::Acquire) == 0 {
+            return;
+        }
+    }
     let n = IPIS.load(Ordering::Relaxed) + 1;
     let msg = MAIL.swap(0, Ordering::AcqRel);
     if msg != 0 {

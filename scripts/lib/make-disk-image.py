@@ -11,6 +11,10 @@ damaged, and an old-style MBR disk. Plain Python, no tools needed.
     make-disk-image.py gpt-esp-full OUT   # the same, the EFI partition with 64 KiB free
     make-disk-image.py gpt-esp-dirty OUT  # the same, the EFI partition not closed cleanly
     make-disk-image.py gpt-esp-fsinfo OUT # gpt-esp with an FSInfo sector holding the free count (bootcopy)
+    make-disk-image.py gpt-esp-fsinfo-4k OUT # the same in 4096-byte blocks: 400 MiB, a 260 MiB EFI partition
+                                             # (Windows' size on 4 KiB disks: FAT32 needs 65525 clusters)
+    make-disk-image.py gpt-esp-full-4k OUT   # gpt-esp-fsinfo-4k with 64 KiB free (bootplan, nvme4k)
+    make-disk-image.py gpt-esp-dirty-4k OUT  # gpt-esp-fsinfo-4k not closed cleanly (bootplan, nvme4k)
 """
 import struct
 import sys
@@ -49,7 +53,8 @@ def gpt(damaged, parts=None, mib=64):
         nm = name.encode("utf-16-le")
         ents[e + 56:e + 56 + len(nm)] = nm
     ecrc = zlib.crc32(bytes(ents))
-    first, last = 34, n - 34
+    eb = len(ents) // S  # blocks the entry array takes (32 of 512 bytes, 4 of 4096)
+    first, last = 2 + eb, n - 2 - eb
 
     def header(me, alt, elba):
         h = bytearray(92)
@@ -63,8 +68,8 @@ def gpt(damaged, parts=None, mib=64):
 
     img[S:S + 92] = header(1, n - 1, 2)
     img[2 * S:2 * S + len(ents)] = ents
-    img[(n - 33) * S:(n - 33) * S + len(ents)] = ents
-    img[(n - 1) * S:(n - 1) * S + 92] = header(n - 1, 1, n - 33)
+    img[(n - 1 - eb) * S:(n - 1 - eb) * S + len(ents)] = ents
+    img[(n - 1) * S:(n - 1) * S + 92] = header(n - 1, 1, n - 1 - eb)
     if damaged:
         img[2 * S + 56] ^= 0x01  # first entry's name: E -> D, the entry CRC no longer matches
         img[(n - 1) * S:n * S] = bytes(S)  # backup header wiped
@@ -93,6 +98,14 @@ ESP_PARTS = [  # 160 MiB: a 100 MiB EFI partition as Windows makes it
     (g("E3C9E316-0B5C-4DB8-817D-F92DF00215AE"), 206848, 239615, "Microsoft reserved partition"),
     (g("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"), 239616, 317439, "Basic data partition"),
     (g("DE94BBA4-06D1-4D40-A16A-BFD50179D6AC"), 317440, 327639, "Recovery"),
+]
+
+
+ESP_PARTS_4K = [  # 400 MiB in 4096-byte blocks: a 260 MiB EFI partition as Windows makes it on a 4 KiB disk
+    (g("C12A7328-F81F-11D2-BA4B-00A0C93EC93B"), 256, 66815, "EFI system partition"),
+    (g("E3C9E316-0B5C-4DB8-817D-F92DF00215AE"), 66816, 70911, "Microsoft reserved partition"),
+    (g("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"), 70912, 91391, "Basic data partition"),
+    (g("DE94BBA4-06D1-4D40-A16A-BFD50179D6AC"), 92160, 102143, "Recovery"),
 ]
 
 
@@ -201,12 +214,21 @@ def gpt_esp(free_kib=None, dirty=False, fsinfo=False):
     return img
 
 
+def gpt_esp_4k(free_kib=None, dirty=False):
+    global S
+    S = 4096  # every sector number below counts in 4 KiB blocks; FAT32 sectors are 4096 bytes too
+    img = gpt(False, ESP_PARTS_4K, 400)
+    fat32(img, 256, 66816 - 256, free_kib, dirty, fsinfo=True)
+    return img
+
+
 def main():
     kind, out = sys.argv[1], sys.argv[2]
     img = {"gpt": lambda: gpt(False), "gpt-damaged": lambda: gpt(True), "mbr": mbr, "mbr-room": mbr_room,
            "blank": lambda: bytearray(16 * 1024 * 1024), "gpt-esp": gpt_esp,
            "gpt-esp-full": lambda: gpt_esp(free_kib=64), "gpt-esp-dirty": lambda: gpt_esp(dirty=True),
-           "gpt-esp-fsinfo": lambda: gpt_esp(fsinfo=True)}[kind]()
+           "gpt-esp-fsinfo": lambda: gpt_esp(fsinfo=True), "gpt-esp-fsinfo-4k": gpt_esp_4k,
+           "gpt-esp-full-4k": lambda: gpt_esp_4k(free_kib=64), "gpt-esp-dirty-4k": lambda: gpt_esp_4k(dirty=True)}[kind]()
     with open(out, "wb") as f:
         f.write(img)
 

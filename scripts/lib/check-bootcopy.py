@@ -4,7 +4,8 @@
     check-bootcopy.py copied  ORIG NOW BOOTFILE   # after bootcopy
     check-bootcopy.py removed ORIG MID NOW        # after bootcopy remove (MID: the image after bootcopy)
 
-The EFI system partition is the one make-disk-image.py's gpt-esp kinds put at sector 2048. Prints
+The EFI system partition is GPT entry 1, where make-disk-image.py's gpt-esp kinds put it (sector 2048; block
+256 in gpt-esp-fsinfo-4k). The block size (512 or 4096) is found from where the GPT header sits. Prints
 "check: ..." lines and, last, "harness: bootcopy image check PASSED" / "harness: bootcopy removal
 check PASSED", or "harness: ... FAILED: <why>". Exit 0 only when it passed.
 """
@@ -15,13 +16,25 @@ import subprocess
 import sys
 import tempfile
 
-S = 512
-START = 2048
+S = 512  # the disk's block size; FAT sectors are this size too (set by geometry() from the image)
+START = 2048  # the EFI partition's first block (GPT entry 1)
 EOC = 0x0FFFFFF8
 
 
 class Bad(Exception):
     pass
+
+
+def geometry(img):
+    """S and START from the image: the GPT header at block 1 (byte 512 or 4096), entry 1's first block."""
+    global S, START
+    for bs in (512, 4096):
+        if img[bs:bs + 8] == b"EFI PART":
+            S = bs
+            elba = struct.unpack_from("<Q", img, bs + 72)[0]
+            START = struct.unpack_from("<Q", img, elba * bs + 32)[0]
+            return
+    raise Bad("no GPT header at block 1 (512 or 4096 bytes)")
 
 
 def geo(img):
@@ -248,6 +261,7 @@ def main():
     mode = sys.argv[1]
     rd = lambda p: open(p, "rb").read()
     try:
+        geometry(rd(sys.argv[2]))
         if mode == "copied":
             check_copied(rd(sys.argv[2]), rd(sys.argv[3]), rd(sys.argv[4]))
         else:

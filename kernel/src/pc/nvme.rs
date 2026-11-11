@@ -91,6 +91,10 @@ static mut MAXB: u64 = RA_BYTES as u64;
 static mut RSTATS: (u64, u64, u64, u64) = (0, 0, 0, 0);
 /// Writes: sectors written, multi-block commands, single-block ones.
 static mut WSTATS: (u64, u64, u64) = (0, 0, 0);
+/// Big copies (table_write_run): 0 = not tried, 1 = on, 2 = off (one sector at a time, as table_write).
+static mut TRUN: u8 = 0;
+/// Big copies: runs sent in one command, sectors in them.
+static mut TSTATS: (u64, u64) = (0, 0);
 
 fn r32(off: u64) -> u32 {
     // SAFETY: BAR0 is mapped uncached by init before any register access.
@@ -692,6 +696,70 @@ pub fn table_write(n: u64, buf: &[u8; 512]) -> bool {
     ok
 }
 
+/// Write `data` (1 to 16 whole 512-byte sectors) from sector `n` of namespace 1 whoever owns it: ONE
+/// Write, then ONE Read and compared, so installdisk and bootcopy do not send a command for every sector
+/// (11 Nov 2026, as ahci.rs). WB carries the run and RA the read back (gathered writes go out first and
+/// the read-ahead is dropped). A run refused or read back different is written again one sector at a
+/// time (table_write) and runs stay off until power-off, with one line. One sector at a time also while
+/// multi-block reads are off. A namespace with blocks bigger than 512 bytes (4 KiB on many laptops) gets
+/// whole device blocks (11 Nov 2026): a block the run only partly covers is read first and the run laid
+/// into it, and a run wider than one command takes (8 KiB, or less if the controller says so) goes out
+/// as several commands, each one a run. The same callers and the same rule as table_write.
+pub fn table_write_run(n: u64, data: &[u8]) -> bool {
+    let c = data.len() / 512;
+    if c == 0 || c * 512 != data.len() || c * 512 > RA_BYTES {
+        return false;
+    }
+    let Some((cap, _)) = raw_info() else { return false };
+    let single = || data.chunks_exact(512).enumerate().all(|(j, s)| table_write(n + j as u64, s.try_into().unwrap()));
+    // SAFETY: single core, kernel/shell context, one command in flight; WB and RA are ours while no
+    // write is gathered (flush) and the read-ahead is dropped.
+    unsafe {
+        if c == 1 || TRUN == 2 || MULTI != 1 {
+            return single();
+        }
+        if n.saturating_add(c as u64) > cap || !flush() {
+            return false;
+        }
+        RA_N = 0;
+        let (per, bs) = (per(), LBA_BYTES as usize);
+        let kk = (kmax() as u64).min((RA_BYTES / bs.max(1)) as u64); // device blocks per command
+        if kk == 0 {
+            return single();
+        }
+        let (wb, rb) = (addr_of_mut!(WB.0) as *mut u8, addr_of_mut!(RA.0) as *mut u8);
+        let mut i = 0usize; // sectors of the run sent so far
+        while i < c {
+            let s = n + i as u64;
+            let b0 = s / per;
+            let end = ((b0 + kk) * per).min(n + c as u64); // the sector after this command's part
+            let k = ((end - 1) / per - b0 + 1) as u32;
+            let (len, head, take) = (k as usize * bs, (s - b0 * per) as usize * 512, (end - s) as usize * 512);
+            // a device block only partly in the run: what the disk holds now around it
+            let whole = head == 0 && take == len;
+            let ok = (whole || rw(OPC_READ, b0, k, wb as u64)) && {
+                core::slice::from_raw_parts_mut(wb.add(head), take).copy_from_slice(&data[i * 512..i * 512 + take]);
+                rw(OPC_WRITE, b0, k, wb as u64)
+                    && rw(OPC_READ, b0, k, rb as u64)
+                    && core::slice::from_raw_parts(rb, len) == core::slice::from_raw_parts(wb as *const u8, len)
+            };
+            if !ok {
+                crate::kprintln!(
+                    "[nvme] {} sectors written in one command were refused or read back different, so big copies go one sector at a time from now on",
+                    take / 512
+                );
+                TRUN = 2;
+                return single();
+            }
+            TRUN = 1;
+            TSTATS.0 += 1;
+            TSTATS.1 += (take / 512) as u64;
+            i += take / 512;
+        }
+        true
+    }
+}
+
 /// `lsnvme`: the controller and its namespace.
 pub fn list() {
     // SAFETY: scalar reads of boot-time state.
@@ -720,5 +788,13 @@ pub fn list() {
         let word = |s: u8| match s { 1 => "on", 2 => "off", _ => "not checked yet" };
         crate::kprintln!("  reads: {} sector(s), {} from the read-ahead, {} multi-block command(s), {} single ({})", r.0, r.1, r.2, r.3, word(mr));
         crate::kprintln!("  writes: {} sector(s), {} multi-block command(s), {} single ({})", w.0, w.1, w.2, word(mw));
+        // SAFETY: scalar reads.
+        let (tr, t) = unsafe { (TRUN, TSTATS) };
+        if tr != 0 {
+            crate::kprintln!(
+                "  big copies (installdisk, bootcopy): {} run(s) in one command, {} sector(s), each read back ({})",
+                t.0, t.1, if tr == 1 { "on" } else { "off" }
+            );
+        }
     }
 }
