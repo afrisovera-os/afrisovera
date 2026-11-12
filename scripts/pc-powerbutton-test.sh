@@ -26,10 +26,10 @@ grade() { # grade <boot1> <boot2>
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$1" | grep -aqE "$2"; }
+    has() { grep -aqE "$2" <<< "$1"; }
     # what came after the press (the first "pressed" line onwards)
     after() { printf '%s\n' "$1" | sed -n '/^\(afrisovera> \)\{0,1\}\[pc\] power button pressed: saving AfriSovera.s files, then switching off$/,$p'; }
-    local READY='^\[pc\] power button: ready -- a press saves the files and switches off \(PM1a 0x[0-9a-f]+, ACPI mode (switched on|already on)\)$'
+    local READY='^\[pc\] power button: ready; a press saves the files and switches off \(PM1a 0x[0-9a-f]+, ACPI mode (switched on|already on)\)$'
     has "$A" "$READY" || _f "boot 1: the power button was not armed at boot"
     has "$B" "$READY" || _f "boot 2: the power button was not armed at boot"
     has "$A" '^acpi: power button on \(PM1a events 0x[0-9a-f]+, control 0x[0-9a-f]+, SMI_CMD 0x[0-9a-f]+, ACPI mode on, presses 0\)$' ||
@@ -53,7 +53,7 @@ grade() { # grade <boot1> <boot2>
     return "$fail"
 }
 
-S1='[pc] power button: ready -- a press saves the files and switches off (PM1a 0x600, ACPI mode switched on)
+S1='[pc] power button: ready; a press saves the files and switches off (PM1a 0x600, ACPI mode switched on)
 afrisovera> acpiinfo
 acpi: 2 core(s), local-APIC ids [0, 1], I/O APIC at 0xfec00000
 acpi: PM timer at I/O port 0x608
@@ -69,7 +69,7 @@ afrisovera> [pc] power button pressed: saving AfriSovera'"'"'s files, then switc
 [pc] powering off (UEFI ResetSystem: shutdown)
 
 == power-button: qemu exited on its own after 1 s =='
-S2='[pc] power button: ready -- a press saves the files and switches off (PM1a 0x600, ACPI mode switched on)
+S2='[pc] power button: ready; a press saves the files and switches off (PM1a 0x600, ACPI mode switched on)
 afrisovera> cat notes.txt
 PWRBTN-7NOV
 afrisovera> [pc] power button pressed: saving AfriSovera'"'"'s files, then switching off
@@ -113,8 +113,8 @@ selftest() {
 }
 
 echo "== PC power button (ACPI fixed event, PC track step 3) =="
-if ! selftest; then echo "PC POWERBUTTON TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC POWERBUTTON SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC POWERBUTTON TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC POWERBUTTON SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

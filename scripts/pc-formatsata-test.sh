@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track step 5 (6 Nov 2026): `formatpart sataN [yes <code>]` -- the same as pc-formatpart, on a SATA
+# PC track step 5 (6 Nov 2026): `formatpart sataN [yes <code>]`: the same as pc-formatpart, on a SATA
 # disk: AfriSovera's partition (the one `installpart sata2` adds to a GPT) formatted with the VFS on the
 # owner's code, and the shell's files kept INSIDE it from then on; Windows' partitions beside it are never
 # written. At boot the AHCI driver finds the partition again (healthy GPT, both headers + entries CRC,
@@ -27,14 +27,14 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     [ -r "$1" ] && [ -r "$2" ] && [ -r "$3" ] && [ -r "$4" ] || { echo "  FAIL: missing log"; return 1; }
     cl() { tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g'; }
     A="$(cl "$1")"; B="$(cl "$2")"; C="$(cl "$3")"; D="$(cl "$4")"
-    has() { printf '%s\n' "$1" | grep -aqxE "$2"; }
+    has() { grep -aqxE "$2" <<< "$1"; }
     blk() { printf '%s\n' "$1" | awk -v c="afrisovera> $2" '$0==c{on=1;next} /^afrisovera>/{on=0} on'; }
     local IC FC
     IC="$(printf '%s\n' "$A" | grep -aoE 'type exactly: installpart sata2 8 yes [0-9a-f]{4}$' | head -1 | awk '{print $NF}')"
     [ -n "$IC" ] || _f "boot 1: installpart sata2 8 did not show its code"
     FC="$(printf '%s\n' "$B" | grep -aoE 'type exactly: formatpart sata2 yes [0-9a-f]{4}$' | head -1 | awk '{print $NF}')"
     [ -n "$FC" ] || _f "boot 2: formatpart sata2 did not show its code"
-    has "$(blk "$A" 'formatpart sata2')" 'formatpart: sata port 2 has no AfriSovera partition in a healthy GPT -- make one with installpart first; nothing written' ||
+    has "$(blk "$A" 'formatpart sata2')" 'formatpart: sata port 2 has no AfriSovera partition in a healthy GPT; make one with installpart first; nothing written' ||
         _f "boot 1: formatpart without a partition did not refuse"
     has "$(blk "$A" 'formatpart sata')" 'formatpart: say which SATA port, e.g. formatpart sata2 \(see lsparts\); nothing written' ||
         _f "boot 1: bare formatpart sata was not refused"
@@ -43,7 +43,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
         _f "boot 2: the install code did not write entry 5"
     has "$(blk "$B" 'formatpart sata2')" "formatpart: sata port 2: AfriSovera's partition, sectors 100352-116735 \(8 MiB\); whatever is in it now is lost, no other partition is touched" ||
         _f "boot 2: formatpart did not name the partition"
-    has "$(blk "$B" 'formatpart sata2 yes zzzz')" 'formatpart: that code does not fit this partition now -- nothing written' || _f "boot 2: a wrong code was not refused"
+    has "$(blk "$B" 'formatpart sata2 yes zzzz')" 'formatpart: that code does not fit this partition now; nothing written' || _f "boot 2: a wrong code was not refused"
     has "$B" 'harness: boot 2: sata image: only the four GPT table sectors changed' || _f "boot 2: formatpart (or the install) wrote more than the table"
     has "$C" "\[ahci\] port 2: AfriSovera's partition at sector 100352 \(8 MiB\) is not formatted yet \(formatpart sata2\)" ||
         _f "boot 3: the driver did not find the unformatted partition at boot"
@@ -52,7 +52,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     has "$(blk "$C" 'lsahci')" "  storage: port 2, AfriSovera's partition, sectors 100352-116735 \(8 MiB\); nothing outside it is written" ||
         _f "boot 3: lsahci does not show the partition as storage"
     has "$(printf '%s\n' "$C" | awk -v c="afrisovera> formatpart sata2" '$0==c{on=1;next} /^afrisovera>/{on=0} on')" \
-        "formatpart: sata port 2 already keeps AfriSovera's files in its partition at sector 100352 \(8 MiB\) -- nothing written" ||
+        "formatpart: sata port 2 already keeps AfriSovera's files in its partition at sector 100352 \(8 MiB\); nothing written" ||
         _f "boot 3: formatpart twice was not refused"
     has "$C" 'harness: boot 3: sata image: every changed sector is inside the partition, AFRIVFS1 at sector 100352' ||
         _f "boot 3: something outside the partition was written (or no AFRIVFS1)"
@@ -67,7 +67,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
 }
 
 M1="afrisovera> formatpart sata2
-formatpart: sata port 2 has no AfriSovera partition in a healthy GPT -- make one with installpart first; nothing written
+formatpart: sata port 2 has no AfriSovera partition in a healthy GPT; make one with installpart first; nothing written
 afrisovera> formatpart sata
 formatpart: say which SATA port, e.g. formatpart sata2 (see lsparts); nothing written
 afrisovera> tablebackup
@@ -82,7 +82,7 @@ afrisovera> formatpart sata2
 formatpart: sata port 2: AfriSovera's partition, sectors 100352-116735 (8 MiB); whatever is in it now is lost, no other partition is touched
 formatpart: nothing written yet. To format it, type exactly: formatpart sata2 yes 77ab
 afrisovera> formatpart sata2 yes zzzz
-formatpart: that code does not fit this partition now -- nothing written
+formatpart: that code does not fit this partition now; nothing written
 afrisovera>
 harness: boot 2: sata image: only the four GPT table sectors changed"
 M3="[ahci] port 2: AfriSovera's partition at sector 100352 (8 MiB) is not formatted yet (formatpart sata2)
@@ -96,7 +96,7 @@ afrisovera> lsahci
 afrisovera> write notes.txt HELLO-SATA-6NOV
 afrisovera> sync
 afrisovera> formatpart sata2
-formatpart: sata port 2 already keeps AfriSovera's files in its partition at sector 100352 (8 MiB) -- nothing written
+formatpart: sata port 2 already keeps AfriSovera's files in its partition at sector 100352 (8 MiB); nothing written
 afrisovera>
 harness: boot 3: sata image: every changed sector is inside the partition, AFRIVFS1 at sector 100352"
 M4="[ahci] port 2: AfriSovera's partition at sector 100352 (8 MiB) holds our files
@@ -146,8 +146,8 @@ selftest() {
 }
 
 echo "== PC install on SATA: AfriSovera's partition formatted and used for the files, nothing outside it written (PC track step 5) =="
-if ! selftest; then echo "PC FORMATSATA TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC FORMATSATA SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC FORMATSATA TEST FAILED (grader selftest); no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC FORMATSATA SELFTEST ONLY; no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

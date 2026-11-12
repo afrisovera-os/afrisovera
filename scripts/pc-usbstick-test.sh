@@ -25,6 +25,12 @@ grade() { # grade <boot1 log> <boot2 log>
         _f "boot 1: the blank USB stick was not identified and chosen for storage"
     hasA '^\[ahci\] port 0: SATA disk, [0-9]+ sectors .*left alone$' || _f "boot 1: the boot disk was not found, or not left alone"
     hasA '^  storage: slot [0-9]+, 16384 blocks of 512 B  <- storage$' || _f "lsusb does not list the stick as storage"
+    hasA '^lsusb late: 2 answers were left unread; the next read of block 0 passed \(same data\), 2 late event\(s\) set aside, 0 recoveries: OK$' ||
+        _f "lsusb late: a late answer was taken as a later transfer's, or the check did not run"
+    hasA '^  storage: [0-9]+ late transfer event' && _f "a late transfer event was seen before the test switch ran"
+    hasA '^lsusb late0: an answer was left unread on endpoint 0; the next request passed \(descriptor of 18 bytes, type 1\), took its own answer, 1 late event\(s\) set aside: OK$' ||
+        _f "lsusb late0: a late endpoint 0 answer was taken as a later request's, or the check did not run"
+    hasA '^  control: [0-9]+ late endpoint 0 answer' && _f "a late endpoint 0 answer was seen before the test switch ran"
     hasA '^\[vfs\] synced [0-9]+ files to disk$' || _f "boot 1: the VFS never synced to the stick"
     hasB '^\[vfs\] VFS restored from disk: [0-9]+ files$' || _f "boot 2: the VFS was not restored from the stick"
     hasB '^HELLO-USB-STICK-5NOV$' || _f "boot 2: notes.txt did not come back from the stick"
@@ -39,6 +45,10 @@ B1="[xhci] port 1: USB storage 46f4:0001 \"QEMU    QEMU HARDDISK\", 16384 blocks
 [vfs] synced 17 files to disk
 afrisovera> lsusb
   storage: slot 1, 16384 blocks of 512 B  <- storage
+afrisovera> lsusb late
+lsusb late: 2 answers were left unread; the next read of block 0 passed (same data), 2 late event(s) set aside, 0 recoveries: OK
+afrisovera> lsusb late0
+lsusb late0: an answer was left unread on endpoint 0; the next request passed (descriptor of 18 bytes, type 1), took its own answer, 1 late event(s) set aside: OK
 afrisovera> write notes.txt HELLO-USB-STICK-5NOV
 [vfs] synced 18 files to disk"
 B2="[vfs] VFS restored from disk: 18 files
@@ -66,14 +76,20 @@ selftest() {
     arm not-persisted red "$B1" "$(printf '%s\n' "$B2" | grep -v '^HELLO')"
     arm no-capacity red "$(printf '%s\n[xhci] port 1: USB storage 46f4:0001 did not report its capacity' "$B1")" "$B2"
     arm empty red "" ""
+    arm late-taken red "$(printf '%s\n' "$B1" | sed 's/^lsusb late: .*/lsusb late: 2 answers were left unread; the next read of block 0 FAILED (DIFFERENT data), 0 late event(s) set aside, 3 recoveries: WRONG/')" "$B2"
+    arm no-late-check red "$(printf '%s\n' "$B1" | grep -v '^lsusb late')" "$B2"
+    arm late-at-boot red "$(printf '%s\n' "$B1" | sed 's/^  storage: slot.*/&\n  storage: 1 late transfer event(s) set aside, not taken as a later transfer'"'"'s/')" "$B2"
+    arm late0-taken red "$(printf '%s\n' "$B1" | sed 's/^lsusb late0: .*/lsusb late0: an answer was left unread on endpoint 0; the next request passed (descriptor of 0 bytes, type 0), took ANOTHER request'"'"'s answer, 0 late event(s) set aside: WRONG/')" "$B2"
+    arm no-late0-check red "$(printf '%s\n' "$B1" | grep -v '^lsusb late0')" "$B2"
+    arm late0-at-boot red "$(printf '%s\n' "$B1" | sed 's/^  storage: slot.*/&\n  control: 1 late endpoint 0 answer(s) set aside, not taken as a later request'"'"'s/')" "$B2"
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 10 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 16 ]
 }
 
 echo "== PC USBSTICK disk (PC track step 3) =="
-if ! selftest; then echo "PC USBSTICK TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC USBSTICK SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC USBSTICK TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC USBSTICK SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }
@@ -102,11 +118,11 @@ boot() { # boot <serial port> <log> <shell commands...>
     kill "$q" 2> /dev/null
     wait "$q" 2> /dev/null
 }
-echo "  --- boot 1: lsusb, write notes.txt, sync ---"
-boot 4824 "$W/boot1.log" "lsusb" "write notes.txt HELLO-USB-STICK-5NOV" "sync"
+echo "  --- boot 1: lsusb, lsusb late, lsusb late0, write notes.txt, sync ---"
+boot 4824 "$W/boot1.log" "lsusb" "lsusb late" "lsusb late0" "write notes.txt HELLO-USB-STICK-5NOV" "sync"
 echo "  --- boot 2: the same disk, cat notes.txt ---"
 boot 4826 "$W/boot2.log" "cat notes.txt"
-cat "$W/boot1.log" "$W/boot2.log" | tr -d '\r' | grep -aE 'USB storage|^  storage:|^\[vfs\]|HELLO' | sed 's/^/  | /'
+cat "$W/boot1.log" "$W/boot2.log" | tr -d '\r' | grep -aE 'USB storage|^  storage:|^  control:|^lsusb late|^\[vfs\]|HELLO' | sed 's/^/  | /'
 
 echo "  --- grading ---"
 if grade "$W/boot1.log" "$W/boot2.log"; then

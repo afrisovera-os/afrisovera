@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track step 5 (7 Nov 2026): `bootplan` -- where AfriSovera's boot file and its firmware boot entry WOULD go
+# PC track step 5 (7 Nov 2026): `bootplan`: where AfriSovera's boot file and its firmware boot entry WOULD go
 # on a disk Windows shares, READ ONLY. It reads each internal disk's EFI system partition (FAT32: boot sector,
 # both FAT copies, the "closed cleanly" bit, \EFI's folders with their long names, the free room) and says
 # where \EFI\afrisovera\afrisovera.efi would go and which Boot#### would be added at the END of BootOrder.
@@ -70,7 +70,7 @@ grade() { # grade <boot1 log> <boot2 log> [<boot3 log>, nvme4k only]
     fi
     # the block of output one command printed, so a line is graded against the command that asked
     blk() { printf '%s\n' "$1" | awk -v c="afrisovera> $2" '$0==c{on=1;next} /^afrisovera>/{on=0} on'; }
-    in_blk() { printf '%s\n' "$1" | grep -aqxE "$2"; }
+    in_blk() { grep -aqxE "$2" <<< "$1"; }
     # the lines of one disk inside a block: from its "bootplan: <disk>:" line to the next disk's
     disk() { printf '%s\n' "$1" | awk -v d="bootplan: $2:" 'index($0,d)==1{on=1;print;next} /^bootplan: /{on=0} on'; }
     local AP AE BP CP="" N1 S2 S3
@@ -97,18 +97,18 @@ grade() { # grade <boot1 log> <boot2 log> [<boot3 log>, nvme4k only]
     S2="$(disk "$BP" "$DN2")"; S3="$(disk "${CP:-$BP}" "$DN3")"
     in_blk "$(disk "$BP" "$UNF")" '  it holds no file system we know' || _f "boot 2: the unformatted EFI partition was not refused"
     in_blk "$S2" "  FAT32, $CLB-byte clusters, 64 KiB free" || _f "boot 2: the full EFI partition's 64 KiB free was not counted"
-    in_blk "$S2" '  plan: none -- the boot file needs [1-9][0-9]* KiB here, only 64 KiB free' || _f "boot 2: the full EFI partition was not refused for room"
-    in_blk "$S3" "  plan: none -- the file system was not closed cleanly \(Windows Fast Startup or a crash\): not changed until Windows has checked it" ||
+    in_blk "$S2" '  plan: none; the boot file needs [1-9][0-9]* KiB here, only 64 KiB free' || _f "boot 2: the full EFI partition was not refused for room"
+    in_blk "$S3" "  plan: none; the file system was not closed cleanly \(Windows Fast Startup or a crash\): not changed until Windows has checked it" ||
         _f "boot $DB: the EFI partition not closed cleanly was not refused"
     in_blk "$BP" "bootplan: $DN4: an old MBR disk \\(boot entries are planned on GPT disks only\\)" || _f "boot 2: the MBR disk was not left out"
-    in_blk "$BP" '  boot entry: none planned -- no EFI system partition with room' || _f "boot 2: an entry was planned with no partition to hold the file"
+    in_blk "$BP" '  boot entry: none planned; no EFI system partition with room' || _f "boot 2: an entry was planned with no partition to hold the file"
     printf '%s\n' "$BP" | grep -aq 'would be copied to' && _f "boot 2: a boot file was planned where none fits"
     if [ -n "$C" ]; then
-        in_blk "$CP" '  boot entry: none planned -- no EFI system partition with room' || _f "boot 3: an entry was planned with no partition that may be changed"
+        in_blk "$CP" '  boot entry: none planned; no EFI system partition with room' || _f "boot 3: an entry was planned with no partition that may be changed"
         printf '%s\n' "$CP" | grep -aq 'would be copied to' && _f "boot 3: a boot file was planned into the partition not closed cleanly"
     fi
     for L in "$AP" "$BP" ${C:+"$CP"}; do
-        in_blk "$L" "bootplan: a plan only -- nothing was written; adding it will ask for the owner's word, with the way back" ||
+        in_blk "$L" "bootplan: a plan only, so nothing was written; adding it will ask for the owner's word, with the way back" ||
             _f "bootplan did not finish with its plan-only line in a boot"
     done
     for L in "$A" "$B" ${C:+"$C"}; do
@@ -136,7 +136,7 @@ bootplan: sata port 2: EFI system partition (GPT entry 1, LBA 2048-206847, 100 M
   plan: AfriSovera's boot file would be copied to \\EFI\\afrisovera\\afrisovera.efi (2354 KiB of the 100776 KiB free); nothing else in this partition changes
   boot entry: Boot0004 \"AfriSovera\" -> sata port 2 partition 1 (start 2048)\\EFI\\afrisovera\\afrisovera.efi would be added at the END of BootOrder
   the PC keeps starting \"UEFI QEMU HARDDISK QM00001 \" first; AfriSovera is picked from the firmware's boot menu
-bootplan: a plan only -- nothing was written; adding it will ask for the owner's word, with the way back
+bootplan: a plan only, so nothing was written; adding it will ask for the owner's word, with the way back
 afrisovera>
 harness: disk images unchanged"
 B2="afrisovera> bootplan
@@ -147,14 +147,14 @@ bootplan: sata port 0: an old MBR disk (boot entries are planned on GPT disks on
 bootplan: sata port 2: EFI system partition (GPT entry 1, LBA 2048-206847, 100 MiB)
   FAT32, 512-byte clusters, 64 KiB free
   \\EFI holds: Microsoft, BOOT
-  plan: none -- the boot file needs 2354 KiB here, only 64 KiB free
+  plan: none; the boot file needs 2354 KiB here, only 64 KiB free
 bootplan: sata port 3: EFI system partition (GPT entry 1, LBA 2048-206847, 100 MiB)
   FAT32, 512-byte clusters, 100776 KiB free
   \\EFI holds: Microsoft, BOOT
-  plan: none -- the file system was not closed cleanly (Windows Fast Startup or a crash): not changed until Windows has checked it
+  plan: none; the file system was not closed cleanly (Windows Fast Startup or a crash): not changed until Windows has checked it
 bootplan: sata port 4: an old MBR disk (boot entries are planned on GPT disks only)
-  boot entry: none planned -- no EFI system partition with room
-bootplan: a plan only -- nothing was written; adding it will ask for the owner's word, with the way back
+  boot entry: none planned; no EFI system partition with room
+bootplan: a plan only, so nothing was written; adding it will ask for the owner's word, with the way back
 afrisovera>
 harness: disk images unchanged"
 if [ "$KIND" = ide ]; then # the same output with the disks named as IDE-mode disks, ide0 being the NvVars folder disk
@@ -175,7 +175,7 @@ bootplan: nvme: EFI system partition (GPT entry 1, LBA 256-66815, 260 MiB)"
 bootplan: sata port 2: EFI system partition (GPT entry 1, LBA 2048-34815, 16 MiB)
   it holds no file system we know"
     I0="bootplan: ide0: an old MBR disk (boot entries are planned on GPT disks only)"
-    PE="bootplan: a plan only -- nothing was written; adding it will ask for the owner's word, with the way back
+    PE="bootplan: a plan only, so nothing was written; adding it will ask for the owner's word, with the way back
 afrisovera>
 harness: disk images unchanged"
     B1="afrisovera> bootentries
@@ -197,20 +197,20 @@ $PE"
 $P0
   FAT32, 4096-byte clusters, 64 KiB free
   \\EFI holds: Microsoft, BOOT
-  plan: none -- the boot file needs 2356 KiB here, only 64 KiB free
+  plan: none; the boot file needs 2356 KiB here, only 64 KiB free
 $U2
 bootplan: sata port 4: an old MBR disk (boot entries are planned on GPT disks only)
 $I0
-  boot entry: none planned -- no EFI system partition with room
+  boot entry: none planned; no EFI system partition with room
 $PE"
     B3="afrisovera> bootplan
 $P0
   FAT32, 4096-byte clusters, 265524 KiB free
   \\EFI holds: Microsoft, BOOT
-  plan: none -- the file system was not closed cleanly (Windows Fast Startup or a crash): not changed until Windows has checked it
+  plan: none; the file system was not closed cleanly (Windows Fast Startup or a crash): not changed until Windows has checked it
 $U2
 $I0
-  boot entry: none planned -- no EFI system partition with room
+  boot entry: none planned; no EFI system partition with room
 $PE"
     if [ "$KIND" = recfirst4k ]; then # only boot 1's disk differs: the EFI partition as GPT entry 2 at block 5376
         B1="$(printf '%s\n' "$B1" | sed 's/^bootplan: nvme: EFI system partition (GPT entry 1, LBA 256-66815, 260 MiB)$/bootplan: nvme: EFI system partition (GPT entry 2, LBA 5376-71935, 260 MiB)/; s/-> nvme partition 1 (start 256)/-> nvme partition 2 (start 5376)/')"
@@ -239,7 +239,7 @@ selftest() {
     arm entry-at-front red "$(printf '%s\n' "$B1" | sed 's/at the END of BootOrder/at the FRONT of BootOrder/')" "$B2"
     arm no-first-choice red "$(printf '%s\n' "$B1" | grep -v 'keeps starting')" "$B2"
     arm unformatted-ok red "$B1" "$(printf '%s\n' "$B2" | grep -v 'holds no file system')"
-    arm full-planned red "$B1" "$(printf '%s\n' "$B2" | sed 's/  plan: none -- the boot file needs \([0-9]*\) KiB here, only 64 KiB free/  plan: AfriSovera'"'"'s boot file would be copied to \\EFI\\afrisovera\\afrisovera.efi (\1 KiB of the 64 KiB free); nothing else in this partition changes/')"
+    arm full-planned red "$B1" "$(printf '%s\n' "$B2" | sed 's/  plan: none; the boot file needs \([0-9]*\) KiB here, only 64 KiB free/  plan: AfriSovera'"'"'s boot file would be copied to \\EFI\\afrisovera\\afrisovera.efi (\1 KiB of the 64 KiB free); nothing else in this partition changes/')"
     arm dirty-not-refused red "$B1" "$(printf '%s\n' "$B2" | grep -v 'not closed cleanly')" "$(printf '%s\n' "$B3" | grep -v 'not closed cleanly')"
     arm mbr-not-named red "$B1" "$(printf '%s\n' "$B2" | grep -v "$DN4: an old MBR")"
     arm entry-without-room red "$B1" "$(printf '%s\n' "$B2" | grep -v 'none planned')"
@@ -273,8 +273,8 @@ WHERE=""; [ "$KIND" = ide ] && WHERE=", disks in IDE mode"; [ -n "$FOURK" ] && W
 [ "$KIND" = recfirst ] && WHERE=", a recovery partition before the EFI partition"
 [ "$KIND" = recfirst4k ] && WHERE=", a recovery partition before the EFI partition on an NVMe disk of 4096-byte blocks"
 echo "== PC boot plan next to Windows, read only$WHERE (PC track step 5) =="
-if ! selftest; then echo "PC BOOTPLAN${UP} TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC BOOTPLAN${UP} SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC BOOTPLAN${UP} TEST FAILED (grader selftest); no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC BOOTPLAN${UP} SELFTEST ONLY; no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

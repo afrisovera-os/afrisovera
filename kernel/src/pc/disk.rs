@@ -1,6 +1,6 @@
 //! `crate::virtio` on the PC: the shared ARM virtio driver (virtio_core, unchanged), with
 //! its five block-device calls widened to the PC's own disks: NVMe (nvme.rs), then SATA
-//! (ahci.rs), then a SATA disk in IDE mode (ide.rs), then a USB stick or disk (xhci.rs), then an SD card (sdhci.rs) -- a built-in eMMC (sdhci.rs) holding our files comes before a USB stick, as an internal disk. The first usable one, in that order after a virtio disk, holds the VFS.
+//! (ahci.rs), then a SATA disk in IDE mode (ide.rs), then a USB stick or disk (xhci.rs), then an SD card (sdhci.rs); a built-in eMMC (sdhci.rs) holding our files comes before a USB stick, as an internal disk. The first usable one, in that order after a virtio disk, holds the VFS.
 //!
 //! The shared VFS and shell reach the disk only through `crate::virtio::{blk_present,
 //! read_sector, write_sector, blk_capacity, blk_selftest}`. Defining those five here

@@ -217,10 +217,17 @@ pub fn list() {
     crate::kprintln!("{}", l.str());
     if let Some(nx) = bv.next {
         let h = hex4(nx);
-        crate::kprintln!(
-            "  BootNext: {} (started ONCE at the next power-on, then the firmware deletes it)",
-            core::str::from_utf8(&h).unwrap_or("?")
-        );
+        let hs = core::str::from_utf8(&h).unwrap_or("?");
+        // a BootNext naming no Boot#### (12 Nov 2026): the firmware deletes it at the next power-on and follows
+        // BootOrder as usual. Only said when every entry was read, so it cannot be one of the entries not kept.
+        if bv.skipped == 0 && !bv.num[..bv.n].contains(&nx) {
+            crate::kprintln!(
+                "  BootNext: {} (no such entry: the firmware deletes it at the next power-on and follows BootOrder)",
+                hs
+            );
+        } else {
+            crate::kprintln!("  BootNext: {} (started ONCE at the next power-on, then the firmware deletes it)", hs);
+        }
     }
     let mut ours = None;
     let mut used = [false; 0x100];
@@ -279,6 +286,36 @@ pub fn list() {
     }
     if bv.skipped > 0 {
         crate::kprintln!("  ({} more entries not shown)", bv.skipped);
+    }
+    // places in BootOrder with no Boot#### behind them (12 Nov 2026): some firmware leaves one when another
+    // system's entry is deleted; it passes over them, and bootentry never takes their numbers. Only said when
+    // every entry was read, so a number cannot just be one of the entries not kept.
+    if bv.skipped == 0 && !bv.order_cut {
+        let mut l = Line::new();
+        let (mut k, mut more) = (0, 0);
+        for (i, &o) in bv.order[..bv.n_order].iter().enumerate() {
+            if bv.num[..bv.n].contains(&o) || bv.order[..i].contains(&o) {
+                continue;
+            }
+            if k == 10 { // the rest are counted, so the line stays within its 200 bytes
+                more += 1;
+                continue;
+            }
+            l.s(if k == 0 { "  in BootOrder but no such entry (the firmware passes over it, nothing is changed): " } else { " " });
+            l.s("Boot");
+            for c in hex4(o) {
+                l.byte(c);
+            }
+            k += 1;
+        }
+        if more > 0 {
+            l.s(" and ");
+            l.num(more);
+            l.s(" more");
+        }
+        if k > 0 {
+            crate::kprintln!("{}", l.str());
+        }
     }
     // the next free number: what an AfriSovera entry would be called
     match (0..0x100u16).find(|n| !used[*n as usize] && !bv.order[..bv.n_order].contains(n)) {
@@ -351,6 +388,155 @@ pub fn numbers() -> Option<(Option<u16>, Option<u16>, Option<(u16, [u8; 64], usi
     }
     let free = (0..0x100u16).find(|n| !used[*n as usize] && !bv.order[..bv.n_order].contains(n));
     Some((free, ours, first))
+}
+
+/// For `bootplan` and `bootnext` (12 Nov 2026): the BootOrder places before the entry the PC really starts first,
+/// each with why the firmware passes over it (no such entry, off, hidden, one of the firmware's own
+/// apps, a damaged entry), so "keeps starting X first" is never taken for BootOrder's first place.
+/// Prints nothing when BootOrder's first place is the one started, or when not every entry was read.
+pub fn passed_over() {
+    let bv = uefi::boot_vars();
+    if !bv.read || bv.skipped > 0 || bv.order_cut {
+        return;
+    }
+    let mut l = Line::new();
+    let (mut c, mut more, mut found) = (0, 0u64, false);
+    for (i, &o) in bv.order[..bv.n_order].iter().enumerate() {
+        if bv.order[..i].contains(&o) {
+            continue;
+        }
+        let why = match (0..bv.n).find(|&k| bv.num[k] == o) {
+            None => "no such entry",
+            Some(e) => {
+                let d = &bv.data[e][..bv.len[e]];
+                if d.len() < 6 {
+                    "damaged"
+                } else {
+                    let attr = u32le(d, 0);
+                    if attr & 1 == 0 {
+                        "off"
+                    } else if attr & 8 != 0 {
+                        "hidden"
+                    } else if attr & 0x1F00 != 0 {
+                        "a firmware app"
+                    } else {
+                        found = true; // the rule numbers() uses for the entry started first
+                        break;
+                    }
+                }
+            }
+        };
+        if c == 6 { // the rest are counted, so the line stays within its 200 bytes
+            more += 1;
+            continue;
+        }
+        l.s(if c == 0 { "  passed over before it in BootOrder: Boot" } else { ", Boot" });
+        for h in hex4(o) {
+            l.byte(h);
+        }
+        l.s(" (");
+        l.s(why);
+        l.byte(b')');
+        c += 1;
+    }
+    if !found || c == 0 {
+        return;
+    }
+    if more > 0 {
+        l.s(" and ");
+        l.num(more);
+        l.s(" more");
+    }
+    crate::kprintln!("{}", l.str());
+}
+
+/// For `bootplan` (11 Nov 2026): every other system's entry in BootOrder, one that starts a file
+/// from a disk partition (Windows Boot Manager, ubuntu), each said to stay as it is, with its
+/// partition, its file and its place in BootOrder. AfriSovera's own entry and the firmware's own
+/// (its setup screen, a shell, a whole disk or the network) are left out. Prints nothing when
+/// the entries were not read or no other system has one.
+pub fn others() {
+    let bv = uefi::boot_vars();
+    if !bv.read {
+        return;
+    }
+    for (place, &o) in bv.order[..bv.n_order].iter().enumerate() {
+        let Some(k) = (0..bv.n).find(|&k| bv.num[k] == o) else { continue };
+        let d = &bv.data[k][..bv.len[k]];
+        if d.len() < 6 {
+            continue;
+        }
+        let (attr, fpl) = (u32le(d, 0), u16le(d, 4) as usize);
+        let mut l = Line::new();
+        l.s("  stays as it is: Boot");
+        for c in hex4(o) {
+            l.byte(c);
+        }
+        l.s(" \"");
+        let (mut i, mut low, mut ln) = (6, [0u8; 10], 0);
+        while i + 1 < d.len() {
+            let c = u16le(d, i);
+            i += 2;
+            if c == 0 {
+                break;
+            }
+            let a = if (0x20..0x7F).contains(&c) { c as u8 } else { b'?' };
+            if ln < low.len() {
+                low[ln] = a.to_ascii_lowercase();
+                ln += 1;
+            }
+            if l.n < 90 {
+                l.byte(a);
+            }
+        }
+        l.byte(b'"');
+        if i + fpl > d.len() {
+            continue;
+        }
+        // the partition (HD node) and the file (its file path nodes, joined) of the first path
+        let (p, mut j, mut part, mut file) = (&d[i..i + fpl], 0, None, Line::new());
+        while j + 4 <= p.len() {
+            let (ty, sub, len) = (p[j], p[j + 1], u16le(p, j + 2) as usize);
+            if len < 4 || j + len > p.len() || ty == 0x7F {
+                break;
+            }
+            let n = &p[j..j + len];
+            if (ty, sub) == (4, 1) && len >= 42 {
+                part = Some(u32le(n, 4));
+            }
+            if (ty, sub) == (4, 4) {
+                let mut m = 4;
+                while m + 1 < len {
+                    let c = u16le(n, m);
+                    if c == 0 {
+                        break;
+                    }
+                    file.byte(if (0x20..0x7F).contains(&c) { c as u8 } else { b'?' });
+                    m += 2;
+                }
+            }
+            j += len;
+        }
+        let Some(pn) = part else { continue };
+        let lowf = file.b.map(|c| c.to_ascii_lowercase());
+        if file.n == 0 || low[..ln].starts_with(b"afrisovera") || lowf[..file.n].windows(12).any(|w| w == b"\\afrisovera\\") {
+            continue;
+        }
+        l.s(", partition ");
+        l.num(pn as u64);
+        l.s(", ");
+        l.s(file.str());
+        if attr & 1 == 0 {
+            l.s(", off");
+        }
+        if attr & 8 != 0 {
+            l.s(", hidden");
+        }
+        l.s(" (place ");
+        l.num(place as u64 + 1);
+        l.s(" in BootOrder)");
+        crate::kprintln!("{}", l.str());
+    }
 }
 
 /// "Boot" + the number, as text.
@@ -453,7 +639,7 @@ fn agreed(cmd: &str, given: Option<&str>, want: u32) -> bool {
     match given {
         Some(c) if c.len() == 4 && u32::from_str_radix(c, 16).ok() == Some(want) => true,
         Some(_) => {
-            crate::kprintln!("{}: that code does not fit the firmware's boot entries as they are now -- nothing written", cmd);
+            crate::kprintln!("{}: that code does not fit the firmware's boot entries as they are now; nothing written", cmd);
             false
         }
         None => {
@@ -476,13 +662,13 @@ fn reads_back(name: &[u8], want: &[u8]) -> bool {
 /// `bootentry [yes <code>]`
 pub fn add(given: Option<&str>) {
     let Some((free, ours, first)) = numbers() else {
-        crate::kprintln!("bootentry: the firmware's boot entries could not be read at power-on -- nothing written");
+        crate::kprintln!("bootentry: the firmware's boot entries could not be read at power-on; nothing written");
         return;
     };
     if let Some(n) = ours {
         let nm = name(n);
         crate::kprintln!(
-            "bootentry: AfriSovera already has a boot entry ({}) -- nothing to add (bootentry remove takes it out)",
+            "bootentry: AfriSovera already has a boot entry ({}); nothing to add (bootentry remove takes it out)",
             core::str::from_utf8(&nm).unwrap_or("?")
         );
         return;
@@ -490,30 +676,30 @@ pub fn add(given: Option<&str>) {
     let (label, ent, start, size, guid) = match crate::esp::placed() {
         Ok(v) => v,
         Err(why) => {
-            crate::kprintln!("bootentry: {} -- nothing written", why);
+            crate::kprintln!("bootentry: {}; nothing written", why);
             return;
         }
     };
     let Some(num) = free else {
-        crate::kprintln!("bootentry: no free Boot number below Boot0100 -- nothing written");
+        crate::kprintln!("bootentry: no free Boot number below Boot0100; nothing written");
         return;
     };
     let nm = name(num);
     let nms = core::str::from_utf8(&nm).unwrap_or("?");
     let mut probe = [0u8; uefi::OPT_MAX];
     if !matches!(uefi::get_global(&nm, &mut probe), Err(uefi::ERR_NOT_FOUND)) {
-        crate::kprintln!("bootentry: the firmware now has a {} that was not there at power-on -- nothing written", nms);
+        crate::kprintln!("bootentry: the firmware now has a {} that was not there at power-on; nothing written", nms);
         return;
     }
     let (order, n) = match order_now() {
         Ok(v) => v,
         Err(why) => {
-            crate::kprintln!("bootentry: {} -- nothing written", why);
+            crate::kprintln!("bootentry: {}; nothing written", why);
             return;
         }
     };
     if n >= uefi::ORDER_MAX || order[..n].contains(&num) {
-        crate::kprintln!("bootentry: BootOrder is full or already names {} -- nothing written", nms);
+        crate::kprintln!("bootentry: BootOrder is full or already names {}; nothing written", nms);
         return;
     }
     let opt = option(ent, start, size, &guid);
@@ -551,13 +737,13 @@ pub fn add(given: Option<&str>) {
     }
     let st = uefi::set_global(&nm, &opt);
     if st != uefi::SUCCESS {
-        crate::kprintln!("bootentry: the firmware refused to write {} (status {:#x}) -- nothing changed", nms, st);
+        crate::kprintln!("bootentry: the firmware refused to write {} (status {:#x}); nothing changed", nms, st);
         return;
     }
     if !reads_back(&nm, &opt) {
         let back = uefi::set_global(&nm, &[]);
         crate::kprintln!(
-            "bootentry: {} did not read back as written -- taken out again ({}); BootOrder not changed",
+            "bootentry: {} did not read back as written, so it was taken out again ({}); BootOrder not changed",
             nms,
             if back == uefi::SUCCESS { "done" } else { "the firmware refused: bootentries shows what is left" }
         );
@@ -569,7 +755,7 @@ pub fn add(given: Option<&str>) {
         let back = uefi::set_global(&nm, &[]);
         let put = if st == uefi::SUCCESS && olen > 0 { uefi::set_global(b"BootOrder", &ob[..olen]) } else { uefi::SUCCESS };
         crate::kprintln!(
-            "bootentry: BootOrder could not be written (status {:#x}) -- {} taken out again ({})",
+            "bootentry: BootOrder could not be written (status {:#x}); {} taken out again ({})",
             st,
             nms,
             if back == uefi::SUCCESS && put == uefi::SUCCESS { "nothing left changed" } else { "the firmware refused: bootentries shows what is left" }
@@ -588,11 +774,11 @@ pub fn add(given: Option<&str>) {
 /// `bootentry remove [yes <code>]`
 pub fn remove(given: Option<&str>) {
     let Some((_, ours, _)) = numbers() else {
-        crate::kprintln!("bootentry remove: the firmware's boot entries could not be read at power-on -- nothing written");
+        crate::kprintln!("bootentry remove: the firmware's boot entries could not be read at power-on; nothing written");
         return;
     };
     let Some(num) = ours else {
-        crate::kprintln!("bootentry remove: AfriSovera has no boot entry -- nothing to remove");
+        crate::kprintln!("bootentry remove: AfriSovera has no boot entry; nothing to remove");
         return;
     };
     let nm = name(num);
@@ -601,14 +787,14 @@ pub fn remove(given: Option<&str>) {
     let olen = match uefi::get_global(&nm, &mut opt) {
         Ok(n) => n,
         Err(_) => {
-            crate::kprintln!("bootentry remove: {} could not be read from the firmware now -- nothing written", nms);
+            crate::kprintln!("bootentry remove: {} could not be read from the firmware now; nothing written", nms);
             return;
         }
     };
     let (order, n) = match order_now() {
         Ok(v) => v,
         Err(why) => {
-            crate::kprintln!("bootentry remove: {} -- nothing written", why);
+            crate::kprintln!("bootentry remove: {}; nothing written", why);
             return;
         }
     };
@@ -638,19 +824,19 @@ pub fn remove(given: Option<&str>) {
     if k != n {
         let st = uefi::set_global(b"BootOrder", &nb[..nlen]);
         if st != uefi::SUCCESS || !reads_back(b"BootOrder", &nb[..nlen]) {
-            crate::kprintln!("bootentry remove: BootOrder could not be written (status {:#x}) -- {} kept; bootentries shows what is there", st, nms);
+            crate::kprintln!("bootentry remove: BootOrder could not be written (status {:#x}), so {} is kept; bootentries shows what is there", st, nms);
             uefi::reread_boot_entries();
             return;
         }
     }
     let st = uefi::set_global(&nm, &[]);
     if st != uefi::SUCCESS || !reads_back(&nm, &[]) {
-        crate::kprintln!("bootentry remove: the firmware did not delete {} (status {:#x}) -- it is out of BootOrder; bootentries shows what is there", nms, st);
+        crate::kprintln!("bootentry remove: the firmware did not delete {} (status {:#x}), but it is out of BootOrder; bootentries shows what is there", nms, st);
         uefi::reread_boot_entries();
         return;
     }
     uefi::reread_boot_entries();
-    crate::kprintln!("bootentry remove: {} deleted and out of BootOrder, read back -- the firmware's boot entries are as before bootentry", nms);
+    crate::kprintln!("bootentry remove: {} deleted and out of BootOrder, read back; the firmware's boot entries are as before bootentry", nms);
 }
 
 // --- `bootnext [yes <code>]` (PC track step 5, 7 Nov 2026) ---
@@ -664,11 +850,11 @@ pub fn remove(given: Option<&str>) {
 /// `bootnext [yes <code>]`
 pub fn next(given: Option<&str>) {
     let Some((_, ours, first)) = numbers() else {
-        crate::kprintln!("bootnext: the firmware's boot entries could not be read at power-on -- nothing written");
+        crate::kprintln!("bootnext: the firmware's boot entries could not be read at power-on; nothing written");
         return;
     };
     let Some(num) = ours else {
-        crate::kprintln!("bootnext: AfriSovera has no boot entry (bootentry adds it first) -- nothing written");
+        crate::kprintln!("bootnext: AfriSovera has no boot entry (bootentry adds it first); nothing written");
         return;
     };
     let nm = name(num);
@@ -677,7 +863,7 @@ pub fn next(given: Option<&str>) {
     let olen = match uefi::get_global(&nm, &mut opt) {
         Ok(n) => n,
         Err(_) => {
-            crate::kprintln!("bootnext: {} could not be read from the firmware now -- nothing written", nms);
+            crate::kprintln!("bootnext: {} could not be read from the firmware now; nothing written", nms);
             return;
         }
     };
@@ -686,12 +872,12 @@ pub fn next(given: Option<&str>) {
         Ok(2) => Some(u16le(&nb, 0)),
         Err(uefi::ERR_NOT_FOUND) => None,
         _ => {
-            crate::kprintln!("bootnext: the firmware's BootNext could not be read now -- nothing written");
+            crate::kprintln!("bootnext: the firmware's BootNext could not be read now; nothing written");
             return;
         }
     };
     if now == Some(num) {
-        crate::kprintln!("bootnext: BootNext already starts {} \"{}\" at the next power-on -- nothing to do", nms, DESC);
+        crate::kprintln!("bootnext: BootNext already starts {} \"{}\" at the next power-on; nothing to do", nms, DESC);
         return;
     }
     let mut l = Line::new();
@@ -713,10 +899,14 @@ pub fn next(given: Option<&str>) {
     l.byte(b')');
     crate::kprintln!("{}", l.str());
     match first {
-        Some((_, d, dn)) => crate::kprintln!(
-            "  the firmware deletes BootNext as it starts it; the power-on after that follows BootOrder again (first in it: \"{}\")",
-            core::str::from_utf8(&d[..dn]).unwrap_or("?")
-        ),
+        Some((_, d, dn)) => {
+            crate::kprintln!(
+                "  the firmware deletes BootNext as it starts it; the power-on after that follows BootOrder again (first in it: \"{}\")",
+                core::str::from_utf8(&d[..dn]).unwrap_or("?")
+            );
+            // the places before it the firmware passes over (12 Nov 2026), as bootplan says them
+            passed_over();
+        }
         None => crate::kprintln!("  the firmware deletes BootNext as it starts it; the power-on after that follows BootOrder again"),
     }
     let nowb: &[u8] = if now.is_some() { &nb } else { &[] };
@@ -726,7 +916,7 @@ pub fn next(given: Option<&str>) {
     let want = num.to_le_bytes();
     let st = uefi::set_global(b"BootNext", &want);
     if st != uefi::SUCCESS || !reads_back(b"BootNext", &want) {
-        crate::kprintln!("bootnext: BootNext could not be written (status {:#x}) -- bootentries shows what is there", st);
+        crate::kprintln!("bootnext: BootNext could not be written (status {:#x}); bootentries shows what is there", st);
         uefi::reread_boot_entries();
         return;
     }

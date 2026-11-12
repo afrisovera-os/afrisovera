@@ -23,10 +23,10 @@ T="${TMPDIR:-/tmp}"
 echo "== PC field report (report <ip> -> tools/report-receiver.py) =="
 echo "  --- grader selftest (no QEMU) ---"
 if ! python3 scripts/lib/report-grade.py --selftest; then
-    echo "PC REPORT TEST FAILED (grader selftest) -- no QEMU run spent"
+    echo "PC REPORT TEST FAILED (grader selftest): no QEMU run spent"
     exit 1
 fi
-[ "${1:-}" = "--selftest" ] && { echo "PC REPORT SELFTEST ONLY -- no measurement taken"; exit 0; }
+[ "${1:-}" = "--selftest" ] && { echo "PC REPORT SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

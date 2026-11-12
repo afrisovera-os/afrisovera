@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track step 3 (8 Nov 2026): an ABSOLUTE pointer on the xHCI controller -- a USB touchscreen
+# PC track step 3 (8 Nov 2026): an ABSOLUTE pointer on the xHCI controller: a USB touchscreen
 # (all-in-one PCs, touch monitors), a graphics tablet, or a remote console's mouse (server
 # KVM/BMC, virtual machines). None of them is a HID boot mouse, so the driver reads the
 # device's HID report descriptor and finds absolute X, Y and the buttons (or a touchscreen's
@@ -66,7 +66,7 @@ grade() { # grade <serial capture> <pixel line>
     [ -r "$1" ] || { echo "  FAIL: missing serial capture"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     P="$2"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[xhci\] controller [0-9a-f]{2}:[0-9a-f]{2}\.[0-7] \(xHCI [0-9]+\.[0-9]+\), [0-9]+ ports, [0-9]+ slots' ||
         _f "the xHCI controller did not come up"
     local ks ts
@@ -157,8 +157,8 @@ selftest() {
 }
 
 echo "== PC xHCI + USB absolute pointer: touchscreen / tablet (PC track step 3) =="
-if ! selftest; then echo "PC USBTABLET TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC USBTABLET SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC USBTABLET TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC USBTABLET SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

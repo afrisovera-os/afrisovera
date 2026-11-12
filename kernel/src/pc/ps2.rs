@@ -85,6 +85,8 @@ static mut MCLICKS: u64 = 0;
 static mut RESYNCS: u64 = 0;
 static mut OVERFLOWS: u64 = 0;
 static mut STALE: u64 = 0;
+static mut AUX_LATE: u64 = 0; // mouse bytes dropped because they were not a command's answer
+static mut CFG_LATE: u64 = 0; // bytes waiting when the config byte was read, kept off its answer
 static mut LAST_BYTE: u64 = 0; // timer::cycles() of the packet byte before
 static mut RATE: u8 = 0; // samples a second set, 0 = left as the pad started
 static mut RES: u8 = 0; // counts per mm set, 0 = left as the pad started
@@ -126,45 +128,126 @@ pub fn init() {
             }
             inb(DATA); // drop whatever the firmware left
         }
-        if !wait_write() {
+        // no IRQ1/IRQ12 (polled), keep translation to set 1; the keyboard port on after
+        let Some((cfg, new)) = cfg_rw(|c| (c & !0b11) | 1 << 6, false, false) else {
+            crate::kprintln!("[ps2] i8042 did not answer, so no PS/2 keyboard");
             return;
-        }
-        outb(STATUS, 0x20); // read the configuration byte
-        if !wait_read() {
-            crate::kprintln!("[ps2] i8042 did not answer -- no PS/2 keyboard");
-            return;
-        }
-        let cfg = inb(DATA);
-        let new = (cfg & !0b11) | 1 << 6; // no IRQ1/IRQ12 (polled), keep translation to set 1
-        if !wait_write() {
-            return;
-        }
-        outb(STATUS, 0x60);
-        if !wait_write() {
-            return;
-        }
-        outb(DATA, new);
-        if wait_write() {
-            outb(STATUS, 0xAE); // enable the keyboard port
-        }
+        };
         ON.store(true, Ordering::Relaxed);
         crate::kprintln!("[ps2] i8042 keyboard controller (config {:#04x} -> {:#04x}), scancode set 1, polled", cfg, new);
         mouse_init();
     }
 }
 
+/// Read the controller's configuration byte (0x20) and write back `f` of it (0x60). The
+/// answer to 0x20 is simply the next byte in the output buffer, so a key or mouse byte already
+/// waiting there (a pad the firmware left streaming, a key pressed at the wrong moment) would
+/// be taken as the configuration, and writing that back can switch translation or a port off.
+/// So both ports are closed first (0xAD, 0xA7), whatever already waits is handed to poll() when
+/// `keep` (at run time) or dropped and counted (at boot), and a byte that comes with the aux
+/// flag is never taken as the answer. The keyboard port is opened again after, the aux port
+/// when `aux`. Some((read, written)), None if the controller did not answer.
+unsafe fn cfg_rw(f: impl FnOnce(u8) -> u8, aux: bool, keep: bool) -> Option<(u8, u8)> {
+    for c in [0xADu8, 0xA7] {
+        if !wait_write() {
+            return None;
+        }
+        outb(STATUS, c);
+    }
+    if keep {
+        poll();
+    }
+    for _ in 0..64 {
+        if inb(STATUS) & 1 == 0 {
+            break;
+        }
+        inb(DATA);
+        CFG_LATE += 1;
+    }
+    let mut out = None;
+    if wait_write() {
+        outb(STATUS, 0x20);
+        for _ in 0..8 {
+            if !wait_read() {
+                break;
+            }
+            let st = inb(STATUS);
+            let b = inb(DATA);
+            if st & 0x20 == 0 {
+                out = Some(b);
+                break;
+            }
+            CFG_LATE += 1; // a mouse byte that slipped in: not the controller's answer
+        }
+    }
+    let mut res = None;
+    if let Some(cfg) = out {
+        let new = f(cfg);
+        if wait_write() {
+            outb(STATUS, 0x60);
+            if wait_write() {
+                outb(DATA, new);
+                res = Some((cfg, new));
+            }
+        }
+    }
+    if wait_write() {
+        outb(STATUS, 0xAE); // the keyboard port on again
+    }
+    if aux && wait_write() {
+        outb(STATUS, 0xA8);
+    }
+    res
+}
+
 /// One byte for the aux (mouse) port, and its answer: Some(0xFA) is the mouse's ACK.
 /// Keyboard bytes that arrive meanwhile are dropped (nothing is typed while the PC boots).
+/// A mouse byte already waiting (an answer that came after its command gave up, or a packet
+/// from a pad the firmware left streaming) is dropped first and counted, so it is never taken
+/// as this command's answer. After the command, bytes that are not an answer (ACK 0xFA,
+/// RESEND 0xFE, ERROR 0xFC) are packet bytes still on their way: skipped and counted too.
+/// RESEND sends the byte once more.
 unsafe fn aux_cmd(cmd: u8) -> Option<u8> {
-    if !wait_write() {
-        return None;
+    aux_drain();
+    let mut got = None;
+    for _ in 0..2 {
+        if !wait_write() {
+            return None;
+        }
+        outb(STATUS, 0xD4); // the next data byte goes to port 2
+        if !wait_write() {
+            return None;
+        }
+        outb(DATA, cmd);
+        got = aux_read();
+        for _ in 0..8 {
+            match got {
+                Some(0xFA | 0xFE | 0xFC) | None => break,
+                Some(_) => {
+                    AUX_LATE += 1;
+                    got = aux_read();
+                }
+            }
+        }
+        if got != Some(0xFE) {
+            break;
+        }
     }
-    outb(STATUS, 0xD4); // the next data byte goes to port 2
-    if !wait_write() {
-        return None;
+    got
+}
+
+/// Drop whatever the controller already holds (mouse bytes are counted in AUX_LATE).
+unsafe fn aux_drain() {
+    for _ in 0..64 {
+        let st = inb(STATUS);
+        if st & 1 == 0 {
+            break;
+        }
+        inb(DATA);
+        if st & 0x20 != 0 {
+            AUX_LATE += 1;
+        }
     }
-    outb(DATA, cmd);
-    aux_read()
 }
 
 /// The next byte from the aux port, if one comes in time.
@@ -185,27 +268,10 @@ unsafe fn aux_read() -> Option<u8> {
 /// Turn the aux port on and the mouse or touchpad behind it to streaming, polled like the
 /// keyboard (IRQ12 stays off). No ACK = no PS/2 mouse; the keyboard is unaffected.
 unsafe fn mouse_init() {
-    if !wait_write() {
+    // the aux port on, its clock on, both interrupts off
+    if cfg_rw(|c| c & !(1 << 5 | 0b11), true, false).is_none() {
         return;
     }
-    outb(STATUS, 0xA8); // enable the aux port
-    if !wait_write() {
-        return;
-    }
-    outb(STATUS, 0x20);
-    if !wait_read() {
-        return;
-    }
-    let cfg = inb(DATA);
-    let new = cfg & !(1 << 5 | 0b11); // aux clock on, both interrupts off
-    if !wait_write() {
-        return;
-    }
-    outb(STATUS, 0x60);
-    if !wait_write() {
-        return;
-    }
-    outb(DATA, new);
     if aux_cmd(0xF6) != Some(0xFA) {
         crate::kprintln!("[ps2] no PS/2 mouse or touchpad on the aux port");
         return;
@@ -368,19 +434,10 @@ pub fn enable_aux_irq() {
     crate::cpu::cli();
     // SAFETY: i8042 port I/O with interrupts off, so the timer's poll cannot interleave.
     unsafe {
-        if wait_write() {
-            outb(STATUS, 0x20);
-            if wait_read() {
-                let cfg = inb(DATA);
-                if wait_write() {
-                    outb(STATUS, 0x60);
-                    if wait_write() {
-                        crate::cpu::ioapic_route(12, crate::cpu::PS2_VECTOR);
-                        outb(DATA, cfg | 0b10); // aux interrupt on; the keyboard's stays off
-                        AUX_IRQ.store(true, Ordering::Relaxed);
-                    }
-                }
-            }
+        crate::cpu::ioapic_route(12, crate::cpu::PS2_VECTOR);
+        // aux interrupt on; the keyboard's stays off. Bytes already waiting go to poll().
+        if cfg_rw(|c| c | 0b10, true, true).is_some() {
+            AUX_IRQ.store(true, Ordering::Relaxed);
         }
     }
     poll(); // a byte already waiting raised no edge: take it now
@@ -501,6 +558,9 @@ pub fn list() {
     );
     // SAFETY: scalar reads of the mouse counters.
     unsafe {
+        if CFG_LATE > 0 {
+            crate::kprintln!("ps2: {} byte(s) waiting were kept off a config byte read", { CFG_LATE });
+        }
         if !MOUSE.load(Ordering::Relaxed) {
             crate::kprintln!("ps2: no PS/2 mouse or touchpad");
             return;
@@ -536,7 +596,96 @@ pub fn list() {
                 { RESYNCS }, { OVERFLOWS }, { STALE }
             );
         }
+        if AUX_LATE > 0 {
+            crate::kprintln!("ps2: {} late mouse byte(s) dropped before or after a command", { AUX_LATE });
+        }
     }
+}
+
+/// `lsps2 late`: a test switch. Stops the stream, asks the mouse's id the raw way and reads
+/// only its ACK, so the id byte is left waiting (as when a command gave up and its answer came
+/// later), then asks the id again with aux_cmd(); right only if the late byte was dropped and
+/// not taken as this command's answer. Streaming is switched on again after. Interrupts are
+/// off meanwhile, so the timer's poll and IRQ 12 cannot take the bytes.
+pub fn late_check() {
+    if !MOUSE.load(Ordering::Relaxed) {
+        crate::kprintln!("lsps2 late: no PS/2 mouse or touchpad");
+        return;
+    }
+    crate::cpu::cli();
+    // SAFETY: i8042 port I/O with interrupts off, as in enable_aux_irq.
+    let (off, left, ack, id, on, dropped) = unsafe {
+        let before = AUX_LATE;
+        let off = aux_cmd(0xF5) == Some(0xFA);
+        let mut left = false;
+        if wait_write() {
+            outb(STATUS, 0xD4);
+            if wait_write() {
+                outb(DATA, 0xF2);
+                left = aux_read() == Some(0xFA) && wait_read();
+            }
+        }
+        let ack = aux_cmd(0xF2);
+        let id = if ack == Some(0xFA) { aux_read() } else { None };
+        let on = aux_cmd(0xF4) == Some(0xFA);
+        (off, left, ack, id, on, AUX_LATE - before)
+    };
+    crate::cpu::sti();
+    // SAFETY: scalar read of boot-time state.
+    let want = unsafe { MOUSE_ID };
+    let ok = off && left && ack == Some(0xFA) && id == Some(want) && on && dropped == 1;
+    crate::kprintln!(
+        "lsps2 late: an unread id byte {}; the next command got {:#04x}, then id {:#04x} (mouse id {:#04x}), {} dropped, streaming {}: {}",
+        if left { "was left waiting" } else { "never came" },
+        ack.unwrap_or(0),
+        id.unwrap_or(0),
+        want,
+        dropped,
+        if on { "on again" } else { "NOT on again" },
+        if ok { "OK" } else { "WRONG" }
+    );
+}
+
+/// `lsps2 cfg`: a test switch. Stops the stream, asks the mouse's id the raw way and reads only
+/// its ACK, so the id byte is left waiting in the controller, then reads and writes back the
+/// configuration byte with cfg_rw() and reads it once more; right only if the waiting byte was
+/// kept off the first read (both reads the same, polled keyboard, translation on, the aux
+/// interrupt as enable_aux_irq left it). Streaming is switched on again after; interrupts off.
+pub fn cfg_check() {
+    if !MOUSE.load(Ordering::Relaxed) {
+        crate::kprintln!("lsps2 cfg: no PS/2 mouse or touchpad");
+        return;
+    }
+    crate::cpu::cli();
+    // SAFETY: i8042 port I/O with interrupts off, as in enable_aux_irq.
+    let (left, a, b, on, dropped) = unsafe {
+        let before = CFG_LATE;
+        let off = aux_cmd(0xF5) == Some(0xFA);
+        let mut left = false;
+        if off && wait_write() {
+            outb(STATUS, 0xD4);
+            if wait_write() {
+                outb(DATA, 0xF2);
+                left = aux_read() == Some(0xFA) && wait_read();
+            }
+        }
+        let a = cfg_rw(|c| c, true, false).map(|x| x.0);
+        let b = cfg_rw(|c| c, true, false).map(|x| x.0);
+        let on = aux_cmd(0xF4) == Some(0xFA);
+        (left, a, b, on, CFG_LATE - before)
+    };
+    crate::cpu::sti();
+    let irq = if AUX_IRQ.load(Ordering::Relaxed) { 0b10 } else { 0 };
+    let ok = left && a.is_some() && a == b && dropped == 1 && on && a.map_or(false, |c| c & 0b11 == irq && c & 1 << 6 != 0);
+    crate::kprintln!(
+        "lsps2 cfg: a mouse byte {}; the config byte read {:#04x}, then {:#04x}, {} kept off it, streaming {}: {}",
+        if left { "was left waiting" } else { "never came" },
+        a.unwrap_or(0),
+        b.unwrap_or(0),
+        dropped,
+        if on { "on again" } else { "NOT on again" },
+        if ok { "OK" } else { "WRONG" }
+    );
 }
 
 /// True when the i8042 keyboard is on.

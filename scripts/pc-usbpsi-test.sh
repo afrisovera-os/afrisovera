@@ -28,7 +28,7 @@ grade() { # grade <serial>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[xhci\] port kinds: .*USB 2\.0 on ports [0-9]+-[0-9]+' || _f "no port kinds line at boot"
     has '^\[xhci\] port kinds: .*speed IDs of its own' && _f "qemu-xhci said it has its own speed IDs before the test table"
     has '^  speed IDs: 0 device\(s\) by a controller.s own table$' || _f "the first usbaddr does not show 0 devices by a table"

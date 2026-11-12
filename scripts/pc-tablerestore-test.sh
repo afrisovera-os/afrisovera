@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track step 5 (6 Nov 2026): `tablerestore <disk> [yes <code>]` -- the way back from an install. It writes
+# PC track step 5 (6 Nov 2026): `tablerestore <disk> [yes <code>]`: the way back from an install. It writes
 # the partition table saved on the USB stick (tablebackup) back onto the disk it came from, when that disk
 # has CHANGED since: only the table's own sectors that differ (the backup GPT copy first), only on the code
 # it prints (tied to the saved copy and to the disk as it is now), read back until tablecheck says
@@ -28,37 +28,37 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     [ -r "$1" ] && [ -r "$2" ] && [ -r "$3" ] && [ -r "$4" ] || { echo "  FAIL: missing log"; return 1; }
     cl() { tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g'; }
     A="$(cl "$1")"; B="$(cl "$2")"; C="$(cl "$3")"; D="$(cl "$4")"
-    has() { printf '%s\n' "$1" | grep -aqxE "$2"; }
+    has() { grep -aqxE "$2" <<< "$1"; }
     blk() { printf '%s\n' "$1" | awk -v c="afrisovera> $2" '$0==c{on=1;next} /^afrisovera>/{on=0} on'; }
     local NW='nothing written' SAVED='tablebackup: nvme: GPT table, 67 sector\(s\) saved on the USB stick at sectors 2049-2116, CRC [0-9a-f]{8}, read back OK'
     local CODE
     CODE="$(printf '%s\n' "$B" | grep -aoE 'type exactly: tablerestore nvme yes [0-9a-f]{4}$' | head -1 | awk '{print $NF}')"
     [ -n "$CODE" ] || _f "boot 2: tablerestore nvme did not show the code to type"
     # boot 1: nothing to restore, in every way
-    has "$(blk "$A" 'tablerestore nvme' | head -2)" "tablerestore: no partition-table backup on a USB stick -- nothing to restore from; $NW" ||
+    has "$(blk "$A" 'tablerestore nvme' | head -2)" "tablerestore: no partition-table backup on a USB stick, so nothing to restore from; $NW" ||
         _f "boot 1: tablerestore without a backup did not refuse"
     has "$(blk "$A" 'tablebackup')" "$SAVED" || _f "boot 1: tablebackup did not save the NVMe GPT"
-    has "$A" "tablerestore: nvme: already the same as its backup -- nothing to restore; $NW" || _f "boot 1: an unchanged disk was not left alone"
-    has "$(blk "$A" 'tablerestore sata9')" "tablerestore: no disk \"sata9\" here -- say nvme or sataN \(see lsparts\); $NW" ||
+    has "$A" "tablerestore: nvme: already the same as its backup, so nothing to restore; $NW" || _f "boot 1: an unchanged disk was not left alone"
+    has "$(blk "$A" 'tablerestore sata9')" "tablerestore: no disk \"sata9\" here; say nvme or sataN \(see lsparts\); $NW" ||
         _f "boot 1: an unknown disk was not refused"
     has "$(blk "$A" 'tablerestore')" 'tablerestore: say the disk, .*' || _f "boot 1: no usage line without a disk"
     has "$A" 'harness: disk images unchanged' || _f "boot 1: a disk image changed"
     # boot 2: the disk changed; the old copy is kept; the code is shown, nothing written yet
-    has "$(blk "$B" 'tablecheck')" 'tablecheck: nvme: CHANGED since the backup \(first difference in sector 1\) -- .*' ||
+    has "$(blk "$B" 'tablecheck')" 'tablecheck: nvme: CHANGED since the backup \(first difference in sector 1\); .*' ||
         _f "boot 2: tablecheck did not see the change"
-    has "$(blk "$B" 'tablebackup')" "tablebackup: nvme: the USB stick holds this disk.s table from BEFORE it changed -- that copy is the way back \(tablerestore\), so nothing was written\. To save the tables as they are now instead, type: tablebackup new" ||
+    has "$(blk "$B" 'tablebackup')" "tablebackup: nvme: the USB stick holds this disk.s table from BEFORE it changed; that copy is the way back \(tablerestore\), so nothing was written\. To save the tables as they are now instead, type: tablebackup new" ||
         _f "boot 2: tablebackup did not refuse to overwrite the copy from before the change"
     printf '%s\n' "$(blk "$B" 'tablebackup')" | grep -aqE 'saved on the USB stick' && _f "boot 2: tablebackup overwrote the old copy"
     local B2; B2="$(blk "$B" 'tablerestore nvme')"
     has "$B2" 'tablerestore: nvme: CHANGED since the backup \(first difference in sector 1\)' || _f "boot 2: tablerestore did not report the change"
     has "$B2" "tablerestore: 4 of the table.s 67 sector\(s\) differ from the saved copy; .*" || _f "boot 2: not exactly 4 of 67 sectors differ"
-    has "$(blk "$B" 'tablerestore nvme yes zzzz')" "tablerestore: that code does not fit this disk.s table now -- $NW" || _f "boot 2: a wrong code was not refused"
-    has "$(blk "$B" 'tablerestore sata2')" "tablerestore: sata port 2: already the same as its backup -- nothing to restore; $NW" ||
+    has "$(blk "$B" 'tablerestore nvme yes zzzz')" "tablerestore: that code does not fit this disk.s table now; $NW" || _f "boot 2: a wrong code was not refused"
+    has "$(blk "$B" 'tablerestore sata2')" "tablerestore: sata port 2: already the same as its backup, so nothing to restore; $NW" ||
         _f "boot 2: the unchanged SATA disk was not left alone"
     has "$B" 'harness: disk images and the stick unchanged' || _f "boot 2: a disk image or the stick changed before the code was typed"
     printf '%s\n' "$A" "$B" | grep -aqE 'saved table is back' && _f "boot 1/2: something was restored without the code"
     # boot 3: the code typed -> the table as it was
-    has "$(blk "$C" "tablerestore nvme yes $CODE")" "tablerestore: nvme: the saved table is back -- 4 sector\(s\) written, read back OK, tablecheck now says unchanged; no partition.s own sectors were touched" ||
+    has "$(blk "$C" "tablerestore nvme yes $CODE")" "tablerestore: nvme: the saved table is back: 4 sector\(s\) written, read back OK, tablecheck now says unchanged; no partition.s own sectors were touched" ||
         _f "boot 3: the code did not put the saved table back (4 sectors)"
     has "$(blk "$C" 'tablecheck')" 'tablecheck: nvme: unchanged since the backup \(67 sector\(s\)\)' || _f "boot 3: tablecheck does not say unchanged"
     local C3; C3="$(blk "$C" 'lsparts')"
@@ -68,7 +68,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     # boot 4: tablebackup new replaces the copy
     has "$(blk "$D" 'tablebackup new')" "$SAVED" || _f "boot 4: tablebackup new did not save the changed table"
     has "$(blk "$D" 'tablecheck')" 'tablecheck: nvme: unchanged since the backup \(67 sector\(s\)\)' || _f "boot 4: tablecheck after tablebackup new"
-    has "$D" "tablerestore: nvme: already the same as its backup -- nothing to restore; $NW" || _f "boot 4: tablerestore after tablebackup new"
+    has "$D" "tablerestore: nvme: already the same as its backup, so nothing to restore; $NW" || _f "boot 4: tablerestore after tablebackup new"
     has "$D" 'harness: nvme image unchanged by the boot' || _f "boot 4: the NVMe image changed"
     if printf '%s\n' "$A" "$B" "$C" "$D" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci|xhci)\] .*(failed|timed out)|FAILED'; then
         _f "the kernel panicked or a disk command failed"
@@ -77,37 +77,37 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
 }
 
 SV='tablebackup: nvme: GPT table, 67 sector(s) saved on the USB stick at sectors 2049-2116, CRC 1a2b3c4d, read back OK'
-SAME='tablerestore: nvme: already the same as its backup -- nothing to restore; nothing written'
+SAME='tablerestore: nvme: already the same as its backup, so nothing to restore; nothing written'
 M1="afrisovera> tablerestore nvme
-tablerestore: no partition-table backup on a USB stick -- nothing to restore from; nothing written
+tablerestore: no partition-table backup on a USB stick, so nothing to restore from; nothing written
 afrisovera> tablebackup
 $SV
 afrisovera> tablerestore nvme
 $SAME
 afrisovera> tablerestore sata9
-tablerestore: no disk \"sata9\" here -- say nvme or sataN (see lsparts); nothing written
+tablerestore: no disk \"sata9\" here; say nvme or sataN (see lsparts); nothing written
 afrisovera> tablerestore
 tablerestore: say the disk, e.g. tablerestore nvme (it shows what would change and the code; nothing is written without the code)
 afrisovera>
 harness: disk images unchanged"
 M2="afrisovera> tablecheck
-tablecheck: nvme: CHANGED since the backup (first difference in sector 1) -- back it up again before any install
+tablecheck: nvme: CHANGED since the backup (first difference in sector 1); back it up again before any install
 afrisovera> tablebackup
-tablebackup: nvme: the USB stick holds this disk's table from BEFORE it changed -- that copy is the way back (tablerestore), so nothing was written. To save the tables as they are now instead, type: tablebackup new
+tablebackup: nvme: the USB stick holds this disk's table from BEFORE it changed; that copy is the way back (tablerestore), so nothing was written. To save the tables as they are now instead, type: tablebackup new
 afrisovera> tablerestore nvme
 tablerestore: nvme: CHANGED since the backup (first difference in sector 1)
 tablerestore: 4 of the table's 67 sector(s) differ from the saved copy; a partition added since would leave the table (its sectors are not touched)
 tablerestore: nothing written yet. To put the saved table back, type exactly: tablerestore nvme yes 5e7a
 afrisovera> tablerestore nvme yes zzzz
 tablerestore: nvme: CHANGED since the backup (first difference in sector 1)
-tablerestore: that code does not fit this disk's table now -- nothing written
+tablerestore: that code does not fit this disk's table now; nothing written
 afrisovera> tablerestore sata2
-tablerestore: sata port 2: already the same as its backup -- nothing to restore; nothing written
+tablerestore: sata port 2: already the same as its backup, so nothing to restore; nothing written
 afrisovera>
 harness: disk images and the stick unchanged"
 M3="afrisovera> tablerestore nvme yes 5e7a
 tablerestore: nvme: CHANGED since the backup (first difference in sector 1)
-tablerestore: nvme: the saved table is back -- 4 sector(s) written, read back OK, tablecheck now says unchanged; no partition's own sectors were touched
+tablerestore: nvme: the saved table is back: 4 sector(s) written, read back OK, tablecheck now says unchanged; no partition's own sectors were touched
 afrisovera> tablecheck
 tablecheck: nvme: unchanged since the backup (67 sector(s))
 afrisovera> lsparts
@@ -137,7 +137,7 @@ selftest() {
     echo "  --- grader selftest (no QEMU) ---"
     arm model-green green "$M1" "$M2" "$M3" "$M4"
     arm crlf green "$(printf '%s\n' "$M1" | sed 's/$/\r/')" "$(printf '%s\n' "$M2" | sed 's/$/\r/')" "$M3" "$M4"
-    arm restore-without-backup red "$(printf '%s\n' "$M1" | sed '0,/^tablerestore: no partition-table backup.*/s//tablerestore: nvme: the saved table is back -- 4 sector(s) written/')" "$M2" "$M3" "$M4"
+    arm restore-without-backup red "$(printf '%s\n' "$M1" | sed '0,/^tablerestore: no partition-table backup.*/s//tablerestore: nvme: the saved table is back: 4 sector(s) written/')" "$M2" "$M3" "$M4"
     arm no-backup-saved red "$(printf '%s\n' "$M1" | grep -v '^tablebackup: nvme')" "$M2" "$M3" "$M4"
     arm unknown-disk-accepted red "$(printf '%s\n' "$M1" | grep -v 'no disk "sata9"')" "$M2" "$M3" "$M4"
     arm boot1-image-changed red "$(printf '%s\n' "$M1" | sed 's/disk images unchanged/disk images CHANGED/')" "$M2" "$M3" "$M4"
@@ -145,12 +145,12 @@ selftest() {
     arm old-copy-overwritten red "$M1" "$(printf '%s\n' "$M2" | sed "s/^tablebackup: nvme: the USB stick holds.*/$SV/")" "$M3" "$M4"
     arm no-code-shown red "$M1" "$(printf '%s\n' "$M2" | grep -v 'type exactly')" "$M3" "$M4"
     arm wrong-count red "$M1" "$(printf '%s\n' "$M2" | sed 's/^tablerestore: 4 of/tablerestore: 9 of/')" "$M3" "$M4"
-    arm wrong-code-accepted red "$M1" "$(printf '%s\n' "$M2" | sed 's/^tablerestore: that code does not fit.*/tablerestore: nvme: the saved table is back -- 4 sector(s) written/')" "$M3" "$M4"
+    arm wrong-code-accepted red "$M1" "$(printf '%s\n' "$M2" | sed 's/^tablerestore: that code does not fit.*/tablerestore: nvme: the saved table is back: 4 sector(s) written/')" "$M3" "$M4"
     arm sata-restored red "$M1" "$(printf '%s\n' "$M2" | grep -v '^tablerestore: sata port 2')" "$M3" "$M4"
     arm boot2-image-changed red "$M1" "$(printf '%s\n' "$M2" | sed 's/and the stick unchanged/or the stick CHANGED/')" "$M3" "$M4"
     arm code-mismatch red "$M1" "$M2" "$(printf '%s\n' "$M3" | sed 's/yes 5e7a/yes 0001/')" "$M4"
     arm not-restored red "$M1" "$M2" "$(printf '%s\n' "$M3" | grep -v 'saved table is back')" "$M4"
-    arm still-changed red "$M1" "$M2" "$(printf '%s\n' "$M3" | sed 's/^tablecheck: nvme: unchanged.*/tablecheck: nvme: CHANGED since the backup (first difference in sector 3) -- x/')" "$M4"
+    arm still-changed red "$M1" "$M2" "$(printf '%s\n' "$M3" | sed 's/^tablecheck: nvme: unchanged.*/tablecheck: nvme: CHANGED since the backup (first difference in sector 3); x/')" "$M4"
     arm entry5-left red "$M1" "$M2" "$(printf '%s\n' "$M3" | sed 's/^  gpt: 4 partition/  part 5: Linux filesystem, LBA 100352-116735 (8 MiB), "Changed"\n  gpt: 4 partition/')" "$M4"
     arm gpt-broken red "$M1" "$M2" "$(printf '%s\n' "$M3" | sed 's/backup header OK/backup header MISSING\/DAMAGED/')" "$M4"
     arm image-not-original red "$M1" "$M2" "$(printf '%s\n' "$M3" | grep -v '^harness')" "$M4"
@@ -164,8 +164,8 @@ selftest() {
 }
 
 echo "== PC tablerestore: the saved partition table put back from the USB stick on the owner's code (PC track step 5) =="
-if ! selftest; then echo "PC TABLERESTORE TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC TABLERESTORE SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC TABLERESTORE TEST FAILED (grader selftest); no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC TABLERESTORE SELFTEST ONLY; no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }
@@ -190,7 +190,7 @@ head -c 8388608 /dev/zero > "$W/stick.img" # a fresh, blank 8 MiB USB stick
 (cd "$W" && md5sum gpt.img mbr-room.img > before.md5 && md5sum mbr-room.img > other.md5)
 
 # what an install does to the NVMe image: a fifth entry (Linux filesystem, LBA 100352-116735, "Changed") in
-# both GPT copies with every CRC redone -- a one-sided change would be repaired by the firmware itself
+# both GPT copies with every CRC redone: a one-sided change would be repaired by the firmware itself
 change() {
     "$PY" - "$W/gpt.img" << 'PYEOF'
 import sys, struct, uuid, zlib

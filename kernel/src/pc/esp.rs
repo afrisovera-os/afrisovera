@@ -14,7 +14,7 @@
 //!
 //! `bootcopy [yes <code>]` (7 Nov 2026) then copies the boot file there on the owner's code --
 //! free clusters, their FAT entries in both copies, two free slots of \EFI, FSInfo's count;
-//! nothing already in the partition is moved or changed -- and `bootcopy remove` takes it out
+//! nothing already in the partition is moved or changed, and `bootcopy remove` takes it out
 //! again (the way back). No firmware boot entry is added by either.
 
 use crate::gpt::{self, Disk};
@@ -327,11 +327,11 @@ fn esps(dk: Disk, cap512: u64, bs: u64, out: &mut [(u64, u64, u64, [u8; 16]); 4]
     }
     let mut rd = |n: u64, o: &mut [u8; 512]| dk.read(n, o);
     let Some(h) = gpt::header(&mut rd, 1, per) else {
-        return Err("the GPT's primary header is damaged -- a damaged table is never changed");
+        return Err("the GPT's primary header is damaged (a damaged table is never changed)");
     };
     let alt = u64le(&h, 32);
     if alt >= blocks || gpt::header(&mut rd, alt, per).is_none() {
-        return Err("the GPT's backup header is missing or damaged -- a damaged table is never changed");
+        return Err("the GPT's backup header is missing or damaged (a damaged table is never changed)");
     }
     let (elba, n_ent, esz) = (u64le(&h, 72), u32le(&h, 80) as u64, u32le(&h, 84) as u64);
     if esz < 128 || esz > 512 || 512 % esz != 0 || n_ent == 0 || n_ent > 1024 {
@@ -358,7 +358,7 @@ fn esps(dk: Disk, cap512: u64, bs: u64, out: &mut [(u64, u64, u64, [u8; 16]); 4]
         }
     }
     if !crc != u32le(&h, 88) {
-        return Err("the GPT's entries are damaged (CRC) -- a damaged table is never changed");
+        return Err("the GPT's entries are damaged (CRC), and a damaged table is never changed");
     }
     Ok(n)
 }
@@ -400,7 +400,7 @@ fn scan(on: bool) -> (Option<Spot>, Option<Spot>) {
     let file = crate::uefi::own_image();
     match file {
         Some(f) => say!(on, "bootplan: AfriSovera's boot file is {} KiB (kept at power-on)", kib(f.len() as u64)),
-        None => say!(on, "bootplan: AfriSovera's boot file was not kept at power-on -- the EFI partitions are shown, no plan is made"),
+        None => say!(on, "bootplan: AfriSovera's boot file was not kept at power-on, so the EFI partitions are shown, no plan is made"),
     }
     let (ds, nd) = gpt::disks();
     let mut chosen: Option<Spot> = None;
@@ -441,7 +441,7 @@ fn scan(on: bool) -> (Option<Spot>, Option<Spot>) {
             let (free, same, clean) = match fat.free() {
                 Ok(v) => v,
                 Err(why) => {
-                    say!(on, "  FAT32, but {} -- not changed", why);
+                    say!(on, "  FAT32, but {}; not changed", why);
                     continue;
                 }
             };
@@ -451,7 +451,7 @@ fn scan(on: bool) -> (Option<Spot>, Option<Spot>) {
             let efi = match fat.sub(fat.root, "EFI") {
                 Ok(v) => v,
                 Err(why) => {
-                    say!(on, "  {} -- not changed", why);
+                    say!(on, "  {}; not changed", why);
                     continue;
                 }
             };
@@ -482,24 +482,24 @@ fn scan(on: bool) -> (Option<Spot>, Option<Spot>) {
                         false
                     });
                     if let Err(why) = r {
-                        say!(on, "  {} -- not changed", why);
+                        say!(on, "  {}; not changed", why);
                         continue;
                     }
                     let what = core::str::from_utf8(&l[..ln]).unwrap_or("?");
                     say!(on, "  \\EFI holds: {}", if ln == 0 { "nothing" } else { what });
                 }
                 Some((_, false)) => {
-                    say!(on, "  \\EFI is a file, not a folder -- not changed");
+                    say!(on, "  \\EFI is a file, not a folder; not changed");
                     continue;
                 }
                 None => say!(on, "  no \\EFI folder yet"),
             }
             if !clean {
-                say!(on, "  plan: none -- the file system was not closed cleanly (Windows Fast Startup or a crash): not changed until Windows has checked it");
+                say!(on, "  plan: none; the file system was not closed cleanly (Windows Fast Startup or a crash): not changed until Windows has checked it");
                 continue;
             }
             if !same {
-                say!(on, "  plan: none -- its two FAT copies differ: not changed until Windows has checked it");
+                say!(on, "  plan: none; its two FAT copies differ: not changed until Windows has checked it");
                 continue;
             }
             let spot = Spot {
@@ -518,7 +518,7 @@ fn scan(on: bool) -> (Option<Spot>, Option<Spot>) {
             };
             if let Some(c) = ours {
                 match fat.bytes_in(c) {
-                    Ok(b) => say!(on, "  \\EFI\\afrisovera is already there ({} KiB) -- nothing to copy", kib(b)),
+                    Ok(b) => say!(on, "  \\EFI\\afrisovera is already there ({} KiB); nothing to copy", kib(b)),
                     Err(why) => say!(on, "  \\EFI\\afrisovera is already there, but {}", why),
                 }
                 if there.is_none() {
@@ -532,7 +532,7 @@ fn scan(on: bool) -> (Option<Spot>, Option<Spot>) {
             if need > free {
                 say!(
                     on,
-                    "  plan: none -- the boot file needs {} KiB here, only {} KiB free",
+                    "  plan: none; the boot file needs {} KiB here, only {} KiB free",
                     kib(need * cb),
                     kib(free * cb)
                 );
@@ -573,15 +573,15 @@ pub fn plan() {
         );
     }
     match crate::bootent::numbers() {
-        None => crate::kprintln!("  boot entry: the firmware's boot entries were not read at power-on -- none can be planned"),
+        None => crate::kprintln!("  boot entry: the firmware's boot entries were not read at power-on, so none can be planned"),
         Some((_, Some(n), _)) => {
             let nm = crate::bootent::name(n);
-            crate::kprintln!("  boot entry: AfriSovera already has one ({}) -- nothing to add", core::str::from_utf8(&nm).unwrap_or("?"));
+            crate::kprintln!("  boot entry: AfriSovera already has one ({}); nothing to add", core::str::from_utf8(&nm).unwrap_or("?"));
         }
         Some((free, None, first)) => match (chosen, free) {
-            (None, _) if already => crate::kprintln!("  boot entry: AfriSovera's file is there but no entry points at it yet -- adding one will ask for the owner's word"),
-            (None, _) => crate::kprintln!("  boot entry: none planned -- no EFI system partition with room"),
-            (Some(_), None) => crate::kprintln!("  boot entry: none planned -- no free Boot number below Boot0100"),
+            (None, _) if already => crate::kprintln!("  boot entry: AfriSovera's file is there but no entry points at it yet; adding one will ask for the owner's word"),
+            (None, _) => crate::kprintln!("  boot entry: none planned; no EFI system partition with room"),
+            (Some(_), None) => crate::kprintln!("  boot entry: none planned; no free Boot number below Boot0100"),
             (Some(s), Some(num)) => {
                 let nm = crate::bootent::name(num);
                 crate::kprintln!(
@@ -593,16 +593,22 @@ pub fn plan() {
                     FILE
                 );
                 match first {
-                    Some((_, d, dn)) => crate::kprintln!(
-                        "  the PC keeps starting \"{}\" first; AfriSovera is picked from the firmware's boot menu",
-                        core::str::from_utf8(&d[..dn]).unwrap_or("?")
-                    ),
+                    Some((_, d, dn)) => {
+                        crate::kprintln!(
+                            "  the PC keeps starting \"{}\" first; AfriSovera is picked from the firmware's boot menu",
+                            core::str::from_utf8(&d[..dn]).unwrap_or("?")
+                        );
+                        // BootOrder's places before it that the firmware passes over, and why (12 Nov 2026)
+                        crate::bootent::passed_over();
+                    }
                     None => crate::kprintln!("  the PC keeps its first choice; AfriSovera is picked from the firmware's boot menu"),
                 }
             }
         },
     }
-    crate::kprintln!("bootplan: a plan only -- nothing was written; adding it will ask for the owner's word, with the way back");
+    // the other systems' own entries (Windows Boot Manager, ubuntu): named, and said to stay as they are
+    crate::bootent::others();
+    crate::kprintln!("bootplan: a plan only, so nothing was written; adding it will ask for the owner's word, with the way back");
 }
 
 // --- `bootcopy`: the boot file copied into the EFI system partition, and taken out again ---
@@ -974,7 +980,7 @@ fn agreed(cmd: &str, given: Option<&str>, want: u32) -> bool {
     match given {
         Some(c) if c.len() == 4 && u32::from_str_radix(c, 16).ok() == Some(want) => true,
         Some(_) => {
-            crate::kprintln!("{}: that code does not fit this EFI partition as it is now -- nothing written", cmd);
+            crate::kprintln!("{}: that code does not fit this EFI partition as it is now; nothing written", cmd);
             false
         }
         None => {
@@ -988,31 +994,31 @@ fn agreed(cmd: &str, given: Option<&str>, want: u32) -> bool {
 /// in the EFI system partition bootplan picks. No boot entry is added here.
 pub fn copy(given: Option<&str>) {
     let Some(file) = crate::uefi::own_image() else {
-        crate::kprintln!("bootcopy: AfriSovera's boot file was not kept at power-on -- nothing to copy; nothing written");
+        crate::kprintln!("bootcopy: AfriSovera's boot file was not kept at power-on, so there is nothing to copy; nothing written");
         return;
     };
     let (chosen, there) = scan(false);
     if let Some(t) = there {
         crate::kprintln!(
-            "bootcopy: {} partition {} already holds \\EFI\\afrisovera -- nothing to copy (bootcopy remove takes it out)",
+            "bootcopy: {} partition {} already holds \\EFI\\afrisovera; nothing to copy (bootcopy remove takes it out)",
             gpt::label_str(&t.label),
             t.ent
         );
         return;
     }
     let Some(s) = chosen else {
-        crate::kprintln!("bootcopy: no EFI system partition can take the boot file (bootplan says why) -- nothing written");
+        crate::kprintln!("bootcopy: no EFI system partition can take the boot file (bootplan says why); nothing written");
         return;
     };
     let lname = gpt::label_str(&s.label);
     if s.efi == 0 {
-        crate::kprintln!("bootcopy: {} partition {} has no \\EFI folder -- not changed (an EFI partition Windows uses always has one); nothing written", lname, s.ent);
+        crate::kprintln!("bootcopy: {} partition {} has no \\EFI folder, so it is not changed (an EFI partition Windows uses always has one); nothing written", lname, s.ent);
         return;
     }
     let fat = match Fat::open(s.dk, s.part, s.len) {
         Ok(f) => f,
         Err(why) => {
-            crate::kprintln!("bootcopy: the EFI partition {} -- nothing written", why);
+            crate::kprintln!("bootcopy: the EFI partition {}; nothing written", why);
             return;
         }
     };
@@ -1041,15 +1047,15 @@ pub fn copy(given: Option<&str>) {
         ended && rn == 2
     });
     if let Err(why) = r {
-        crate::kprintln!("bootcopy: {} -- nothing written", why);
+        crate::kprintln!("bootcopy: {}; nothing written", why);
         return;
     }
     if rn < 2 {
-        crate::kprintln!("bootcopy: \\EFI has no two free entries side by side (it would have to grow) -- not changed; nothing written");
+        crate::kprintln!("bootcopy: \\EFI has no two free entries side by side (it would have to grow), so it is not changed; nothing written");
         return;
     }
     let Some(tilde) = (1..=9u8).find(|&i| !used[i as usize]) else {
-        crate::kprintln!("bootcopy: \\EFI already has AFRISO~1 to AFRISO~9 -- not changed; nothing written");
+        crate::kprintln!("bootcopy: \\EFI already has AFRISO~1 to AFRISO~9, so it is not changed; nothing written");
         return;
     };
     crate::kprintln!(
@@ -1066,7 +1072,7 @@ pub fn copy(given: Option<&str>) {
         kib(s.free * cb)
     );
     let Some(want) = code(b"bootcopy", &s, &fat, file.len() as u64) else {
-        crate::kprintln!("bootcopy: a read FAILED -- nothing written");
+        crate::kprintln!("bootcopy: a read FAILED; nothing written");
         return;
     };
     if !agreed("bootcopy", given, want) {
@@ -1078,14 +1084,14 @@ pub fn copy(given: Option<&str>) {
     let fc = match fat.take(nfile, file) {
         Ok(c) => c,
         Err(why) => {
-            crate::kprintln!("bootcopy: {} -- \\EFI was not changed; chkdsk in Windows frees any clusters already taken", why);
+            crate::kprintln!("bootcopy: {}; \\EFI was not changed, and chkdsk in Windows frees any clusters already taken", why);
             return;
         }
     };
     let dc = match fat.take(1, &[]) {
         Ok(c) => c,
         Err(why) => {
-            crate::kprintln!("bootcopy: {} -- \\EFI was not changed; chkdsk in Windows frees any clusters already taken", why);
+            crate::kprintln!("bootcopy: {}; \\EFI was not changed, and chkdsk in Windows frees any clusters already taken", why);
             return;
         }
     };
@@ -1114,7 +1120,7 @@ pub fn copy(given: Option<&str>) {
         && fat.put_slot(run[1].0, run[1].1, &de)
         && fat.fsinfo(-((nfile + 1) as i64));
     if !ok {
-        crate::kprintln!("bootcopy: a write FAILED part way -- bootcopy remove (or chkdsk in Windows) puts it right");
+        crate::kprintln!("bootcopy: a write FAILED part way; bootcopy remove (or chkdsk in Windows) puts it right");
         return;
     }
     // read it all back
@@ -1136,25 +1142,25 @@ pub fn copy(given: Option<&str>) {
                 kib(file.len() as u64),
                 kib(free * cb)
             );
-            crate::kprintln!("bootcopy: no boot entry was added -- the PC starts exactly as before; bootcopy remove takes the file out again");
+            crate::kprintln!("bootcopy: no boot entry was added, so the PC starts exactly as before; bootcopy remove takes the file out again");
         }
-        Err(why) => crate::kprintln!("bootcopy: reading back FAILED: {} -- bootcopy remove takes it out again", why),
+        Err(why) => crate::kprintln!("bootcopy: reading back FAILED: {}; bootcopy remove takes it out again", why),
     }
 }
 
-/// `bootcopy remove [yes <code>]`: \EFI\afrisovera taken out again -- only when it holds
+/// `bootcopy remove [yes <code>]`: \EFI\afrisovera taken out again, only when it holds
 /// afrisovera.efi and nothing else (what bootcopy put there).
 pub fn remove(given: Option<&str>) {
     let (_, there) = scan(false);
     let Some(s) = there else {
-        crate::kprintln!("bootcopy remove: no EFI system partition holds \\EFI\\afrisovera that may be changed (bootplan says why) -- nothing written");
+        crate::kprintln!("bootcopy remove: no EFI system partition holds \\EFI\\afrisovera that may be changed (bootplan says why); nothing written");
         return;
     };
     let lname = gpt::label_str(&s.label);
     let fat = match Fat::open(s.dk, s.part, s.len) {
         Ok(f) => f,
         Err(why) => {
-            crate::kprintln!("bootcopy remove: the EFI partition {} -- nothing written", why);
+            crate::kprintln!("bootcopy remove: the EFI partition {}; nothing written", why);
             return;
         }
     };
@@ -1167,11 +1173,11 @@ pub fn remove(given: Option<&str>) {
         }
         false
     }) {
-        crate::kprintln!("bootcopy remove: {} -- nothing written", why);
+        crate::kprintln!("bootcopy remove: {}; nothing written", why);
         return;
     }
     if others > 0 {
-        crate::kprintln!("bootcopy remove: \\EFI\\afrisovera holds other files too -- not removed (only what bootcopy put there is taken out); nothing written");
+        crate::kprintln!("bootcopy remove: \\EFI\\afrisovera holds other files too, so it is not removed (only what bootcopy put there is taken out); nothing written");
         return;
     }
     let cb = fat.cluster_bytes();
@@ -1179,11 +1185,11 @@ pub fn remove(given: Option<&str>) {
     let flen = if fc == 0 { Some(0) } else { fat.chain_len(fc) };
     let dlen = fat.chain_len(s.ours);
     let (Some(flen), Some(dlen)) = (flen, dlen) else {
-        crate::kprintln!("bootcopy remove: a cluster chain is damaged -- not changed until Windows has checked it; nothing written");
+        crate::kprintln!("bootcopy remove: a cluster chain is damaged, so it is not changed until Windows has checked it; nothing written");
         return;
     };
     if flen != (size as u64).div_ceil(cb) {
-        crate::kprintln!("bootcopy remove: afrisovera.efi's chain does not fit its size -- not changed until Windows has checked it; nothing written");
+        crate::kprintln!("bootcopy remove: afrisovera.efi's chain does not fit its size, so it is not changed until Windows has checked it; nothing written");
         return;
     }
     // \EFI's entry for the folder and the long-name pieces just before it
@@ -1224,7 +1230,7 @@ pub fn remove(given: Option<&str>) {
         false
     });
     if r.is_err() || found == 0 {
-        crate::kprintln!("bootcopy remove: \\EFI\\afrisovera's entry could not be found again -- nothing written");
+        crate::kprintln!("bootcopy remove: \\EFI\\afrisovera's entry could not be found again; nothing written");
         return;
     }
     crate::kprintln!(
@@ -1235,7 +1241,7 @@ pub fn remove(given: Option<&str>) {
         kib(size as u64)
     );
     let Some(want) = code(b"bootremove", &s, &fat, (s.ours as u64) << 32 | size as u64) else {
-        crate::kprintln!("bootcopy remove: a read FAILED -- nothing written");
+        crate::kprintln!("bootcopy remove: a read FAILED; nothing written");
         return;
     };
     if !agreed("bootcopy remove", given, want) {
@@ -1245,7 +1251,7 @@ pub fn remove(given: Option<&str>) {
     let mut ok = (0..found).rev().all(|i| fat.put_slot(at[i].0, at[i].1, &[0xE5]));
     ok = ok && (fc == 0 || fat.release(fc)) && fat.release(s.ours) && fat.fsinfo((flen + dlen) as i64);
     if !ok {
-        crate::kprintln!("bootcopy remove: a write FAILED part way -- chkdsk in Windows puts the partition right");
+        crate::kprintln!("bootcopy remove: a write FAILED part way; chkdsk in Windows puts the partition right");
         return;
     }
     let back = Fat::open(s.dk, s.part, s.len).and_then(|f| {

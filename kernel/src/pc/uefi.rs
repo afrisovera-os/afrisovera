@@ -1,7 +1,7 @@
 //! The few UEFI firmware calls the PC kernel needs before it takes the machine over.
 //!
 //! Hand-written, not a crate: the kernel has no dependencies and this is the whole of
-//! the firmware interface it uses — find the memory map, find the screen, and leave
+//! the firmware interface it uses: find the memory map, find the screen, and leave
 //! the firmware ("exit boot services"). After that the firmware is never called again.
 //! Layouts are UEFI 2.x (x86-64, `efiapi` = the Microsoft x64 calling convention).
 
@@ -61,7 +61,7 @@ pub const GOP_GUID: Guid =
     Guid(0x9042a9de, 0x23dc, 0x4a38, [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a]);
 
 /// One entry of the firmware's memory map. Entries are `desc_size` apart, which may be
-/// larger than this struct — always step by `desc_size`, never by `size_of`.
+/// larger than this struct; always step by `desc_size`, never by `size_of`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MemoryDescriptor {
@@ -293,13 +293,13 @@ impl Uefi {
             let hp: HandleProtocolFn = core::mem::transmute(self.bs().f[HANDLE_PROTOCOL]);
             let mut li: *mut core::ffi::c_void = core::ptr::null_mut();
             if hp(self.image, &LOADED_IMAGE_GUID, &mut li) != SUCCESS || li.is_null() {
-                crate::kprintln!("[pc] own boot file: no loaded-image protocol -- installdisk will not be possible");
+                crate::kprintln!("[pc] own boot file: no loaded-image protocol; installdisk will not be possible");
                 return;
             }
             let li = &*(li as *const LoadedImage);
             let mut fs: *mut core::ffi::c_void = core::ptr::null_mut();
             if li.device.is_null() || hp(li.device, &SIMPLE_FS_GUID, &mut fs) != SUCCESS || fs.is_null() {
-                crate::kprintln!("[pc] own boot file: the boot device has no file system the firmware reads -- installdisk will not be possible");
+                crate::kprintln!("[pc] own boot file: the boot device has no file system the firmware reads; installdisk will not be possible");
                 return;
             }
             // the path: the file-path nodes of the image's device path, else the default one
@@ -343,13 +343,13 @@ impl Uefi {
             let fs = fs as *mut SimpleFs;
             let mut root: *mut File = core::ptr::null_mut();
             if ((*fs).open_volume)(fs, &mut root) != SUCCESS || root.is_null() {
-                crate::kprintln!("[pc] own boot file: the boot volume could not be opened -- installdisk will not be possible");
+                crate::kprintln!("[pc] own boot file: the boot volume could not be opened; installdisk will not be possible");
                 return;
             }
             let mut f: *mut File = core::ptr::null_mut();
             if ((*root).open)(root, &mut f, path.as_ptr(), 1, 0) != SUCCESS || f.is_null() {
                 ((*root).close)(root);
-                crate::kprintln!("[pc] own boot file: it could not be opened -- installdisk will not be possible");
+                crate::kprintln!("[pc] own boot file: it could not be opened; installdisk will not be possible");
                 return;
             }
             let mut size = 0u64;
@@ -359,7 +359,7 @@ impl Uefi {
             if !sized || size == 0 || size as usize > OWN_MAX {
                 ((*f).close)(f);
                 ((*root).close)(root);
-                crate::kprintln!("[pc] own boot file: its size could not be read ({} B) -- installdisk will not be possible", size);
+                crate::kprintln!("[pc] own boot file: its size could not be read ({} B); installdisk will not be possible", size);
                 return;
             }
             let ap: AllocatePagesFn = core::mem::transmute(self.bs().f[ALLOCATE_PAGES]);
@@ -368,7 +368,7 @@ impl Uefi {
             if ap(ALLOC_MAX_ADDRESS, MEM_OWN_IMAGE, pages, &mut at) != SUCCESS || at == 0 {
                 ((*f).close)(f);
                 ((*root).close)(root);
-                crate::kprintln!("[pc] own boot file: no memory for it -- installdisk will not be possible");
+                crate::kprintln!("[pc] own boot file: no memory for it; installdisk will not be possible");
                 return;
             }
             let mut got = 0usize;
@@ -382,7 +382,7 @@ impl Uefi {
             ((*f).close)(f);
             ((*root).close)(root);
             if got != size as usize {
-                crate::kprintln!("[pc] own boot file: read {} of {} B -- installdisk will not be possible", got, size);
+                crate::kprintln!("[pc] own boot file: read {} of {} B; installdisk will not be possible", got, size);
                 return;
             }
             OWN = (at, got);
@@ -493,7 +493,7 @@ impl Uefi {
         unsafe { read_boot_vars(rt) };
         let bv = boot_vars();
         if rt.is_null() {
-            crate::kprintln!("[pc] boot entries: {} -- bootentries will say so", bv.why);
+            crate::kprintln!("[pc] boot entries: {}; bootentries will say so", bv.why);
             return;
         }
         crate::kprintln!(

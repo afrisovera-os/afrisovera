@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PC track step 5 (6 Nov 2026): `tablebackup` copies every internal disk's partition table to a USB stick
 # (read back and CRC-checked; the internal disks are only READ) and `tablecheck` compares that copy, sector
-# by sector, with the disk now -- the backup an install must have before it may ever change a table.
+# by sector, with the disk now: the backup an install must have before it may ever change a table.
 #
 # Boot 1: the Windows-like GPT on NVMe, the full MBR disk on SATA port 2, the damaged GPT (backup header
 # wiped) on SATA port 3 and a blank 8 MiB USB stick. `tablecheck` first finds no backup; `tablebackup`
@@ -25,7 +25,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     [ -r "$1" ] && [ -r "$2" ] && [ -r "$3" ] && [ -r "$4" ] || { echo "  FAIL: missing log"; return 1; }
     cl() { tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g'; }
     A="$(cl "$1")"; B="$(cl "$2")"; C="$(cl "$3")"; D="$(cl "$4")"
-    has() { printf '%s\n' "$1" | grep -aqxE "$2"; }
+    has() { grep -aqxE "$2" <<< "$1"; }
     blk() { printf '%s\n' "$1" | awk -v c="afrisovera> $2" '$0==c{on=1;next} /^afrisovera>/{on=0} on'; }
     local A0 A1 B1 C1 D0 D1 OK='read back OK'
     A0="$(blk "$A" 'tablecheck')"; A1="$(blk "$A" 'tablebackup')"; B1="$(blk "$B" 'tablecheck')"
@@ -47,16 +47,16 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     has "$B1" 'tablecheck: sata port 2: unchanged since the backup \(1 sector\(s\)\)' || _f "boot 2: SATA port 2 not unchanged"
     has "$B1" 'tablecheck: sata port 3: unchanged since the backup \(34 sector\(s\)\)' || _f "boot 2: SATA port 3 not unchanged"
     printf '%s\n' "$B1" | grep -aqE '(nvme|port [23]): (CHANGED|.*damaged|that disk)' && _f "boot 2: a disk that did not change was reported"
-    has "$C1" 'tablecheck: nvme: CHANGED since the backup \(first difference in sector 1\) -- back it up again before any install' ||
+    has "$C1" 'tablecheck: nvme: CHANGED since the backup \(first difference in sector 1\); back it up again before any install' ||
         _f "boot 3: the renamed GPT entry (header CRC, sector 1) was not caught"
     has "$C1" 'tablecheck: sata port 2: the copy on the USB stick is damaged \(data CRC\)' ||
         _f "boot 3: the damaged copy of SATA port 2 was not caught"
     has "$C1" 'tablecheck: sata port 3: that disk is not here now' || _f "boot 3: the missing SATA port 3 was not noticed"
-    has "$D0" "tablebackup: no USB stick to hold the backup \(plug in a blank stick or one of AfriSovera.s\) -- nothing written" ||
+    has "$D0" "tablebackup: no USB stick to hold the backup \(plug in a blank stick or one of AfriSovera.s\); nothing written" ||
         _f "boot 4: tablebackup without a stick did not refuse"
     has "$D1" 'tablecheck: no partition-table backup on a USB stick \(run tablebackup\)' || _f "boot 4: tablecheck without a stick"
     for L in "$B1" "$C1"; do
-        has "$L" 'tablecheck: read only -- nothing was written' || _f "a tablecheck did not finish"
+        has "$L" 'tablecheck: read only; nothing was written' || _f "a tablecheck did not finish"
     done
     for L in "$A" "$B" "$C" "$D"; do
         has "$L" 'harness: disk images unchanged' || _f "an internal disk image changed during a boot (or the check is missing)"
@@ -85,19 +85,19 @@ tablecheck: nvme: unchanged since the backup (67 sector(s))
 tablecheck: sata port 0: unchanged since the backup (1 sector(s))
 tablecheck: sata port 2: unchanged since the backup (1 sector(s))
 tablecheck: sata port 3: unchanged since the backup (34 sector(s))
-tablecheck: read only -- nothing was written
+tablecheck: read only; nothing was written
 afrisovera>
 $H"
 M3="afrisovera> tablecheck
-tablecheck: nvme: CHANGED since the backup (first difference in sector 1) -- back it up again before any install
+tablecheck: nvme: CHANGED since the backup (first difference in sector 1); back it up again before any install
 tablecheck: sata port 0: unchanged since the backup (1 sector(s))
 tablecheck: sata port 2: the copy on the USB stick is damaged (data CRC)
 tablecheck: sata port 3: that disk is not here now
-tablecheck: read only -- nothing was written
+tablecheck: read only; nothing was written
 afrisovera>
 $H"
 M4="afrisovera> tablebackup
-tablebackup: no USB stick to hold the backup (plug in a blank stick or one of AfriSovera's) -- nothing written
+tablebackup: no USB stick to hold the backup (plug in a blank stick or one of AfriSovera's); nothing written
 afrisovera> tablecheck
 tablecheck: no partition-table backup on a USB stick (run tablebackup)
 afrisovera>
@@ -119,9 +119,9 @@ selftest() {
     arm no-check-first red "$(printf '%s\n' "$M1" | grep -v '^tablecheck: no partition')" "$M2" "$M3" "$M4"
     arm nvme-short red "$(printf '%s\n' "$M1" | sed 's/67 sector(s) saved/35 sector(s) saved/')" "$M2" "$M3" "$M4"
     arm nvme-not-read-back red "$(printf '%s\n' "$M1" | sed '0,/read back OK/s//read back FAILED/')" "$M2" "$M3" "$M4"
-    arm damaged-not-saved red "$(printf '%s\n' "$M1" | sed 's/^tablebackup: sata port 3: .*/tablebackup: sata port 3: the GPT is damaged -- skipped/')" "$M2" "$M3" "$M4"
+    arm damaged-not-saved red "$(printf '%s\n' "$M1" | sed 's/^tablebackup: sata port 3: .*/tablebackup: sata port 3: the GPT is damaged, skipped/')" "$M2" "$M3" "$M4"
     arm copy-mismatch red "$(printf '%s\n' "$M1" | grep -v '^harness: the stick')" "$M2" "$M3" "$M4"
-    arm false-change red "$M1" "$(printf '%s\n' "$M2" | sed 's/^tablecheck: sata port 2: unchanged.*/tablecheck: sata port 2: CHANGED since the backup (first difference in sector 0) -- back it up again before any install/')" "$M3" "$M4"
+    arm false-change red "$M1" "$(printf '%s\n' "$M2" | sed 's/^tablecheck: sata port 2: unchanged.*/tablecheck: sata port 2: CHANGED since the backup (first difference in sector 0); back it up again before any install/')" "$M3" "$M4"
     arm change-missed red "$M1" "$M2" "$(printf '%s\n' "$M3" | sed 's/^tablecheck: nvme: CHANGED.*/tablecheck: nvme: unchanged since the backup (67 sector(s))/')" "$M4"
     arm wrong-sector red "$M1" "$M2" "$(printf '%s\n' "$M3" | sed 's/difference in sector 1/difference in sector 2/')" "$M4"
     arm bad-copy-missed red "$M1" "$M2" "$(printf '%s\n' "$M3" | sed 's/^tablecheck: sata port 2: .*/tablecheck: sata port 2: unchanged since the backup (1 sector(s))/')" "$M4"
@@ -136,8 +136,8 @@ selftest() {
 }
 
 echo "== PC partition-table backup to a USB stick (PC track step 5) =="
-if ! selftest; then echo "PC TABLEBACKUP TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC TABLEBACKUP SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC TABLEBACKUP TEST FAILED (grader selftest); no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC TABLEBACKUP SELFTEST ONLY; no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

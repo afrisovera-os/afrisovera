@@ -58,7 +58,7 @@ grade() { # grade <serial> <pixels>
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     P="$(tr -d '\r' < "$2" 2> /dev/null)"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     # each step's line, in order: the serial log after `gui` must hold them as a subsequence
     local steps=(
         '^\[gui\] Tonga desktop rendered'

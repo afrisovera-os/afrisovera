@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # PC IPC + SCHEDULER check (suite 694, PC track step 1: processes, capabilities, IPC and the
-# timer scheduler on x86-64, 4 Nov 2026 -- the Phase 0 proof, on a PC).
+# timer scheduler on x86-64, 4 Nov 2026: the Phase 0 proof, on a PC).
 #
 # Same boot as suites 691-693: `mansa-pc` as EFI/BOOT/BOOTX64.EFI, QEMU q35 + EDK II (OVMF),
 # graded from the serial log. This suite grades kernel/src/pc/proc.rs.
-#   IPC -- P0 holds only a RECV capability on endpoint 0, P1 only a SEND capability:
+#   IPC: P0 holds only a RECV capability on endpoint 0, P1 only a SEND capability:
 #   1. P0 runs first and blocks in RECV; P1 sends 0x42; P0 prints 0x42 only AFTER P1 has
-#      exited -- the message crossed address spaces through the kernel, and P0 was blocked;
+#      exited: the message crossed address spaces through the kernel, and P0 was blocked;
 #   2. every request without the right is refused BY THE KERNEL, by name: P1's RECV on 0,
 #      P0's SEND on 0, P0's RECV on handle 2 (no capability there at all);
 #   3. isolation: both wrote a mark at the SAME virtual address; each reads back its own
-#      (P1 0x5e4d, P0 0xec7) -- separate address spaces, not one shared page;
+#      (P1 0x5e4d, P0 0xec7): separate address spaces, not one shared page;
 #   4. the kernel's summary: 2 exited, 3 refused, 0 faults (ok).
-#   SCHEDULER -- two workers that never yield, each waiting to be preempted 3 times:
+#   SCHEDULER: two workers that never yield, each waiting to be preempted 3 times:
 #   5. both print a slice count >= 3 and exit; the kernel counts >= 2 timer switches
-#      between them (ok) -- only preemption can let both finish.
-#   ENDPOINTS (review R1-10, 8 Nov 2026) -- P0 waits on endpoint 1, P1 on endpoint 2; P2 sends 0xb2
+#      between them (ok): only preemption can let both finish.
+#   ENDPOINTS (review R1-10, 8 Nov 2026): P0 waits on endpoint 1, P1 on endpoint 2; P2 sends 0xb2
 #   on endpoint 2, P3 0xa1 on endpoint 1; P4 holds a capability past the last endpoint:
 #   6. P0 prints 0xa1 and P1 prints 0xb2 (a SEND that woke any receiver gives them crossed);
 #      P4's RECV is refused; the kernel's summary: 5 exited, 1 refused, 0 faults (ok).
@@ -37,7 +37,7 @@ grade() {
         return 1
     fi
     L="$(tr -d '\r' < "$F" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$L" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$L"; }
     line() { printf '%s\n' "$L" | grep -anE "$1" | head -1 | cut -d: -f1; }
 
     local LX LM
@@ -46,7 +46,7 @@ grade() {
     if [ -z "$LM" ]; then
         _f "P0 never received 0x42 from P1"
     elif [ -z "$LX" ] || [ "$LM" -lt "$LX" ]; then
-        _f "P0 printed 0x42 before P1 exited -- it was never blocked waiting for the message"
+        _f "P0 printed 0x42 before P1 exited; it was never blocked waiting for the message"
     fi
     has '^\[P1\] RECV on handle 0 refused: no RECV capability$' ||
         _f "P1's RECV on its send-only handle was not refused"
@@ -55,7 +55,7 @@ grade() {
     has '^\[P0\] RECV on handle 2 refused: no RECV capability$' ||
         _f "P0's RECV on a handle it holds no capability for was not refused"
     has '^\[P1\] 0x5e4d$' || _f "P1 did not read back its own mark (0x5e4d)"
-    has '^\[P0\] 0xec7$' || _f "P0 did not read back its own mark (0xec7) -- address spaces not separate"
+    has '^\[P0\] 0xec7$' || _f "P0 did not read back its own mark (0xec7); address spaces not separate"
     has '^\[pc\] IPC: 2 processes in separate address spaces, 2 exited, 3 requests refused for lack of a capability, 0 faults \(ok\)$' ||
         _f "the kernel's IPC summary is not '2 exited, 3 refused, 0 faults (ok)'"
 
@@ -80,10 +80,10 @@ grade() {
 ' "$L" | sed -n '/^\[pc\] scheduler: /,/^\[pc\] IPC endpoints: /p')"
     printf '%s
 ' "$E" | grep -aqE '^\[P0\] 0xa1$' ||
-        _f "P0 (waiting on endpoint 1) did not get 0xa1 -- endpoints are not separate"
+        _f "P0 (waiting on endpoint 1) did not get 0xa1; endpoints are not separate"
     printf '%s
 ' "$E" | grep -aqE '^\[P1\] 0xb2$' ||
-        _f "P1 (waiting on endpoint 2) did not get 0xb2 -- endpoints are not separate"
+        _f "P1 (waiting on endpoint 2) did not get 0xb2; endpoints are not separate"
     printf '%s
 ' "$E" | grep -aqE '^\[P4\] RECV on handle 0 refused: no RECV capability$' ||
         _f "P4's capability past the last endpoint was not refused"
@@ -160,8 +160,8 @@ selftest() {
     arm no-switches red < <(printf '%s\n' "$GREEN" | sed 's/, 6 switches between/, 0 switches between/')
     arm worker-not-preempted red < <(printf '%s\n' "$GREEN" | sed '/^\[pc\] IPC: /,$ s/^\[P1\] 0x3$/[P1] 0x1/')
     arm worker-missing red < <(printf '%s\n' "$GREEN" | sed 's/time-sliced by the APIC timer, 6 switches between them, 2 exited (ok)/time-sliced by the APIC timer, 6 switches between them, 1 exited (WRONG)/')
-    arm process-fault red < <(printf '%s\n' "$GREEN" | sed 's/^\[P0\] exit 0$/[P0] fault: vector 14 at RIP 0x10000000004 (address 0x0) -- process stopped/')
-    arm deadlock red < <(printf '%s\n' "$GREEN" | sed 's/^\[pc\] MANSA-PC BOOT OK$/[proc] 1 process(es) blocked forever on IPC -- deadlock, stopping them\n[pc] MANSA-PC BOOT OK/')
+    arm process-fault red < <(printf '%s\n' "$GREEN" | sed 's/^\[P0\] exit 0$/[P0] fault: vector 14 at RIP 0x10000000004 (address 0x0); process stopped/')
+    arm deadlock red < <(printf '%s\n' "$GREEN" | sed 's/^\[pc\] MANSA-PC BOOT OK$/[proc] 1 process(es) blocked forever on IPC, a deadlock; stopping them\n[pc] MANSA-PC BOOT OK/')
     arm verdict-in-prose red < <(printf '%s\n' "$GREEN" | sed 's/^\[P0\] 0x42$/  [P0] 0x42/')
     arm endpoints-crossed red < <(printf '%s
 ' "$GREEN" | sed 's/^\[P0\] 0xa1$/[P0] 0xb2/; s/^\[P1\] 0xb2$/[P1] 0xa1/')
@@ -178,10 +178,10 @@ selftest() {
 # ------------------------------------------------------------------- driver --
 echo "== PC IPC + scheduler (suite 694, PC track step 1) =="
 if ! selftest; then
-    echo "PC IPC TEST FAILED (grader selftest) -- no QEMU run spent"
+    echo "PC IPC TEST FAILED (grader selftest): no QEMU run spent"
     exit 1
 fi
-[ "${1:-}" = "--selftest" ] && { echo "PC IPC SELFTEST ONLY -- no measurement taken"; exit 0; }
+[ "${1:-}" = "--selftest" ] && { echo "PC IPC SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || { echo "PC IPC TEST FAILED (harness: qemu-system-x86_64 not on PATH)"; exit 1; }
 QDIR="$(dirname "$(command -v qemu-system-x86_64)")"
@@ -214,7 +214,7 @@ timeout 240 qemu-system-x86_64 -M q35 -m 256M \
     -serial "file:$(winpath "$SER")" -display none -no-reboot -net none \
     -fw_cfg name=opt/afrisovera/poweroff,string=1
 QRC=$?
-echo "  qemu exit $QRC ($([ "$QRC" -eq 124 ] && echo 'timed out -- the kernel never powered off' || echo 'the kernel powered off'))"
+echo "  qemu exit $QRC ($([ "$QRC" -eq 124 ] && echo 'timed out; the kernel never powered off' || echo 'the kernel powered off'))"
 tr -d '\r' < "$SER" 2>/dev/null | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | grep -aE '^\[(pc|user|proc|P[0-9])\]|^kernel heap: [0-9]|^ *\[FAIL\]' | sed 's/^/  | /'
 
 echo "  --- grading ---"

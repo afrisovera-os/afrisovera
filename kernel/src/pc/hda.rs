@@ -75,7 +75,7 @@ const W_MIXER: u32 = 2;
 const W_SELECTOR: u32 = 3;
 const W_PIN: u32 = 4;
 
-/// 44.1 kHz (base 44.1, x1, /1), 16 bits, 2 channels -- what voice.rs and the tone make.
+/// 44.1 kHz (base 44.1, x1, /1), 16 bits, 2 channels: what voice.rs and the tone make.
 const FMT_44K1_16_STEREO: u16 = 0x4011;
 const FMT_48K_16_STEREO: u16 = 0x0011;
 const RATE_HZ: u32 = 44100;
@@ -125,6 +125,7 @@ static mut READY: bool = false;
 static mut CORB_N: u16 = 256;
 static mut RIRB_N: u16 = 256;
 static mut RIRB_RP: u16 = 0;
+static mut LATE: u32 = 0; // late or unsolicited answers dropped before a command (lshda)
 static mut SD: u64 = 0; // the output stream descriptor's offset
 static mut PCI_AT: (u8, u8, u8) = (0, 0, 0);
 static mut PCI_ID: (u16, u16) = (0, 0);
@@ -248,6 +249,19 @@ fn cmd(nid: u8, verb: u32, payload: u32) -> Option<u32> {
         let v = if verb <= 0xF { CAD << 28 | (nid as u32) << 20 | verb << 16 | (payload & 0xFFFF) } else {
             CAD << 28 | (nid as u32) << 20 | verb << 8 | (payload & 0xFF)
         };
+        // Commands go one at a time, so an answer already in the RIRB is not this command's: it is a
+        // late one from a command that timed out (or an unsolicited one). Taken as ours, every later
+        // command would get the answer of the one before it. Drop them first, as Linux's
+        // azx_rirb_get_response matches each answer to the command that is waiting.
+        let mut late = 0u16;
+        while r16(RIRBWP) & 0xFF != RIRB_RP && late < RIRB_N {
+            RIRB_RP = (RIRB_RP + 1) % RIRB_N;
+            late += 1;
+        }
+        if late > 0 {
+            w8(RIRBSTS, 0x05);
+            LATE += late as u32;
+        }
         let wp = ((r16(CORBWP) & 0xFF) + 1) % CORB_N;
         write_volatile(addr_of_mut!(CORB.0[wp as usize]), v);
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -1161,7 +1175,7 @@ pub fn audio(rest: &str) {
     if rest == "tone" {
         crate::kprintln!("[audio] streaming a test tone through Intel HD Audio...");
         if tone() {
-            crate::kprintln!("[audio] done — captured by the wav audiodev if attached");
+            crate::kprintln!("[audio] done: captured by the wav audiodev if attached");
         }
     } else {
         // SAFETY: reads of boot-time state.
@@ -1209,7 +1223,7 @@ pub fn list() {
                     pin_kind(w.cfg),
                     if w.cfg >> 30 == 1 { ", not connected on this board" } else { "" },
                     w.cfg,
-                    match pin_rank(&w) { Some(_) => "", None => " -- not used" }
+                    match pin_rank(&w) { Some(_) => "", None => ", not used" }
                 ),
                 W_OUT => crate::kprintln!("  node {} audio output (DAC){}", w.nid, if w.caps & (1 << 9) != 0 { ", digital" } else { "" }),
                 W_PIN if w.pincaps & (1 << 5) != 0 => crate::kprintln!(
@@ -1240,5 +1254,41 @@ pub fn list() {
         } else {
             crate::kprintln!("lshda: not usable: {}", WHY);
         }
+        if LATE > 0 {
+            crate::kprintln!("lshda: late codec answers dropped before a command: {}", LATE);
+        }
+    }
+}
+
+/// `lshda late`: a test switch. Puts a codec command on the CORB and does not read its answer
+/// (as when a command timed out and its answer came later), then asks the codec's vendor id
+/// with the normal cmd(); right only if the late answer was dropped and not taken as this one.
+pub fn late_check() {
+    // SAFETY: single core; the rings are ours, as in cmd().
+    unsafe {
+        if BAR == 0 || CODEC_ID == 0 {
+            crate::kprintln!("lshda late: no HD Audio codec on this PC");
+            return;
+        }
+        let before = LATE;
+        let rp = RIRB_RP;
+        let v = CAD << 28 | GET_PARAM << 8 | P_NODES; // node 0, a different answer than the id
+        let wp = ((r16(CORBWP) & 0xFF) + 1) % CORB_N;
+        write_volatile(addr_of_mut!(CORB.0[wp as usize]), v);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        w16(CORBWP, wp);
+        let landed = wait_us(100_000, || r16(RIRBWP) & 0xFF != rp);
+        let got = cmd(0, GET_PARAM, P_VENDOR);
+        let again = cmd(0, GET_PARAM, P_VENDOR);
+        let ok = landed && got == Some(CODEC_ID) && again == Some(CODEC_ID) && LATE > before;
+        crate::kprintln!(
+            "lshda late: an unread answer {}; the next command got {:#010x}, then {:#010x} (codec id {:#010x}), {} dropped: {}",
+            if landed { "was left in the ring" } else { "never came" },
+            got.unwrap_or(0),
+            again.unwrap_or(0),
+            CODEC_ID,
+            LATE - before,
+            if ok { "OK" } else { "WRONG" }
+        );
     }
 }

@@ -93,14 +93,14 @@ pub fn win_create(owner: usize, w: usize, h: usize) -> i64 {
         let wi = win(id);
         (*wi).used = true;
         (*wi).owner = owner;
-        (*wi).w = w.min(CW);
+        // At least 2: the compositor draws the body at `w - 2` (afriui.md section 19; a 0 or 1 wrapped and faulted).
+        (*wi).w = w.clamp(2, CW);
         (*wi).h = h.min(CH);
         // Simple grid placement.
         (*wi).x = 30 + (id % 2) * 300;
         (*wi).y = 44 + (id / 2) * 200;
-        for p in 0..CW * CH {
-            (*wi).buf[p] = 0;
-        }
+        // One memset (compiler_builtins, fast at opt-level 0), not a 31,200-pixel loop (afriui.md section 20).
+        core::ptr::write_bytes(core::ptr::addr_of_mut!((*wi).buf) as *mut u32, 0, CW * CH);
         NWINS += 1;
         id as i64
     }
@@ -149,15 +149,51 @@ pub fn win_text(id: usize, x: usize, y: usize, ch: u8, color: u32) {
 
 /// Composite the desktop and all app surfaces onto the framebuffer.
 pub fn win_present() {
-    // Wallpaper + status bar.
-    for y in 0..H {
-        let t = y * 100 / H;
-        fb::fill_rect(0, y, W, 1, lerp(WALL_TOP, WALL_BOT, t));
-    }
-    fb::fill_rect(0, 0, W, 28, BAR);
-    fb::draw_string(10, 6, "AFRISOVERA OS", GOLD, 2);
-    fb::draw_string(W - 232, 10, "TONGA WM  --  APP SURFACES", DIM, 1);
+    present_wall();
+    present_text();
+    present_windows();
+}
 
+/// The status bar's height: the wallpaper starts below it, and its pixels never change.
+const BAR_H: usize = 28;
+/// The status bar with its text, drawn once and kept (afriui.md section 20). 70 KiB.
+static mut BAR_PIXELS: [u32; W * BAR_H] = [0; W * BAR_H];
+static mut BAR_KEPT: bool = false;
+
+/// win_present, part 1: the wallpaper gradient below the bar (split out for `fbcon wm`, afriui.md section 20).
+/// Row y has the colour `lerp(.., y * 100 / H)`, so rows come in bands of one colour: each band is one `fill_rect`
+/// (one row filled, then copied down), not one call and one `lerp` per row. The bar covers rows 0..BAR_H, so the
+/// gradient starts below it. Same pixels as the old row-by-row loop.
+fn present_wall() {
+    let mut y = BAR_H;
+    while y < H {
+        let t = y * 100 / H;
+        let end = ((t + 1) * H).div_ceil(100).min(H); // the first row of the next band
+        fb::fill_rect(0, y, W, end - y, lerp(WALL_TOP, WALL_BOT, t));
+        y = end;
+    }
+}
+
+/// win_present, part 2: the status bar and its two lines of text. Drawn once, then copied back from BAR_PIXELS.
+fn present_text() {
+    // SAFETY: syscall or shell context, single writer; BAR_PIXELS is W * BAR_H pixels and the framebuffer's first
+    // BAR_H rows are W * BAR_H pixels; the two never overlap.
+    unsafe {
+        let kept = core::ptr::addr_of_mut!(BAR_PIXELS) as *mut u32;
+        if BAR_KEPT {
+            fb::blit(0, 0, W, BAR_H, kept, W);
+            return;
+        }
+        fb::fill_rect(0, 0, W, BAR_H, BAR);
+        fb::draw_string(10, 6, "AFRISOVERA OS", GOLD, 2);
+        fb::draw_string(W - 232, 10, "TONGA WM  --  APP SURFACES", DIM, 1);
+        core::ptr::copy_nonoverlapping(fb::pixels(), kept, W * BAR_H);
+        BAR_KEPT = true;
+    }
+}
+
+/// win_present, part 3: each window's chrome and its surface.
+fn present_windows() {
     let accents = [0x1B_3A_6B, 0x2B_1B_6B, 0x1B_5B_3A, 0x6B_3A_1B];
     // SAFETY: read-only iteration over the window table in syscall context.
     unsafe {
@@ -202,4 +238,82 @@ fn fmt_u32(mut v: u32, buf: &mut [u8; 12]) -> &str {
         buf[j] = tmp[i - 1 - j];
     }
     core::str::from_utf8(&buf[..i]).unwrap_or("?")
+}
+
+/// `fbcon wm` (afriui.md section 20): time win_create and win_present (with its three parts), then two checks:
+/// a re-created surface is all zero, and a hash of the whole screen after win_present with two patterned windows.
+/// Leaves the window server empty and the console redrawn. Refuses, with one line, when a window is in use or the
+/// desk or another graphics screen is shown (the architect's condition 1), so it never resets a live window table.
+pub fn wm_time() {
+    // SAFETY: shell mainline; reads the window table's `used` flags only.
+    let busy = (0..NWIN).filter(|&i| unsafe { (*win(i)).used }).count();
+    if busy > 0 || crate::desk::shown() || !fb::console_shown() {
+        crate::kprintln!(
+            "[fbwm] refused: {} window(s) in use, desk {}, console {} (fbcon wm needs no windows and the console shown)",
+            busy,
+            if crate::desk::shown() { "shown" } else { "hidden" },
+            if fb::console_shown() { "shown" } else { "hidden" }
+        );
+        return;
+    }
+    let hz = crate::timer::hz().max(1);
+    let us = |t0: u64| crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / hz;
+    let (mut big, mut small, mut present, mut wall, mut text, mut wins) =
+        (u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX);
+    for _ in 0..8 {
+        wm_reset();
+        let t0 = crate::timer::cycles();
+        let _ = win_create(0, CW, CH);
+        big = big.min(us(t0));
+        wm_reset();
+        let t0 = crate::timer::cycles();
+        let _ = win_create(0, 40, 20);
+        small = small.min(us(t0));
+        let t0 = crate::timer::cycles();
+        win_present();
+        present = present.min(us(t0));
+        let t0 = crate::timer::cycles();
+        present_wall();
+        wall = wall.min(us(t0));
+        let t0 = crate::timer::cycles();
+        present_text();
+        text = text.min(us(t0));
+        let t0 = crate::timer::cycles();
+        present_windows();
+        wins = wins.min(us(t0));
+    }
+    // Clear check: a used surface, reset, created again, must be all zero.
+    wm_reset();
+    let id = win_create(0, CW, CH) as usize;
+    win_fill(id, 0, 0, CW, CH, 0x00AB_CDEF);
+    wm_reset();
+    let id = win_create(0, CW, CH) as usize;
+    // SAFETY: shell mainline; `id` is the slot just created.
+    let zero = unsafe { (*win(id)).buf.iter().filter(|&&p| p == 0).count() };
+    // Match check: two windows with known patterns, then a hash of the whole screen.
+    wm_reset();
+    let a = win_create(1, CW, CH) as usize;
+    let b = win_create(2, 40, 20) as usize;
+    for k in 0..6 {
+        win_fill(a, k * 37, k * 19, 50, 30, 0x0011_2233u32.wrapping_mul(k as u32 + 1));
+    }
+    for (i, &c) in b"FAST WM".iter().enumerate() {
+        win_text(a, 8 + i * 9, 100, c, WHITE);
+    }
+    win_fill(b, 0, 0, 40, 20, 0x0033_6699);
+    win_fill(b, 5, 5, 10, 10, GOLD);
+    win_present();
+    let fbp = fb::pixels();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for i in 0..W * H {
+        // SAFETY: `pixels()` is the W x H framebuffer.
+        h = (h ^ unsafe { *fbp.add(i) } as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    wm_reset();
+    fb::console_reset();
+    crate::kprintln!(
+        "[fbwm] win_create {}x{}: fastest {} us; 40x20: fastest {} us; win_present: fastest {} us (wallpaper {}, text {}, windows {})",
+        CW, CH, big, small, present, wall, text, wins
+    );
+    crate::kprintln!("[fbwm] clear check: {} of {} pixels zero; screen hash {:016x}", zero, CW * CH, h);
 }

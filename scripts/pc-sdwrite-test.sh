@@ -36,7 +36,7 @@ grade() { # grade <boot1> <boot2> <boot3> <boot4>
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     C="$(tr -d '\r' < "$3" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     D="$(tr -d '\r' < "$4" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$1" | grep -aqE "$2"; }
+    has() { grep -aqE "$2" <<< "$1"; }
     count() { printf '%s\n' "$1" | grep -acE "$2"; }
     # the write counts: at least <min> blocks, most of them by CMD25, few commands
     mostly_multi() { # mostly_multi <log> <min blocks>
@@ -201,8 +201,8 @@ selftest() {
 }
 
 echo "== PC SD/eMMC multi-block writes (PC track step 3) =="
-if ! selftest; then echo "PC SDWRITE TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC SDWRITE SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC SDWRITE TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC SDWRITE SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

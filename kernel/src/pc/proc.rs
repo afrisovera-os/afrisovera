@@ -1,6 +1,6 @@
 //! Processes on the PC: several ring-3 programs, each in its OWN address space, that can
 //! reach each other only through an IPC endpoint they hold a capability for, and that take
-//! turns on the CPU — by blocking in IPC, or by the local-APIC timer slicing them.
+//! turns on the CPU, by blocking in IPC, or by the local-APIC timer slicing them.
 //!
 //! The x86-64 twin of the ARM kernel's process.rs (Phase 0's finale), built the simplest
 //! way the PC allows: switching process is swapping the saved trap frame (and CR3) before
@@ -10,7 +10,7 @@
 //!
 //! Capabilities: a process names an endpoint by a small handle; the kernel looks the handle
 //! up in THAT process's table and checks the right (SEND or RECV). No handle, no right, no
-//! access — there is no ambient authority. An endpoint holds one message.
+//! access: there is no ambient authority. An endpoint holds one message.
 
 use crate::cpu::{TrapFrame, USER_CS, USER_DS};
 use crate::{frame, mmu, user};
@@ -117,7 +117,7 @@ fn kstack_top(slot: usize) -> Option<u64> {
             Some((p as usize + crate::heap::STACK_SIZE) as u64)
         }
         Err(why) => {
-            crate::kprintln!("[proc] P{} NOT spawned: no kernel stack -- {}", slot, why);
+            crate::kprintln!("[proc] P{} NOT spawned: no kernel stack ({})", slot, why);
             None
         }
     }
@@ -250,7 +250,7 @@ fn switch(f: &mut TrapFrame) {
         None => {
             let alive = procs().iter().filter(|p| matches!(p.state, State::BlockedSend | State::BlockedRecv)).count();
             if alive > 0 {
-                crate::kprintln!("[proc] {} process(es) blocked forever on IPC -- deadlock, stopping them", alive);
+                crate::kprintln!("[proc] {} process(es) blocked forever on IPC, a deadlock; stopping them", alive);
             }
             user::back_to_kernel(procs().iter().filter(|p| p.state == State::Dead).count() as u64);
         }
@@ -468,7 +468,7 @@ pub fn fault(f: &mut TrapFrame, vector: u64, addr: u64) {
     FAULTS.fetch_add(1, Ordering::Relaxed);
     // the tail is the shared log's wording (ARM: "EL0 fault in P.. killing"), which the registry reads
     crate::kprintln!(
-        "[P{}] fault: vector {} at RIP {:#x} (address {:#x}) -- process stopped (EL0 fault in P{}, ring 3: killing it)",
+        "[P{}] fault: vector {} at RIP {:#x} (address {:#x}); process stopped (EL0 fault in P{}, ring 3: killing it)",
         pid, vector, f.rip, addr, pid
     );
     procs()[pid].state = State::Dead;
@@ -605,7 +605,7 @@ proc_prog_sleep:
     int 0x80
 proc_prog_sleep_end:
 
-// gui: the ARM `user_gui` (the `wm` demo) in x86 -- a 200x100 window whose background
+// gui: the ARM `user_gui` (the `wm` demo) in x86: a 200x100 window whose background
 // colour depends on the pid, a gold header bar, a green and a red block, present, exit.
 .global proc_prog_gui
 .global proc_prog_gui_end
@@ -720,7 +720,7 @@ proc_prog_edit:
     int 0x80
 proc_prog_edit_end:
 
-// fault: write to address 0, a kernel-only page -- the CPU raises a page fault from ring 3
+// fault: write to address 0, a kernel-only page, so the CPU raises a page fault from ring 3
 .global proc_prog_fault
 .global proc_prog_fault_end
 proc_prog_fault:

@@ -6,7 +6,7 @@
 # PC kernel (q35 + UEFI) with ONLY a USB network device (QEMU `usb-net` on a `qemu-xhci`,
 # user-mode networking). usb-net offers RNDIS and CDC-ECM; the driver takes ECM when both are
 # offered, as Linux does (pc-usbnet grades that), so this suite asks for RNDIS through fw_cfg
-# `opt/afrisovera/usbnet-rndis` -- a phone offers RNDIS only and needs no switch. pc/xhci.rs:
+# `opt/afrisovera/usbnet-rndis`: a phone offers RNDIS only and needs no switch. pc/xhci.rs:
 # INITIALIZE, the MAC queried (OID_802_3_PERMANENT_ADDRESS), the packet filter SET, frames in
 # and out of PACKET_MSGs; pc/nic.rs puts it behind the emulated virtio-net device. Graded:
 # the RNDIS lines, DHCP lease, ping to the gateway, a TCP connection carrying an exact payload
@@ -24,7 +24,7 @@ grade() { # grade <serial> <peer log>
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     P="$(cat "$2" 2> /dev/null)"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[xhci\] port [0-9]+: USB Ethernet adapter [0-9a-f]{4}:[0-9a-f]{4} \(RNDIS, [a-z]+ speed\), slot [0-9]+, MAC ([0-9a-f]{2}:){5}[0-9a-f]{2}$' ||
         _f "the adapter was not enumerated as RNDIS with its MAC"
     has '^\[xhci\] RNDIS: initialized \(the device sends up to [0-9]+ packet\(s\), [0-9]+ bytes per transfer\), packet filter set$' ||
@@ -95,8 +95,8 @@ selftest() {
 }
 
 echo "== PC phone USB tethering (RNDIS) =="
-if ! selftest; then echo "PC USBTETHER TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC USBTETHER SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC USBTETHER TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC USBTETHER SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

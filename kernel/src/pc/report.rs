@@ -246,11 +246,11 @@ pub fn command(arg: &str) {
         }
     };
     if !crate::virtio_core::net_present() {
-        crate::kprintln!("report: no wired network card was found -- lse1000, lsrtl and lsusb show what is there");
+        crate::kprintln!("report: no wired network card was found; lse1000, lsrtl and lsusb show what is there");
         return;
     }
     if crate::virtio_core::report_lease().is_none() {
-        crate::kprintln!("report: the router gave this PC no address -- is the network cable plugged in?");
+        crate::kprintln!("report: the router gave this PC no address. Is the network cable plugged in?");
         return;
     }
     crate::kprintln!("[report] collecting this PC's details ...");
@@ -266,21 +266,21 @@ pub fn command(arg: &str) {
             if r.closed { "" } else { " (the close was not answered; the report was received)" }
         ),
         Err(e) => {
-            crate::kprint!("report: NOT SENT -- ");
+            crate::kprint!("report: NOT SENT: ");
             match e {
                 E::NoCard => crate::kprintln!("no wired network card"),
                 E::NoLease => crate::kprintln!("the router gave this PC no address (is the cable plugged in?)"),
                 E::NoRoute => crate::kprintln!("that address is on another network and the router gave no gateway"),
                 E::NoArp(h) => crate::kprintln!(
-                    "nobody at {}.{}.{}.{} answered -- is that the right address, on the same router?",
+                    "nobody at {}.{}.{}.{} answered. Is that the right address, on the same router?",
                     h[0], h[1], h[2], h[3]
                 ),
                 E::Refused => crate::kprintln!(
-                    "{}.{}.{}.{} is there but nothing listens on port {} -- start tools/report-receiver.py first",
+                    "{}.{}.{}.{} is there but nothing listens on port {}; start tools/report-receiver.py first",
                     ip[0], ip[1], ip[2], ip[3], port
                 ),
                 E::NoAnswer => crate::kprintln!(
-                    "{}.{}.{}.{} never answered -- its firewall may block Python (allow it on private networks)",
+                    "{}.{}.{}.{} never answered; its firewall may block Python (allow it on private networks)",
                     ip[0], ip[1], ip[2], ip[3]
                 ),
                 E::Stalled(n) => crate::kprintln!("the receiver stopped answering after {} of {} bytes", n, len),

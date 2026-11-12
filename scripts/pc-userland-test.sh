@@ -2,7 +2,7 @@
 # PC track (5 Nov 2026): the PC's ring-3 userland, and that it gives its memory back.
 #
 # Boots the PC kernel and runs `frame`, `niavm` (the Nia WASM interpreter as a ring-3
-# process: its host calls -- the on-device AI and Asili Voice -- are system calls),
+# process: its host calls (the on-device AI and Asili Voice) are system calls),
 # `rustapp` (compiled Rust in ring 3), `wm` (three ring-3 programs draw their own windows),
 # and `frame` again. Graded: each program's own output, clean exits, and the frame pool
 # using exactly as many frames after as before (mmu::free_space returns every address
@@ -18,7 +18,7 @@ grade() { # grade <serial>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^    \[asili voice @EL0\] speaking: "I AM ASILI' || _f "niavm: the WASM module's ai + speak host calls did not reach the kernel"
     has '^    \[P[0-9]+ @EL0\] Nia interpreter exited \(ring 3, code 0\)$' || _f "niavm did not exit cleanly"
     has '^\[P[0-9]+\] 0x37$' && has '^\[P[0-9]+\] 0xc0de$' || _f "rustapp did not print 0x37 and 0xc0de"
@@ -74,7 +74,7 @@ selftest() {
     arm wm-short red "$(printf '%s\n' "$GREEN" | sed 's/(3 clean)/(2 clean)/')"
     arm frames-leak red "$(printf '%s\n' "$GREEN" | sed '$ s/17 used, 16367 free/39 used, 16345 free/')"
     arm one-frame-line red "$(printf '%s\n' "$GREEN" | sed '$d')"
-    arm fault red "$(printf '%s\n[P0] fault: vector 14 at RIP 0x1 (address 0x0) -- process stopped' "$GREEN")"
+    arm fault red "$(printf '%s\n[P0] fault: vector 14 at RIP 0x1 (address 0x0); process stopped' "$GREEN")"
     arm empty red ""
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
@@ -82,8 +82,8 @@ selftest() {
 }
 
 echo "== PC ring-3 userland (niavm, rustapp, wm) and address-space reclaim =="
-if ! selftest; then echo "PC USERLAND TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC USERLAND SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC USERLAND TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC USERLAND SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

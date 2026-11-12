@@ -20,7 +20,7 @@ grade() { # grade <serial>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[desk\] desktop opened' || _f "desk (typed on the USB keyboard) did not open the desktop"
     if has '\[desk\] [a-z]+ profile, hidden;'; then _f "desk alone printed the hidden desktop's status instead of opening it"; fi
     printf '%s\n' "$S" | sed -n '/^\[desk\] desktop opened/,$p' | grep -aqE '\[desk\] open files$' ||

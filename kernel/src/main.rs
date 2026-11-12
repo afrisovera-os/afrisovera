@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+mod appget;
 mod asili;
 mod board;
 mod config;
@@ -1010,19 +1011,10 @@ pub extern "C" fn kernel_main(dtb: u64) -> ! {
 
     // 6) Mount the in-RAM filesystem and register it, then drop into the shell.
     vfs::seed();
-    // Seed two real .wasm apps as files so the user can `nia <file>` them.
-    vfs::write("hello.wasm", nia::hello_wasm());
-    vfs::write("sum.wasm", nia::sum_wasm());
-    vfs::write("draw.wasm", nia::draw_wasm());
-    vfs::write("fileapp.wasm", nia::file_wasm());
-    vfs::write("clock.wasm", nia::clock_wasm());
-    vfs::write("type.wasm", nia::type_wasm());
-    vfs::write("ai.wasm", nia::ai_wasm());
-    vfs::write("chat.wasm", nia::chat_wasm());
-    vfs::write("notify.wasm", nia::notify_wasm());
-    vfs::write("notify2.wasm", nia::notify2_wasm());
-    vfs::write("net.wasm", nia::net_wasm());
-    vfs::write("rand.wasm", nia::rand_wasm());
+    // Seed the bundled .wasm apps as files so the user can `nia <file>` them.
+    for (name, bytes) in nia::BUNDLED {
+        vfs::write(name, bytes()); // the bundled apps, from the one table the manifest also uses
+    }
     vfs::write("sample.webapp", web::sample());
     vfs::write("sample.apkmeta", daraja::sample());
     asili::register("ramfs", asili::Class::Storage, 0, true);
@@ -1032,6 +1024,9 @@ pub extern "C" fn kernel_main(dtb: u64) -> ! {
     if virtio::blk_present() {
         vfs::load_from_disk();
     }
+    // Bundled apps belong to the kernel: a disk copy that differs is replaced by the built-in one, and a
+    // missing one is seeded again.
+    nia::restore_bundled();
 
     // Load/refresh persistent system config (hostname, DHCP lease, boot counter)
     // and bump the boot count. No-op when there is no disk to persist to.
@@ -1042,13 +1037,10 @@ pub extern "C" fn kernel_main(dtb: u64) -> ! {
     kprintln!("[mansa] sha256 self-test (FIPS \"abc\"): {}", if sha256::self_test() { "PASS" } else { "FAIL" });
     kprintln!("[mansa] sha512 self-test (FIPS \"abc\"): {}", if sha512::self_test() { "PASS" } else { "FAIL" });
     kprintln!("[mansa] ed25519 self-test (RFC 8032 #1): {}", if ed25519::self_test() { "PASS" } else { "FAIL" });
-    for name in [
-        "hello.wasm", "sum.wasm", "draw.wasm", "fileapp.wasm", "clock.wasm", "type.wasm", "ai.wasm",
-        "chat.wasm", "notify.wasm",
-    ] {
-        if let Some(d) = vfs::read_raw(name) {
-            integrity::record(name, d);
-        }
+    // The manifest: each bundled app's hash from its COMPILED-IN bytes, never from the disk copy (a
+    // tampered disk copy must not become "integrity OK"; claude/appget, architect's manifest decision).
+    for (name, bytes) in nia::BUNDLED {
+        integrity::record(name, bytes());
     }
 
     cpu::irq_enable(); // timer keeps ticking

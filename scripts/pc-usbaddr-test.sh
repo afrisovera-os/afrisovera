@@ -26,7 +26,7 @@ grade() { # grade <serial>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[xhci\] 0 device\(s\) connected, no USB keyboard$' || _f "the boot did not start with an empty xHCI"
     has 'usb: new devices are tried first with descriptor read before the address \(BSR\); then the other way, then this way again$' ||
         _f "usbaddr bsr did not switch to descriptor first"
@@ -99,8 +99,8 @@ selftest() {
 }
 
 echo "== PC USB addressing (F2) =="
-if ! selftest; then echo "PC USBADDR TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC USBADDR SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC USBADDR TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC USBADDR SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

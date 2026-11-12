@@ -7,7 +7,7 @@
 //! `ap_tramp` (below) is copied to such a page; it switches to protected mode, turns on PAE
 //! and long mode on a copy of the kernel's top-level page table in the page below it (CR3 is
 //! loaded in 32-bit mode, so it must be below 4 GiB, and the kernel's own table may not be:
-//! on the HP ENVY the image, and so the frame pool, was loaded above 4 GiB -- field item F3),
+//! on the HP ENVY the image, and so the frame pool, was loaded above 4 GiB, field item F3),
 //! and jumps to `ap_main` on a stack of its own, which moves to the kernel's own table
 //! (CR3 = `mmu::root()`). From there the demo is the ARM one, step for step:
 //!   1. core 1 checks in ("[core 1] online", "SMP: 2 cores online");
@@ -413,7 +413,7 @@ pub fn ipi() {
         crate::kprintln!("[core 1] IPC msg {} from core 0 -> result {}", msg, result);
         REPLY.store(msg << 32 | result, Ordering::Release);
     } else {
-        crate::kprintln!("[core 1] SGI from core 0 ({}) -- an x86 IPI, vector {:#x}", n, IPI_VECTOR);
+        crate::kprintln!("[core 1] SGI from core 0 ({}): an x86 IPI, vector {:#x}", n, IPI_VECTOR);
     }
     IPIS.store(n, Ordering::Release);
 }

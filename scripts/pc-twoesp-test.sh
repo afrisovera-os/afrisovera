@@ -70,7 +70,7 @@ grade() { # grade <boot1 log> .. <boot5 log>
     A="$(cl "$1")"; B="$(cl "$2")"; C="$(cl "$3")"; D="$(cl "$4")"; E="$(cl "$5")"
     blk() { printf '%s\n' "$1" | awk -v c="afrisovera> $2" '$0==c{on=1;next} /^afrisovera>/{on=0} on'; }
     pblk() { printf '%s\n' "$1" | awk -v c="^afrisovera> $2" '$0~c{on=1;next} /^afrisovera>/{on=0} on'; }
-    in_blk() { printf '%s\n' "$1" | grep -aqxE "$2"; }
+    in_blk() { grep -aqxE "$2" <<< "$1"; }
     # the lines of one EFI partition in a bootplan block: from its heading to the next "bootplan:" line
     part() { printf '%s\n' "$1" | awk -v h="bootplan: $2: EFI system partition" 'index($0,h)==1{on=1;print;next} /^bootplan:/{on=0} on'; }
     local P1 W1 L1 P3 W3 L3 NUM
@@ -140,7 +140,7 @@ grade() { # grade <boot1 log> .. <boot5 log>
     in_blk "$D2" 'bootcopy remove: nothing written yet. To do it, type exactly: bootcopy remove yes [0-9a-f]{4}' || _f "boot 4: bootcopy remove gave no code"
     # boot 5: both taken out, the Linux disk untouched
     E1="$(pblk "$E" 'bootentry remove yes ')"; E2="$(pblk "$E" 'bootcopy remove yes ')"; EE="$(blk "$E" bootentries)"
-    in_blk "$E1" "bootentry remove: $NUM deleted and out of BootOrder, read back -- the firmware's boot entries are as before bootentry" ||
+    in_blk "$E1" "bootentry remove: $NUM deleted and out of BootOrder, read back; the firmware's boot entries are as before bootentry" ||
         _f "boot 5: bootentry remove did not delete $NUM and read back"
     in_blk "$E2" "bootcopy remove: \\\\EFI\\\\afrisovera taken out of $NAME partition 1, read back \(both FAT copies equal, ${FREE1:-none} KiB free again\)" ||
         _f "boot 5: bootcopy remove did not take the file out of $NAME partition 1 with ${FREE1:-(unknown)} KiB free again"
@@ -182,7 +182,7 @@ bootplan: sata port 2: EFI system partition (GPT entry 1, LBA 2048-206847, 100 M
 bootplan: the boot file would go to nvme partition 1 (start 256), the one Windows starts from; no other EFI partition is changed
   boot entry: Boot0005 \"AfriSovera\" -> nvme partition 1 (start 256)\\EFI\\afrisovera\\afrisovera.efi would be added at the END of BootOrder
   the PC keeps starting \"UEFI QEMU HARDDISK QM00001 \" first; AfriSovera is picked from the firmware's boot menu
-bootplan: a plan only -- nothing was written; adding it will ask for the owner's word, with the way back
+bootplan: a plan only, so nothing was written; adding it will ask for the owner's word, with the way back
 afrisovera> bootcopy
 bootcopy: AfriSovera's boot file (2360 KiB) -> nvme partition 1 (start 256)\\EFI\\afrisovera\\afrisovera.efi
   it takes 2368 KiB of the 265524 KiB free; nothing already in the partition is moved or changed; no boot entry is added yet
@@ -205,13 +205,13 @@ bootplan: AfriSovera's boot file is 2360 KiB (kept at power-on)
 bootplan: nvme: EFI system partition (GPT entry 1, LBA 256-66815, 260 MiB)
   FAT32, 4096-byte clusters, 263160 KiB free
   \\EFI holds: Microsoft, BOOT, afrisovera
-  \\EFI\\afrisovera is already there (2360 KiB) -- nothing to copy
+  \\EFI\\afrisovera is already there (2360 KiB); nothing to copy
 bootplan: sata port 2: EFI system partition (GPT entry 1, LBA 2048-206847, 100 MiB)
   FAT32, 512-byte clusters, 102275 KiB free
   \\EFI holds: ubuntu, BOOT
   plan: AfriSovera's boot file would be copied to \\EFI\\afrisovera\\afrisovera.efi (2361 KiB of the 102275 KiB free); nothing else in this partition changes
-  boot entry: AfriSovera already has one (Boot0005) -- nothing to add
-bootplan: a plan only -- nothing was written; adding it will ask for the owner's word, with the way back
+  boot entry: AfriSovera already has one (Boot0005); nothing to add
+bootplan: a plan only, so nothing was written; adding it will ask for the owner's word, with the way back
 afrisovera>
 harness: sata port 2 image byte-identical to a fresh copy
 harness: nvme image changed only inside its EFI partition"
@@ -226,7 +226,7 @@ bootcopy remove: nothing written yet. To do it, type exactly: bootcopy remove ye
 afrisovera>"
 M5="afrisovera> bootentry remove yes 0e3d
 bootentry remove: Boot0005 \"AfriSovera\" would be deleted
-bootentry remove: Boot0005 deleted and out of BootOrder, read back -- the firmware's boot entries are as before bootentry
+bootentry remove: Boot0005 deleted and out of BootOrder, read back; the firmware's boot entries are as before bootentry
 afrisovera> bootcopy remove yes 09bc
 bootcopy remove: nvme partition 1 (start 256): \\EFI\\afrisovera (2360 KiB) would be taken out; nothing else in the partition changes
 bootcopy remove: \\EFI\\afrisovera taken out of nvme partition 1, read back (both FAT copies equal, 265524 KiB free again)
@@ -247,7 +247,7 @@ bootplan: sata port 2: EFI system partition (GPT entry 1, LBA 2048-206847, 100 M
   plan: AfriSovera's boot file would be copied to \\EFI\\afrisovera\\afrisovera.efi (2361 KiB of the 102275 KiB free); nothing else in this partition changes
 bootplan: the boot file would go to nvme partition 1 (start 256), the one Windows starts from; no other EFI partition is changed
   boot entry: Boot0005 \"AfriSovera\" -> nvme partition 1 (start 256)\\EFI\\afrisovera\\afrisovera.efi would be added at the END of BootOrder
-bootplan: a plan only -- nothing was written; adding it will ask for the owner's word, with the way back
+bootplan: a plan only, so nothing was written; adding it will ask for the owner's word, with the way back
 afrisovera>
 harness: sata port 2 image byte-identical to a fresh copy
 harness: nvme image changed only inside its EFI partition"

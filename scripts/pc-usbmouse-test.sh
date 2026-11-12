@@ -7,7 +7,7 @@
 # then types `lsusb` on the USB keyboard and saves a screenshot.
 # Graded: both devices are enumerated on their own slots, `lsusb` reports the pointer at
 # 420,300 (it starts at the console's middle, 320,240) with 2 clicks, and the screenshot
-# shows the pointer there -- black tip, white fill -- and not at the middle any more.
+# shows the pointer there (black tip, white fill) and not at the middle any more.
 #   scripts/pc-usbmouse-test.sh              # grader selftest, then the QEMU boot
 #   scripts/pc-usbmouse-test.sh --selftest   # grader selftest only
 set -uo pipefail
@@ -59,7 +59,7 @@ grade() { # grade <serial capture> <pixel line>
     [ -r "$1" ] || { echo "  FAIL: missing serial capture"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     P="$2"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[xhci\] controller [0-9a-f]{2}:[0-9a-f]{2}\.[0-7] \(xHCI [0-9]+\.[0-9]+\), [0-9]+ ports, [0-9]+ slots' ||
         _f "the xHCI controller did not come up"
     local ks ms
@@ -133,8 +133,8 @@ selftest() {
 }
 
 echo "== PC xHCI + USB mouse (PC track step 3) =="
-if ! selftest; then echo "PC USBMOUSE TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC USBMOUSE SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC USBMOUSE TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC USBMOUSE SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

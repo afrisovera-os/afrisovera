@@ -8,6 +8,10 @@ exists only while that command runs. The body moves UNCHANGED (same text, re-ind
   python3 scripts/lib/exec-split.py --list            # every arm: lines, name, first line
   python3 scripts/lib/exec-split.py help net sort ...  # move these arms (by first pattern name)
   python3 scripts/lib/exec-split.py --top 20           # move the 20 longest arms not yet moved
+  python3 scripts/lib/exec-split.py --by-frame docs/evidence-exec-split-census.txt 100
+                                                       # move the 100 arms with the largest measured frames
+  python3 scripts/lib/exec-split.py --undo             # put every moved body back
+  python3 scripts/lib/exec-split.py --undo isweird ... # put back only these (one slice), keep the rest
 
 Moved functions go to kernel/src/shell_exec_cmds.rs, pulled into shell.rs with `include!` (the shell_arch.rs
 pattern), so they sit in the same module with the same names in scope on both kernels (the PC includes shell.rs by
@@ -81,7 +85,7 @@ def why_not(a, L):
     return None
 
 
-def undo():
+def undo(only=None):
     """Put every moved body back in its arm: the exact inverse of a move. Run on a split tree, it must give the
     base shell.rs byte for byte (that is the proof the bodies moved unchanged), and lets one cloud job build the
     base and the branch side by side for a like-for-like md5."""
@@ -89,10 +93,16 @@ def undo():
         print("exec-split: nothing to undo")
         return 0
     src = open(CMDS, encoding="utf-8").read()
-    fns = {}
-    for m in re.finditer(r"#\[allow\(unused_variables\)\]\nfn (cmd_[0-9A-Za-z_]+)\(line: &str, cmd: &str, rest: &str\) \{\n(.*?)\n\}\n",
-                         src, re.S):
-        fns[m.group(1)] = m.group(2).split("\n")
+    fns, spans = {}, {}
+    # a whole moved function (doc line, attributes, signature, body) plus the blank line the move put before it
+    for m in re.finditer(r"\n/// `[^\n]*\n#\[inline\(never\)\]\n#\[allow\(unused_variables\)\]\n"
+                         r"fn (cmd_[0-9A-Za-z_]+)\(line: &str, cmd: &str, rest: &str\) \{\n(.*?)\n\}\n", src, re.S):
+        if only is None or m.group(1) in only:
+            fns[m.group(1)] = m.group(2).split("\n")
+            spans[m.group(1)] = (m.start(), m.end())
+    if only is not None and set(only) - set(fns):
+        print("exec-split: undo found no function for %s" % sorted(set(only) - set(fns)))
+        return 1
     L = open(SHELL, encoding="utf-8").read().split("\n")
     out = []
     call = re.compile(r"^(\s*)(.*) => (cmd_[0-9A-Za-z_]+)\(line, cmd, rest\)(,)$")
@@ -103,7 +113,7 @@ def undo():
             out.append("%s%s => {" % (ind, m.group(2)))
             out.extend((ind + b) if b.strip() else b for b in fns.pop(m.group(3)))
             out.append(ind + "}")
-        elif l == INCLUDE:
+        elif l == INCLUDE and only is None:
             continue
         else:
             out.append(l)
@@ -111,15 +121,21 @@ def undo():
         print("exec-split: undo found no call for %s" % sorted(fns))
         return 1
     open(SHELL, "w", encoding="utf-8", newline="\n").write("\n".join(out))
-    import os
-    os.remove(CMDS)
-    print("exec-split: undone")
+    if only is None:
+        import os
+        os.remove(CMDS)
+    else:
+        # cut the undone functions out of the cmds file, last first so the offsets stay valid
+        for a, b in sorted(spans.values(), reverse=True):
+            src = src[:a] + src[b:]
+        open(CMDS, "w", encoding="utf-8", newline="\n").write(src)
+    print("exec-split: undone %s" % ("all" if only is None else "%d function(s)" % len(spans)))
     return 0
 
 
 def main(argv):
     if argv[:1] == ["--undo"]:
-        return undo()
+        return undo([n if n.startswith("cmd_") else ident(n) for n in argv[1:]] if argv[1:] else None)
     L = open(SHELL, encoding="utf-8").read().split("\n")
     al, end = arms(L)
     if argv[:1] == ["--list"]:
@@ -130,6 +146,16 @@ def main(argv):
     if argv[:1] == ["--top"]:
         n = int(argv[1])
         pick = [a for a in sorted(al, key=lambda a: -a["lines"]) if not why_not(a, L)][:n]
+    elif argv[:1] == ["--by-frame"]:
+        # a census file: lines "<bytes> <command> ..." ("#" comments); largest measured frame first
+        frame = {}
+        for l in open(argv[1], encoding="utf-8"):
+            f = l.split()
+            if f and not l.startswith("#"):
+                frame[f[1]] = int(f[0])
+        n = int(argv[2])
+        pick = [a for a in sorted(al, key=lambda a: -frame.get(a["name"], 0)) if not why_not(a, L)][:n]
+        print("exec-split: by frame, %d arm(s), %d B in the census" % (len(pick), sum(frame.get(a["name"], 0) for a in pick)))
     else:
         by = {a["name"]: a for a in al}
         pick = []

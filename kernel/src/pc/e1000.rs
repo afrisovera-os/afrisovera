@@ -3,7 +3,7 @@
 //! The common wired NIC of PCs and laptops (82540EM in QEMU's `e1000`, 82574L in `e1000e`,
 //! and the same register set on many real Intel parts). Legacy descriptors, one RX ring and
 //! one TX ring, polled: `send` puts one frame on the wire, `recv` takes one off. The shared
-//! TCP/IP stack never sees this file -- pc/virtio_pci.rs presents this NIC to it as a
+//! TCP/IP stack never sees this file: pc/virtio_pci.rs presents this NIC to it as a
 //! virtio-net device, so `ping`, DHCP, DNS and TCP run on it unchanged.
 //! Intel 8254x/82574 software developer's manuals: registers 13, descriptors 3.2/3.3.
 //!
@@ -170,6 +170,8 @@ static mut RECEIVED: u64 = 0;
 /// piece up to and including its EOP descriptor is dropped, so its tail is never taken for
 /// a frame of its own (Gemini D3).
 static mut DROPPING: bool = false;
+/// How often the transmit ring stopped moving and was restarted (send, tx_restart).
+static mut TX_RESTARTS: u64 = 0;
 
 /// Queue 0's ring registers: 0x2800/0x3800 on e1000/e1000e, 0xC000/0xE000 on igb/igc.
 fn q(off: u64) -> u64 {
@@ -209,14 +211,14 @@ unsafe fn rx_state(i: usize) -> (bool, bool, bool, usize) {
 }
 
 /// igb/igc: switch the copper PHY's power on (register 0 bit 11, Power Down, over MDIC to
-/// PHY address 1), as Linux igb_power_up_phy_copper does -- a firmware that never used the
-/// port may leave it off -- and restart auto-negotiation (bit 12 on, bit 9 restart), as
+/// PHY address 1), as Linux igb_power_up_phy_copper does (a firmware that never used the
+/// port may leave it off) and restart auto-negotiation (bit 12 on, bit 9 restart), as
 /// igb_copper_link_autoneg does: these parts do not report a link (STATUS.LU) until it has
 /// run after a reset (QEMU's igb likewise). Silent when MDIC does not answer.
 fn phy_power_up() {
     let mdic = |op: u32, reg: u32, data: u32| -> Option<u32> {
         w(MDIC, data & 0xFFFF | reg << 16 | 1 << 21 | op << 26);
-        if !wait(|| r(MDIC) & 1 << 28 != 0) || r(MDIC) & 1 << 30 != 0 {
+        if !wait(REG_MS, || r(MDIC) & 1 << 28 != 0) || r(MDIC) & 1 << 30 != 0 {
             return None;
         }
         Some(r(MDIC) & 0xFFFF)
@@ -226,15 +228,28 @@ fn phy_power_up() {
     }
 }
 
-fn wait(mut done: impl FnMut() -> bool) -> bool {
-    for _ in 0..20_000_000u64 {
+/// Poll `done` for up to `ms` milliseconds of real time. Before 12 Nov this was a count of 20
+/// million polls, so how long the NIC had depended on the CPU and on how slow its register reads
+/// were; AHCI, IDE and NVMe wait by the clock.
+fn wait(ms: u64, mut done: impl FnMut() -> bool) -> bool {
+    let (t0, hz) = (crate::timer::cycles(), crate::timer::hz().max(1));
+    loop {
         if done() {
             return true;
         }
+        if crate::timer::cycles().wrapping_sub(t0) > hz.saturating_mul(ms) / 1000 {
+            return false;
+        }
         core::hint::spin_loop();
     }
-    false
 }
+
+/// The limits, in milliseconds. REG_MS: one register handshake (a PHY or EEPROM read, a queue
+/// switching on or off), microseconds on real parts. RESET_MS: a software reset. TX_MS: a
+/// transmit descriptor handed back; longer than that and the ring is restarted.
+const REG_MS: u64 = 100;
+const RESET_MS: u64 = 1_000;
+const TX_MS: u64 = 1_000;
 
 /// Find a known Intel NIC, reset it and bring up its RX and TX rings. True when ready.
 pub fn init() -> bool {
@@ -264,7 +279,7 @@ pub fn init() -> bool {
     // Reset, with every interrupt masked (this driver polls), then link up.
     w(IMC, 0xFFFF_FFFF);
     w(CTRL, r(CTRL) | CTRL_RST);
-    if !wait(|| r(CTRL) & CTRL_RST == 0) {
+    if !wait(RESET_MS, || r(CTRL) & CTRL_RST == 0) {
         crate::kprintln!("[e1000] {} did not come out of reset", name);
         return false;
     }
@@ -301,7 +316,7 @@ pub fn init() -> bool {
                 break;
             }
             w(EERD, word << shift | 1);
-            ok = wait(|| r(EERD) & done != 0);
+            ok = wait(REG_MS, || r(EERD) & done != 0);
             let v = r(EERD) >> 16;
             mac[word as usize * 2] = v as u8;
             mac[word as usize * 2 + 1] = (v >> 8) as u8;
@@ -341,7 +356,7 @@ pub fn init() -> bool {
         // and only then hand the NIC the buffers through RDT
         w(SRRCTL, SRRCTL_ADV_ONEBUF | (BUF / 1024) as u32);
         w(RXDCTL, QUEUE_ENABLE | 1 << 16);
-        if !wait(|| r(RXDCTL) & QUEUE_ENABLE != 0) {
+        if !wait(REG_MS, || r(RXDCTL) & QUEUE_ENABLE != 0) {
             crate::kprintln!("[e1000] {}: receive queue did not switch on", name);
             return false;
         }
@@ -355,7 +370,7 @@ pub fn init() -> bool {
     w(TDT, 0);
     if adv {
         w(TXDCTL, QUEUE_ENABLE | 1 << 16);
-        if !wait(|| r(TXDCTL) & QUEUE_ENABLE != 0) {
+        if !wait(REG_MS, || r(TXDCTL) & QUEUE_ENABLE != 0) {
             crate::kprintln!("[e1000] {}: transmit queue did not switch on", name);
             return false;
         }
@@ -395,14 +410,26 @@ pub fn send(frame: &[u8]) -> bool {
         }
         let i = TX_NEXT;
         let dsc = addr_of_mut!(TXR.0[i]);
-        if !wait(|| read_volatile(addr_of!((*dsc).status)) & DD != 0) {
-            crate::kprintln!("[e1000] transmit ring stuck");
+        if !wait(TX_MS, || read_volatile(addr_of!((*dsc).status)) & DD != 0) {
+            // The NIC stopped taking frames (a link that went down with the ring full, a
+            // hung DMA engine). Without a restart DD never comes back on this descriptor, so
+            // every later send would fail the same way until a reboot.
+            let link = if r(STATUS) & 2 != 0 { "up" } else { "down" };
+            crate::kprintln!(
+                "[e1000] transmit ring stuck (link {}): dropping the {} queued frames and restarting the transmit ring",
+                link, NTX
+            );
+            let ok = tx_restart();
+            crate::kprintln!(
+                "[e1000] {}",
+                if ok { "transmit ring ready again" } else { "transmit queue did not switch on again after the restart" }
+            );
             return false;
         }
         core::ptr::copy_nonoverlapping(frame.as_ptr(), addr_of_mut!(TXB.0[i]) as *mut u8, frame.len());
         if ADV {
             // advanced data descriptor: length, DTYP data, DCMD (EOP, IFCS, RS, DEXT), PAYLEN;
-            // the NIC writes DD back into bit 32 -- the same byte as the legacy status
+            // the NIC writes DD back into bit 32, the same byte as the legacy status
             let n = frame.len() as u64;
             let cmd = ((CMD_EOP | CMD_IFCS | CMD_RS) as u64) << 24 | ADV_DEXT;
             let p = dsc as *mut u64;
@@ -419,6 +446,40 @@ pub fn send(frame: &[u8]) -> bool {
         w(TDT, TX_NEXT as u32);
         SENT += 1;
         true
+    }
+}
+
+/// Stop the transmitter, hand every TX descriptor back to the driver (DD set), point the
+/// NIC's head and tail at slot 0 and start it again, the same steps `init` uses for the
+/// ring (8254x manual 13.4.37: TDH is written only while TCTL.EN is clear; 82576 7.2.1.2:
+/// an igb/igc queue is switched off through TXDCTL first). The receive side is not touched.
+/// True when the transmitter is back on.
+fn tx_restart() -> bool {
+    // SAFETY: single core; send is the only other user of the TX ring and TX_NEXT, and it
+    // is the caller.
+    unsafe {
+        let tctl = r(TCTL);
+        w(TCTL, tctl & !TCTL_EN);
+        if ADV {
+            w(TXDCTL, 0);
+            wait(REG_MS, || r(TXDCTL) & QUEUE_ENABLE == 0);
+        }
+        let tx = &mut (*addr_of_mut!(TXR)).0;
+        for (i, dsc) in tx.iter_mut().enumerate() {
+            write_volatile(dsc, TxDesc { addr: addr_of!(TXB.0[i]) as u64, status: DD, ..TX0 });
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        w(TDH, 0);
+        w(TDT, 0);
+        TX_NEXT = 0;
+        TX_RESTARTS += 1;
+        let mut ok = true;
+        if ADV {
+            w(TXDCTL, QUEUE_ENABLE | 1 << 16);
+            ok = wait(REG_MS, || r(TXDCTL) & QUEUE_ENABLE != 0);
+        }
+        w(TCTL, tctl | TCTL_EN);
+        ok
     }
 }
 
@@ -475,6 +536,11 @@ pub fn list() {
         name, b, d, f, bar, m[0], m[1], m[2], m[3], m[4], m[5], if link_up() { "up" } else { "down" }
     );
     crate::kprintln!("  frames sent {}, received {}", s, rcv);
+    // SAFETY: scalar read.
+    let restarts = unsafe { TX_RESTARTS };
+    if restarts > 0 {
+        crate::kprintln!("  transmit ring restarts after it stopped moving: {}", restarts);
+    }
     dma_line();
 }
 

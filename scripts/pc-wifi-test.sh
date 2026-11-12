@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track step 3, Wi-Fi groundwork (7 Nov 2026): `wifi` -- the PC's network chips, READ ONLY.
+# PC track step 3, Wi-Fi groundwork (7 Nov 2026): `wifi`: the PC's network chips, READ ONLY.
 #
 # Before a Wi-Fi driver is written we need to know which chip the owner's PCs have. `wifi` walks every PCI
 # bus (only reads), lists every network controller (class 0x02) with its vendor:device id, names known Wi-Fi
@@ -34,32 +34,32 @@ grade() { # grade <serial log>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqxE "$1"; }
+    has() { grep -aqxE "$1" <<< "$S"; }
     has 'wifi: network chips on this PC.s PCI buses \(read only, nothing is changed\)' || _f "wifi did not answer"
-    has '  [0-9a-f]{2}:[0-9a-f]{2}\.[0-7] 8086:10d3 Ethernet \(cable\): 82574L \(e1000e\) -- AfriSovera drives it' ||
+    has '  [0-9a-f]{2}:[0-9a-f]{2}\.[0-7] 8086:10d3 Ethernet \(cable\): 82574L \(e1000e\); AfriSovera drives it' ||
         _f "the Intel 82574L was not listed as driven"
     has '  [0-9a-f]{2}:[0-9a-f]{2}\.[0-7] 10ec:8029 Ethernet \(cable\): no driver in AfriSovera yet' ||
         _f "the Realtek RTL8029 was not listed as having no driver"
     has 'wifi: [1-9][0-9]* PCI function\(s\) looked at, 2 network chip\(s\), 0 Wi-Fi' || _f "the counts are not 2 network chips, 0 Wi-Fi"
     has 'wifi: USB devices AfriSovera does not use: 1' || _f "the USB card reader was not counted as the one unused USB device"
-    has '  usb 08e6:4433 \(class [0-9a-f]{2}/[0-9a-f]{2}\) not a Wi-Fi stick in AfriSovera.s list -- tell us this id if it is one' ||
+    has '  usb 08e6:4433 \(class [0-9a-f]{2}/[0-9a-f]{2}\) not a Wi-Fi stick in AfriSovera.s list; tell us this id if it is one' ||
         _f "the USB card reader (08e6:4433) was not listed as not a Wi-Fi stick"
     printf '%s\n' "$S" | grep -aqE '^  usb [0-9a-f]{4}:[0-9a-f]{4} Wi-Fi stick:' && _f "a USB Wi-Fi stick was listed on a PC that has none"
     has 'wifi: no Wi-Fi chip on PCI and no USB Wi-Fi stick AfriSovera knows' || _f "no 'no Wi-Fi chip' line"
-    has '  for the owner: AfriSovera has no Wi-Fi driver yet -- connect with a network cable .*' || _f "no line for the owner"
+    has '  for the owner: AfriSovera has no Wi-Fi driver yet; connect with a network cable .*' || _f "no line for the owner"
     printf '%s\n' "$S" | grep -aqE '^  [0-9a-f]{2}:[0-9a-f]{2}\.[0-7] [0-9a-f]{4}:[0-9a-f]{4} Wi-Fi' && _f "a Wi-Fi chip was listed on a PC that has none"
-    has 'wifi: 8086:2723 is Intel Wi-Fi 6 AX200 \(Wi-Fi\) -- Linux driver iwlwifi; needs Intel.s closed firmware file loaded first' ||
+    has 'wifi: 8086:2723 is Intel Wi-Fi 6 AX200 \(Wi-Fi\); Linux driver iwlwifi; needs Intel.s closed firmware file loaded first' ||
         _f "8086:2723 was not named Intel AX200 (iwlwifi)"
-    has 'wifi: 168c:0036 is Qualcomm Atheros QCA9565 / AR9565 \(Wi-Fi\) -- Linux driver ath9k; needs NO firmware file -- .*' ||
+    has 'wifi: 168c:0036 is Qualcomm Atheros QCA9565 / AR9565 \(Wi-Fi\); Linux driver ath9k; needs NO firmware file; .*' ||
         _f "the Device Manager id was not named QCA9565 (ath9k, no firmware)"
     has 'wifi: 8086:15b8 is I219-V \(e1000e\), a wired Ethernet chip AfriSovera drives \(a network cable works\)' ||
         _f "8086:15b8 was not named a driven I219-V"
-    has 'wifi: 1234:5678 is not in AfriSovera.s list of network chips -- tell us this id' || _f "an unknown id was not called unknown"
+    has 'wifi: 1234:5678 is not in AfriSovera.s list of network chips; tell us this id' || _f "an unknown id was not called unknown"
     has 'wifi: give the chip.s id as 8086:2723, or as Windows. Device Manager shows it .*' || _f "a malformed id was not refused with the usage line"
-    has 'wifi: usb 0cf3:9271 is Qualcomm Atheros AR9271 .* \(USB Wi-Fi stick\) -- Linux driver ath9k_htc; its firmware file is OPEN source .*' ||
+    has 'wifi: usb 0cf3:9271 is Qualcomm Atheros AR9271 .* \(USB Wi-Fi stick\); Linux driver ath9k_htc; its firmware file is OPEN source .*' ||
         _f "the USB Device Manager id was not named AR9271 (ath9k_htc, open firmware)"
-    has 'wifi: usb 148f:7601 is MediaTek MT7601U \(USB Wi-Fi stick\) -- Linux driver mt7601u; .*' || _f "148f:7601 was not named the MT7601U stick"
-    has 'wifi: usb 1234:5678 is not in AfriSovera.s list of USB Wi-Fi sticks -- tell us this id' || _f "an unknown USB id was not called unknown"
+    has 'wifi: usb 148f:7601 is MediaTek MT7601U \(USB Wi-Fi stick\); Linux driver mt7601u; .*' || _f "148f:7601 was not named the MT7601U stick"
+    has 'wifi: usb 1234:5678 is not in AfriSovera.s list of USB Wi-Fi sticks; tell us this id' || _f "an unknown USB id was not called unknown"
     if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
     return "$fail"
 }
@@ -67,29 +67,29 @@ grade() { # grade <serial log>
 GREEN="[pc] MANSA-PC BOOT OK
 afrisovera> wifi
 wifi: network chips on this PC's PCI buses (read only, nothing is changed)
-  00:02.0 8086:10d3 Ethernet (cable): 82574L (e1000e) -- AfriSovera drives it
+  00:02.0 8086:10d3 Ethernet (cable): 82574L (e1000e); AfriSovera drives it
   00:03.0 10ec:8029 Ethernet (cable): no driver in AfriSovera yet
 wifi: 10 PCI function(s) looked at, 2 network chip(s), 0 Wi-Fi
 wifi: USB devices AfriSovera does not use: 1
-  usb 08e6:4433 (class 00/0b) not a Wi-Fi stick in AfriSovera's list -- tell us this id if it is one
+  usb 08e6:4433 (class 00/0b) not a Wi-Fi stick in AfriSovera's list; tell us this id if it is one
 wifi: no Wi-Fi chip on PCI and no USB Wi-Fi stick AfriSovera knows
-  for the owner: AfriSovera has no Wi-Fi driver yet -- connect with a network cable (an Intel Ethernet port) or a USB Ethernet adapter; the chip named above tells us which Wi-Fi driver to write first
+  for the owner: AfriSovera has no Wi-Fi driver yet; connect with a network cable (an Intel Ethernet port) or a USB Ethernet adapter; the chip named above tells us which Wi-Fi driver to write first
 afrisovera> wifi 8086:2723
-wifi: 8086:2723 is Intel Wi-Fi 6 AX200 (Wi-Fi) -- Linux driver iwlwifi; needs Intel's closed firmware file loaded first
+wifi: 8086:2723 is Intel Wi-Fi 6 AX200 (Wi-Fi); Linux driver iwlwifi; needs Intel's closed firmware file loaded first
 afrisovera> wifi $DMID
-wifi: 168c:0036 is Qualcomm Atheros QCA9565 / AR9565 (Wi-Fi) -- Linux driver ath9k; needs NO firmware file -- the easiest chip to write a first Wi-Fi driver for
+wifi: 168c:0036 is Qualcomm Atheros QCA9565 / AR9565 (Wi-Fi); Linux driver ath9k; needs NO firmware file; the easiest chip to write a first Wi-Fi driver for
 afrisovera> wifi 8086:15b8
 wifi: 8086:15b8 is I219-V (e1000e), a wired Ethernet chip AfriSovera drives (a network cable works)
 afrisovera> wifi 1234:5678
-wifi: 1234:5678 is not in AfriSovera's list of network chips -- tell us this id
+wifi: 1234:5678 is not in AfriSovera's list of network chips; tell us this id
 afrisovera> wifi 86:2723
 wifi: give the chip's id as 8086:2723, or as Windows' Device Manager shows it (PCI\\VEN_8086&DEV_2723 or USB\\VID_0BDA&PID_8179)
 afrisovera> wifi $UMID
-wifi: usb 0cf3:9271 is Qualcomm Atheros AR9271 (e.g. TP-Link TL-WN722N v1, Alfa AWUS036NHA) (USB Wi-Fi stick) -- Linux driver ath9k_htc; its firmware file is OPEN source (free to ship) -- the easiest USB stick to write a first Wi-Fi driver for
+wifi: usb 0cf3:9271 is Qualcomm Atheros AR9271 (e.g. TP-Link TL-WN722N v1, Alfa AWUS036NHA) (USB Wi-Fi stick); Linux driver ath9k_htc; its firmware file is OPEN source (free to ship); the easiest USB stick to write a first Wi-Fi driver for
 afrisovera> wifi 148f:7601
-wifi: usb 148f:7601 is MediaTek MT7601U (USB Wi-Fi stick) -- Linux driver mt7601u; needs MediaTek's firmware file loaded first
+wifi: usb 148f:7601 is MediaTek MT7601U (USB Wi-Fi stick); Linux driver mt7601u; needs MediaTek's firmware file loaded first
 afrisovera> wifi $UBAD
-wifi: usb 1234:5678 is not in AfriSovera's list of USB Wi-Fi sticks -- tell us this id"
+wifi: usb 1234:5678 is not in AfriSovera's list of USB Wi-Fi sticks; tell us this id"
 
 selftest() {
     local D pass=0 bad=0
@@ -105,26 +105,26 @@ selftest() {
     arm model-green green "$GREEN"
     arm crlf green "$(printf '%s\n' "$GREEN" | sed 's/$/\r/')"
     arm no-answer red "$(printf '%s\n' "$GREEN" | grep -v '^wifi: network chips')"
-    arm e1000-not-driven red "$(printf '%s\n' "$GREEN" | sed 's/82574L (e1000e) -- AfriSovera drives it/no driver in AfriSovera yet/')"
+    arm e1000-not-driven red "$(printf '%s\n' "$GREEN" | sed 's/82574L (e1000e); AfriSovera drives it/no driver in AfriSovera yet/')"
     arm rtl-missing red "$(printf '%s\n' "$GREEN" | grep -v '10ec:8029')"
-    arm rtl-claimed red "$(printf '%s\n' "$GREEN" | sed 's/10ec:8029 Ethernet (cable): no driver in AfriSovera yet/10ec:8029 Ethernet (cable): RTL8029 -- AfriSovera drives it/')"
+    arm rtl-claimed red "$(printf '%s\n' "$GREEN" | sed 's/10ec:8029 Ethernet (cable): no driver in AfriSovera yet/10ec:8029 Ethernet (cable): RTL8029; AfriSovera drives it/')"
     arm count-wrong red "$(printf '%s\n' "$GREEN" | sed 's/2 network chip(s), 0 Wi-Fi/3 network chip(s), 0 Wi-Fi/')"
-    arm wifi-invented red "$(printf '%s\n' "$GREEN" | sed 's/^  00:03.0 10ec:8029 Ethernet (cable): no driver in AfriSovera yet/&\n  00:04.0 8086:2723 Wi-Fi: Intel Wi-Fi 6 AX200 -- x/')"
+    arm wifi-invented red "$(printf '%s\n' "$GREEN" | sed 's/^  00:03.0 10ec:8029 Ethernet (cable): no driver in AfriSovera yet/&\n  00:04.0 8086:2723 Wi-Fi: Intel Wi-Fi 6 AX200; x/')"
     arm no-owner-line red "$(printf '%s\n' "$GREEN" | grep -v 'for the owner')"
     arm ax200-wrong red "$(printf '%s\n' "$GREEN" | sed 's/is Intel Wi-Fi 6 AX200/is Intel Wi-Fi 6E AX210/')"
     arm devmgr-not-parsed red "$(printf '%s\n' "$GREEN" | sed 's/^wifi: 168c:0036 is .*/wifi: give the chip'"'"'s id as 8086:2723/')"
     arm ath9k-firmware red "$(printf '%s\n' "$GREEN" | sed 's/needs NO firmware file/needs a firmware file/')"
-    arm i219-unknown red "$(printf '%s\n' "$GREEN" | sed 's/^wifi: 8086:15b8 is .*/wifi: 8086:15b8 is not in AfriSovera'"'"'s list of network chips -- tell us this id/')"
-    arm unknown-named red "$(printf '%s\n' "$GREEN" | sed 's/^wifi: 1234:5678 is .*/wifi: 1234:5678 is Intel Wi-Fi 6 AX200 (Wi-Fi) -- x/')"
+    arm i219-unknown red "$(printf '%s\n' "$GREEN" | sed 's/^wifi: 8086:15b8 is .*/wifi: 8086:15b8 is not in AfriSovera'"'"'s list of network chips; tell us this id/')"
+    arm unknown-named red "$(printf '%s\n' "$GREEN" | sed 's/^wifi: 1234:5678 is .*/wifi: 1234:5678 is Intel Wi-Fi 6 AX200 (Wi-Fi); x/')"
     arm bad-id-accepted red "$(printf '%s\n' "$GREEN" | grep -v '^wifi: give the chip')"
     arm usb-not-counted red "$(printf '%s\n' "$GREEN" | sed 's/does not use: 1/does not use: 0/')"
     arm usb-serial-missing red "$(printf '%s\n' "$GREEN" | grep -v '^  usb 08e6:4433')"
-    arm usb-stick-invented red "$(printf '%s\n' "$GREEN" | sed 's/^  usb 08e6:4433 .*/  usb 08e6:4433 Wi-Fi stick: x -- y/')"
+    arm usb-stick-invented red "$(printf '%s\n' "$GREEN" | sed 's/^  usb 08e6:4433 .*/  usb 08e6:4433 Wi-Fi stick: x; y/')"
     arm no-wifi-line-old red "$(printf '%s\n' "$GREEN" | sed 's/^wifi: no Wi-Fi chip on PCI .*/wifi: no Wi-Fi chip on PCI (USB Wi-Fi sticks are not looked for yet)/')"
     arm ar9271-wrong red "$(printf '%s\n' "$GREEN" | sed 's/ath9k_htc; its firmware file is OPEN source/ath9k_htc; needs a closed firmware file/')"
     arm usb-devmgr-not-parsed red "$(printf '%s\n' "$GREEN" | grep -v '^wifi: usb 0cf3:9271')"
-    arm mt7601-unknown red "$(printf '%s\n' "$GREEN" | sed 's/^wifi: usb 148f:7601 is .*/wifi: 148f:7601 is not in AfriSovera'"'"'s list of network chips -- tell us this id/')"
-    arm usb-unknown-named red "$(printf '%s\n' "$GREEN" | sed 's/^wifi: usb 1234:5678 is .*/wifi: usb 1234:5678 is Ralink RT5370 (USB Wi-Fi stick) -- x/')"
+    arm mt7601-unknown red "$(printf '%s\n' "$GREEN" | sed 's/^wifi: usb 148f:7601 is .*/wifi: 148f:7601 is not in AfriSovera'"'"'s list of network chips; tell us this id/')"
+    arm usb-unknown-named red "$(printf '%s\n' "$GREEN" | sed 's/^wifi: usb 1234:5678 is .*/wifi: usb 1234:5678 is Ralink RT5370 (USB Wi-Fi stick); x/')"
     arm panic red "$(printf '%s\nKERNEL PANIC\n' "$GREEN")"
     arm empty red ""
     rm -rf "$D"
@@ -133,8 +133,8 @@ selftest() {
 }
 
 echo "== PC network chips and Wi-Fi (wifi, read only) =="
-if ! selftest; then echo "PC WIFI TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC WIFI SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC WIFI TEST FAILED (grader selftest); no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC WIFI SELFTEST ONLY; no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

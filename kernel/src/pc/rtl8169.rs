@@ -3,12 +3,12 @@
 //! The RTL8111/8168 is the wired chip on most consumer desktop boards and laptops (the
 //! RTL8101/8102/8103 is its 100 Mbit sibling, the RTL8169/8110 the older PCI one): Linux
 //! drives them all with r8169. They share the "C+" descriptor format of the RTL8139C+ (Linux
-//! 8139cp), which is what QEMU's `rtl8139` card is -- so one ring layout is proved on QEMU and
+//! 8139cp), which is what QEMU's `rtl8139` card is, so one ring layout is proved on QEMU and
 //! the real chips differ only in a few register offsets (marked below).
 //!
 //! 16-byte descriptors (opts1, opts2, buffer address) in two rings, polled, as e1000.rs does:
 //! `send` puts one frame on the wire, `recv` takes one off. The shared TCP/IP stack never sees
-//! this file -- pc/nic.rs and pc/virtio_pci.rs present the card to it as a virtio-net device.
+//! this file: pc/nic.rs and pc/virtio_pci.rs present the card to it as a virtio-net device.
 //! Sources: Realtek RTL8139C+ and RTL8169 datasheets (descriptor formats), Linux 8139cp.c and
 //! r8169_main.c (register names and the start-up order), QEMU hw/net/rtl8139.c (C+ mode).
 //!
@@ -109,6 +109,8 @@ static mut SENT: u64 = 0;
 static mut RECEIVED: u64 = 0;
 /// Inside a frame spread over several descriptors (FS without LS): dropped up to its LS.
 static mut DROPPING: bool = false;
+/// How often the transmit ring stopped moving and both rings were restarted (send, restart).
+static mut TX_RESTARTS: u64 = 0;
 
 fn r8(off: u64) -> u8 {
     // SAFETY: the register BAR is mapped uncached by init before any register access.
@@ -131,15 +133,28 @@ fn w32(off: u64, v: u32) {
     unsafe { write_volatile((BAR + off) as *mut u32, v) }
 }
 
-fn wait(mut done: impl FnMut() -> bool) -> bool {
-    for _ in 0..20_000_000u64 {
+/// Poll `done` for up to `ms` milliseconds of real time. Before 12 Nov this was a count of 20
+/// million polls, so how long the NIC had depended on the CPU and on how slow its register reads
+/// were; AHCI, IDE and NVMe wait by the clock.
+fn wait(ms: u64, mut done: impl FnMut() -> bool) -> bool {
+    let (t0, hz) = (crate::timer::cycles(), crate::timer::hz().max(1));
+    loop {
         if done() {
             return true;
         }
+        if crate::timer::cycles().wrapping_sub(t0) > hz.saturating_mul(ms) / 1000 {
+            return false;
+        }
         core::hint::spin_loop();
     }
-    false
 }
+
+/// The limits, in milliseconds. REG_MS: one register handshake (a PHY or EEPROM read, a queue
+/// switching on or off), microseconds on real parts. RESET_MS: a software reset. TX_MS: a
+/// transmit descriptor handed back; longer than that and the ring is restarted.
+const REG_MS: u64 = 100;
+const RESET_MS: u64 = 1_000;
+const TX_MS: u64 = 1_000;
 
 /// The first memory BAR (the registers): BAR1 on the 8139/8169, BAR2 (64-bit) on PCIe 8168s.
 fn mem_bar(b: u8, d: u8, f: u8) -> u64 {
@@ -205,7 +220,7 @@ pub fn init() -> bool {
     // Every interrupt masked (this driver polls), then a software reset.
     w16(INTR_MASK, 0);
     w8(CHIP_CMD, CMD_RESET);
-    if !wait(|| r8(CHIP_CMD) & CMD_RESET == 0) {
+    if !wait(RESET_MS, || r8(CHIP_CMD) & CMD_RESET == 0) {
         crate::kprintln!("[rtl] {} did not come out of reset", name);
         return false;
     }
@@ -225,18 +240,7 @@ pub fn init() -> bool {
     // SAFETY: the rings and buffers are ours alone until CHIP_CMD enables the engines.
     unsafe {
         MAC = mac;
-        let rx = &mut (*addr_of_mut!(RXR)).0;
-        for (i, dsc) in rx.iter_mut().enumerate() {
-            let end = if i == NRX - 1 { EOR } else { 0 };
-            *dsc = Desc { opts1: OWN | end | BUF as u32, opts2: 0, addr: addr_of!(RXB.0[i]) as u64 };
-        }
-        let tx = &mut (*addr_of_mut!(TXR)).0;
-        for (i, dsc) in tx.iter_mut().enumerate() {
-            let end = if i == NTX - 1 { EOR } else { 0 };
-            *dsc = Desc { opts1: end, opts2: 0, addr: addr_of!(TXB.0[i]) as u64 };
-        }
-        RX_NEXT = 0;
-        TX_NEXT = 0;
+        fill_rings();
     }
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     let (rxa, txa) = (addr_of!(RXR) as u64, addr_of!(TXR) as u64);
@@ -284,6 +288,59 @@ pub fn link_up() -> bool {
     present() && link()
 }
 
+/// Every RX descriptor handed to the NIC (OWN set), every TX descriptor back with the driver
+/// (OWN clear), each pointing at its own buffer, and both ring positions at slot 0.
+///
+/// # Safety
+/// Only while the NIC's receiver and transmitter are off (init, restart): it rewrites
+/// descriptors the chip may otherwise be reading.
+unsafe fn fill_rings() {
+    let rx = &mut (*addr_of_mut!(RXR)).0;
+    for (i, dsc) in rx.iter_mut().enumerate() {
+        let end = if i == NRX - 1 { EOR } else { 0 };
+        write_volatile(dsc, Desc { opts1: OWN | end | BUF as u32, opts2: 0, addr: addr_of!(RXB.0[i]) as u64 });
+    }
+    let tx = &mut (*addr_of_mut!(TXR)).0;
+    for (i, dsc) in tx.iter_mut().enumerate() {
+        let end = if i == NTX - 1 { EOR } else { 0 };
+        write_volatile(dsc, Desc { opts1: end, opts2: 0, addr: addr_of!(TXB.0[i]) as u64 });
+    }
+    RX_NEXT = 0;
+    TX_NEXT = 0;
+    DROPPING = false;
+}
+
+/// The transmit ring stopped moving: switch the receiver and transmitter off, give both rings
+/// back to their start and switch them on again, as Linux 8139cp's cp_tx_timeout does
+/// (cp_stop_hw, cp_clean_rings, cp_init_rings, cp_start_hw). The chips keep their own ring
+/// positions and only go back to descriptor 0 when an engine is switched on again, so the
+/// receive ring is restarted too; frames waiting in it are dropped. No chip reset: the MAC
+/// address and the PHY's link are kept. True when both engines are back on.
+fn restart() -> bool {
+    // SAFETY: single core; send (the caller) and recv are the only users of the rings and
+    // their positions, and the engines are off while fill_rings rewrites them.
+    unsafe {
+        w8(CHIP_CMD, 0);
+        wait(REG_MS, || r8(CHIP_CMD) & (CMD_RX_EN | CMD_TX_EN) == 0);
+        fill_rings();
+        TX_RESTARTS += 1;
+    }
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    let (rxa, txa) = (addr_of!(RXR) as u64, addr_of!(TXR) as u64);
+    // init's order: unlocked, ring addresses (high half first), locked, engines on, then
+    // the RX/TX configuration again (some 8169s drop it while the engines are off)
+    w8(CFG9346, 0xC0);
+    w32(TX_DESC_HI, (txa >> 32) as u32);
+    w32(TX_DESC_LO, txa as u32);
+    w32(RX_DESC_HI, (rxa >> 32) as u32);
+    w32(RX_DESC_LO, rxa as u32);
+    w8(CFG9346, 0x00);
+    w8(CHIP_CMD, CMD_RX_EN | CMD_TX_EN);
+    w32(RX_CONFIG, RXCFG);
+    w32(TX_CONFIG, TXCFG);
+    r8(CHIP_CMD) & (CMD_RX_EN | CMD_TX_EN) == CMD_RX_EN | CMD_TX_EN
+}
+
 /// Put one Ethernet frame (no FCS: the NIC appends it) on the wire. False if the ring
 /// stays full.
 pub fn send(frame: &[u8]) -> bool {
@@ -294,8 +351,20 @@ pub fn send(frame: &[u8]) -> bool {
         }
         let i = TX_NEXT;
         let dsc = addr_of_mut!(TXR.0[i]);
-        if !wait(|| read_volatile(addr_of!((*dsc).opts1)) & OWN == 0) {
-            crate::kprintln!("[rtl] transmit ring stuck");
+        if !wait(TX_MS, || read_volatile(addr_of!((*dsc).opts1)) & OWN == 0) {
+            // The NIC stopped taking frames (a link that went down with the ring full, a
+            // hung DMA engine). Without a restart OWN never clears on this descriptor, so
+            // every later send would fail the same way until a reboot.
+            crate::kprintln!(
+                "[rtl] transmit ring stuck (link {}): dropping the {} queued frames and restarting both rings",
+                if link() { "up" } else { "down" },
+                NTX
+            );
+            let ok = restart();
+            crate::kprintln!(
+                "[rtl] {}",
+                if ok { "transmit and receive rings ready again" } else { "receiver and transmitter did not switch on again after the restart" }
+            );
             return false;
         }
         let buf = addr_of_mut!(TXB.0[i]) as *mut u8;
@@ -376,6 +445,11 @@ pub fn list() {
         name, b, d, f, bar, m[0], m[1], m[2], m[3], m[4], m[5], if link_up() { "up" } else { "down" }
     );
     crate::kprintln!("  frames sent {}, received {}", s, rcv);
+    // SAFETY: scalar read.
+    let restarts = unsafe { TX_RESTARTS };
+    if restarts > 0 {
+        crate::kprintln!("  ring restarts after the transmit ring stopped moving: {}", restarts);
+    }
     dma_line();
 }
 

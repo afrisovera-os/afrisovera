@@ -481,7 +481,7 @@ extern "sysv64" fn pc_trap(f: &mut TrapFrame) {
         8 | 14 if f.cs & 3 == 0 && crate::stackinfo::in_guard(cr2()) => {
             let (lo, hi) = crate::stackinfo::guard();
             crate::uart::emergency_print(format_args!(
-                "\n[pc] STACK OVERFLOW: kernel stack ran into its guard {:#x}..{:#x} (vector {} {}, CR2 {:#x}, RIP {:#x}) -- halted\n",
+                "\n[pc] STACK OVERFLOW: kernel stack ran into its guard {:#x}..{:#x} (vector {} {}, CR2 {:#x}, RIP {:#x}); halted\n",
                 lo,
                 hi,
                 f.vector,
@@ -499,7 +499,7 @@ extern "sysv64" fn pc_trap(f: &mut TrapFrame) {
             // SAFETY: reads the faulting address register (meaningful for #PF).
             unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)) };
             crate::kprintln!(
-                "[pc] EXCEPTION vector {} ({}) error {:#x} at RIP {:#x} (CR2 {:#x}) -- halted",
+                "[pc] EXCEPTION vector {} ({}) error {:#x} at RIP {:#x} (CR2 {:#x}); halted",
                 v,
                 NAMES.get(v as usize).copied().unwrap_or("interrupt"),
                 f.error,

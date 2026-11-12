@@ -57,19 +57,22 @@ if not re.search(r"\[pc\] kernel stack: (?:\d+) KiB at 0x[0-9a-f]+\.\.0x[0-9a-f]
     bad.append("the boot did not report the kernel stack with its guard unmapped")
 if not re.search(r"\[stack\] pc guard 0x[0-9a-f]+\.\.0x[0-9a-f]+: 0 of 16 pages mapped, stack above it mapped -> OK", t):
     bad.append("`stack guards`: the guard is not an unmapped hole under a mapped stack")
-m = re.search(r"\[pc\] STACK OVERFLOW: kernel stack ran into its guard (0x[0-9a-f]+)\.\.(0x[0-9a-f]+) \(vector (\d+)", t)
+m = re.search(r"\[pc\] STACK OVERFLOW: kernel stack ran into its guard (0x[0-9a-f]+)\.\.(0x[0-9a-f]+) \(vector (\d+)[^,]*, CR2 (0x[0-9a-f]+)", t)
 if not m:
-    bad.append("no STACK OVERFLOW report (an unguarded dive runs on into the memory below)")
+    bad.append("no STACK OVERFLOW report with a CR2 (an unguarded dive runs on into the memory below)")
 # The dive starts inside shell::exec, already about 600 KB down (Actions 42930389150), so the level count is not
-# the measure; the measure is how close to the stack's bottom the last progress line got.
-depths = [int(x) for x in re.findall(r"overflow-test depth (\d+)", t)]
+# the measure. Nor is the last progress line: it comes every 32 levels (about 140 KiB), so where it lands depends
+# on how deep shell::exec starts the dive, and any shell change moves it. The measure is the faulting address
+# (CR2): a write just under the stack's bottom, inside the guard, means the dive really used the whole stack.
 rsps = [int(x, 16) for x in re.findall(r"overflow-test depth \d+ rsp (0x[0-9a-f]+)", t)]
 ks = re.search(r"\[pc\] kernel stack: (?:\d+) KiB at (0x[0-9a-f]+)\.\.", t)
 if not rsps or not ks:
     bad.append("no dive progress lines, or no kernel-stack line to measure them against")
-elif min(rsps) - int(ks.group(1), 16) > 64 * 1024:
-    bad.append("the dive stopped %d KiB above the stack bottom: the stack was not really exhausted"
-               % ((min(rsps) - int(ks.group(1), 16)) // 1024))
+elif m:
+    bottom, cr2 = int(ks.group(1), 16), int(m.group(4), 16)
+    if not (int(m.group(1), 16) <= cr2 < bottom and bottom - cr2 <= 8 * 1024):
+        bad.append("the fault at %s is not just under the stack bottom %s: the stack was not really exhausted"
+                   % (m.group(4), ks.group(1)))
 if "should be unreachable" in t:
     bad.append("the dive RETURNED, so the stack never ran out")
 if bad:
@@ -77,6 +80,6 @@ if bad:
     for b in bad:
         print("  - " + b)
     sys.exit(1)
-print("PC STACKGUARD TEST PASSED  (guard %s..%s unmapped; the dive reached %d B above the stack bottom, then vector %s, reported lock-free)"
-      % (m.group(1), m.group(2), min(rsps) - int(ks.group(1), 16), m.group(3)))
+print("PC STACKGUARD TEST PASSED  (guard %s..%s unmapped; the dive faulted %d B under the stack bottom, vector %s, reported lock-free)"
+      % (m.group(1), m.group(2), int(ks.group(1), 16) - int(m.group(4), 16), m.group(3)))
 PY

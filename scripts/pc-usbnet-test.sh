@@ -2,7 +2,7 @@
 # PC track step 3 (5 Nov 2026): a USB Ethernet adapter (CDC-ECM) on the xHCI.
 #
 # Boots the PC kernel (q35 + UEFI) with ONLY a USB network adapter (QEMU `usb-net` on a
-# `qemu-xhci`) on user-mode networking -- no virtio NIC, no Intel NIC. pc/xhci.rs enumerates
+# `qemu-xhci`) on user-mode networking: no virtio NIC, no Intel NIC. pc/xhci.rs enumerates
 # it (CDC-ECM configuration, MAC from its string descriptor, bulk IN/OUT) and pc/nic.rs puts
 # it behind the emulated virtio-net device, so this grades the whole path: DHCP lease, ARP +
 # ICMP ping to the gateway, and a TCP connection that carries an exact payload to a peer on
@@ -20,7 +20,7 @@ grade() { # grade <serial> <peer log>
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     P="$(cat "$2" 2> /dev/null)"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[xhci\] port [0-9]+: USB Ethernet adapter [0-9a-f]{4}:[0-9a-f]{4} \(CDC-ECM, [a-z]+ speed\), slot [0-9]+, MAC ([0-9a-f]{2}:){5}[0-9a-f]{2}$' ||
         _f "the USB Ethernet adapter was not enumerated with its MAC"
     has '^\[virtio\] slot [0-9]+: virtio-net \(id=1\), emulated over the USB Ethernet adapter \(CDC-ECM\)$' ||
@@ -85,8 +85,8 @@ selftest() {
 }
 
 echo "== PC USB Ethernet adapter (CDC-ECM) =="
-if ! selftest; then echo "PC USBNET TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC USBNET SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC USBNET TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC USBNET SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

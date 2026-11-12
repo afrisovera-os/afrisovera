@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track step 5 (6 Nov 2026): `installpart <disk> <MiB> [yes <code>]` -- the one command that writes an
+# PC track step 5 (6 Nov 2026): `installpart <disk> <MiB> [yes <code>]`: the one command that writes an
 # internal disk. It adds AfriSovera's (empty, unformatted) partition to a healthy GPT disk as one new entry
 # in the free space `installplan` names, in both GPT copies with both CRCs redone, and only when the USB
 # stick holds a backup of that disk's table that matches the disk now AND the owner types the code the
@@ -27,25 +27,25 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log>
     [ -r "$1" ] && [ -r "$2" ] && [ -r "$3" ] || { echo "  FAIL: missing log"; return 1; }
     cl() { tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g'; }
     A="$(cl "$1")"; B="$(cl "$2")"; C="$(cl "$3")"
-    has() { printf '%s\n' "$1" | grep -aqxE "$2"; }
+    has() { grep -aqxE "$2" <<< "$1"; }
     blk() { printf '%s\n' "$1" | awk -v c="afrisovera> $2" '$0==c{on=1;next} /^afrisovera>/{on=0} on'; }
     local NW='only a healthy GPT disk with room in a free entry can be changed \(see the plan above\)'
     local CODE
     CODE="$(printf '%s\n' "$A" | grep -aoE 'type exactly: installpart nvme 8 yes [0-9a-f]{4}$' | head -1 | awk '{print $NF}')"
     [ -n "$CODE" ] || _f "boot 1: installpart nvme 8 did not show the code to type"
-    has "$(blk "$A" 'installpart nvme 4')" 'installpart: there is no partition-table backup on a USB stick -- run tablebackup first; nothing written' ||
+    has "$(blk "$A" 'installpart nvme 4')" 'installpart: there is no partition-table backup on a USB stick; run tablebackup first; nothing written' ||
         _f "boot 1: installpart without a backup did not refuse"
     has "$(blk "$A" 'tablebackup')" 'tablebackup: nvme: GPT table, 67 sector\(s\) saved on the USB stick at sectors 2049-2116, CRC [0-9a-f]{8}, read back OK' ||
         _f "boot 1: tablebackup did not save the NVMe GPT"
     local A16; A16="$(blk "$A" 'installpart nvme 16')"
-    has "$A16" '  plan: the largest free space holds 9 MiB, less than the 16 MiB asked -- .*' && has "$A16" "installpart: nothing written -- $NW" ||
+    has "$A16" '  plan: the largest free space holds 9 MiB, less than the 16 MiB asked; .*' && has "$A16" "installpart: nothing written; $NW" ||
         _f "boot 1: 16 MiB in a 9 MiB gap was not refused"
-    has "$(blk "$A" 'installpart sata2 8')" "installpart: nothing written -- $NW" || _f "boot 1: the MBR disk was not refused"
+    has "$(blk "$A" 'installpart sata2 8')" "installpart: nothing written; $NW" || _f "boot 1: the MBR disk was not refused"
     local A8; A8="$(blk "$A" 'installpart nvme 8')"
     has "$A8" "  plan: AfriSovera's partition would be LBA 100352-116735 \(8 MiB\) in the free space LBA 100352-118783, as GPT entry 5; no other partition moves or shrinks" ||
         _f "boot 1: the plan for 8 MiB is not entry 5 at LBA 100352-116735"
     has "$A8" 'installpart: the table matches its backup on the USB stick' || _f "boot 1: the backup was not matched"
-    has "$(blk "$A" 'installpart nvme 8 yes zzzz')" 'installpart: that code does not fit this disk.s table now -- nothing written' ||
+    has "$(blk "$A" 'installpart nvme 8 yes zzzz')" 'installpart: that code does not fit this disk.s table now; nothing written' ||
         _f "boot 1: a wrong code was not refused"
     has "$(blk "$A" 'installpart nvme')" 'installpart: say the disk and the size in MiB, .*' || _f "boot 1: no usage line without a size"
     has "$A" 'harness: disk images unchanged' || _f "boot 1: a disk image changed before the code was typed"
@@ -59,9 +59,9 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log>
     has "$B2" '  gpt: 5 partition\(s\), usable LBA 34-131038, primary header OK, backup header OK, entries CRC OK' ||
         _f "boot 2: the GPT is not whole after the write"
     B3="$(blk "$B" 'tablecheck')"
-    has "$B3" 'tablecheck: nvme: CHANGED since the backup \(first difference in sector 1\) -- .*' || _f "boot 2: tablecheck did not see the change"
+    has "$B3" 'tablecheck: nvme: CHANGED since the backup \(first difference in sector 1\); .*' || _f "boot 2: tablecheck did not see the change"
     B4="$(printf '%s\n' "$B" | awk -v c="afrisovera> installpart nvme 8 yes $CODE" '$0==c{n++} n==2&&$0!=c&&/^afrisovera>/{exit} n==2&&$0!=c')"
-    has "$B4" "installpart: nothing written -- $NW" || _f "boot 2: the same install twice was not refused"
+    has "$B4" "installpart: nothing written; $NW" || _f "boot 2: the same install twice was not refused"
     has "$B" 'harness: nvme image: only sectors 1, 3, 131040, 131071 changed; both GPT copies valid and equal; entry 5 is AfriSovera.s, LBA 100352-116735, a random GUID' ||
         _f "boot 2: the NVMe image does not hold exactly the planned change"
     has "$B" 'harness: other disk images unchanged' || _f "boot 2: another disk image changed"
@@ -77,22 +77,22 @@ NW='only a healthy GPT disk with room in a free entry can be changed (see the pl
 PL="  plan: AfriSovera's partition would be LBA 100352-116735 (8 MiB) in the free space LBA 100352-118783, as GPT entry 5; no other partition moves or shrinks"
 M1="afrisovera> installpart nvme 4
 installpart: nvme, 64 MiB, AfriSovera's partition of 4 MiB
-installpart: there is no partition-table backup on a USB stick -- run tablebackup first; nothing written
+installpart: there is no partition-table backup on a USB stick; run tablebackup first; nothing written
 afrisovera> tablebackup
 tablebackup: nvme: GPT table, 67 sector(s) saved on the USB stick at sectors 2049-2116, CRC 1a2b3c4d, read back OK
 afrisovera> installpart nvme 16
-  plan: the largest free space holds 9 MiB, less than the 16 MiB asked -- make room by shrinking Windows from Windows itself (Disk Management, Shrink Volume)
-installpart: nothing written -- $NW
+  plan: the largest free space holds 9 MiB, less than the 16 MiB asked; make room by shrinking Windows from Windows itself (Disk Management, Shrink Volume)
+installpart: nothing written; $NW
 afrisovera> installpart sata2 8
   plan: AfriSovera's partition would be LBA 34816-51199 (8 MiB) in the free space LBA 34816-131071, as MBR slot 2; no other partition moves or shrinks
-installpart: nothing written -- $NW
+installpart: nothing written; $NW
 afrisovera> installpart nvme 8
 $PL
 installpart: the table matches its backup on the USB stick
 installpart: nothing written yet. To write it, type exactly: installpart nvme 8 yes 3f9c
 afrisovera> installpart nvme 8 yes zzzz
 installpart: the table matches its backup on the USB stick
-installpart: that code does not fit this disk's table now -- nothing written
+installpart: that code does not fit this disk's table now; nothing written
 afrisovera> installpart nvme
 installpart: say the disk and the size in MiB, e.g. installpart nvme 8192 (it shows the plan and the code; nothing is written without the code)
 afrisovera>
@@ -106,10 +106,10 @@ afrisovera> lsparts
   part 5: AfriSovera, LBA 100352-116735 (8 MiB), \"AfriSovera\"
   gpt: 5 partition(s), usable LBA 34-131038, primary header OK, backup header OK, entries CRC OK
 afrisovera> tablecheck
-tablecheck: nvme: CHANGED since the backup (first difference in sector 1) -- back it up again before any install
+tablecheck: nvme: CHANGED since the backup (first difference in sector 1); back it up again before any install
 afrisovera> installpart nvme 8 yes 3f9c
-  plan: the largest free space holds 1 MiB, less than the 8 MiB asked -- make room
-installpart: nothing written -- $NW
+  plan: the largest free space holds 1 MiB, less than the 8 MiB asked; make room
+installpart: nothing written; $NW
 afrisovera>
 harness: nvme image: only sectors 1, 3, 131040, 131071 changed; both GPT copies valid and equal; entry 5 is AfriSovera's, LBA 100352-116735, a random GUID
 harness: other disk images unchanged"
@@ -155,8 +155,8 @@ selftest() {
 }
 
 echo "== PC install: AfriSovera's partition written into a GPT on the owner's code (PC track step 5) =="
-if ! selftest; then echo "PC INSTALLPART TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC INSTALLPART SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC INSTALLPART TEST FAILED (grader selftest); no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC INSTALLPART SELFTEST ONLY; no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

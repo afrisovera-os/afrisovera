@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track step 5 (6 Nov 2026): installdisk -- a whole internal disk given to AfriSovera (a
+# PC track step 5 (6 Nov 2026): installdisk: a whole internal disk given to AfriSovera (a
 # spare PC), which then starts AfriSovera with NO USB stick.
 #
 # A 1 GiB NVMe disk that looks used (an MBR with an NTFS partition, as a Windows PC's disk
@@ -10,7 +10,7 @@
 # + AfriSovera's partition, formatted), a file written. The harness then reads the image
 # itself: protective MBR, both GPT headers, the two entries, and the FAT32 file system's
 # EFI\BOOT\BOOTX64.EFI byte-identical to the kernel that was booted.
-# Boot 3: qemu-system-x86_64 DIRECTLY, with only the NVMe disk -- no stick, no boot disk:
+# Boot 3: qemu-system-x86_64 DIRECTLY, with only the NVMe disk: no stick, no boot disk:
 # the firmware must start AfriSovera from the NVMe disk, and the file must come back.
 #   scripts/pc-installdisk-test.sh              # grader selftest, then the three QEMU boots
 #   scripts/pc-installdisk-test.sh --selftest   # grader selftest only
@@ -66,7 +66,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log>
     hasA '^  mbr 1: type 0x07 ' || _f "boot 1: installdisk did not show what is on the disk now (the NTFS partition)"
     hasA "^installdisk: nothing written yet\\. Only on a PC that is AfriSovera.s alone, type exactly: installdisk $CMD yes [0-9a-f]{4}\$" ||
         _f "boot 1: installdisk did not give the code"
-    hasA '^installdisk: that code does not fit this disk as it is now -- nothing written$' || _f "boot 1: a wrong code was not refused"
+    hasA '^installdisk: that code does not fit this disk as it is now; nothing written$' || _f "boot 1: a wrong code was not refused"
     hasA '^harness: boot 1: the disk image is unchanged$' || _f "boot 1: the disk was written before the code was typed"
     hasB "^installdisk: $NAME: GPT written \\(EFI system partition LBA $ESPR, AfriSovera.s partition LBA $AFR-[0-9]+\\), boot file [0-9]+ KiB written and read back OK" ||
         _f "boot 2: the table and boot file were not written and read back"
@@ -96,16 +96,16 @@ B1="[pc] own boot file \\EFI\\BOOT\\BOOTX64.EFI (2205 KiB) kept for installdisk
 afrisovera> installdisk nvme
 installdisk: nvme, 1024 MiB, 512-byte blocks. What is on it now:
   mbr 1: type 0x07 (NTFS/exFAT), start 2048, 2095104 sectors (1023 MiB)
-installdisk: EVERYTHING on this disk will be ERASED -- Windows or anything else on it is lost for good.
+installdisk: EVERYTHING on this disk will be ERASED; Windows or anything else on it is lost for good.
 installdisk: nothing written yet. Only on a PC that is AfriSovera's alone, type exactly: installdisk nvme yes 3fa1
 afrisovera> installdisk nvme yes zzzz
-installdisk: that code does not fit this disk as it is now -- nothing written
+installdisk: that code does not fit this disk as it is now; nothing written
 
 harness: boot 1: the disk image is unchanged"
 B2="afrisovera> installdisk nvme yes 3fa1
 installdisk: nvme: GPT written (EFI system partition LBA 2048-616447, AfriSovera's partition LBA 616448-2095103), boot file 2205 KiB written and read back OK (14500 sectors)
 installdisk: AfriSovera's partition formatted (722 MiB); the shell's files are kept there from now on
-installdisk: DONE -- take the USB stick out and restart (reboot): the PC starts AfriSovera from this disk
+installdisk: DONE; take the USB stick out and restart (reboot): the PC starts AfriSovera from this disk
 
 harness: boot 2: GPT ok (protective MBR, both headers, 2 entries), FAT32 EFI\\BOOT\\BOOTX64.EFI is the booted kernel byte for byte"
 B3="$BOOT3_LINE
@@ -184,8 +184,8 @@ selftest() {
 }
 
 echo "== PC install ($UP): a whole disk given to AfriSovera, booted with no USB stick (PC track step 5) =="
-if ! selftest; then echo "PC INSTALLDISK TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC INSTALLDISK SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC INSTALLDISK TEST FAILED (grader selftest); no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC INSTALLDISK SELFTEST ONLY; no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

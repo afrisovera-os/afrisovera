@@ -5,7 +5,7 @@
 # Boots the PC kernel (q35 + UEFI) four times with QEMU's `sdhci-pci`. Boots 1-2: a blank 4 GiB SDHC
 # card (`sd-card`); boots 3-4: a blank 4 GiB eMMC (`emmc`). At every boot the first 8 blocks read by
 # one CMD18 must equal the same blocks read one at a time ("multi-block reads: on"). Boots 1 and 3:
-# claim the disk, write a file, sync, then the write/read-back self-test (`disk`) twice -- the second
+# claim the disk, write a file, sync, then the write/read-back self-test (`disk`) twice: the second
 # time the block written is already in the read-ahead copy, so a write updating that copy is used.
 # Boots 2 and 4: the VFS is loaded from the disk (its sectors read in order), the file comes back, and
 # `lssd` counts the reads: at least 3/4 of them must come from multi-block reads, in at most a quarter
@@ -31,7 +31,7 @@ grade() { # grade <boot1> <boot2> <boot3> <boot4>
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     C="$(tr -d '\r' < "$3" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     D="$(tr -d '\r' < "$4" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$1" | grep -aqE "$2"; }
+    has() { grep -aqE "$2" <<< "$1"; }
     count() { printf '%s\n' "$1" | grep -acE "$2"; }
     # the read counts after a VFS load: most blocks from CMD18, few commands
     mostly_multi() { # mostly_multi <log>
@@ -177,8 +177,8 @@ selftest() {
 }
 
 echo "== PC SD/eMMC multi-block reads and read-ahead (PC track step 3) =="
-if ! selftest; then echo "PC SDMULTI TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC SDMULTI SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC SDMULTI TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC SDMULTI SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

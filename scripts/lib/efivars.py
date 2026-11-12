@@ -7,6 +7,7 @@ tool does the same to the store file before the first power-on, so the tests can
 commands work beside it and leave it exactly as it was.
 
     efivars.py add-boot VARS NUM DESC DISK GPT_OFF FILE   # e.g. add-boot vars.fd 0005 ubuntu win.img 1024 \\EFI\\ubuntu\\grubx64.efi
+    efivars.py add-boot VARS NUM DESC DISK GPT_OFF FILE ATTR  # ATTR in hex: 1 active (the default), 0 off, 9 active and hidden, 8 off and hidden
     efivars.py list VARS                                  # the variables in the store (name, state, size)
 
 DISK is the disk image, GPT_OFF the byte of the GPT entry for the partition (its number is worked out from GPT_OFF:
@@ -68,7 +69,7 @@ def append(d, name, data):
     d[o:o + need] = bytes(h) + n + data
 
 
-def load_option(desc, disk, goff, path):
+def load_option(desc, disk, goff, path, attr=1):
     x = open(disk, "rb").read()
     # the entry array starts at block 2: 512-byte blocks put it at 1024, 4 KiB blocks at 8192
     bs = 4096 if goff >= 8192 else 512
@@ -79,7 +80,7 @@ def load_option(desc, disk, goff, path):
     fn = (path + "\0").encode("utf-16-le")
     fp = struct.pack("<BBH", 4, 4, 4 + len(fn)) + fn
     dp = hd + fp + bytes([0x7F, 0xFF, 4, 0])
-    return struct.pack("<IH", 1, len(dp)) + (desc + "\0").encode("utf-16-le") + dp, pno, first, last - first + 1, sig
+    return struct.pack("<IH", attr, len(dp)) + (desc + "\0").encode("utf-16-le") + dp, pno, first, last - first + 1, sig
 
 
 def main(a):
@@ -90,13 +91,14 @@ def main(a):
             print("  %-12s %s  %4d bytes  state 0x%02x%s" % (name, g, ds, st, "" if st == ADDED else " (deleted)"))
         print("  %d variables; free from byte %d to %d" % (len(vs), o, end))
         return 0
-    if len(a) == 7 and a[0] == "add-boot":
+    if len(a) in (7, 8) and a[0] == "add-boot":
         vars_, num, desc, disk, goff, path = a[1], a[2].upper(), a[3], a[4], int(a[5]), a[6]
+        attr = int(a[7], 16) if len(a) == 8 else 1  # LOAD_OPTION_ACTIVE 1, LOAD_OPTION_HIDDEN 8
         d = bytearray(open(vars_, "rb").read())
         name = "Boot" + num
         if live(d, name):
             raise SystemExit("efivars: %s is already in the store" % name)
-        opt, pno, start, size, sig = load_option(desc, disk, goff, path)
+        opt, pno, start, size, sig = load_option(desc, disk, goff, path, attr)
         old = live(d, "BootOrder")
         order = struct.pack("<H", int(num, 16))
         if old:
@@ -112,8 +114,10 @@ def main(a):
         if len(got) != 1 or bytes(d[got[0][4]:got[0][4] + got[0][5]]) != opt or len(bo) != 1 or bytes(d[bo[0][4]:bo[0][4] + bo[0][5]]) != order:
             raise SystemExit("efivars: %s or BootOrder did not read back" % name)
         open(vars_, "wb").write(d)
-        print("harness: %s \"%s\" HD(%d,GPT,%s,start %d)/%s written to the variable store, first in BootOrder (%s)"
+        print("harness: %s \"%s\" HD(%d,GPT,%s,start %d)/%s%s written to the variable store, first in BootOrder (%s)"
               % (name, desc, pno, uuid.UUID(bytes_le=sig), start, path,
+                 "" if attr == 1 else " (attributes %X: %s)" % (attr, ", ".join(
+                     (["active"] if attr & 1 else ["off"]) + (["hidden"] if attr & 8 else []))),
                  " ".join("%04X" % struct.unpack_from("<H", order, i)[0] for i in range(0, len(order), 2))))
         return 0
     print(__doc__)

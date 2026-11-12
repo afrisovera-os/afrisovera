@@ -2,7 +2,7 @@
 # PC track step 3 (5 Nov 2026): the Intel e1000e wired NIC.
 #
 # Boots the PC kernel (q35 + UEFI) with ONLY an Intel 82574L (QEMU `e1000e`) on user-mode
-# networking -- no virtio NIC. pc/e1000.rs drives the card and pc/virtio_pci.rs presents it
+# networking: no virtio NIC. pc/e1000.rs drives the card and pc/virtio_pci.rs presents it
 # to the shared TCP/IP stack as a virtio-net device, so this grades the whole path on real
 # NIC hardware: DHCP lease, ARP + ICMP ping to the gateway, and a TCP connection that
 # carries an exact payload to a peer on the host and reads its reply. `lse1000` must show
@@ -20,7 +20,7 @@ grade() { # grade <serial> <peer log>
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     P="$(cat "$2" 2> /dev/null)"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[e1000\] 82574L \(e1000e\) at [0-9a-f]{2}:[0-9a-f]{2}\.[0-7], MAC ([0-9a-f]{2}:){5}[0-9a-f]{2}, link up$' ||
         _f "the 82574L was not found with its MAC and link up"
     has '^\[virtio\] slot [0-9]+: virtio-net \(id=1\), emulated over the Intel NIC \(e1000\)$' ||
@@ -101,8 +101,8 @@ selftest() {
 }
 
 echo "== PC Intel e1000e NIC (PC track step 3) =="
-if ! selftest; then echo "PC E1000 TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC E1000 SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC E1000 TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC E1000 SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

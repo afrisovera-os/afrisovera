@@ -17,7 +17,7 @@ T="${TMPDIR:-/tmp}"
 grade() { # grade <serial log>; prints FAIL lines, returns 0 when green
     local S fail=0 d
     S="$(tr -d '\r' < "$1" 2> /dev/null)"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|\[pc\] (fault|exception)'; then echo "  FAIL: the kernel panicked or faulted"; fail=1; fi
     has '^rtcinfo: present true  status-B 0x[0-9a-f]{2}$' || { echo "  FAIL: rtcinfo did not say the CMOS RTC is present"; fail=1; }
     has '^rtcinfo: mode (BCD|binary), (12|24)-hour; raw hour 0x[0-9a-f]{2} minute 0x[0-9a-f]{2} second 0x[0-9a-f]{2}, century 0x[0-9a-f]{2}$' ||

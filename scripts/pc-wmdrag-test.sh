@@ -18,7 +18,7 @@ grade() { # grade <serial>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[xhci\] port [0-9]+: USB mouse ' || _f "no USB mouse was enumerated"
     has '^    \[wm\] 3 ring-3 window program\(s\) drew and exited \(3 clean\)$' || _f "wm (typed on the USB keyboard) did not draw three windows"
     has '^wm: window 0 at 130,124 size 200x100$' || _f "window 0 was not dragged from 30,44 to 130,124"

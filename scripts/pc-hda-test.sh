@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track step 3, sound (7 Nov 2026): Intel HD Audio -- the PC's own sound chip (kernel/src/pc/hda.rs).
+# PC track step 3, sound (7 Nov 2026): Intel HD Audio: the PC's own sound chip (kernel/src/pc/hda.rs).
 #
 # Every PC and laptop has an HD Audio controller with a codec behind it; until now the PC kernel could only
 # play through QEMU's virtio-sound, which no real PC has. hda.rs resets the controller, talks to the codec
@@ -15,6 +15,8 @@
 # SOUND (the WAV file the codec wrote, not a serial line): the tone is there as a square wave of at least
 # 15000 frames at 441 Hz (+-10), and `say` added at least 4000 more loud frames with at least 50 different
 # sample values (speech, not a copy of the tone or silence).
+# Since 12 Nov 2026 also `lshda late`: a codec answer left unread in the RIRB (as after a command that timed
+# out) must be dropped, not taken as the next command's answer; graded on the line it prints.
 #   scripts/pc-hda-test.sh              # grader selftest, then the QEMU boot
 #   scripts/pc-hda-test.sh --selftest   # grader selftest only
 set -uo pipefail
@@ -85,7 +87,7 @@ grade() { # grade <serial log>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqxE "$1"; }
+    has() { grep -aqxE "$1" <<< "$S"; }
     local P='pin [0-9]+ \(line out\) <- DAC [0-9]+'
     has "\[hda\] Intel ICH9 HD Audio at [0-9a-f]{2}:[0-9a-f]{2}\.[0-7] \(8086:293e\), codec 0 1af4:[0-9a-f]{4}, sound out through $P" ||
         _f "no boot line naming the ICH9 controller, the QEMU codec and the line-out path"
@@ -104,6 +106,9 @@ grade() { # grade <serial log>
     printf '%s\n' "$S" | sed -n '/^\[say\] speaking: "hello"$/,$p' | grep -aqE "^\[hda\] played ([5-9][0-9]{3}|[1-9][0-9]{4,}) samples \([0-9]+ periods, ~[0-9]+ ms\) at 44100 Hz through $P\$" ||
         _f "say was not played through HD Audio"
     has 'intel-hda +[a-z]+ +0x0+ +OK' || _f "intel-hda is not in devices"
+    has 'lshda late: an unread answer was left in the ring; the next command got (0x[0-9a-f]{8}), then \1 \(codec id \1\), [1-9][0-9]* dropped: OK' ||
+        _f "lshda late: a late codec answer was taken as the next command's answer"
+    if printf '%s\n' "$S" | grep -aqE '^lshda: late codec answers dropped'; then _f "late codec answers came in normal use"; fi
     if printf '%s\n' "$S" | grep -aqE '^\[hda\] (the output stream|HD Audio controller found but not usable)'; then _f "the HD Audio stream stuck or the controller was refused"; fi
     if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
     return "$fail"
@@ -123,14 +128,16 @@ afrisovera> audio
 afrisovera> audio tone
 [audio] streaming a test tone through Intel HD Audio...
 [hda] played 16384 samples (16 periods, ~371 ms) at 44100 Hz through pin 3 (line out) <- DAC 2
-[audio] done — captured by the wav audiodev if attached
+[audio] done: captured by the wav audiodev if attached
 afrisovera> say hello
 [say] speaking: \"hello\"
 [hda] played 25578 samples (25 periods, ~580 ms) at 44100 Hz through pin 3 (line out) <- DAC 2
 [asili voice] synthesized 25578 samples
 afrisovera> devices
 NAME               CLASS      MMIO          STATUS
-intel-hda          audio      0x0000000000  OK"
+intel-hda          audio      0x0000000000  OK
+afrisovera> lshda late
+lshda late: an unread answer was left in the ring; the next command got 0x1af40012, then 0x1af40012 (codec id 0x1af40012), 1 dropped: OK"
 WGREEN='wav: frames=70000 rate=44100 ch=2 loud=42000 tone_frames=16384 tone_hz=441.0 voice_loud=25000 voice_distinct=900'
 
 selftest() {
@@ -150,7 +157,7 @@ selftest() {
     arm hdmi-path red "$(printf '%s\n' "$GREEN" | sed 's/pin 3 (line out)/pin 3 (digital out)/g')"
     arm no-lshda red "$(printf '%s\n' "$GREEN" | grep -v '^lshda: Intel')"
     arm two-codecs red "$(printf '%s\n' "$GREEN" | sed 's/1 codec(s) answered (mask 0x0001)/2 codec(s) answered (mask 0x0003)/')"
-    arm pin-unused red "$(printf '%s\n' "$GREEN" | sed 's/(config 0x01014010)/(config 0x01014010) -- not used/')"
+    arm pin-unused red "$(printf '%s\n' "$GREEN" | sed 's/(config 0x01014010)/(config 0x01014010), not used/')"
     arm no-dac red "$(printf '%s\n' "$GREEN" | grep -v 'audio output (DAC)')"
     arm 48k red "$(printf '%s\n' "$GREEN" | sed 's/44\.1 kHz 16-bit/48 kHz 16-bit/')"
     arm audio-virtio red "$(printf '%s\n' "$GREEN" | sed 's/^\[audio\] HD Audio online.*/[audio] no virtio-sound device (boot QEMU with -device virtio-sound-device,audiodev=snd0)/')"
@@ -159,6 +166,10 @@ selftest() {
     arm say-silent red "$(printf '%s\n' "$GREEN" | grep -v '^\[hda\] played 25578')"
     arm no-device-row red "$(printf '%s\n' "$GREEN" | grep -v '^intel-hda')"
     arm stuck red "$(printf '%s\n' "$GREEN" | sed 's/^\[audio\] done.*/&\n[hda] the output stream stopped moving at byte 4096 (LPIB 0x1000)/')"
+    arm late-shifted red "$(printf '%s\n' "$GREEN" | sed 's/got 0x1af40012, then 0x1af40012/got 0x00010001, then 0x1af40012/; s/dropped: OK/dropped: WRONG/')"
+    arm late-shifted-ok red "$(printf '%s\n' "$GREEN" | sed 's/got 0x1af40012, then 0x1af40012/got 0x00010001, then 0x1af40012/')"
+    arm late-none-dropped red "$(printf '%s\n' "$GREEN" | sed 's/, 1 dropped: OK/, 0 dropped: OK/')"
+    arm late-in-use red "$(printf '%s\n' "$GREEN" | sed 's/^lshda: sound goes out.*/&\nlshda: late codec answers dropped before a command: 3/')"
     arm panic red "$(printf '%s\nKERNEL PANIC\n' "$GREEN")"
     arm empty red ""
     arm wav-missing red "$GREEN" "wav: missing"
@@ -185,12 +196,12 @@ EOF
     arm measured-600hz red "$GREEN" "$(wav "$D/high.wav")"
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 26 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 30 ]
 }
 
 echo "== PC sound: Intel HD Audio (hda.rs) =="
-if ! selftest; then echo "PC HDA TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC HDA SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC HDA TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC HDA SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }
@@ -219,7 +230,7 @@ W="$(mktemp -d "$T/pc-hda.XXXXXX")"
 mkdir -p "$W/stick/EFI/BOOT"
 cp "$PC_EFI" "$W/stick/EFI/BOOT/BOOTX64.EFI"
 
-echo "  --- boot: ICH9 HD Audio + QEMU's hda-output codec, recorded to a WAV file; lshda, audio, audio tone, say hello, devices ---"
+echo "  --- boot: ICH9 HD Audio + QEMU's hda-output codec, recorded to a WAV file; lshda, audio, audio tone, say hello, devices, lshda late ---"
 "$REALQ" -M q35 -m 256M -display none -nic none \
     -drive "if=pflash,format=raw,unit=0,readonly=on,file=$(winpath "$OVMF")" \
     -drive "format=raw,file=fat:rw:$(winpath "$W/stick")" \
@@ -228,7 +239,7 @@ echo "  --- boot: ICH9 HD Audio + QEMU's hda-output codec, recorded to a WAV fil
     -serial "tcp:127.0.0.1:5482,server,nowait" -qmp "tcp:127.0.0.1:5483,server,nowait" &
 Q=$!
 AFRISH_BOOT_GRACE="${AFRISH_BOOT_GRACE:-10}" "$PY" scripts/shell-demo.py 5482 5483 "$W/shot.png" \
-    lshda audio "audio tone" "say hello" devices > "$W/boot.log" 2>&1
+    lshda audio "audio tone" "say hello" devices "lshda late" > "$W/boot.log" 2>&1
 # a clean QEMU exit, so the wav audiodev finishes its file (header sizes, last buffer)
 "$PY" - << 'EOF' 2> /dev/null
 import socket

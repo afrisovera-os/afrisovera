@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track (5 Nov 2026): USB hot-plug -- a keyboard plugged in after boot, then pulled out.
+# PC track (5 Nov 2026): USB hot-plug: a keyboard plugged in after boot, then pulled out.
 #
 # Boots the PC kernel with an xHCI and NOTHING on it. Through QMP, scripts/lib/usb-steps.py
 # plugs in a USB keyboard (device_add), types `lsusb` on it, unplugs it (device_del) and
@@ -20,7 +20,7 @@ grade() { # grade <serial>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[xhci\] 0 device\(s\) connected, no USB keyboard$' || _f "the boot did not start with no USB keyboard"
     has '\[xhci\] port [0-9]+: USB keyboard [0-9a-f]{4}:[0-9a-f]{4} \([a-z]+ speed\), slot [0-9]+, interrupt-IN endpoint' ||
         _f "the keyboard plugged in after boot was not enumerated"
@@ -82,8 +82,8 @@ selftest() {
 }
 
 echo "== PC USB hot-plug =="
-if ! selftest; then echo "PC USBPLUG TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC USBPLUG SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC USBPLUG TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC USBPLUG SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

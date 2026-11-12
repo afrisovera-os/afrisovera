@@ -6,7 +6,7 @@
 //! ring, one event ring), resets each connected port, gives the first HID boot keyboard a
 //! slot and an address, reads its descriptors, configures its interrupt-IN endpoint, and
 //! from then on the local-APIC timer interrupt turns each 8-byte boot report into
-//! characters on the same console input ring COM1 fills -- so the shell can be typed on a
+//! characters on the same console input ring COM1 fills, so the shell can be typed on a
 //! real USB keyboard. A HID boot mouse (3/1/2) on another port is enumerated the same way;
 //! its 3-byte reports move a pointer over the 640x480 console (clamped, drawn by screen.rs)
 //! and count button presses. One keyboard and one mouse, polled, no hot-plug yet.
@@ -33,7 +33,9 @@ const T_ADDRESS_DEVICE: u32 = 11;
 const T_CONFIGURE_EP: u32 = 12;
 const T_EVALUATE_CTX: u32 = 13;
 const T_RESET_EP: u32 = 14;
+const T_STOP_EP: u32 = 15;
 const T_SET_TR_DEQ: u32 = 16;
+const T_NOOP: u32 = 23;
 const CC_STALL: u32 = 6;
 const T_EV_TRANSFER: u32 = 32;
 const T_EV_COMMAND: u32 = 33;
@@ -412,6 +414,10 @@ static mut MSC_EPI_ADDR: u8 = 0; // endpoint addresses, for CLEAR_FEATURE(ENDPOI
 static mut MSC_EPO_ADDR: u8 = 0;
 static mut MSC_IFACE: u8 = 0;
 static mut MSC_RECOVERIES: u64 = 0;
+static mut MSC_STALE: u64 = 0; // transfer events for an older TRB, set aside by wait_xfer
+static mut CTL_STALE: u64 = 0; // endpoint 0 events for an older request, set aside by wait_control
+static mut CTL_TOOK: u64 = 0; // the TRB whose event ended the last control transfer (lsusb late0)
+static mut CTL_WANT: u64 = 0; // the status TRB of the last control transfer queued
 static mut MSC_TAG: u32 = 1;
 static mut MSC_BLOCKS: u64 = 0;
 static mut MSC_BS: u32 = 512;
@@ -452,8 +458,42 @@ static mut MSC_WSTATS: (u64, u64, u64) = (0, 0, 0);
 static mut PATH: (u32, u32, u32) = (0, 0, 0);
 static mut HUBS: u32 = 0;
 /// The last device enumerated without being used: (vendor, product, device class, the class
-/// of its first interface) -- for the boot log, so a real machine's report says what it was.
+/// of its first interface), for the boot log, so a real machine's report says what it was.
 static mut LAST_OTHER: (u16, u16, u8, u8) = (0, 0, 0, 0);
+/// The same device's first mass storage interface that is not Bulk-Only SCSI, as (subclass,
+/// protocol), when msc_setup saw one: a disk that speaks only UAS is then named as such.
+static mut MSC_SEEN: (u8, u8) = (0, 0);
+// UAS (USB Attached SCSI, 12 Nov 2026): a disk that offers only UAS, on a high-speed port, where
+// UAS runs without streams (UAS r04, as Linux uas.c for such devices): the status pipe is armed,
+// the command IU goes out on the command pipe, the device answers READ READY or WRITE READY on the
+// status pipe before the data, and a SENSE IU ends the command. The four pipes, by the Pipe Usage
+// descriptor after each endpoint: command (MSC_OUT_RING), status (UAS_ST_RING), data in (EPIN[d])
+// and data out (UAS_DO_RING). On a USB 3 port UAS needs streams (UAS_STREAMS, below).
+static mut MSC_UAS: bool = false;
+static mut UAS_DCI: [u32; 4] = [0; 4]; // command, status, data in, data out
+static mut UAS_ST_RING: Ring<NXFER> = Ring([TRB0; NXFER]);
+static mut PUASST: Prod = Prod { idx: 0, cycle: 1 };
+static mut UAS_DO_RING: Ring<NXFER> = Ring([TRB0; NXFER]);
+static mut PUASDO: Prod = Prod { idx: 0, cycle: 1 };
+static mut UAS_ST: Buf = Buf([0; 512]);
+/// A transfer event of one of the four pipes that came while another was waited for, by DCI.
+static mut UAS_EV: [Option<Trb>; 32] = [None; 32];
+static mut UAS_TAG: u16 = 0;
+// UAS on a USB 3 port (12 Nov 2026): streams, as UAS r04 and Linux uas.c. The status, data in and
+// data out pipes each get a Stream Context Array of 4 (MaxPStreams 1, linear, streams 1 to 3) and
+// streams 1 and 2 are used: the tag of a command is its stream on all three pipes (tags 1 and 2
+// in turn, one command at a time). Status, data and command are queued at once and the device
+// moves the data when it is ready (no READ READY or WRITE READY with streams). Rings by pipe and
+// stream: UAS_SR[2 * (pipe - 1) + stream - 1], pipe 1 status, 2 data in, 3 data out.
+static mut UAS_STREAMS: bool = false;
+/// On a USB 3 port, the data pipes' bursts from their SuperSpeed Endpoint Companions (bMaxBurst
+/// + 1 packets, in and out), set as each endpoint's Max Burst Size; (0, 0) below USB 3.
+static mut MSC_BURST: (u32, u32) = (0, 0);
+#[repr(C, align(64))]
+struct Sca([[u32; 4]; 4]);
+static mut UAS_SCA: [Sca; 3] = [const { Sca([[0; 4]; 4]) }; 3];
+static mut UAS_SR: [Ring<NXFER>; 6] = [const { Ring([TRB0; NXFER]) }; 6];
+static mut PUAS_SR: [Prod; 6] = [Prod { idx: 0, cycle: 1 }; 6];
 /// Every device enumerated without being used since power-on, once per vendor:product (the same
 /// four fields as LAST_OTHER), for `wifi`: a USB Wi-Fi stick is named from its vendor:product.
 static mut OTHERS: [(u16, u16, u8, u8); 8] = [(0, 0, 0, 0); 8];
@@ -537,7 +577,7 @@ static mut PSI_TEST: bool = false;
 /// port-change event starting the next try).
 static mut LEFT: [u32; NCTL] = [0; NCTL];
 /// Per hub (by device index): the ports its status-change endpoint reported (bit n = port n),
-/// for `service`; and what its ports need -- (speed, TT hub slot, TT port, number of ports).
+/// for `service`; and what its ports need: (speed, TT hub slot, TT port, number of ports).
 static mut HUBCHG: [u16; NDEV] = [0; NDEV];
 static mut HUBI: [(u32, u32, u32, u32); NDEV] = [(0, 0, 0, 0); NDEV];
 static mut HUB_WATCHED: u32 = 0; // hubs whose status-change endpoint runs (hot-plug behind them)
@@ -545,6 +585,25 @@ static mut HUB_WATCHED: u32 = 0; // hubs whose status-change endpoint runs (hot-
 static mut BUSY: bool = false;
 static mut PLUGS: u64 = 0;
 static mut UNPLUGS: u64 = 0;
+/// A controller that stopped working: the USBSTS value the timer poll saw with Host System Error
+/// (bit 2) or Host Controller Error (bit 12) set, 0 while it is fine. xHCI 4.24.1: after either
+/// the controller does nothing more until it is reset, so every USB device on it (keyboard,
+/// stick) was lost until a restart. `service` resets it and finds its devices again, as Linux's
+/// xhci_hc_died and usb_hc_died lead to a reset of the host.
+static mut DEAD: [u32; NCTL] = [0; NCTL];
+/// The last DEAD came from a test switch (`xhcireset fault` or `xhcireset noanswer`), named here.
+static mut DEAD_TEST: &str = "";
+/// DEAD bit for a command that got no answer while USBSTS looked fine (USBSTS bit 31 is reserved,
+/// so it never comes from the controller). xHCI 4.6.1.2: every command ends with an event; Linux
+/// counts one that does not come in 5 s as a dead host (xhci_handle_command_timeout).
+const NO_ANSWER: u32 = 1 << 31;
+/// `xhcireset noanswer`: the next command is put on the ring without ringing the doorbell.
+static mut NOANSWER_TEST: bool = false;
+/// Each controller's resets after a fatal error or `xhcireset`, and whether it was given up on
+/// (it did not come back, or it failed again after RESTART_MAX resets).
+static mut RESTARTS: [u32; NCTL] = [0; NCTL];
+static mut GIVEN_UP: [bool; NCTL] = [false; NCTL];
+const RESTART_MAX: u32 = 3;
 /// Field item F2 (HP ENVY, Intel Sunrise Point: Address Device and GET_DESCRIPTOR ending with
 /// completion code 4, a USB transaction error). Two ways to give a new device its address:
 /// plain (Address Device sends SET_ADDRESS at once, then the descriptor is read) and, as Linux's
@@ -670,15 +729,36 @@ fn doorbell(slot: u32, target: u32) {
     w32(unsafe { DB } + 4 * slot as u64, target);
 }
 
-fn wait(mut done: impl FnMut() -> bool) -> bool {
-    for _ in 0..30_000_000u64 {
+/// Poll `done` for up to `ms` milliseconds of real time. A count of polls ran from a fraction of
+/// a second to seconds, depending on the CPU and on how slow the register reads were.
+fn wait(ms: u64, mut done: impl FnMut() -> bool) -> bool {
+    let t0 = crate::timer::cycles();
+    loop {
         if done() {
             return true;
         }
+        if past(t0, ms) {
+            return false;
+        }
         core::hint::spin_loop();
     }
-    false
 }
+
+/// True once `ms` milliseconds have gone by since the cycle count `t0`.
+fn past(t0: u64, ms: u64) -> bool {
+    crate::timer::cycles().wrapping_sub(t0) > crate::timer::hz().max(1).saturating_mul(ms) / 1000
+}
+
+/// The limits, in milliseconds. HANDOFF_MS: the firmware letting go of the controller (Linux
+/// waits 1 s). START_MS: HCHalted clearing after Run (xHCI 5.4.2: 16 microframes, 2 ms).
+/// PORT_RESET_MS: a port reset finishing (PRC; Linux gives a hub port 800 ms). CONTROL_MS: a
+/// control transfer (USB 2.0 9.2.6.4: 5 s for a standard request). BULK_MS: one transfer of a
+/// stick's SCSI command (30 s, the SCSI disk timeout Linux uses).
+const HANDOFF_MS: u64 = 1_000;
+const START_MS: u64 = 100;
+const PORT_RESET_MS: u64 = 800;
+const CONTROL_MS: u64 = 5_000;
+const BULK_MS: u64 = 30_000;
 
 /// Put one TRB on a producer ring, inserting the Link TRB (cycle toggle) at the end.
 unsafe fn push(ring: *mut Trb, n: usize, p: &mut Prod, param: u64, status: u32, control: u32) {
@@ -723,28 +803,55 @@ unsafe fn next_event() -> Option<Trb> {
     Some(t)
 }
 
-/// Wait for an event of `ty` (others -- port changes -- are passed over).
+/// Wait up to 5 seconds of real time for an event of `ty` (others, such as port changes, are
+/// passed over). A spin count ran from a fraction of a second to seconds, depending on the CPU,
+/// and a command that runs out of it now costs a controller reset.
 unsafe fn wait_event(ty: u32) -> Option<Trb> {
-    for _ in 0..30_000_000u64 {
+    let (t0, hz) = (crate::timer::cycles(), crate::timer::hz().max(1));
+    loop {
         if let Some(t) = next_event() {
             if (t.control >> 10) & 0x3F == ty {
                 return Some(t);
             }
             handle(t); // another device's transfer: served, not dropped
         }
+        if crate::timer::cycles().wrapping_sub(t0) / (hz / 1000).max(1) > 5000 {
+            return None;
+        }
         core::hint::spin_loop();
     }
-    None
 }
 
-/// Wait for the transfer event of endpoint 0 of `slot` (a control transfer); every other
-/// event is served as the timer poll would serve it. Dropping them lost a running device's
-/// report (its transfer was never re-queued) whenever a second device enumerated.
-unsafe fn wait_control(slot: u32) -> Option<Trb> {
-    for _ in 0..30_000_000u64 {
+/// A command on the current controller got no completion event in 5 seconds. The controller is
+/// marked as stopped, so the next idle moment resets it and finds its devices again, as after a
+/// fatal error (`service`); before, every later command waited in vain too.
+unsafe fn no_answer(control: u32) {
+    let st = r32(op(0x04));
+    crate::kprintln!("[xhci] controller {}: command type {} got no answer in 5 s (USBSTS {:#x})", CUR + 1, (control >> 10) & 0x3F, st);
+    LAST_CC = 0;
+    if DEAD[CUR] == 0 && !GIVEN_UP[CUR] {
+        DEAD[CUR] = st | NO_ANSWER;
+    }
+}
+
+/// Wait for the transfer event of endpoint 0 of `slot` for the request whose TRBs are `td`
+/// (setup, data, status; the data one 0 when there is none); every other event is served as the
+/// timer poll would serve it. Dropping them lost a running device's report (its transfer was
+/// never re-queued) whenever a second device enumerated. An endpoint 0 event of the slot for
+/// another TRB (the answer to a request whose wait gave up) is set aside and counted: before,
+/// it ended this wait with that request's status.
+unsafe fn wait_control(slot: u32, td: [u64; 3]) -> Option<Trb> {
+    let t0 = crate::timer::cycles();
+    while !past(t0, CONTROL_MS) {
         if let Some(t) = next_event() {
             if (t.control >> 10) & 0x3F == T_EV_TRANSFER && t.control >> 24 == slot && (t.control >> 16) & 0x1F == 1 {
-                return Some(t);
+                let at = t.param & !0xF;
+                if at != 0 && td.contains(&at) {
+                    CTL_TOOK = at;
+                    return Some(t);
+                }
+                CTL_STALE += 1;
+                continue;
             }
             handle(t);
         }
@@ -755,9 +862,21 @@ unsafe fn wait_control(slot: u32) -> Option<Trb> {
 
 /// One command on the command ring; its completion event, if it succeeded.
 unsafe fn command(param: u64, control: u32) -> Option<Trb> {
-    push(addr_of_mut!(CMD[CUR].0) as *mut Trb, NCMD, &mut *addr_of_mut!(PCMD), param, 0, control);
-    doorbell(0, 0);
-    let ev = wait_event(T_EV_COMMAND)?;
+    command_st(param, 0, control)
+}
+
+/// `command` with its status field set (Set TR Dequeue Pointer names a stream there).
+unsafe fn command_st(param: u64, status: u32, control: u32) -> Option<Trb> {
+    push(addr_of_mut!(CMD[CUR].0) as *mut Trb, NCMD, &mut *addr_of_mut!(PCMD), param, status, control);
+    if NOANSWER_TEST {
+        NOANSWER_TEST = false; // the test: the controller is never told about this command
+    } else {
+        doorbell(0, 0);
+    }
+    let Some(ev) = wait_event(T_EV_COMMAND) else {
+        no_answer(control);
+        return None;
+    };
     if ev.status >> 24 != CC_SUCCESS {
         crate::kprintln!("[xhci] command type {} failed (completion code {})", (control >> 10) & 0x3F, ev.status >> 24);
         LAST_CC = ev.status >> 24;
@@ -775,14 +894,16 @@ unsafe fn control(d: usize, rtype: u8, req: u8, value: u16, index: u16, len: u16
     let setup = rtype as u64 | (req as u64) << 8 | (value as u64) << 16 | (index as u64) << 32 | (len as u64) << 48;
     let trt = if len == 0 { 0 } else if input { 3 } else { 2 };
     let first = push_held(ring, NXFER, p, setup, 8, T_SETUP << 10 | 1 << 6 | trt << 16, true);
+    let mut data = 0;
     if len > 0 {
-        push(ring, NXFER, p, addr_of!(DBUF) as u64, len as u32, T_DATA << 10 | (input as u32) << 16);
+        data = push_held(ring, NXFER, p, addr_of!(DBUF) as u64, len as u32, T_DATA << 10 | (input as u32) << 16, false) as u64;
     }
     let status_in = len == 0 || !input;
-    push(ring, NXFER, p, 0, 0, T_STATUS << 10 | 1 << 5 | (status_in as u32) << 16);
+    let status = push_held(ring, NXFER, p, 0, 0, T_STATUS << 10 | 1 << 5 | (status_in as u32) << 16, false) as u64;
     release(first); // the whole TD is written: only now may the controller see its first TRB
     doorbell(slot, 1);
-    match wait_control(slot) {
+    CTL_WANT = status;
+    match wait_control(slot, [first as u64, data, status]) {
         Some(ev) if matches!(ev.status >> 24, CC_SUCCESS | CC_SHORT) => true,
         Some(ev) => {
             crate::kprintln!("[xhci] control request {:#04x} failed (completion code {})", req, ev.status >> 24);
@@ -840,7 +961,7 @@ fn handoff(bar: u64) {
         if v & 0xFF == 1 {
             if v & 1 << 16 != 0 {
                 w32(at, v | 1 << 24); // OS owned
-                if !wait(|| r32(at) & 1 << 16 == 0) {
+                if !wait(HANDOFF_MS, || r32(at) & 1 << 16 == 0) {
                     crate::kprintln!("[xhci] the firmware did not release the controller; taking it anyway");
                     w32(at, r32(at) & !(1 << 16));
                 }
@@ -1187,7 +1308,8 @@ fn start(b: u8, d: u8, f: u8) -> bool {
         if nscratch > 0 {
             let arr = addr_of_mut!(SCRATCH_ARR[c].0) as *mut u64;
             for i in 0..(nscratch as usize).min(256) {
-                let Some(page) = crate::frame::alloc() else {
+                // a reset controller (`restart`) keeps the pages it was given at boot
+                let Some(page) = (if *arr.add(i) != 0 { Some(*arr.add(i) as usize) } else { crate::frame::alloc() }) else {
                     crate::kprintln!("[xhci] no frame for scratchpad buffer {}", i);
                     return false;
                 };
@@ -1203,7 +1325,7 @@ fn start(b: u8, d: u8, f: u8) -> bool {
         w64(RT + 0x20 + 0x18, addr_of!(EVT[c]) as u64); // ERDP
         w64(RT + 0x20 + 0x10, addr_of!(ERST[c]) as u64); // ERSTBA (last: it starts the ring)
         w32(op(0x00), 1); // run, interrupts off (polled)
-        if !wait(|| r32(op(0x04)) & 1 == 0) {
+        if !wait(START_MS, || r32(op(0x04)) & 1 == 0) {
             crate::kprintln!("[xhci] controller did not start");
             return false;
         }
@@ -1233,7 +1355,7 @@ fn start(b: u8, d: u8, f: u8) -> bool {
             if sc & 1 << 1 == 0 {
                 let neutral = sc & !(1 << 1 | 0x00FE_0000 | 1 << 4 | 1 << 31 | 1 << 16);
                 w32(portsc(p), neutral | 1 << 4); // PR
-                wait(|| r32(portsc(p)) & 1 << 21 != 0); // PRC
+                wait(PORT_RESET_MS, || r32(portsc(p)) & 1 << 21 != 0); // PRC
                 crate::timer::busywait_ms(20); // reset recovery (USB 2.0 TRSTRCY, 10 ms min)
             }
             let sc = r32(portsc(p));
@@ -1301,6 +1423,7 @@ unsafe fn settle(c: usize) {
 /// A device that is neither gets its slot disabled again, so `d` stays free.
 unsafe fn hid(d: usize, port: u32, speed: u32) -> bool {
     LAST_OTHER = (0, 0, 0, 0); // this try's own descriptor, never the last device's
+    MSC_SEEN = (0, 0);
     let ev = match command(0, T_ENABLE_SLOT << 10) {
         Some(e) => e,
         None => return false,
@@ -1421,8 +1544,8 @@ unsafe fn enumerate(d: usize, port: u32, speed: u32) -> bool {
     if total >= 9 + 9 && DBUF.0[9 + 1] == 4 {
         LAST_OTHER.3 = DBUF.0[9 + 5]; // the first interface's class
     }
-    // find a HID boot keyboard (3/1/1) or boot mouse (3/1/2) interface -- one of a kind not
-    // already enumerated -- and its interrupt-IN endpoint
+    // find a HID boot keyboard (3/1/1) or boot mouse (3/1/2) interface (one of a kind not
+    // already enumerated) and its interrupt-IN endpoint
     let (mut i, mut iface, mut in_kbd, mut ep, mut kind) = (0usize, 0u8, false, None, 0u8);
     // and the first other HID interface (not a keyboard), in case it is an absolute pointer:
     // (interface, report descriptor length, its interrupt-IN endpoint)
@@ -1651,6 +1774,15 @@ pub fn poll() {
         let home = CUR;
         for c in 0..NRUN.max(1) {
             select(c);
+            if DEAD[c] == 0 && !GIVEN_UP[c] {
+                let st = r32(op(0x04));
+                if st & (1 << 2 | 1 << 12) != 0 {
+                    DEAD[c] = st; // reset by `service`, outside the interrupt
+                }
+            }
+            if DEAD[c] != 0 || GIVEN_UP[c] {
+                continue; // its event ring is not read until it runs again
+            }
             while let Some(ev) = next_event() {
                 handle(ev);
             }
@@ -1781,6 +1913,20 @@ unsafe fn handle(ev: Trb) {
     queue_report(d);
 }
 
+/// The device just left alone in words, for the boot log: its class, or for a mass storage
+/// device that msc_setup could not use, the transport it speaks (UAS only, CBI only, or Bulk-Only
+/// with a command set other than SCSI), so a real PC's report says why the disk was not used.
+unsafe fn other_name(c: u8) -> &'static str {
+    match (c, MSC_SEEN) {
+        (0x08, (0, 0)) => class_name(c),
+        (0x08, (_, 0x62)) => "mass storage, UAS only: needs streams, which this port or controller lacks",
+        (0x08, (_, 0x00 | 0x01)) => "mass storage, CBI only (an old USB floppy drive): not driven",
+        (0x08, (_, 0x50)) => "mass storage, Bulk-Only but not SCSI commands: not driven",
+        (0x08, _) => "mass storage of a kind not driven",
+        _ => class_name(c),
+    }
+}
+
 /// A USB class code in words, for the boot log.
 fn class_name(c: u8) -> &'static str {
     match c {
@@ -1808,13 +1954,42 @@ fn class_name(c: u8) -> &'static str {
 pub fn service() {
     // SAFETY: mainline, single core; BUSY keeps the timer poll off the event ring meanwhile.
     unsafe {
-        if !READY || BUSY || ((*addr_of!(PENDING)).iter().all(|&p| p == 0) && (*addr_of!(HUBCHG)).iter().all(|&h| h == 0)) {
+        if !READY
+            || BUSY
+            || ((*addr_of!(PENDING)).iter().all(|&p| p == 0)
+                && (*addr_of!(HUBCHG)).iter().all(|&h| h == 0)
+                && (*addr_of!(DEAD)).iter().all(|&s| s == 0))
+        {
             return;
         }
         BUSY = true;
         let home = CUR;
         for c in 0..NRUN.max(1) {
-            if PENDING[c] != 0 {
+            if DEAD[c] != 0 {
+                select(c);
+                let st = DEAD[c] & !NO_ANSWER;
+                let what = match (st & 1 << 2 != 0, st & 1 << 12 != 0) {
+                    _ if DEAD[c] & NO_ANSWER != 0 => "a command got no answer",
+                    (true, true) => "a host system error and a controller error",
+                    (true, false) => "a host system error",
+                    _ => "a controller error",
+                };
+                let test = DEAD_TEST;
+                DEAD_TEST = "";
+                if RESTARTS[c] >= RESTART_MAX {
+                    DEAD[c] = 0;
+                    GIVEN_UP[c] = true;
+                    crate::kprintln!(
+                        "[xhci] controller {} stopped working again ({}, USBSTS {:#x}{}) after {} resets: its USB devices are not used until the next start",
+                        c + 1, what, st, test, RESTART_MAX
+                    );
+                    continue;
+                }
+                crate::kprintln!("[xhci] controller {} stopped working ({}, USBSTS {:#x}{})", c + 1, what, st, test);
+                restart(c);
+                PENDING[c] = 0;
+            }
+            if PENDING[c] != 0 && !GIVEN_UP[c] {
                 select(c);
                 service_ports(c);
             }
@@ -1837,8 +2012,15 @@ pub fn service() {
 /// Free device `d` on controller `c` (the current one): its slot disabled, what it was used
 /// for forgotten, the entry freed. A hub also takes its port count out of `lsusb`'s total.
 unsafe fn detach(d: usize, c: usize) {
+    command(0, T_DISABLE_SLOT << 10 | DEVS[d].slot << 24);
+    forget(d, c);
+    UNPLUGS += 1;
+}
+
+/// `detach` without the Disable Slot command (for a controller that is being reset): what
+/// device `d` was used for forgotten, its entry freed.
+unsafe fn forget(d: usize, c: usize) {
     let (slot, kind) = (DEVS[d].slot, DEVS[d].kind);
-    command(0, T_DISABLE_SLOT << 10 | slot << 24);
     DCBAA[c].0[slot as usize] = 0;
     match kind {
         KIND_KBD => {
@@ -1856,6 +2038,7 @@ unsafe fn detach(d: usize, c: usize) {
         KIND_MSC => {
             MSC_SLOT = 0;
             MSC_USABLE = false;
+            (MSC_UAS, UAS_STREAMS) = (false, false);
             (MSC_RA_N, MSC_WB_N) = (0, 0); // gathered writes are lost with the device
         }
         KIND_HUB if HUBI[d].3 != 0 => {
@@ -1870,7 +2053,99 @@ unsafe fn detach(d: usize, c: usize) {
     HUBCHG[d] = 0;
     HUBI[d] = (0, 0, 0, 0);
     DEVS[d] = NO_DEV;
-    UNPLUGS += 1;
+}
+
+/// Reset controller `c` (the current one; BUSY is set) and find its devices again: every device
+/// on it is forgotten (the controller lost their slots), its rings start over and `start` runs
+/// as at boot (reset, rings, ports, devices). Gathered USB stick writes not yet sent are lost
+/// with the controller. True if it runs again.
+unsafe fn restart(c: usize) -> bool {
+    let (b, d, f) = *addr_of!(PCI_AT);
+    let lost_writes = if MSC_SLOT != 0 && MSC_D < NDEV && DEVS[MSC_D].ctl == c { MSC_WB_N } else { 0 };
+    let mut before = 0;
+    for i in 0..NDEV {
+        if DEVS[i].slot != 0 && DEVS[i].ctl == c {
+            forget(i, c);
+            before += 1;
+        }
+    }
+    crate::kprintln!(
+        "[xhci] controller {}: resetting it and finding its devices again ({} device(s) were in use{})",
+        c + 1, before, if lost_writes > 0 { "; gathered USB stick writes not yet sent are lost" } else { "" }
+    );
+    (PCMD, EV_IDX, EV_CYCLE, CONNECTED) = (Prod { idx: 0, cycle: 1 }, 0, 1, 0);
+    DEAD[c] = 0;
+    RESTARTS[c] += 1;
+    if start(b, d, f) {
+        GIVEN_UP[c] = false;
+        let after = (0..NDEV).filter(|&i| DEVS[i].slot != 0 && DEVS[i].ctl == c).count();
+        crate::kprintln!("[xhci] controller {} running again after the reset: {} of {} device(s) found again", c + 1, after, before);
+        true
+    } else {
+        (GIVEN_UP[c], DEAD[c]) = (true, 0); // a command lost during the reset does not start another
+        crate::kprintln!("[xhci] controller {} did not come back after the reset: its USB devices are not used until the next start", c + 1);
+        false
+    }
+}
+
+/// `xhcireset [n]`: reset controller n (1 if not given) by hand, the path a controller that
+/// stopped working takes, after sending any gathered USB stick writes. `xhcireset fault [n]`
+/// (test switch) marks it as stopped with a controller error instead, so the timer poll's path
+/// runs: the next idle moment finds it and resets it. `xhcireset noanswer [n]` (test switch)
+/// sends a No Op command without ringing the doorbell, so the command gets no answer and the
+/// no-answer path runs: 5 seconds, then the reset at the next idle moment.
+pub fn reset_cmd(rest: &str) {
+    let mut words = rest.split_whitespace();
+    let mut w = words.next();
+    let fault = w == Some("fault");
+    let noanswer = w == Some("noanswer");
+    if fault || noanswer {
+        w = words.next();
+    }
+    // SAFETY: mainline, single core; BUSY keeps the timer poll off the rings meanwhile.
+    unsafe {
+        if !READY || OP == 0 {
+            crate::kprintln!("xhcireset: no running xHCI controller");
+            return;
+        }
+        let n = NRUN.max(1);
+        let Some(k) = w.map_or(Some(1), |s| s.parse::<usize>().ok()).filter(|&k| (1..=n).contains(&k)) else {
+            crate::kprintln!("xhcireset: give a controller from 1 to {} (lsusb lists them)", n);
+            return;
+        };
+        let c = k - 1;
+        if noanswer {
+            (BUSY, NOANSWER_TEST) = (true, true);
+            let home = CUR;
+            select(c);
+            crate::kprintln!("xhcireset: sending controller {} a No Op command without ringing its doorbell (test)", k);
+            let answered = command(0, T_NOOP << 10).is_some();
+            NOANSWER_TEST = false;
+            if !answered && DEAD[c] & NO_ANSWER != 0 {
+                DEAD_TEST = ", set by xhcireset noanswer";
+            }
+            select(home);
+            BUSY = false;
+            crate::kprintln!("xhcireset: {}", if answered { "the command was answered after all" } else { "no answer; the controller is reset at the next idle moment" });
+            return;
+        }
+        if fault {
+            DEAD_TEST = ", set by xhcireset fault";
+            DEAD[c] = 1 << 12;
+            crate::kprintln!("xhcireset: controller {} marked as stopped (test); it is reset at the next idle moment", k);
+            return;
+        }
+        BUSY = true;
+        let home = CUR;
+        select(c);
+        if MSC_SLOT != 0 && MSC_D < NDEV && DEVS[MSC_D].ctl == c {
+            msc_flush();
+        }
+        let ok = restart(c);
+        select(home);
+        BUSY = false;
+        crate::kprintln!("xhcireset: {}", if ok { "done" } else { "the controller did not come back" });
+    }
 }
 
 /// How many hub tiers a route string goes through.
@@ -1887,7 +2162,7 @@ unsafe fn hub_port_route(d: usize, hp: u32) -> (u32, u32) {
 
 /// `service` for hub `d` (its controller current): every port its status-change endpoint
 /// reported is read; its change bits are acknowledged; a device gone is detached with
-/// everything behind it, a new one reset and enumerated -- as a root port's are.
+/// everything behind it, a new one reset and enumerated, as a root port's are.
 unsafe fn service_hub(d: usize) {
     let bits = core::mem::replace(&mut HUBCHG[d], 0);
     let (c, nports) = (DEVS[d].ctl, HUBI[d].3);
@@ -2018,7 +2293,7 @@ unsafe fn hub_port(d: usize, hp: u32, fd: usize) -> bool {
         let (v, pr, dc, ic) = LAST_OTHER;
         crate::kprintln!(
             "[xhci] hub port {}: device {:04x}:{:04x} ({}) is not one this driver uses",
-            hp, v, pr, class_name(if dc != 0 { dc } else { ic })
+            hp, v, pr, other_name(if dc != 0 { dc } else { ic })
         );
     }
     PATH = saved;
@@ -2041,7 +2316,7 @@ unsafe fn attach(fd: usize, p: u32, sc: u32) -> bool {
             );
             sc = r32(portsc(p));
             w32(portsc(p), (sc & !(1 << 1 | 0x00FE_0000 | 1 << 4 | 1 << 31 | 1 << 16)) | 1 << 4); // PR
-            wait(|| r32(portsc(p)) & 1 << 21 != 0); // PRC
+            wait(PORT_RESET_MS, || r32(portsc(p)) & 1 << 21 != 0); // PRC
             crate::timer::busywait_ms(ms); // reset recovery (USB 2.0 TRSTRCY is 10 ms at least)
             sc = r32(portsc(p));
             w32(portsc(p), (sc & !(1 << 1 | 0x00FE_0000 | 1 << 4 | 1 << 31 | 1 << 16)) | (sc & 0x00FE_0000));
@@ -2171,6 +2446,15 @@ unsafe fn dma_check() -> (u32, u32, &'static str) {
     chk(&mut st, "stick command", addr_of!(CBW) as u64, 64, K64);
     chk(&mut st, "stick status", addr_of!(CSW) as u64, 64, K64);
     chk(&mut st, "stick block", addr_of!(MSCBUF) as u64, 4096, K64);
+    chk(&mut st, "UAS status ring", addr_of!(UAS_ST_RING) as u64, size_of::<Ring<NXFER>>(), K64);
+    chk(&mut st, "UAS data-out ring", addr_of!(UAS_DO_RING) as u64, size_of::<Ring<NXFER>>(), K64);
+    chk(&mut st, "UAS status buffer", addr_of!(UAS_ST) as u64, 512, K64);
+    for i in 0..3 {
+        chk(&mut st, "UAS stream array", addr_of!(UAS_SCA[i]) as u64, size_of::<Sca>(), K64);
+    }
+    for i in 0..6 {
+        chk(&mut st, "UAS stream ring", addr_of!(UAS_SR[i]) as u64, size_of::<Ring<NXFER>>(), K64);
+    }
     chk(&mut st, "stick read-ahead", addr_of!(MSC_RA) as u64, MSC_RA_BYTES, K64);
     chk(&mut st, "stick write-behind", addr_of!(MSC_WB) as u64, MSC_RA_BYTES, K64);
     chk(&mut st, "network ring", addr_of!(EPOUT) as u64, size_of::<Ring<NXFER>>(), K64);
@@ -2236,7 +2520,7 @@ unsafe fn left_alone(c: usize, p: u32, hot: bool) {
     } else {
         crate::kprintln!(
             "[xhci] port {}: device {:04x}:{:04x} ({}) {}not one this driver uses",
-            p, v, pr, class_name(if dc != 0 { dc } else { ic }), if hot { "plugged in, " } else { "is " }
+            p, v, pr, other_name(if dc != 0 { dc } else { ic }), if hot { "plugged in, " } else { "is " }
         );
     }
 }
@@ -2282,7 +2566,7 @@ unsafe fn service_ports(c: usize) {
             let mut sc = sc;
             if sc & 1 << 1 == 0 {
                 w32(portsc(p), (sc & !(1 << 1 | 0x00FE_0000 | 1 << 4 | 1 << 31 | 1 << 16)) | 1 << 4);
-                wait(|| r32(portsc(p)) & 1 << 21 != 0);
+                wait(PORT_RESET_MS, || r32(portsc(p)) & 1 << 21 != 0);
                 crate::timer::busywait_ms(20);
                 sc = r32(portsc(p));
                 w32(portsc(p), (sc & !(1 << 1 | 0x00FE_0000 | 1 << 4 | 1 << 31 | 1 << 16)) | (sc & 0x00FE_0000));
@@ -2308,7 +2592,7 @@ unsafe fn service_ports(c: usize) {
 
 /// A USB hub (class 9): select its configuration, tell the controller it is a hub (slot
 /// context Hub bit and port count), power its ports, and enumerate whatever is connected
-/// to each -- with the route string and, behind a high-speed hub, the transaction
+/// to each, with the route string and, behind a high-speed hub, the transaction
 /// translator the controller needs for full/low-speed devices. Then its status-change
 /// endpoint is started: a device plugged into or pulled out of one of its ports later is
 /// served by `service` (`service_hub`), as a root port's is.
@@ -2422,7 +2706,7 @@ unsafe fn hub_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16, protoco
 /// A USB stick or disk: mass storage class (8), SCSI transparent (6), Bulk-Only (0x50), with
 /// a bulk IN and a bulk OUT endpoint. Configure them, then INQUIRY, TEST UNIT READY and READ
 /// CAPACITY(10); like every disk here it is used for storage only if sector 0 is blank or
-/// already AFRIVFS1 -- the stick the PC booted from (FAT) is listed and never written.
+/// already AFRIVFS1; the stick the PC booted from (FAT) is listed and never written.
 unsafe fn msc_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bool {
     let slot = DEVS[d].slot;
     if !control(d, 0x80, 6, 0x0200, 0, 9) {
@@ -2434,6 +2718,16 @@ unsafe fn msc_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bool
         return false;
     }
     let (mut i, mut ours, mut ein, mut eout) = (0usize, false, None, None);
+    // the first UAS interface (protocol 0x62): its number and alternate setting, and each pipe's
+    // bulk endpoint (address, max packet), named by the Pipe Usage descriptor (0x24) after it
+    let (mut uas, mut uas_if, mut last_ep) = (false, None::<(u8, u8)>, None::<(u8, u32)>);
+    let mut pipes: [Option<(u8, u32)>; 4] = [None; 4];
+    // each pipe's MaxStreams from the SuperSpeed Endpoint Companion (0x30) after its endpoint:
+    // 2^n streams (0 below USB 3)
+    let (mut last_ss, mut pstreams) = (0u8, [0u8; 4]);
+    // and each one's bMaxBurst (0 to 15: 1 to 16 packets per burst): the UAS pipes by Pipe Usage,
+    // the Bulk-Only in and out endpoints by which one the companion follows (1 in, 2 out)
+    let (mut last_burst, mut pburst, mut bot_last, mut bot_burst) = (0u8, [0u8; 4], 0u8, (0u8, 0u8));
     while i + 2 <= total {
         let len = DBUF.0[i] as usize;
         if len < 2 {
@@ -2442,18 +2736,52 @@ unsafe fn msc_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bool
         match DBUF.0[i + 1] {
             4 if i + 9 <= total => {
                 ours = (DBUF.0[i + 5], DBUF.0[i + 6], DBUF.0[i + 7]) == (8, 6, 0x50);
+                uas = (DBUF.0[i + 5], DBUF.0[i + 6], DBUF.0[i + 7]) == (8, 6, 0x62) && uas_if.is_none();
+                last_ep = None;
                 if ours {
                     MSC_IFACE = DBUF.0[i + 2];
+                } else if DBUF.0[i + 5] == 8 && MSC_SEEN == (0, 0) {
+                    MSC_SEEN = (DBUF.0[i + 6], DBUF.0[i + 7]);
+                }
+                if uas {
+                    uas_if = Some((DBUF.0[i + 2], DBUF.0[i + 3]));
                 }
             }
-            5 if ours && i + 7 <= total => {
+            5 if (ours || uas) && i + 7 <= total => {
                 let (addr, attr) = (DBUF.0[i + 2], DBUF.0[i + 3]);
                 let mps = u16::from_le_bytes([DBUF.0[i + 4], DBUF.0[i + 5]]) as u32 & 0x7FF;
-                if attr & 3 == 2 {
-                    if addr & 0x80 != 0 {
-                        ein.get_or_insert((addr & 0xF, mps));
-                    } else {
-                        eout.get_or_insert((addr & 0xF, mps));
+                bot_last = 0;
+                if attr & 3 == 2 && ours {
+                    if addr & 0x80 != 0 && ein.is_none() {
+                        ein = Some((addr & 0xF, mps));
+                        bot_last = 1;
+                    } else if addr & 0x80 == 0 && eout.is_none() {
+                        eout = Some((addr & 0xF, mps));
+                        bot_last = 2;
+                    }
+                }
+                last_ep = if attr & 3 == 2 && uas { Some((addr, mps)) } else { None };
+                (last_ss, last_burst) = (0, 0);
+            }
+            0x30 if (ours || uas) && i + 4 <= total => {
+                let burst = DBUF.0[i + 2].min(15);
+                match bot_last {
+                    1 => bot_burst.0 = burst,
+                    2 => bot_burst.1 = burst,
+                    _ => {}
+                }
+                bot_last = 0;
+                if uas {
+                    (last_ss, last_burst) = (DBUF.0[i + 3] & 0x1F, burst);
+                }
+            }
+            0x24 if uas && i + 3 <= total => {
+                let id = DBUF.0[i + 2] as usize;
+                if let (1..=4, Some(e)) = (id, last_ep.take()) {
+                    if pipes[id - 1].is_none() {
+                        pipes[id - 1] = Some(e);
+                        pstreams[id - 1] = last_ss;
+                        pburst[id - 1] = last_burst;
                     }
                 }
             }
@@ -2461,30 +2789,108 @@ unsafe fn msc_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bool
         }
         i += len;
     }
-    let (Some((epi, mpsi)), Some((epo, mpso))) = (ein, eout) else { return false };
+    let bot_eps = match (ein, eout) {
+        (Some(a), Some(b)) => Some((a, b)),
+        _ => None,
+    };
+    // UAS only when there is no Bulk-Only way in, with all four pipes found and each one pointing
+    // the way its name says; on a high-speed port without streams, on a USB 3 port with streams
+    // when the controller has them (HCCPARAMS1 MaxPSASize, 4 contexts or more) and the status and
+    // data pipes take at least 2 streams each
+    let psa = if speed >= 4 { bar0(PCI_AT.0, PCI_AT.1, PCI_AT.2).map_or(0, |b| (r32(b + 0x10) >> 12) & 0xF) } else { 0 };
+    let streams = speed >= 4 && psa >= 1 && pstreams[1..].iter().all(|&m| m >= 1);
+    let uas_ok = bot_eps.is_none() && (speed == 3 || streams) && uas_if.is_some()
+        && pipes.iter().enumerate().all(|(k, p)| p.is_some_and(|(a, _)| (a & 0x80 != 0) == (k == 1 || k == 2)));
+    if bot_eps.is_none() && !uas_ok {
+        return false;
+    }
     if !control(d, 0x00, 9, cval as u16, 0, 0) {
         return false;
     }
-    let (din, dout) = (2 * epi as u32 + 1, 2 * epo as u32);
+    // (DCI, transfer ring, endpoint type, max packet, max burst) of each pipe used; the burst only on
+    // a USB 3 port (Max Burst Size is 0 below it)
+    let ss = speed >= 4;
+    let mut list = [(0u32, 0u64, 0u32, 0u32, 0u32); 4];
+    let n;
+    if let Some(((epi, mpsi), (epo, mpso))) = bot_eps {
+        let (bi, bo) = if ss { (bot_burst.0 as u32, bot_burst.1 as u32) } else { (0, 0) };
+        list[0] = (2 * epi as u32 + 1, addr_of!(EPIN[d]) as u64, 6, mpsi, bi);
+        list[1] = (2 * epo as u32, addr_of!(MSC_OUT_RING) as u64, 2, mpso, bo);
+        n = 2;
+        (MSC_EPI_ADDR, MSC_EPO_ADDR) = (0x80 | epi, epo);
+    } else {
+        let (ifn, alt) = uas_if.unwrap_or((0, 0));
+        if alt != 0 && !control(d, 0x01, 11, alt as u16, ifn as u16, 0) {
+            return false; // SET_INTERFACE to the UAS setting
+        }
+        MSC_IFACE = ifn;
+        let rings = [addr_of!(MSC_OUT_RING) as u64, addr_of!(UAS_ST_RING) as u64, addr_of!(EPIN[d]) as u64, addr_of!(UAS_DO_RING) as u64];
+        for k in 0..4 {
+            let (a, mps) = pipes[k].unwrap_or((0, 0));
+            let input = a & 0x80 != 0;
+            let burst = if ss { pburst[k] as u32 } else { 0 };
+            list[k] = (2 * (a & 0xF) as u32 + input as u32, rings[k], if input { 6 } else { 2 }, mps, burst);
+        }
+        n = 4;
+    }
     *addr_of_mut!(PMSCOUT) = Prod { idx: 0, cycle: 1 };
+    *addr_of_mut!(PUASST) = Prod { idx: 0, cycle: 1 };
+    *addr_of_mut!(PUASDO) = Prod { idx: 0, cycle: 1 };
     core::ptr::write_bytes(addr_of_mut!(MSC_OUT_RING) as *mut u8, 0, core::mem::size_of::<Ring<NXFER>>());
+    core::ptr::write_bytes(addr_of_mut!(UAS_ST_RING) as *mut u8, 0, core::mem::size_of::<Ring<NXFER>>());
+    core::ptr::write_bytes(addr_of_mut!(UAS_DO_RING) as *mut u8, 0, core::mem::size_of::<Ring<NXFER>>());
+    let streams = n == 4 && streams;
+    if streams {
+        core::ptr::write_bytes(addr_of_mut!(UAS_SR) as *mut u8, 0, core::mem::size_of::<[Ring<NXFER>; 6]>());
+        core::ptr::write_bytes(addr_of_mut!(UAS_SCA) as *mut u8, 0, core::mem::size_of::<[Sca; 3]>());
+        *addr_of_mut!(PUAS_SR) = [Prod { idx: 0, cycle: 1 }; 6];
+        // stream 0 is reserved; streams 1 and 2: a primary transfer ring each (SCT 1), DCS 1
+        for k in 0..3 {
+            for s in 0..2 {
+                let r = addr_of!(UAS_SR[2 * k + s]) as u64;
+                (*addr_of_mut!(UAS_SCA[k])).0[s + 1] = [r as u32 | 1 << 1 | 1, (r >> 32) as u32, 0, 0];
+            }
+        }
+    }
     let inb = addr_of_mut!(INCTX.0) as *mut u8;
     core::ptr::write_bytes(inb, 0, 4096);
-    *ctx(inb, 0).add(1) = 1 | 1 << din | 1 << dout;
+    let (mut flags, mut top) = (1u32, 0u32);
+    for &(dci, ..) in &list[..n] {
+        flags |= 1 << dci;
+        top = top.max(dci);
+    }
+    *ctx(inb, 0).add(1) = flags;
     let sl = ctx(inb, 1);
-    *sl = speed << 20 | din.max(dout) << 27 | PATH.0;
+    *sl = speed << 20 | top << 27 | PATH.0;
     *sl.add(1) = port << 16;
     *sl.add(2) = PATH.1 | PATH.2 << 8;
-    for (dci, tr, ty, mps) in [(din, addr_of!(EPIN[d]) as u64, 6u32, mpsi), (dout, addr_of!(MSC_OUT_RING) as u64, 2u32, mpso)] {
+    for (k, &(dci, tr, ty, mps, burst)) in list[..n].iter().enumerate() {
         let ec = ctx(inb, 1 + dci as usize);
-        *ec.add(1) = 3 << 1 | ty << 3 | mps << 16;
+        *ec.add(1) = 3 << 1 | ty << 3 | burst << 8 | mps << 16;
         *ec.add(2) = tr as u32 | 1;
         *ec.add(3) = (tr >> 32) as u32;
         *ec.add(4) = 1024;
+        if streams && k >= 1 {
+            // MaxPStreams 1 (4 stream contexts), LSA: the dequeue pointer is the stream array
+            let a = addr_of!(UAS_SCA[k - 1]) as u64;
+            *ec = 1 << 10 | 1 << 15;
+            *ec.add(2) = a as u32;
+            *ec.add(3) = (a >> 32) as u32;
+        }
     }
     if command(inb as u64, T_CONFIGURE_EP << 10 | slot << 24).is_none() {
         return false;
     }
+    let (din, dout) = if n == 4 { (list[2].0, list[3].0) } else { (list[0].0, list[1].0) };
+    MSC_UAS = n == 4;
+    UAS_STREAMS = streams;
+    // data in, data out: list 0 and 1 (Bulk-Only) or 2 and 3 (UAS)
+    MSC_BURST = match (ss, n == 4) {
+        (false, _) => (0, 0),
+        (true, true) => (list[2].4 + 1, list[3].4 + 1),
+        (true, false) => (list[0].4 + 1, list[1].4 + 1),
+    };
+    UAS_DCI = [list[0].0, list[1].0, list[2].0, list[3].0];
     DEVS[d].dci = din;
     DEVS[d].kind = KIND_MSC;
     NDEVS = NDEVS.max(d + 1);
@@ -2493,9 +2899,18 @@ unsafe fn msc_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bool
     MSC_PORT = port;
     MSC_IN = din;
     MSC_OUT = dout;
-    MSC_EPI_ADDR = 0x80 | epi;
-    MSC_EPO_ADDR = epo;
     READY = true;
+    if UAS_STREAMS {
+        crate::kprintln!(
+            "[xhci] port {}: USB disk {:04x}:{:04x} speaks only UAS: driven over USB Attached SCSI ({}, four pipes, streams 1 and 2)",
+            port, vid, pid, if speed == 4 { "SuperSpeed" } else { "SuperSpeed Plus" }
+        );
+    } else if MSC_UAS {
+        crate::kprintln!(
+            "[xhci] port {}: USB disk {:04x}:{:04x} speaks only UAS: driven over USB Attached SCSI (high speed, four pipes, no streams)",
+            port, vid, pid
+        );
+    }
     // INQUIRY: vendor and product, for lsusb
     if bot(&[0x12, 0, 0, 0, 36, 0], 36, true) {
         core::ptr::copy_nonoverlapping(mscbuf()[8..].as_ptr(), addr_of_mut!(MSC_NAME) as *mut u8, 24);
@@ -2506,7 +2921,7 @@ unsafe fn msc_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bool
             ready = true; // TEST UNIT READY
             break;
         }
-        // (a failed command's sense data -- after power-on, UNIT ATTENTION -- is read by bot())
+        // (a failed command's sense data (after power-on, UNIT ATTENTION) is read by bot())
         crate::timer::busywait_ms(100);
     }
     // READ CAPACITY(10): last LBA and block length, big-endian
@@ -2747,12 +3162,20 @@ unsafe fn msc_flush() -> bool {
     ok
 }
 
-/// Wait for the transfer event of endpoint `dci` of `slot`, serving every other event.
-unsafe fn wait_xfer(slot: u32, dci: u32) -> Option<Trb> {
-    for _ in 0..60_000_000u64 {
+/// Wait for the transfer event of the TRB at `trb` on endpoint `dci` of `slot`, serving every
+/// other event. An event of the stick for another TRB (an answer that came after its
+/// wait gave up, or the "stopped" event of one that was cut off) is set aside and counted, not
+/// taken as this transfer's: before, it ended this wait with the wrong length and status.
+unsafe fn wait_xfer(slot: u32, dci: u32, trb: u64) -> Option<Trb> {
+    let t0 = crate::timer::cycles();
+    while !past(t0, BULK_MS) {
         if let Some(t) = next_event() {
-            if (t.control >> 10) & 0x3F == T_EV_TRANSFER && t.control >> 24 == slot && (t.control >> 16) & 0x1F == dci {
-                return Some(t);
+            if (t.control >> 10) & 0x3F == T_EV_TRANSFER && t.control >> 24 == slot {
+                if (t.control >> 16) & 0x1F == dci && t.param & !0xF == trb {
+                    return Some(t);
+                }
+                MSC_STALE += 1; // the stick runs one transfer at a time: any other is an old one
+                continue;
             }
             handle(t);
         }
@@ -2777,6 +3200,9 @@ unsafe fn bot_at(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
 }
 
 unsafe fn bot_inner(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
+    if MSC_UAS {
+        return uas_cmd(cdb, len, dir_in, buf);
+    }
     let w = &mut (*addr_of_mut!(CBW)).0;
     w.fill(0);
     w[0..4].copy_from_slice(&0x4342_5355u32.to_le_bytes()); // "USBC"
@@ -2794,7 +3220,7 @@ unsafe fn bot_inner(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
         bot_reset(); // the device would not even take the command: start over
         return false;
     }
-    // the data, if any; a STALL here is the device saying "no" -- clear it and read the status
+    // the data, if any; a STALL here is the device saying "no"; clear it and read the status
     if len > 0 {
         let c = cc_of(msc_xfer(dir_in, buf, len));
         if c == Some(CC_STALL) {
@@ -2817,37 +3243,225 @@ unsafe fn bot_inner(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
         bot_reset(); // phase error, or a status we cannot trust: Bulk-Only reset recovery
         return false;
     }
-    if cs[12] != 0 && cdb[0] != 0x03 {
+    // the status is kept before REQUEST SENSE: its own wrapper lands in CSW and says "passed",
+    // which must not turn this failed command into a good one (its data would be taken as read)
+    let status = cs[12];
+    if status != 0 && cdb[0] != 0x03 {
         // a failed command: read its sense data, or many sticks refuse the next one
         let saved = *mscbuf();
         bot_inner(&[0x03, 0, 0, 0, 18, 0], 18, true, addr_of!(MSCBUF) as u64);
         *mscbuf() = saved;
     }
-    cs[12] == 0
+    status == 0
+}
+
+/// One transfer queued on UAS pipe `k` (0 command, 1 status, 2 data in, 3 data out).
+unsafe fn uas_queue(k: usize, buf: u64, len: u32) {
+    let d = MSC_D;
+    let s = UAS_TAG as usize; // with streams, the stream this command's tag names
+    let (ring, p): (*mut Trb, *mut Prod) = match k {
+        0 => (addr_of_mut!(MSC_OUT_RING.0) as *mut Trb, addr_of_mut!(PMSCOUT)),
+        _ if UAS_STREAMS => (addr_of_mut!(UAS_SR[2 * (k - 1) + s - 1].0) as *mut Trb, addr_of_mut!(PUAS_SR[2 * (k - 1) + s - 1])),
+        1 => (addr_of_mut!(UAS_ST_RING.0) as *mut Trb, addr_of_mut!(PUASST)),
+        2 => (addr_of_mut!(EPIN[d].0) as *mut Trb, addr_of_mut!(PEPIN[d])),
+        _ => (addr_of_mut!(UAS_DO_RING.0) as *mut Trb, addr_of_mut!(PUASDO)),
+    };
+    let dci = UAS_DCI[k];
+    let isp = if dci & 1 == 1 { 1 << 2 } else { 0 }; // IN: an event on a short packet too
+    push(ring, NXFER, &mut *p, buf, len, T_NORMAL << 10 | 1 << 5 | isp);
+    let sid = if UAS_STREAMS && k > 0 { (s as u32) << 16 } else { 0 };
+    doorbell(MSC_SLOT, dci | sid);
+}
+
+/// After a UAS command over streams went wrong: each stream pipe still holding a transfer is
+/// stopped (a halted one reset and its halt cleared), and both streams' dequeue pointers moved to
+/// where the next transfer will be queued, so no old transfer waits on a stream for a later tag.
+unsafe fn uas_flush() {
+    let outb = addr_of_mut!(OUTCTX[MSC_D].0) as *mut u8;
+    for k in 1..4 {
+        let dci = UAS_DCI[k];
+        match read_volatile(ctx(outb, dci as usize)) & 7 {
+            1 => {
+                command(0, T_STOP_EP << 10 | MSC_SLOT << 24 | dci << 16);
+            }
+            2 => {
+                command(0, T_RESET_EP << 10 | MSC_SLOT << 24 | dci << 16);
+                control(MSC_D, 0x02, 1, 0, (dci / 2 | (dci & 1) << 7) as u16, 0);
+            }
+            _ => {}
+        }
+        for s in 0..2 {
+            let i = 2 * (k - 1) + s;
+            let p = (*addr_of!(PUAS_SR))[i];
+            let deq = addr_of!(UAS_SR[i]) as u64 + 16 * p.idx as u64;
+            command_st(deq | 1 << 1 | p.cycle as u64, (s as u32 + 1) << 16, T_SET_TR_DEQ << 10 | MSC_SLOT << 24 | dci << 16);
+        }
+    }
+    UAS_EV = [None; 32];
+}
+
+/// One SCSI command over UAS with streams: the status and the data queued on the command's
+/// stream, then the command IU; the SENSE IU with its tag ends it (true when GOOD), and when it
+/// carries data the data transfer has ended too.
+unsafe fn uas_cmd_streams(len: u32, dir_in: bool, buf: u64) -> bool {
+    let tag = UAS_TAG;
+    let good = |c: Option<u32>| matches!(c, Some(CC_SUCCESS) | Some(CC_SHORT));
+    let sb = addr_of!(UAS_ST) as u64;
+    let k = if dir_in { 2 } else { 3 };
+    uas_queue(1, sb, 512);
+    if len > 0 {
+        uas_queue(k, buf, len);
+    }
+    uas_queue(0, addr_of!(CBW) as u64, 32);
+    let ok = 'run: {
+        if !good(uas_wait(0)) {
+            break 'run None;
+        }
+        for _ in 0..4 {
+            if !good(uas_wait(1)) {
+                break 'run None;
+            }
+            let (id, mine, status) = {
+                let s = &(*addr_of!(UAS_ST)).0;
+                (s[0], u16::from_be_bytes([s[2], s[3]]) == tag, s[6])
+            };
+            match id {
+                // a SENSE IU that is not GOOD may end the command before its data moved
+                3 if mine && status == 0 => break 'run if len == 0 || good(uas_wait(k)) { Some(true) } else { None },
+                3 if mine => break 'run if len == 0 { Some(false) } else { None },
+                3 => uas_queue(1, sb, 512), // an earlier command's status: wait on for ours
+                _ => break 'run None,       // a RESPONSE IU (the command refused)
+            }
+        }
+        None
+    };
+    match ok {
+        Some(g) => g,
+        None => {
+            MSC_RECOVERIES += 1;
+            uas_flush();
+            false
+        }
+    }
+}
+
+/// The completion code of the next transfer on UAS pipe `k`. Events of the other three pipes
+/// that come meanwhile are kept for their own wait; every other event is served.
+unsafe fn uas_wait(k: usize) -> Option<u32> {
+    let dcis = UAS_DCI;
+    let dci = dcis[k];
+    if let Some(t) = UAS_EV[dci as usize] {
+        UAS_EV[dci as usize] = None;
+        return Some(t.status >> 24);
+    }
+    let t0 = crate::timer::cycles();
+    while !past(t0, BULK_MS) {
+        if let Some(t) = next_event() {
+            let e = (t.control >> 16) & 0x1F;
+            if (t.control >> 10) & 0x3F == T_EV_TRANSFER && t.control >> 24 == MSC_SLOT && dcis.contains(&e) {
+                if e == dci {
+                    return Some(t.status >> 24);
+                }
+                UAS_EV[e as usize] = Some(t);
+                continue;
+            }
+            handle(t);
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
+/// One SCSI command over UAS without streams: the status pipe armed, the 32-byte command IU sent,
+/// then READ READY / WRITE READY on the status pipe lets the data go (the status pipe armed again
+/// beside it), and the SENSE IU with this command's tag ends it: true when its status is GOOD. A
+/// failed command's sense data comes inside that IU, so no REQUEST SENSE follows.
+unsafe fn uas_cmd(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
+    UAS_TAG = if UAS_STREAMS { UAS_TAG % 2 + 1 } else { UAS_TAG % 0xFFFE + 1 };
+    let tag = UAS_TAG;
+    let iu = &mut (*addr_of_mut!(CBW)).0;
+    iu.fill(0);
+    iu[0] = 1; // COMMAND IU; task attribute SIMPLE, LUN 0
+    iu[2..4].copy_from_slice(&tag.to_be_bytes());
+    iu[16..16 + cdb.len().min(16)].copy_from_slice(&cdb[..cdb.len().min(16)]);
+    UAS_EV = [None; 32];
+    if UAS_STREAMS {
+        return uas_cmd_streams(len, dir_in, buf);
+    }
+    let good = |c: Option<u32>| matches!(c, Some(CC_SUCCESS) | Some(CC_SHORT));
+    let sb = addr_of!(UAS_ST) as u64;
+    uas_queue(1, sb, 512);
+    uas_queue(0, addr_of!(CBW) as u64, 32);
+    if !good(uas_wait(0)) {
+        MSC_RECOVERIES += 1;
+        return false;
+    }
+    let mut data_done = len == 0;
+    for _ in 0..4 {
+        if !good(uas_wait(1)) {
+            MSC_RECOVERIES += 1;
+            return false;
+        }
+        let (id, mine, status) = {
+            let s = &(*addr_of!(UAS_ST)).0;
+            (s[0], u16::from_be_bytes([s[2], s[3]]) == tag, s[6])
+        };
+        match id {
+            3 if mine => return status == 0, // SENSE IU
+            6 | 7 if mine && !data_done && (id == 6) == dir_in => {
+                // READ READY / WRITE READY: the data now, and the status pipe armed for the end
+                data_done = true;
+                let k = if dir_in { 2 } else { 3 };
+                uas_queue(k, buf, len);
+                uas_queue(1, sb, 512);
+                if !good(uas_wait(k)) {
+                    MSC_RECOVERIES += 1;
+                    return false;
+                }
+            }
+            3 => uas_queue(1, sb, 512), // an earlier command's status: wait on for ours
+            _ => {
+                MSC_RECOVERIES += 1;
+                return false; // a RESPONSE IU (the command refused) or a READY out of turn
+            }
+        }
+    }
+    false
 }
 
 /// One bulk transfer on the stick's IN or OUT endpoint; its completion event.
 unsafe fn msc_xfer(dir_in: bool, buf: u64, len: u32) -> Option<Trb> {
     let d = MSC_D;
     if dir_in {
-        push(addr_of_mut!(EPIN[d].0) as *mut Trb, NXFER, &mut (*addr_of_mut!(PEPIN))[d], buf, len, T_NORMAL << 10 | 1 << 5 | 1 << 2);
+        let at = push_held(addr_of_mut!(EPIN[d].0) as *mut Trb, NXFER, &mut (*addr_of_mut!(PEPIN))[d], buf, len, T_NORMAL << 10 | 1 << 5 | 1 << 2, false);
         doorbell(MSC_SLOT, MSC_IN);
-        wait_xfer(MSC_SLOT, MSC_IN)
+        wait_xfer(MSC_SLOT, MSC_IN, at as u64)
     } else {
-        push(addr_of_mut!(MSC_OUT_RING.0) as *mut Trb, NXFER, &mut *addr_of_mut!(PMSCOUT), buf, len, T_NORMAL << 10 | 1 << 5);
+        let at = push_held(addr_of_mut!(MSC_OUT_RING.0) as *mut Trb, NXFER, &mut *addr_of_mut!(PMSCOUT), buf, len, T_NORMAL << 10 | 1 << 5, false);
         doorbell(MSC_SLOT, MSC_OUT);
-        wait_xfer(MSC_SLOT, MSC_OUT)
+        wait_xfer(MSC_SLOT, MSC_OUT, at as u64)
     }
 }
 
 /// A halted (stalled) endpoint: xHCI Reset Endpoint, CLEAR_FEATURE(ENDPOINT_HALT) to the
 /// device, then move the controller's dequeue pointer past the stalled transfer to where the
-/// next one will be queued (Set TR Dequeue Pointer).
+/// next one will be queued (Set TR Dequeue Pointer). An endpoint still running (a transfer that
+/// timed out, or a Bulk-Only reset after a bad status) is stopped first, as uas_flush does: Reset
+/// Endpoint and Set TR Dequeue are refused on a running endpoint (xHCI 4.6.8, 4.6.10), which left
+/// the lost transfer queued for the stick to answer late.
 unsafe fn unwedge(dir_in: bool) {
     let d = MSC_D;
     let (dci, addr) = if dir_in { (MSC_IN, MSC_EPI_ADDR) } else { (MSC_OUT, MSC_EPO_ADDR) };
     MSC_RECOVERIES += 1;
-    command(0, T_RESET_EP << 10 | MSC_SLOT << 24 | dci << 16);
+    match read_volatile(ctx(addr_of_mut!(OUTCTX[d].0) as *mut u8, dci as usize)) & 7 {
+        1 => {
+            command(0, T_STOP_EP << 10 | MSC_SLOT << 24 | dci << 16);
+        }
+        2 => {
+            command(0, T_RESET_EP << 10 | MSC_SLOT << 24 | dci << 16);
+        }
+        _ => {}
+    }
     control(d, 0x02, 1, 0, addr as u16, 0);
     let (ring, prod) = if dir_in {
         (addr_of!(EPIN[d].0) as u64, (*addr_of!(PEPIN))[d])
@@ -2871,6 +3485,110 @@ unsafe fn bot_reset() {
 fn mscbuf() -> &'static mut [u8; 4096] {
     // SAFETY: single core; only bot() and its callers use it, one transaction at a time.
     unsafe { &mut (*addr_of_mut!(MSCBUF)).0 }
+}
+
+/// `lsusb late`: a test switch for a Bulk-Only stick. Reads block 0, then sends a TEST UNIT READY
+/// whose two answers (the command's and its status's) are left unread on the event ring, as when
+/// a wait gives up and the stick answers after, then reads block 0 again. Right only if the second
+/// read gives the same data with no recovery and both late events were set aside; the old
+/// wait_xfer took them as the read's own and needed a Bulk-Only reset. Interrupts off.
+pub fn late_check() {
+    // SAFETY: mainline; BUSY and interrupts off keep the timer poll off the event ring.
+    unsafe {
+        if !msc_present() || MSC_UAS {
+            crate::kprintln!("lsusb late: {}", if MSC_UAS { "the stick speaks UAS; this check is for Bulk-Only" } else { "no USB stick in use" });
+            return;
+        }
+        let Some(home) = on(DEVS[MSC_D].ctl) else { return };
+        crate::cpu::cli();
+        let was_busy = BUSY;
+        BUSY = true;
+        let bs = MSC_BS as usize;
+        let ok1 = msc_flush() && msc_io(0, false);
+        let first = *mscbuf();
+        let (stale0, rec0) = (MSC_STALE, MSC_RECOVERIES);
+        // TEST UNIT READY: its wrapper out and its status in, queued but never waited for
+        let w = &mut (*addr_of_mut!(CBW)).0;
+        w.fill(0);
+        w[0..4].copy_from_slice(&0x4342_5355u32.to_le_bytes()); // "USBC"
+        w[4..8].copy_from_slice(&MSC_TAG.to_le_bytes());
+        MSC_TAG = MSC_TAG.wrapping_add(1);
+        w[14] = 6; // a 6-byte command block of zeros: TEST UNIT READY
+        let d = MSC_D;
+        push(addr_of_mut!(MSC_OUT_RING.0) as *mut Trb, NXFER, &mut *addr_of_mut!(PMSCOUT), addr_of!(CBW) as u64, 31, T_NORMAL << 10 | 1 << 5);
+        doorbell(MSC_SLOT, MSC_OUT);
+        push(addr_of_mut!(EPIN[d].0) as *mut Trb, NXFER, &mut (*addr_of_mut!(PEPIN))[d], addr_of!(CSW) as u64, 13, T_NORMAL << 10 | 1 << 5 | 1 << 2);
+        doorbell(MSC_SLOT, MSC_IN);
+        let t0 = crate::timer::cycles();
+        while !past(t0, 100) {
+            core::hint::spin_loop(); // both answers come in and stay unread
+        }
+        let ok2 = msc_io(0, false);
+        let same = mscbuf()[..bs] == first[..bs];
+        let (stale, rec) = (MSC_STALE - stale0, MSC_RECOVERIES - rec0);
+        BUSY = was_busy;
+        crate::cpu::sti();
+        select(home);
+        let ok = ok1 && ok2 && same && stale == 2 && rec == 0;
+        crate::kprintln!(
+            "lsusb late: 2 answers were left unread; the next read of block 0 {} ({}), {} late event(s) set aside, {} recoveries: {}",
+            if ok2 { "passed" } else { "FAILED" },
+            if same { "same data" } else { "DIFFERENT data" },
+            stale,
+            rec,
+            if ok { "OK" } else { "WRONG" }
+        );
+    }
+}
+
+/// `lsusb late0`: a test switch for endpoint 0. On the stick (or the first device), queues a
+/// GET_STATUS whose answer is left unread on the event ring, as when a request's wait gives up
+/// and the device answers after, then reads the device descriptor. Right only if the read
+/// passed, took its own answer (not the GET_STATUS's, as the old wait_control did) and set one
+/// late event aside. Interrupts off.
+pub fn late0_check() {
+    // SAFETY: mainline; BUSY and interrupts off keep the timer poll off the event ring.
+    unsafe {
+        let d = if msc_present() { MSC_D } else { match (0..NDEV).find(|&d| DEVS[d].slot != 0) { Some(d) => d, None => {
+            crate::kprintln!("lsusb late0: no USB device");
+            return;
+        } } };
+        let Some(home) = on(DEVS[d].ctl) else { return };
+        crate::cpu::cli();
+        let was_busy = BUSY;
+        BUSY = true;
+        let stale0 = CTL_STALE;
+        // GET_STATUS (device, 2 bytes in): setup, data, status, rung but never waited for
+        let ring = addr_of_mut!(EP0[d].0) as *mut Trb;
+        let p = &mut (*addr_of_mut!(PEP0))[d];
+        let first = push_held(ring, NXFER, p, 0x80 | 2 << 48, 8, T_SETUP << 10 | 1 << 6 | 3 << 16, true);
+        push(ring, NXFER, p, addr_of!(DBUF) as u64, 2, T_DATA << 10 | 1 << 16);
+        push(ring, NXFER, p, 0, 0, T_STATUS << 10 | 1 << 5);
+        release(first);
+        doorbell(DEVS[d].slot, 1);
+        let t0 = crate::timer::cycles();
+        while !past(t0, 100) {
+            core::hint::spin_loop(); // its answer comes in and stays unread
+        }
+        (&mut (*addr_of_mut!(DBUF)).0)[..18].fill(0);
+        let ok = control(d, 0x80, 6, 0x0100, 0, 18);
+        let (len, ty) = (DBUF.0[0], DBUF.0[1]);
+        let own = CTL_TOOK == CTL_WANT;
+        let stale = CTL_STALE - stale0;
+        BUSY = was_busy;
+        crate::cpu::sti();
+        select(home);
+        let good = ok && len == 18 && ty == 1 && own && stale == 1;
+        crate::kprintln!(
+            "lsusb late0: an answer was left unread on endpoint 0; the next request {} (descriptor of {} bytes, type {}), took {} answer, {} late event(s) set aside: {}",
+            if ok { "passed" } else { "FAILED" },
+            len,
+            ty,
+            if own { "its own" } else { "ANOTHER request's" },
+            stale,
+            if good { "OK" } else { "WRONG" }
+        );
+    }
 }
 
 /// READ(10) / WRITE(10) (or the 16-byte forms) of one device block at `lba` through MSCBUF.
@@ -3753,7 +4471,7 @@ unsafe fn audio_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bo
     keep_alt(cur.take(), &mut best);
     let Some(a) = best else {
         if uac2 {
-            crate::kprintln!("[xhci] port {}: USB audio {:04x}:{:04x} is Audio Class 2.0 -- not driven yet", port, vid, pid);
+            crate::kprintln!("[xhci] port {}: USB audio {:04x}:{:04x} is Audio Class 2.0, not driven yet", port, vid, pid);
         }
         return false;
     };
@@ -3972,7 +4690,7 @@ pub fn audio_cmd(rest: &str) {
     if rest == "tone" {
         crate::kprintln!("[audio] streaming a test tone through the USB audio device...");
         if audio_tone() {
-            crate::kprintln!("[audio] done — played by the USB headset or speaker");
+            crate::kprintln!("[audio] done: played by the USB headset or speaker");
         }
     } else {
         // SAFETY: scalar reads of enumeration-time state.
@@ -3986,7 +4704,7 @@ pub fn audio_cmd(rest: &str) {
 }
 
 /// An absolute pointer's report: the pointer goes to the place it names (buttons as they
-/// were, so a held button drags), then the buttons change there -- a tap lands where touched.
+/// were, so a held button drags), then the buttons change there; a tap lands where touched.
 unsafe fn tablet_report(r: &[u8]) {
     let a = TAB;
     if a.id != 0 && r.first() != Some(&a.id) {
@@ -4134,6 +4852,12 @@ pub fn list() {
             let (b, d, f) = *addr_of!(PCI_AT);
             crate::kprintln!("usb: xHCI controller {:02x}:{:02x}.{}, {} ports, {} connected", b, d, f, { PORTS }, { CONNECTED });
             kinds_line(c, "  ");
+            if RESTARTS[c] > 0 {
+                crate::kprintln!("  controller resets (it stopped working, or xhcireset): {}", { RESTARTS[c] });
+            }
+            if GIVEN_UP[c] {
+                crate::kprintln!("  this controller stopped working: its devices are not used until the next start");
+            }
         }
         select(home);
         if HUBS > 0 {
@@ -4145,6 +4869,18 @@ pub fn list() {
                 "  storage: slot {}, {} blocks of {} B{}",
                 { MSC_SLOT }, { MSC_BLOCKS }, { MSC_BS }, if MSC_USABLE { "  <- storage" } else { "  (other data, read-only to us)" }
             );
+            if MSC_UAS {
+                crate::kprintln!(
+                    "  storage transport: UAS (USB Attached SCSI, four pipes, {}), {} recoveries",
+                    if UAS_STREAMS { "streams 1 and 2" } else { "no streams" }, { MSC_RECOVERIES }
+                );
+            }
+            if MSC_BURST.0 > 0 {
+                crate::kprintln!(
+                    "  storage bursts: {} packets in, {} out (SuperSpeed endpoint companion)",
+                    { MSC_BURST.0 }, { MSC_BURST.1 }
+                );
+            }
             if MSC_LONG {
                 let c = match MSC_LONGCHK { 1 => "checked at the last block", 2 => "check did not pass", _ => "not checked" };
                 crate::kprintln!("  storage commands: READ(16)/WRITE(16), over 2^32 blocks ({})", c);
@@ -4165,6 +4901,12 @@ pub fn list() {
             if MSC_RECOVERIES > 0 {
                 crate::kprintln!("  storage: {} stall/phase recoveries", { MSC_RECOVERIES });
             }
+            if MSC_STALE > 0 {
+                crate::kprintln!("  storage: {} late transfer event(s) set aside, not taken as a later transfer's", { MSC_STALE });
+            }
+        }
+        if CTL_STALE > 0 {
+            crate::kprintln!("  control: {} late endpoint 0 answer(s) set aside, not taken as a later request's", { CTL_STALE });
         }
         if PLUGS + UNPLUGS > 0 {
             crate::kprintln!("  hot-plug: {} plugged in, {} unplugged since boot", { PLUGS }, { UNPLUGS });

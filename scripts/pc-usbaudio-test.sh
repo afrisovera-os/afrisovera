@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track step 3, sound (8 Nov 2026): USB audio -- headsets, USB speakers, a monitor's or dock's sound
+# PC track step 3, sound (8 Nov 2026): USB audio: headsets, USB speakers, a monitor's or dock's sound
 # (kernel/src/pc/xhci.rs, Audio Class 1.0).
 #
 # A USB headset is the cheapest sound a PC can have and the only one on many thin clients and desk setups;
@@ -92,7 +92,7 @@ grade() { # grade <serial log>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqxE "$1"; }
+    has() { grep -aqxE "$1" <<< "$S"; }
     has '\[xhci\] port [0-9]+: USB audio 46f4:0002 \(full speed\), slot [0-9]+, 2 channel\(s\) 16-bit at 48000 Hz, isochronous OUT endpoint 1 every 1000 us, unmuted' ||
         _f "no boot line for the USB audio device (48 kHz stereo, endpoint 1 every 1 ms, unmuted)"
     has '  port [0-9]+: connected, enabled, speed [0-9]+  <- audio' || _f "lsusb did not mark the audio device's port"
@@ -120,7 +120,7 @@ afrisovera> audio
 afrisovera> audio tone
 [audio] streaming a test tone through the USB audio device...
 [usb-audio] played 16384 samples (~371 ms) as 17833 frames at 48000 Hz in 372 packets
-[audio] done — played by the USB headset or speaker
+[audio] done: played by the USB headset or speaker
 afrisovera> say hello
 [say] speaking: \"hello\"
 [usb-audio] played 25578 samples (~580 ms) as 27840 frames at 48000 Hz in 580 packets
@@ -151,7 +151,7 @@ selftest() {
     arm no-boot-line red "$(printf '%s\n' "$GREEN" | grep -v '^\[xhci\] port 5: USB audio')"
     arm muted red "$(printf '%s\n' "$GREEN" | sed 's/ every 1000 us, unmuted/ every 1000 us/')"
     arm mono red "$(printf '%s\n' "$GREEN" | sed 's/2 channel(s) 16-bit/1 channel(s) 16-bit/')"
-    arm uac2-refused red "$(printf '[xhci] port 5: USB audio 46f4:0002 is Audio Class 2.0 -- not driven yet\n%s\n' "$GREEN" | grep -v 'isochronous OUT')"
+    arm uac2-refused red "$(printf '[xhci] port 5: USB audio 46f4:0002 is Audio Class 2.0, not driven yet\n%s\n' "$GREEN" | grep -v 'isochronous OUT')"
     arm no-port-mark red "$(printf '%s\n' "$GREEN" | sed 's/  <- audio$//')"
     arm missed red "$(printf '%s\n' "$GREEN" | sed 's/952 played, 0 missed/950 played, 2 missed/')"
     arm not-all-played red "$(printf '%s\n' "$GREEN" | sed 's/952 played/940 played/')"
@@ -198,8 +198,8 @@ EOF
 }
 
 echo "== PC sound: USB audio (xhci.rs, Audio Class 1.0) =="
-if ! selftest; then echo "PC USBAUDIO TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC USBAUDIO SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC USBAUDIO TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC USBAUDIO SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

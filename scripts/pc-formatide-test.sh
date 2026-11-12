@@ -25,16 +25,16 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     [ -r "$1" ] && [ -r "$2" ] && [ -r "$3" ] && [ -r "$4" ] || { echo "  FAIL: missing log"; return 1; }
     cl() { tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g'; }
     A="$(cl "$1")"; B="$(cl "$2")"; C="$(cl "$3")"; D="$(cl "$4")"
-    has() { printf '%s\n' "$1" | grep -aqxE "$2"; }
+    has() { grep -aqxE "$2" <<< "$1"; }
     blk() { printf '%s\n' "$1" | awk -v c="afrisovera> $2" '$0==c{on=1;next} /^afrisovera>/{on=0} on'; }
     local IC FC
     IC="$(printf '%s\n' "$A" | grep -aoE 'type exactly: installpart ide0 8 yes [0-9a-f]{4}$' | head -1 | awk '{print $NF}')"
     [ -n "$IC" ] || _f "boot 1: installpart ide0 8 did not show its code"
     FC="$(printf '%s\n' "$B" | grep -aoE 'type exactly: formatpart ide0 yes [0-9a-f]{4}$' | head -1 | awk '{print $NF}')"
     [ -n "$FC" ] || _f "boot 2: formatpart ide0 did not show its code"
-    has "$(blk "$A" 'formatpart ide0')" 'formatpart: ide0 has no AfriSovera partition in a healthy GPT -- make one with installpart first; nothing written' ||
+    has "$(blk "$A" 'formatpart ide0')" 'formatpart: ide0 has no AfriSovera partition in a healthy GPT; make one with installpart first; nothing written' ||
         _f "boot 1: formatpart without a partition did not refuse"
-    has "$(blk "$A" 'formatpart ide')" 'formatpart: no disk "ide" here -- say nvme, sataN, ideN or emmc \(see lsparts\); nothing written' ||
+    has "$(blk "$A" 'formatpart ide')" 'formatpart: no disk "ide" here; say nvme, sataN, ideN or emmc \(see lsparts\); nothing written' ||
         _f "boot 1: bare formatpart ide was not refused"
     has "$(blk "$A" 'lsparts')" 'lsparts: ide0 \(SATA in IDE mode\), 64 MiB, 512-byte sectors' || _f "boot 1: lsparts does not list ide0"
     has "$A" 'harness: boot 1: disk images unchanged' || _f "boot 1: a disk image changed"
@@ -42,7 +42,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
         _f "boot 2: the install code did not write entry 5"
     has "$(blk "$B" 'formatpart ide0')" "formatpart: ide0: AfriSovera's partition, sectors 100352-116735 \(8 MiB\); whatever is in it now is lost, no other partition is touched" ||
         _f "boot 2: formatpart did not name the partition"
-    has "$(blk "$B" 'formatpart ide0 yes zzzz')" 'formatpart: that code does not fit this partition now -- nothing written' || _f "boot 2: a wrong code was not refused"
+    has "$(blk "$B" 'formatpart ide0 yes zzzz')" 'formatpart: that code does not fit this partition now; nothing written' || _f "boot 2: a wrong code was not refused"
     has "$B" 'harness: boot 2: ide image: only the four GPT table sectors changed' || _f "boot 2: formatpart (or the install) wrote more than the table"
     has "$C" "\[ide\] ide0: AfriSovera's partition at sector 100352 \(8 MiB\) is not formatted yet \(formatpart ide0\)" ||
         _f "boot 3: the driver did not find the unformatted partition at boot"
@@ -52,7 +52,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
         _f "boot 3: lside does not mark ide0 as storage"
     has "$(blk "$C" 'lside')" "  storage partition: sectors 100352-116735 \(8 MiB\)" || _f "boot 3: lside does not show the partition"
     has "$(printf '%s\n' "$C" | awk -v c="afrisovera> formatpart ide0" '$0==c{on=1;next} /^afrisovera>/{on=0} on')" \
-        "formatpart: ide0 already keeps AfriSovera's files in its partition at sector 100352 \(8 MiB\) -- nothing written" ||
+        "formatpart: ide0 already keeps AfriSovera's files in its partition at sector 100352 \(8 MiB\); nothing written" ||
         _f "boot 3: formatpart twice was not refused"
     has "$C" 'harness: boot 3: ide image: every changed sector is inside the partition, AFRIVFS1 at sector 100352' ||
         _f "boot 3: something outside the partition was written (or no AFRIVFS1)"
@@ -67,12 +67,12 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
 }
 
 M1="afrisovera> formatpart ide0
-formatpart: ide0 has no AfriSovera partition in a healthy GPT -- make one with installpart first; nothing written
+formatpart: ide0 has no AfriSovera partition in a healthy GPT; make one with installpart first; nothing written
 afrisovera> formatpart ide
-formatpart: no disk \"ide\" here -- say nvme, sataN, ideN or emmc (see lsparts); nothing written
+formatpart: no disk \"ide\" here; say nvme, sataN, ideN or emmc (see lsparts); nothing written
 afrisovera> lsparts
 lsparts: ide0 (SATA in IDE mode), 64 MiB, 512-byte sectors
-lsparts: read only -- nothing was written
+lsparts: read only; nothing was written
 afrisovera> tablebackup
 tablebackup: ide0: GPT table, 67 sector(s) saved on the USB stick at sectors 2049-2116, CRC 1a2b3c4d, read back OK
 afrisovera> installpart ide0 8
@@ -85,7 +85,7 @@ afrisovera> formatpart ide0
 formatpart: ide0: AfriSovera's partition, sectors 100352-116735 (8 MiB); whatever is in it now is lost, no other partition is touched
 formatpart: nothing written yet. To format it, type exactly: formatpart ide0 yes 77ab
 afrisovera> formatpart ide0 yes zzzz
-formatpart: that code does not fit this partition now -- nothing written
+formatpart: that code does not fit this partition now; nothing written
 afrisovera>
 harness: boot 2: ide image: only the four GPT table sectors changed"
 M3="[ide] ide0: AfriSovera's partition at sector 100352 (8 MiB) is not formatted yet (formatpart ide0)
@@ -101,7 +101,7 @@ ide: controller 00:03.0, interface 0x80
 afrisovera> write notes.txt HELLO-IDE-10NOV
 afrisovera> sync
 afrisovera> formatpart ide0
-formatpart: ide0 already keeps AfriSovera's files in its partition at sector 100352 (8 MiB) -- nothing written
+formatpart: ide0 already keeps AfriSovera's files in its partition at sector 100352 (8 MiB); nothing written
 afrisovera>
 harness: boot 3: ide image: every changed sector is inside the partition, AFRIVFS1 at sector 100352"
 M4="[ide] ide0: AfriSovera's partition at sector 100352 (8 MiB) holds our files

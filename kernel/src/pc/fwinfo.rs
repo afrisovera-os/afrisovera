@@ -135,14 +135,14 @@ pub fn show() {
     );
     const START: &str = "the firmware can start AfriSovera from its own boot entry (bootplan, bootcopy, bootentry, bootnext)";
     if !answers {
-        crate::kprintln!("  for the owner: the firmware's variable services do not answer -- bootentry and bootnext cannot work on this PC; start AfriSovera from the USB stick");
+        crate::kprintln!("  for the owner: the firmware's variable services do not answer; bootentry and bootnext cannot work on this PC; start AfriSovera from the USB stick");
         return;
     }
     match fw.secure {
-        Var::Value(1) => crate::kprintln!("  for the owner: Secure Boot is on -- this firmware only starts signed files and AfriSovera's boot file is not signed; switch Secure Boot off in the firmware set-up before bootentry"),
-        Var::Value(0) if fw.setup == Var::Value(0) => crate::kprintln!("  for the owner: Secure Boot is off (keys are enrolled, so it can be switched back on later) -- {}", START),
-        Var::Value(0) => crate::kprintln!("  for the owner: Secure Boot is off -- {}", START),
-        Var::Absent => crate::kprintln!("  for the owner: this firmware has no Secure Boot to switch off -- {}", START),
-        _ => crate::kprintln!("  for the owner: the firmware gave an unclear Secure Boot answer -- look in its set-up screen before bootentry"),
+        Var::Value(1) => crate::kprintln!("  for the owner: Secure Boot is on; this firmware only starts signed files and AfriSovera's boot file is not signed; switch Secure Boot off in the firmware set-up before bootentry"),
+        Var::Value(0) if fw.setup == Var::Value(0) => crate::kprintln!("  for the owner: Secure Boot is off (keys are enrolled, so it can be switched back on later); {}", START),
+        Var::Value(0) => crate::kprintln!("  for the owner: Secure Boot is off; {}", START),
+        Var::Absent => crate::kprintln!("  for the owner: this firmware has no Secure Boot to switch off; {}", START),
+        _ => crate::kprintln!("  for the owner: the firmware gave an unclear Secure Boot answer; look in its set-up screen before bootentry"),
     }
 }

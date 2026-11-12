@@ -27,7 +27,7 @@ grade_boot() { # grade_boot <serial> <keyboard b:d.f> <stick b:d.f> <keyboard in
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial capture"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     if [ "$KI" = 1 ]; then MI=2; else MI=1; fi
     has "^\[xhci\] $KI of 2: ${K//./\\.} \(1b36:000d\), 1 device\(s\) connected <- used$" ||
         _f "$K (keyboard) was not named as used"
@@ -157,8 +157,8 @@ selftest() {
 }
 
 echo "== PC with two xHCI controllers driven at once (PC track step 3) =="
-if ! selftest; then echo "PC XHCI-MULTI TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC XHCI-MULTI SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC XHCI-MULTI TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC XHCI-MULTI SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

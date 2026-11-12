@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track (5 Nov 2026): a USB hub -- the keyboard and the mouse plugged into it, not into the PC.
+# PC track (5 Nov 2026): a USB hub: the keyboard and the mouse plugged into it, not into the PC.
 #
 # Boots the PC kernel with a USB hub on the xHCI (QEMU usb-hub) and a USB keyboard and a USB
 # mouse on the HUB's ports 1 and 3. xhci.rs must find the hub, power and reset its ports and
@@ -21,7 +21,7 @@ grade() { # grade <serial>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[xhci\] port [0-9]+: USB hub [0-9a-f]{4}:[0-9a-f]{4} \([a-z]+ speed\), slot [0-9]+, [0-9]+ ports$' || _f "the USB hub was not set up"
     has '^\[xhci\] port [0-9]+: USB keyboard ' || _f "no USB keyboard was enumerated behind the hub"
     has '^\[xhci\] port [0-9]+: USB mouse ' || _f "no USB mouse was enumerated behind the hub"
@@ -86,8 +86,8 @@ selftest() {
 }
 
 echo "== PC USB hub (keyboard + mouse behind it) =="
-if ! selftest; then echo "PC USBHUB TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC USBHUB SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC USBHUB TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC USBHUB SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

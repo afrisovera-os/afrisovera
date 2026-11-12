@@ -31,7 +31,7 @@ grade() { # grade <boot log>
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     # the Nth block of output after the command line "afrisovera> <cmd>" (exact), up to the next prompt
     blk() { printf '%s\n' "$A" | awk -v c="afrisovera> $1" -v n="$2" '$0==c{k++;on=(k==n);next} /^afrisovera>/{on=0} on'; }
-    in_blk() { printf '%s\n' "$1" | grep -aqxE "$2"; }
+    in_blk() { grep -aqxE "$2" <<< "$1"; }
     P1="$(blk bootplan 1)"; P2="$(blk bootplan 2)"
     for PB in "$P1" "$P2"; do
         local w; [ "$PB" = "$P1" ] && w="first" || w="second"
@@ -39,18 +39,18 @@ grade() { # grade <boot log>
             _f "$w bootplan: the shared EFI partition on $NAME was not listed"
         in_blk "$PB" "  FAT32, $CLB-byte clusters, 64 KiB free" || _f "$w bootplan: the 64 KiB free was not counted"
         in_blk "$PB" '  \\EFI holds: Microsoft, BOOT, ubuntu' || _f "$w bootplan: Microsoft, BOOT and ubuntu were not all seen"
-        in_blk "$PB" '  plan: none -- the boot file needs [1-9][0-9]* KiB here, only 64 KiB free' ||
+        in_blk "$PB" '  plan: none; the boot file needs [1-9][0-9]* KiB here, only 64 KiB free' ||
             _f "$w bootplan: the full partition was not refused for room"
         if printf '%s\n' "$PB" | grep -aq '^  plan: AfriSovera'; then _f "$w bootplan: a copy was planned into the full partition"; fi
         if printf '%s\n' "$PB" | grep -aq '^bootplan: the boot file would go to'; then _f "$w bootplan: a partition was named for the boot file"; fi
-        in_blk "$PB" '  boot entry: none planned -- no EFI system partition with room' || _f "$w bootplan: a boot entry was planned"
+        in_blk "$PB" '  boot entry: none planned; no EFI system partition with room' || _f "$w bootplan: a boot entry was planned"
         if printf '%s\n' "$PB" | grep -aq '^bootplan: sata port 2: EFI system partition'; then _f "$w bootplan: an EFI partition was found on the blank disk"; fi
     done
-    in_blk "$(blk bootcopy 1)" 'bootcopy: no EFI system partition can take the boot file \(bootplan says why\) -- nothing written' ||
+    in_blk "$(blk bootcopy 1)" 'bootcopy: no EFI system partition can take the boot file \(bootplan says why\); nothing written' ||
         _f "bootcopy did not refuse"
-    in_blk "$(blk 'bootcopy yes 0000' 1)" 'bootcopy: no EFI system partition can take the boot file \(bootplan says why\) -- nothing written' ||
+    in_blk "$(blk 'bootcopy yes 0000' 1)" 'bootcopy: no EFI system partition can take the boot file \(bootplan says why\); nothing written' ||
         _f "bootcopy yes 0000 did not refuse"
-    in_blk "$(blk bootentry 1)" 'bootentry: no EFI system partition holds \\EFI\\afrisovera \(bootcopy puts it there first\) -- nothing written' ||
+    in_blk "$(blk bootentry 1)" 'bootentry: no EFI system partition holds \\EFI\\afrisovera \(bootcopy puts it there first\); nothing written' ||
         _f "bootentry did not refuse"
     if printf '%s\n' "$A" | grep -aqE '^(bootcopy|bootentry): nothing written yet\. To do it'; then _f "a code was offered for a write"; fi
     if printf '%s\n' "$A" | grep -aqE '^bootcopy: copied to|added at the END of BootOrder and read back'; then _f "something was written"; fi
@@ -65,17 +65,17 @@ PLAN="bootplan: AfriSovera's boot file is 2360 KiB (kept at power-on)
 bootplan: sata port 4: EFI system partition (GPT entry 1, LBA 2048-206847, 100 MiB)
   FAT32, 512-byte clusters, 64 KiB free
   \\EFI holds: Microsoft, BOOT, ubuntu
-  plan: none -- the boot file needs 2361 KiB here, only 64 KiB free
-  boot entry: none planned -- no EFI system partition with room
-bootplan: a plan only -- nothing was written; adding it will ask for the owner's word, with the way back"
+  plan: none; the boot file needs 2361 KiB here, only 64 KiB free
+  boot entry: none planned; no EFI system partition with room
+bootplan: a plan only, so nothing was written; adding it will ask for the owner's word, with the way back"
 M="afrisovera> bootplan
 $PLAN
 afrisovera> bootcopy
-bootcopy: no EFI system partition can take the boot file (bootplan says why) -- nothing written
+bootcopy: no EFI system partition can take the boot file (bootplan says why); nothing written
 afrisovera> bootcopy yes 0000
-bootcopy: no EFI system partition can take the boot file (bootplan says why) -- nothing written
+bootcopy: no EFI system partition can take the boot file (bootplan says why); nothing written
 afrisovera> bootentry
-bootentry: no EFI system partition holds \\EFI\\afrisovera (bootcopy puts it there first) -- nothing written
+bootentry: no EFI system partition holds \\EFI\\afrisovera (bootcopy puts it there first); nothing written
 afrisovera> bootplan
 $PLAN
 afrisovera>

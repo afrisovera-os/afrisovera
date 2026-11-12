@@ -7,8 +7,8 @@
 //!
 //! Safety rule for the user's disks: the VFS stores files on an AHCI disk only if sector 0
 //! is blank or already carries the VFS marker. A disk with a boot sector, a partition table
-//! or a file system (0x55AA at 510) is somebody's data -- on QEMU, the UEFI boot disk itself
-//! -- and is listed but never written.
+//! or a file system (0x55AA at 510) is somebody's data (on QEMU, the UEFI boot disk itself)
+//! and is listed but never written.
 //! Multi-block commands (10 Nov 2026), as NVMe and the USB disks got on 9-10 Nov: on the storage
 //! disk a read fetches up to 8 KiB (16 sectors, or 2 on a 4Kn drive) with one READ DMA EXT into
 //! a read-ahead the next reads are served from, and the VFS's in-order save is gathered by device
@@ -111,6 +111,8 @@ static mut WSTATS: (u64, u64, u64) = (0, 0, 0);
 static mut TRUN: u8 = 0;
 /// Big copies sent in one command: runs, sectors.
 static mut TSTATS: (u64, u64) = (0, 0);
+/// Link resets (COMRESET) sent to bring a port back after a failed command left the drive busy.
+static mut RESETS: u64 = 0;
 
 fn hba(off: u64) -> u32 {
     // SAFETY: ABAR is mapped uncached by init before any caller runs.
@@ -127,24 +129,39 @@ fn port_w(p: u32, off: u64, v: u32) {
     hba_w(0x100 + p as u64 * 0x80 + off, v)
 }
 
-fn wait(mut done: impl FnMut() -> bool) -> bool {
-    for _ in 0..50_000_000u64 {
+/// Poll `done` for up to `ms` milliseconds of real time. Before 12 Nov this was a count of 50
+/// million polls, so how long a port had depended on the CPU and on how slow its register reads
+/// were (seconds on one machine, a minute on another); IDE and NVMe already wait by the clock.
+fn wait(ms: u64, mut done: impl FnMut() -> bool) -> bool {
+    let (t0, hz) = (crate::timer::cycles(), crate::timer::hz().max(1));
+    loop {
         if done() {
             return true;
         }
+        if crate::timer::cycles().wrapping_sub(t0) > hz.saturating_mul(ms) / 1000 {
+            return false;
+        }
         core::hint::spin_loop();
     }
-    false
 }
+
+/// The limits, in milliseconds. ENGINE_MS: AHCI 10.1.2 gives a port 500 ms to stop its command
+/// list (CR) and FIS receive (FR). DRIVE_MS: a drive still busy, or one coming back after a
+/// COMRESET (a hard disk may have to spin up). CMD_MS: one ATA command, as long as Linux allows
+/// one (30 s). HANDOFF_MS: AHCI 10.6.3, 25 ms for the firmware to start, then 2 s to finish.
+const ENGINE_MS: u64 = 500;
+const DRIVE_MS: u64 = 10_000;
+const CMD_MS: u64 = 30_000;
+const HANDOFF_MS: u64 = 2_100;
 
 /// Stop a port's command engine (AHCI 10.1.2), so its list/FIS pointers may be changed.
 fn stop(p: u32) -> bool {
     port_w(p, P_CMD, port(p, P_CMD) & !CMD_ST);
-    if !wait(|| port(p, P_CMD) & CMD_CR == 0) {
+    if !wait(ENGINE_MS, || port(p, P_CMD) & CMD_CR == 0) {
         return false;
     }
     port_w(p, P_CMD, port(p, P_CMD) & !CMD_FRE);
-    wait(|| port(p, P_CMD) & CMD_FR == 0)
+    wait(ENGINE_MS, || port(p, P_CMD) & CMD_FR == 0)
 }
 
 /// Point port `p` at our command list and FIS area and start it.
@@ -173,7 +190,7 @@ fn command(p: u32, ata: u8, lba: u64, write: bool) -> bool {
 /// One ATA command of `k` logical sectors through slot 0 with one PRD over `buf` (BUF, RA or WB:
 /// physically contiguous, k * sector size bytes). Returns success.
 fn xfer(p: u32, ata: u8, lba: u64, k: u32, buf: u64, write: bool) -> bool {
-    if !wait(|| port(p, P_TFD) & (TFD_BSY | TFD_DRQ) == 0) {
+    if !wait(DRIVE_MS, || port(p, P_TFD) & (TFD_BSY | TFD_DRQ) == 0) {
         crate::kprintln!("[ahci] port {} busy", p);
         return false;
     }
@@ -210,7 +227,7 @@ fn xfer(p: u32, ata: u8, lba: u64, k: u32, buf: u64, write: bool) -> bool {
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     port_w(p, P_IS, 0xFFFF_FFFF);
     port_w(p, P_CI, 1);
-    let ok = wait(|| port(p, P_CI) & 1 == 0 || port(p, P_IS) & IS_TFES != 0);
+    let ok = wait(CMD_MS, || port(p, P_CI) & 1 == 0 || port(p, P_IS) & IS_TFES != 0);
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     if !ok || port(p, P_IS) & IS_TFES != 0 || port(p, P_TFD) & TFD_ERR != 0 {
         crate::kprintln!(
@@ -218,10 +235,51 @@ fn xfer(p: u32, ata: u8, lba: u64, k: u32, buf: u64, write: bool) -> bool {
             p, ata, lba, port(p, P_IS), port(p, P_TFD)
         );
         // recover the port for the next command
-        start(p);
+        recover(p);
         return false;
     }
     true
+}
+
+/// COMRESET (AHCI 10.4.2: PxSCTL.DET = 1 for at least 1 ms, then 0; PxCMD.ST must be clear)
+/// and wait up to a second for the link. Returns whether the link is up (PxSSTS.DET = 3).
+fn comreset(p: u32) -> bool {
+    port_w(p, P_SCTL, (port(p, P_SCTL) & !0xF) | 1);
+    crate::timer::busywait_ms(2);
+    port_w(p, P_SCTL, port(p, P_SCTL) & !0xF);
+    let (t0, hz) = (crate::timer::cycles(), crate::timer::hz().max(1));
+    while port(p, P_SSTS) & 0xF != 3 && crate::timer::cycles() - t0 < hz {
+        core::hint::spin_loop();
+    }
+    port(p, P_SSTS) & 0xF == 3
+}
+
+/// Bring a port back after a failed command (AHCI 6.2.2.1/6.2.2.2): stop its engine and, when the
+/// drive is idle, start it again. When the engine does not stop, or the drive still holds BSY or
+/// DRQ, a plain restart would leave every later command "busy": send a COMRESET first.
+fn recover(p: u32) {
+    let stopped = stop(p);
+    if stopped && port(p, P_TFD) & (TFD_BSY | TFD_DRQ) == 0 {
+        start(p);
+        return;
+    }
+    crate::kprintln!(
+        "[ahci] port {}: {} (TFD {:#x}), resetting the link (COMRESET)",
+        p, if stopped { "the drive is still busy after the failed command" } else { "the command engine did not stop" }, port(p, P_TFD)
+    );
+    // SAFETY: single core, kernel context.
+    unsafe { RESETS += 1 };
+    // stop() cleared ST even when CR stayed set, as COMRESET needs
+    let back = comreset(p) && wait(DRIVE_MS, || port(p, P_TFD) & (TFD_BSY | TFD_DRQ) == 0);
+    port_w(p, P_SERR, 0xFFFF_FFFF);
+    if back && start(p) {
+        crate::kprintln!("[ahci] port {}: the drive answered the reset and is ready again", p);
+    } else {
+        crate::kprintln!(
+            "[ahci] port {}: no answer after the reset (SSTS {:#x}, TFD {:#x}); later commands on it will fail",
+            p, port(p, P_SSTS), port(p, P_TFD)
+        );
+    }
 }
 
 fn buf() -> &'static mut [u8; 4096] {
@@ -246,7 +304,7 @@ pub fn init() {
     // take the controller from the firmware (BIOS/OS handoff, AHCI 10.6) when it offers one
     if hba(CAP2) & 1 != 0 {
         hba_w(BOHC, hba(BOHC) | 1 << 1); // OS owned
-        if !wait(|| hba(BOHC) & 1 == 0) {
+        if !wait(HANDOFF_MS, || hba(BOHC) & 1 == 0) {
             crate::kprintln!("[ahci] the firmware did not release the controller; continuing");
         }
     }
@@ -274,14 +332,7 @@ pub fn init() {
         }
         // a link that is not up (a sleeping SSD after a cold boot): COMRESET, then wait for it
         if port(p, P_SSTS) & 0xF != 3 {
-            port_w(p, P_SCTL, (port(p, P_SCTL) & !0xF) | 1);
-            crate::timer::busywait_ms(2);
-            port_w(p, P_SCTL, port(p, P_SCTL) & !0xF);
-            let (t0, hz) = (crate::timer::cycles(), crate::timer::hz().max(1));
-            while port(p, P_SSTS) & 0xF != 3 && crate::timer::cycles() - t0 < hz {
-                core::hint::spin_loop();
-            }
-            if port(p, P_SSTS) & 0xF != 3 {
+            if !comreset(p) {
                 continue; // nothing there
             }
             crate::timer::busywait_ms(10); // let the drive settle before its first command
@@ -848,5 +899,10 @@ pub fn list() {
             "  big copies (installdisk, bootcopy): {} run(s) in one command, {} sector(s), each read back ({})",
             t.0, t.1, if tr == 1 { "on" } else { "off" }
         );
+    }
+    // SAFETY: scalar read.
+    let resets = unsafe { RESETS };
+    if resets > 0 {
+        crate::kprintln!("  link resets after a failed command left the drive busy: {}", resets);
     }
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PC track step 3 (7 Nov 2026): a PS/2 mouse or a laptop's built-in touchpad (in its
-# PS/2-compatible mode) on the i8042's aux port -- QEMU q35's default mouse.
+# PS/2-compatible mode) on the i8042's aux port: QEMU q35's default mouse.
 #
 # Boots the PC kernel with NO USB controller, so QMP's mouse events go to the PS/2 mouse and
 # its send-key to the PS/2 keyboard. scripts/lib/usb-mouse.py moves the mouse by +100,+60 and
@@ -17,6 +17,13 @@
 # wheel rolled up, up, up, down (MOUSE_WHEEL, before the typing) scrolls the console 3, 6, 9
 # then 6 lines back (COM1 notes), and lsps2 counts the 4 notches. The notes come after the
 # prompt, so the typed `lsps2` may stand on a line of its own.
+# Since 12 Nov 2026 (a late mouse byte): `lsps2 late` is typed after `lsps2`. It leaves the
+# mouse's id byte unread, then asks the id again; graded: that late byte was dropped (1), the
+# next command got its own ACK and the right id, streaming is on again, and the plain `lsps2`
+# before it showed no late byte (none at boot in QEMU).
+# Since 12 Nov 2026 (the config byte read): `lsps2 cfg` follows. It leaves the id byte unread
+# again, then reads the i8042 config byte twice; graded: the waiting byte was kept off the
+# first read (1), both reads agree, and nothing was waiting at a config read during boot.
 #   scripts/pc-ps2mouse-test.sh              # grader selftest, then the QEMU boot
 #   scripts/pc-ps2mouse-test.sh --selftest   # grader selftest only
 set -uo pipefail
@@ -68,7 +75,7 @@ grade() { # grade <serial capture> <pixel line>
     [ -r "$1" ] || { echo "  FAIL: missing serial capture"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     P="$2"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[ps2\] i8042 keyboard controller \(config 0x[0-9a-f]{2} -> 0x[0-9a-f]{2}\), scancode set 1, polled$' ||
         _f "the i8042 keyboard controller was not found"
     has '^\[ps2\] PS/2 mouse or touchpad \(id 0x0[034]\) on the aux port, (3-byte packets|4-byte packets with a wheel), polled$' ||
@@ -80,6 +87,12 @@ grade() { # grade <serial capture> <pixel line>
     [ "$ups" = "3 6 9 6 " ] || _f "the wheel did not scroll the console 3, 6, 9 then 6 lines back: '${ups}'"
     has '^ps2: wheel on \(4-byte packets\); 4 notch\(es\), 3 console lines each$' ||
         _f "lsps2 does not count 4 wheel notches: $(printf '%s\n' "$S" | grep -aE '^ps2: (no )?wheel' | tail -1)"
+    has '^lsps2 late: an unread id byte was left waiting; the next command got 0xfa, then id 0x03 \(mouse id 0x03\), 1 dropped, streaming on again: OK$' ||
+        _f "a late mouse byte was not dropped before the next command: $(printf '%s\n' "$S" | grep -aE '^lsps2 late' | tail -1)"
+    has '^lsps2 cfg: a mouse byte was left waiting; the config byte read (0x[0-9a-f]{2}), then \1, 1 kept off it, streaming on again: OK$' ||
+        _f "a waiting mouse byte was taken as the config byte: $(printf '%s\n' "$S" | grep -aE '^lsps2 cfg' | tail -1)"
+    has '^ps2: [0-9]+ byte\(s\) waiting were kept off' && _f "bytes were waiting at a config read during boot (QEMU sends none): $(printf '%s\n' "$S" | grep -aE '^ps2: [0-9]+ byte' | head -1)"
+    has '^ps2: [0-9]+ late mouse byte' && _f "late mouse bytes were dropped in normal use (QEMU sends none): $(printf '%s\n' "$S" | grep -aE '^ps2: [0-9]+ late' | head -1)"
     has '^\[xhci\] port [0-9]+: USB mouse' && _f "a USB mouse was enumerated: this boot must have none"
     printf '%s\n' "$S" | grep -aqE '^(afrisovera> )?lsps2$' || _f "lsps2 typed on the PS/2 keyboard did not reach the shell"
     has '^ps2: i8042 keyboard, polled; [0-9]+ scancodes read, [0-9]+ keys typed$' || _f "lsps2 did not report the keyboard"
@@ -126,6 +139,10 @@ ps2: pointer at 420,300
 ps2: rate 100 samples/s, resolution 8 counts/mm; IRQ 12, 13 interrupts
 ps2: acceleration on: x1.00 at 50 mm/s, x1.00 at 100, x1.50 at 175, x2.00 at 250, x3.00 from 400; 0 packet(s) sped up
 ps2: wheel on (4-byte packets); 4 notch(es), 3 console lines each
+afrisovera> lsps2 late
+lsps2 late: an unread id byte was left waiting; the next command got 0xfa, then id 0x03 (mouse id 0x03), 1 dropped, streaming on again: OK
+afrisovera> lsps2 cfg
+lsps2 cfg: a mouse byte was left waiting; the config byte read 0x46, then 0x46, 1 kept off it, streaming on again: OK
 afrisovera> "
 GPX="tip=000000 fill=ffffff mid=080b12"
 
@@ -170,16 +187,22 @@ selftest() {
     arm curve-flat red "$(printf '%s\n' "$GREEN" | sed 's/x2\.00 at 250, x3\.00/x1.00 at 250, x1.00/')" "$GPX"
     arm settings-as-found red "$(printf '%s\n' "$GREEN" | sed 's|rate 100 samples/s, resolution 8 counts/mm|rate as found, resolution as found|')" "$GPX"
     arm no-rate-line red "$(printf '%s\n' "$GREEN" | grep -v '^ps2: rate')" "$GPX"
+    arm late-taken red "$(printf '%s\n' "$GREEN" | sed 's/^lsps2 late: .*/lsps2 late: an unread id byte was left waiting; the next command got 0x03, then id 0x00 (mouse id 0x03), 0 dropped, streaming on again: WRONG/')" "$GPX"
+    arm late-not-run red "$(printf '%s\n' "$GREEN" | grep -v '^lsps2 late:')" "$GPX"
+    arm late-at-boot red "$(printf '%s\n' "$GREEN" | sed 's/^ps2: wheel on.*/&\nps2: 2 late mouse byte(s) dropped before or after a command/')" "$GPX"
+    arm cfg-taken red "$(printf '%s\n' "$GREEN" | sed 's/^lsps2 cfg: .*/lsps2 cfg: a mouse byte was left waiting; the config byte read 0x03, then 0x46, 0 kept off it, streaming on again: WRONG/')" "$GPX"
+    arm cfg-not-run red "$(printf '%s\n' "$GREEN" | grep -v '^lsps2 cfg:')" "$GPX"
+    arm cfg-at-boot red "$(printf '%s\n' "$GREEN" | sed 's/^ps2: wheel on.*/&\nps2: 1 byte(s) waiting were kept off a config byte read/')" "$GPX"
     arm panic red "$(printf '%s\n[pc] PANIC: x' "$GREEN")" "$GPX"
     arm empty red "" ""
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 32 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 38 ]
 }
 
 echo "== PC PS/2 mouse / touchpad (PC track step 3) =="
-if ! selftest; then echo "PC PS2MOUSE TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC PS2MOUSE SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC PS2MOUSE TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC PS2MOUSE SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }
@@ -198,11 +221,11 @@ winpath() { if command -v cygpath > /dev/null; then cygpath -m "$1"; else printf
 qemu-system-aarch64 -M virt -m 256M -display none \
     -serial "tcp:127.0.0.1:4976,server,nowait" -qmp "tcp:127.0.0.1:4977,server,nowait" &
 QPID=$!
-MOUSE_WHEEL="up up up down" python3 scripts/lib/usb-mouse.py 4976 4977 "$W/serial.log" "$(winpath "$W/screen.png")" 100 60 2 "lsps2"
+MOUSE_WHEEL="up up up down" python3 scripts/lib/usb-mouse.py 4976 4977 "$W/serial.log" "$(winpath "$W/screen.png")" 100 60 2 "lsps2" "lsps2 late" "lsps2 cfg"
 kill "$QPID" 2> /dev/null
 wait "$QPID" 2> /dev/null
 PX="$(pixels "$W/screen.png" 2> /dev/null || echo 'tip=none fill=none mid=none (no screenshot)')"
-tr -d '\r' < "$W/serial.log" | grep -aE '^\[ps2\]|^\[xhci\]|^\[con\]|^afrisovera> lsps2|^ps2:' | sed 's/^/  | /'
+tr -d '\r' < "$W/serial.log" | grep -aE '^\[ps2\]|^\[xhci\]|^\[con\]|^afrisovera> lsps2|^ps2:|^lsps2 (late|cfg):' | sed 's/^/  | /'
 echo "  | pixels: $PX"
 
 echo "  --- grading ---"

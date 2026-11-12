@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track step 5 (7 Nov 2026): bootentries -- the firmware's boot entries, READ ONLY.
+# PC track step 5 (7 Nov 2026): bootentries: the firmware's boot entries, READ ONLY.
 #
 # Booting AfriSovera from its own partition next to Windows needs one more firmware boot entry
 # (Boot#### + BootOrder). Before anything is ever added, `bootentries` shows the entries as the
@@ -23,7 +23,7 @@ grade() { # grade <serial log>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[pc\] boot entries: [1-9][0-9]* read \([1-9][0-9]* in BootOrder, started from one of them\), kept for bootentries$' ||
         _f "at power-on the kernel did not read the boot entries (with BootOrder and BootCurrent)"
     has "^bootentries: the firmware's boot entries, as read at power-on \\(nothing is changed\\)\$" ||
@@ -92,8 +92,8 @@ selftest() {
 }
 
 echo "== PC firmware boot entries (bootentries, read only) =="
-if ! selftest; then echo "PC BOOTENTRIES TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC BOOTENTRIES SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC BOOTENTRIES TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC BOOTENTRIES SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

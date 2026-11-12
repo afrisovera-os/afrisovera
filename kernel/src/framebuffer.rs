@@ -30,22 +30,29 @@ const FOURCC_XRGB8888: u32 = 0x3432_5258;
 struct Framebuffer([u32; WIDTH * HEIGHT]);
 static mut FB: Framebuffer = Framebuffer([0; WIDTH * HEIGHT]);
 
-#[inline]
-fn put(x: usize, y: usize, rgb: u32) {
-    if x < WIDTH && y < HEIGHT {
-        // SAFETY: bounds-checked index into the framebuffer; single writer.
-        unsafe {
-            (addr_of_mut!(FB) as *mut u32).add(y * WIDTH + x).write(rgb);
-        }
-    }
-}
-
 /// Fill a rectangle (clipped to the screen). Public so the Tonga compositor can
 /// draw surfaces onto the framebuffer.
+/// Fast at opt-level 0 (afriui.md section 18): the first row is filled by doubling copies, then copied down; the
+/// copies are compiler_builtins' memcpy, which is optimised even in a debug build.
 pub fn fill_rect(x0: usize, y0: usize, w: usize, h: usize, rgb: u32) {
-    for y in y0..(y0 + h).min(HEIGHT) {
-        for x in x0..(x0 + w).min(WIDTH) {
-            put(x, y, rgb);
+    let (x1, y1) = (x0.saturating_add(w).min(WIDTH), y0.saturating_add(h).min(HEIGHT));
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let n = x1 - x0;
+    // SAFETY: rows y0..y1 and columns x0..x1 are inside the framebuffer (clipped above); single writer.
+    unsafe {
+        let fb = addr_of_mut!(FB) as *mut u32;
+        let row = fb.add(y0 * WIDTH + x0);
+        row.write(rgb);
+        let mut done = 1;
+        while done < n {
+            let k = done.min(n - done);
+            core::ptr::copy_nonoverlapping(row, row.add(done), k);
+            done += k;
+        }
+        for y in y0 + 1..y1 {
+            core::ptr::copy_nonoverlapping(row, fb.add(y * WIDTH + x0), n);
         }
     }
 }
@@ -53,18 +60,35 @@ pub fn fill_rect(x0: usize, y0: usize, w: usize, h: usize, rgb: u32) {
 /// Copy a `w`x`h` pixel block from `src` (row stride `stride`) to (dx, dy).
 /// Used by the compositor to blit an app's surface buffer onto the screen.
 ///
+/// Fast at opt-level 0 (afriui.md section 19): the block is clipped to the screen once (saturating, so a huge `w` or
+/// `h` cannot wrap), then each row is one memmove (compiler_builtins, optimised even in a debug build); the same
+/// pixels as the old per-pixel loop.
+///
 /// # Safety
-/// `src` must point to at least `stride*h` valid u32 pixels.
+/// `src` must be valid for `(h-1)*stride + w` u32 pixels (stride 0 is allowed: every row reads the same `w`
+/// pixels), and must not overlap the destination rows on the framebuffer: rows are copied top to bottom, and the
+/// memmove only protects within one row.
 pub unsafe fn blit(dx: usize, dy: usize, w: usize, h: usize, src: *const u32, stride: usize) {
-    for j in 0..h {
-        for i in 0..w {
-            put(dx + i, dy + j, *src.add(j * stride + i));
-        }
+    let (x1, y1) = (dx.saturating_add(w).min(WIDTH), dy.saturating_add(h).min(HEIGHT));
+    if dx >= x1 || dy >= y1 {
+        return;
+    }
+    let (n, rows) = (x1 - dx, y1 - dy);
+    let fb = addr_of_mut!(FB) as *mut u32;
+    for j in 0..rows {
+        // SAFETY: the caller's contract covers src's row j; the destination row is on screen (clipped above).
+        core::ptr::copy(src.add(j * stride), fb.add((dy + j) * WIDTH + dx), n);
     }
 }
 
 /// Enable/disable console mirroring — used when switching to a graphical
 /// (Tonga) surface so shell echo doesn't scribble over the desktop.
+/// The text console is on screen (`fbcon wm` refuses otherwise, afriui.md section 20).
+pub fn console_shown() -> bool {
+    // SAFETY: single scalar read, single-threaded shell context.
+    unsafe { CON_ON }
+}
+
 pub fn set_console(on: bool) {
     // SAFETY: single scalar write, single-threaded shell context.
     unsafe {
@@ -235,12 +259,24 @@ unsafe fn con_putc(c: u8) {
             if CCOL >= CON_COLS {
                 con_newline();
             }
-            let x = CON_X + CCOL * CH;
-            let y = CON_Y + CROW * CH;
-            fill_rect(x, y, CH, CH, CON_BG);
-            draw_char(x, y, c, TEXT, CON_SCALE);
+            con_glyph(CON_X + CCOL * CH, CON_Y + CROW * CH, c);
             CCOL += 1;
         }
+    }
+}
+
+const _: () = assert!(CON_SCALE == 1, "con_glyph draws 8x8 cells");
+
+/// One console character with its background: each 8-pixel row is built in a small array and copied in once.
+unsafe fn con_glyph(x: usize, y: usize, c: u8) {
+    let fb = addr_of_mut!(FB) as *mut u32;
+    let mut px = [CON_BG; 8];
+    for (row, bits) in font::glyph(c).iter().enumerate() {
+        for (col, p) in px.iter_mut().enumerate() {
+            *p = if (bits >> (7 - col)) & 1 == 1 { TEXT } else { CON_BG };
+        }
+        // SAFETY: the cell is inside the console region (CCOL < CON_COLS, CROW < CON_ROWS).
+        core::ptr::copy_nonoverlapping(px.as_ptr(), fb.add((y + row) * WIDTH + x), 8);
     }
 }
 
@@ -253,7 +289,7 @@ unsafe fn con_newline() {
     }
 }
 
-/// Scroll the console region up one text row by moving pixels.
+/// Scroll the console region up one text row: each pixel row moves with one memmove (afriui.md section 18).
 unsafe fn con_scroll() {
     let fb = addr_of_mut!(FB) as *mut u32;
     let w = CON_COLS * CH;
@@ -261,11 +297,151 @@ unsafe fn con_scroll() {
     for y in 0..(h - CH) {
         let src = (CON_Y + CH + y) * WIDTH + CON_X;
         let dst = (CON_Y + y) * WIDTH + CON_X;
-        for x in 0..w {
-            fb.add(dst + x).write(*fb.add(src + x));
-        }
+        core::ptr::copy(fb.add(src), fb.add(dst), w);
     }
     fill_rect(CON_X, CON_Y + h - CH, w, CH, CON_BG);
+}
+
+/// A hash of console pixel rows `r0..r1` (FNV-1a over the pixels), for `fbcon time`'s scroll check.
+unsafe fn con_hash(r0: usize, r1: usize) -> u64 {
+    let fb = addr_of_mut!(FB) as *const u32;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for y in r0..r1 {
+        for x in 0..CON_COLS * CH {
+            h = (h ^ *fb.add((CON_Y + y) * WIDTH + CON_X + x) as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// `fbcon time` (afriui.md section 18): the time of one console line with a scroll, through the real
+/// `kprintln!` path, on the shown console; then the scroll on its own, with two self-checks.
+pub fn con_time() {
+    // SAFETY: shell mainline; the cursor statics are only also written by prints, and none run in between.
+    if !unsafe { CON_ON } {
+        crate::kprintln!("[fbcon] the console is not shown (type 'clear' first)");
+        return;
+    }
+    let hz = crate::timer::hz().max(1);
+    let us = |t0: u64| crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / hz;
+    const LINES: u64 = 8;
+    let (mut fast, mut slow) = (u64::MAX, 0u64);
+    for k in 0..LINES {
+        // SAFETY: as above; the line starts at the bottom row, so its newline scrolls.
+        unsafe {
+            CROW = CON_ROWS - 1;
+            CCOL = 0;
+        }
+        let t0 = crate::timer::cycles();
+        crate::kprintln!("[FBCON] LINE {} OF {}: 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 ABCDEF", k + 1, LINES);
+        let t = us(t0);
+        fast = fast.min(t);
+        slow = slow.max(t);
+    }
+    // the glyph check: the last line now sits one row above the bottom
+    let line = b"[FBCON] LINE 8 OF 8: 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 ABCDEF";
+    let n = line.len().min(CON_COLS);
+    let mut bad = 0usize;
+    let fb = addr_of_mut!(FB) as *const u32;
+    for (i, &c) in line[..n].iter().enumerate() {
+        let g = font::glyph(c);
+        for (row, bits) in g.iter().enumerate() {
+            for col in 0..8 {
+                let want = if (bits >> (7 - col)) & 1 == 1 { TEXT } else { CON_BG };
+                let (x, y) = (CON_X + i * CH + col, CON_Y + (CON_ROWS - 2) * CH + row);
+                // SAFETY: inside the console region.
+                if unsafe { *fb.add(y * WIDTH + x) } != want {
+                    bad += 1;
+                }
+            }
+        }
+    }
+    // the scroll alone, with its check
+    let (mut ok, mut scroll) = (0u64, 0u64);
+    for _ in 0..LINES {
+        // SAFETY: as above.
+        unsafe {
+            let before = con_hash(1 * CH, CON_ROWS * CH);
+            let t0 = crate::timer::cycles();
+            con_scroll();
+            scroll = scroll.max(us(t0));
+            let fbp = addr_of_mut!(FB) as *const u32;
+            let mut blank = true;
+            for y in (CON_ROWS - 1) * CH..CON_ROWS * CH {
+                for x in 0..CON_COLS * CH {
+                    blank &= *fbp.add((CON_Y + y) * WIDTH + CON_X + x) == CON_BG;
+                }
+            }
+            if blank && con_hash(0, (CON_ROWS - 1) * CH) == before {
+                ok += 1;
+            }
+        }
+    }
+    crate::kprintln!("[fbcon] one line with a scroll: fastest {} us, slowest {} us over {} lines; the scroll alone: {} us", fast, slow, LINES, scroll);
+    crate::kprintln!("[fbcon] scroll check: {} of {} scrolls moved every row up one text row", ok, LINES);
+    crate::kprintln!("[fbcon] glyph check: {} chars, {} pixels differ", n, bad);
+}
+
+/// `fbcon blit` (afriui.md section 19): the time of a console-sized and a whole-screen `blit`, from one stack row
+/// with stride 0 (no statics), then a copy check and a clip check; the console is redrawn after.
+pub fn blit_time() {
+    // SAFETY: shell mainline; nothing else draws while the verb runs.
+    if !unsafe { CON_ON } {
+        crate::kprintln!("[fbblit] the console is not shown (type 'clear' first)");
+        return;
+    }
+    let hz = crate::timer::hz().max(1);
+    let us = |t0: u64| crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / hz;
+    let mut row = [0u32; WIDTH];
+    for (i, p) in row.iter_mut().enumerate() {
+        *p = 0x10_20_30 + i as u32;
+    }
+    let (cw, chh) = (CON_COLS * CH, CON_ROWS * CH);
+    let (mut con, mut full) = (u64::MAX, u64::MAX);
+    for _ in 0..8 {
+        let t0 = crate::timer::cycles();
+        // SAFETY: stride 0 reads the same `cw` pixels of `row` for every row.
+        unsafe { blit(CON_X, CON_Y, cw, chh, row.as_ptr(), 0) };
+        con = con.min(us(t0));
+        let t0 = crate::timer::cycles();
+        // SAFETY: as above, WIDTH pixels.
+        unsafe { blit(0, 0, WIDTH, HEIGHT, row.as_ptr(), 0) };
+        full = full.min(us(t0));
+    }
+    let fb = addr_of_mut!(FB) as *const u32;
+    let px = |x: usize, y: usize| unsafe { *fb.add(y * WIDTH + x) }; // SAFETY: callers pass on-screen points.
+    // copy check: 24 x 8 from a 32-stride source, every pixel different
+    let mut src = [0u32; 32 * 8];
+    for (k, p) in src.iter_mut().enumerate() {
+        *p = 0x00_A0_00_00 | k as u32;
+    }
+    fill_rect(0, 0, WIDTH, HEIGHT, 0);
+    // SAFETY: src holds 32 * 8 pixels.
+    unsafe { blit(100, 50, 24, 8, src.as_ptr(), 32) };
+    let mut right = 0;
+    for j in 0..8 {
+        for i in 0..24 {
+            right += (px(100 + i, 50 + j) == src[j * 32 + i]) as usize;
+        }
+    }
+    // clip check: 64 x 64 put 20 from the right edge and 10 from the bottom; only 20 x 10 fits
+    let mut big = [0u32; 64];
+    for (i, p) in big.iter_mut().enumerate() {
+        *p = 0x00_00_B0_00 | i as u32;
+    }
+    fill_rect(0, 0, WIDTH, HEIGHT, 0);
+    // SAFETY: stride 0 reads `big`'s 64 pixels for every row.
+    unsafe { blit(WIDTH - 20, HEIGHT - 10, 64, 64, big.as_ptr(), 0) };
+    let mut inside = 0;
+    for j in 0..10 {
+        for i in 0..20 {
+            inside += (px(WIDTH - 20 + i, HEIGHT - 10 + j) == big[i]) as usize;
+        }
+    }
+    let edge = px(WIDTH - 21, HEIGHT - 11) == 0 && px(WIDTH - 21, HEIGHT - 1) == 0 && px(WIDTH - 1, HEIGHT - 11) == 0;
+    console_init();
+    crate::kprintln!("[fbblit] console block {}x{}: fastest {} us; whole screen {}x{}: fastest {} us", cw, chh, con, WIDTH, HEIGHT, full);
+    crate::kprintln!("[fbblit] copy check: {} of 192 pixels right; clip check: {} of 200 inside, edge {}", right, inside, if edge { "unchanged" } else { "CHANGED" });
 }
 
 /// Draw a single glyph at scale, transparent background (only lit pixels drawn).
@@ -323,8 +499,7 @@ pub fn draw_string(x0: usize, y0: usize, s: &str, fg: u32, scale: usize) -> usiz
     x
 }
 
-/// Redraw the console header + clear the log region (used by a future `clear`).
-#[allow(dead_code)]
+/// Redraw the console header + clear the log region (`fbcon wm` uses it, afriui.md section 20).
 pub fn console_reset() {
     console_init();
 }

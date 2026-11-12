@@ -27,7 +27,7 @@ grade() { # grade <serial>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     cnt() { printf '%s\n' "$S" | grep -acE "$1"; }
     has '^\[xhci\] 0 device\(s\) connected, no USB keyboard$' || _f "the boot did not start with an empty xHCI"
     has "^\\[xhci\\] memory: $LIM" || _f "the boot line does not say every structure is inside its limits"

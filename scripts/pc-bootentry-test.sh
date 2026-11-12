@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track step 5 (7 Nov 2026): `bootentry` -- AfriSovera's own firmware boot entry next to Windows, on the
+# PC track step 5 (7 Nov 2026): `bootentry`: AfriSovera's own firmware boot entry next to Windows, on the
 # owner's code, and `bootentry remove`, the way back.
 #
 # bootcopy puts AfriSovera's boot file into the EFI system partition Windows uses
@@ -62,7 +62,7 @@ grade() { # grade <boot1 log> ... <boot5 log>
     A="$(cl "$1")"; B="$(cl "$2")"; C="$(cl "$3")"; D="$(cl "$4")"; E="$(cl "$5")"
     blk() { printf '%s\n' "$1" | awk -v c="afrisovera> $2" '$0==c{on=1;next} /^afrisovera>/{on=0} on'; }
     pblk() { printf '%s\n' "$1" | awk -v c="^afrisovera> $2" '$0~c{on=1;next} /^afrisovera>/{on=0} on'; }
-    in_blk() { printf '%s\n' "$1" | grep -aqxE "$2"; }
+    in_blk() { grep -aqxE "$2" <<< "$1"; }
     local NUM ORDER0 G
     NUM="$(blk "$A" bootentries | sed -nE 's/^  [0-9]+ entries; the next free number is (Boot[0-9A-F]{4})$/\1/p' | head -1)"
     ORDER0="$(blk "$A" bootentries | sed -nE 's/^  BootOrder:(( [0-9A-F]{4})+)$/\1/p' | head -1)"
@@ -71,9 +71,9 @@ grade() { # grade <boot1 log> ... <boot5 log>
     [ -n "$ORDER0" ] || _f "boot 1: bootentries did not give BootOrder"
     [ -n "$G" ] || _f "harness: the EFI partition's GUID was not read from the image"
     NUM="${NUM:-Boot????}"; local N4="${NUM#Boot}"
-    in_blk "$(blk "$A" bootentry)" "bootentry: no EFI system partition holds \\\\EFI\\\\afrisovera \(bootcopy puts it there first\) -- nothing written" ||
+    in_blk "$(blk "$A" bootentry)" "bootentry: no EFI system partition holds \\\\EFI\\\\afrisovera \(bootcopy puts it there first\); nothing written" ||
         _f "boot 1: bootentry was not refused without the boot file in place"
-    in_blk "$(blk "$A" 'bootentry remove')" 'bootentry remove: AfriSovera has no boot entry -- nothing to remove' ||
+    in_blk "$(blk "$A" 'bootentry remove')" 'bootentry remove: AfriSovera has no boot entry; nothing to remove' ||
         _f "boot 1: bootentry remove did not find nothing to remove"
     # boot 2
     printf '%s\n' "$(pblk "$B" 'bootcopy yes ')" | grep -aqE "^bootcopy: copied to $NAME partition $PNO.*read back the same" ||
@@ -85,7 +85,7 @@ grade() { # grade <boot1 log> ... <boot5 log>
     in_blk "$B2" '  the PC keeps starting ".+" first; AfriSovera is picked from the firmware.s boot menu' ||
         _f "boot 2: bootentry did not say the PC keeps its first choice"
     in_blk "$B2" 'bootentry: nothing written yet. To do it, type exactly: bootentry yes [0-9a-f]{4}' || _f "boot 2: bootentry did not give the code"
-    in_blk "$(blk "$B" 'bootentry yes zzzz')" "bootentry: that code does not fit the firmware's boot entries as they are now -- nothing written" ||
+    in_blk "$(blk "$B" 'bootentry yes zzzz')" "bootentry: that code does not fit the firmware's boot entries as they are now; nothing written" ||
         _f "boot 2: a wrong code was not refused"
     # boot 3
     local C1 CE; C1="$(pblk "$C" 'bootentry yes ')"; CE="$(blk "$C" bootentries)"
@@ -97,9 +97,9 @@ grade() { # grade <boot1 log> ... <boot5 log>
     in_blk "$CE" "  $NUM  active  \"AfriSovera\"  HD\($PNO,GPT,$G,start $STARTL\)/$FILE_RE" ||
         _f "boot 3: bootentries does not show $NUM active, pointing at partition $PNO ($G) and the file"
     in_blk "$CE" "  AfriSovera's own entry: $NUM" || _f "boot 3: bootentries does not name AfriSovera's own entry $NUM"
-    in_blk "$(blk "$C" bootentry)" "bootentry: AfriSovera already has a boot entry \($NUM\) -- nothing to add \(bootentry remove takes it out\)" ||
+    in_blk "$(blk "$C" bootentry)" "bootentry: AfriSovera already has a boot entry \($NUM\); nothing to add \(bootentry remove takes it out\)" ||
         _f "boot 3: a second bootentry did not refuse"
-    in_blk "$(blk "$C" bootplan)" "  boot entry: AfriSovera already has one \($NUM\) -- nothing to add" || _f "boot 3: bootplan did not see the entry"
+    in_blk "$(blk "$C" bootplan)" "  boot entry: AfriSovera already has one \($NUM\); nothing to add" || _f "boot 3: bootplan did not see the entry"
     # boot 4: stored in flash, seen at power-on
     local DE; DE="$(blk "$D" bootentries)"
     in_blk "$DE" "bootentries: the firmware's boot entries, as read at power-on \(nothing is changed\)" || _f "boot 4: bootentries did not read at power-on"
@@ -113,11 +113,11 @@ grade() { # grade <boot1 log> ... <boot5 log>
     in_blk "$D2" "  BootOrder now:$ORDER0 $N4  -> after:$ORDER0" || _f "boot 4: bootentry remove did not show BootOrder back to$ORDER0"
     in_blk "$D2" 'bootentry remove: nothing written yet. To do it, type exactly: bootentry remove yes [0-9a-f]{4}' ||
         _f "boot 4: bootentry remove did not give the code"
-    in_blk "$(blk "$D" 'bootentry remove yes zzzz')" "bootentry remove: that code does not fit the firmware's boot entries as they are now -- nothing written" ||
+    in_blk "$(blk "$D" 'bootentry remove yes zzzz')" "bootentry remove: that code does not fit the firmware's boot entries as they are now; nothing written" ||
         _f "boot 4: a wrong code was not refused"
     # boot 5
     local E1 EE; E1="$(pblk "$E" 'bootentry remove yes ')"; EE="$(blk "$E" bootentries)"
-    in_blk "$E1" "bootentry remove: $NUM deleted and out of BootOrder, read back -- the firmware's boot entries are as before bootentry" ||
+    in_blk "$E1" "bootentry remove: $NUM deleted and out of BootOrder, read back; the firmware's boot entries are as before bootentry" ||
         _f "boot 5: bootentry remove did not delete $NUM and read back"
     in_blk "$EE" "  BootOrder:$ORDER0" || _f "boot 5: BootOrder is not back to$ORDER0"
     in_blk "$EE" "  AfriSovera's own entry: none yet \(adding one will ask for the owner's word\)" || _f "boot 5: an AfriSovera entry is still there"
@@ -143,9 +143,9 @@ bootentries: the firmware's boot entries, as read at power-on (nothing is change
 afrisovera> bootcopy
 bootcopy: nothing written yet. To do it, type exactly: bootcopy yes 3fa2
 afrisovera> bootentry
-bootentry: no EFI system partition holds \\EFI\\afrisovera (bootcopy puts it there first) -- nothing written
+bootentry: no EFI system partition holds \\EFI\\afrisovera (bootcopy puts it there first); nothing written
 afrisovera> bootentry remove
-bootentry remove: AfriSovera has no boot entry -- nothing to remove
+bootentry remove: AfriSovera has no boot entry; nothing to remove
 afrisovera>"
 L2="afrisovera> bootcopy yes 3fa2
 bootcopy: copied to sata port 2 partition 1\\EFI\\afrisovera\\afrisovera.efi, read back the same (2360 KiB, both FAT copies equal, 98415 KiB free now)
@@ -156,7 +156,7 @@ bootentry: Boot0005 \"AfriSovera\" -> sata port 2 partition 1 (start 2048, 20480
 bootentry: nothing written yet. To do it, type exactly: bootentry yes 51c7
 afrisovera> bootentry yes zzzz
 bootentry: Boot0005 \"AfriSovera\" -> sata port 2 partition 1 (start 2048, 204800 blocks)\\EFI\\afrisovera\\afrisovera.efi
-bootentry: that code does not fit the firmware's boot entries as they are now -- nothing written
+bootentry: that code does not fit the firmware's boot entries as they are now; nothing written
 afrisovera>"
 L3="afrisovera> bootentry yes 51c7
 bootentry: Boot0005 \"AfriSovera\" -> sata port 2 partition 1 (start 2048, 204800 blocks)\\EFI\\afrisovera\\afrisovera.efi
@@ -169,9 +169,9 @@ bootentries: the firmware's boot entries, as read again after bootentry changed 
   6 entries; the next free number is Boot0006
   AfriSovera's own entry: Boot0005
 afrisovera> bootentry
-bootentry: AfriSovera already has a boot entry (Boot0005) -- nothing to add (bootentry remove takes it out)
+bootentry: AfriSovera already has a boot entry (Boot0005); nothing to add (bootentry remove takes it out)
 afrisovera> bootplan
-  boot entry: AfriSovera already has one (Boot0005) -- nothing to add
+  boot entry: AfriSovera already has one (Boot0005); nothing to add
 afrisovera>
 harness: EFI partition GUID $ESPG"
 L4="afrisovera> bootentries
@@ -186,11 +186,11 @@ bootentry remove: Boot0005 \"AfriSovera\" would be deleted
   the file in the EFI partition stays (bootcopy remove takes it out)
 bootentry remove: nothing written yet. To do it, type exactly: bootentry remove yes 0e3d
 afrisovera> bootentry remove yes zzzz
-bootentry remove: that code does not fit the firmware's boot entries as they are now -- nothing written
+bootentry remove: that code does not fit the firmware's boot entries as they are now; nothing written
 afrisovera>"
 L5="afrisovera> bootentry remove yes 0e3d
 bootentry remove: Boot0005 \"AfriSovera\" would be deleted
-bootentry remove: Boot0005 deleted and out of BootOrder, read back -- the firmware's boot entries are as before bootentry
+bootentry remove: Boot0005 deleted and out of BootOrder, read back; the firmware's boot entries are as before bootentry
 afrisovera> bootentries
 bootentries: the firmware's boot entries, as read again after bootentry changed them (nothing is changed here)
   BootOrder: 0001 0002 0003 0004 0000
@@ -239,7 +239,7 @@ selftest() {
     arm remove-no-code red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | grep -v 'type exactly')" "$L5"
     arm not-removed red "$L1" "$L2" "$L3" "$L4" "$(printf '%s\n' "$L5" | grep -v 'deleted and out of BootOrder')"
     arm order-not-back red "$L1" "$L2" "$L3" "$L4" "$(printf '%s\n' "$L5" | sed 's/^  BootOrder: 0001 0002 0003 0004 0000$/  BootOrder: 0001 0002 0003 0000 0004/')"
-    arm firmware-refused red "$L1" "$L2" "$(printf '%s\nbootentry: the firmware refused to write Boot0005 (status 0x8000000000000008) -- nothing changed' "$L3")" "$L4" "$L5"
+    arm firmware-refused red "$L1" "$L2" "$(printf '%s\nbootentry: the firmware refused to write Boot0005 (status 0x8000000000000008); nothing changed' "$L3")" "$L4" "$L5"
     arm panic red "$(printf '%s\nKERNEL PANIC at bootent.rs' "$L1")" "$L2" "$L3" "$L4" "$L5"
     arm empty red "" "" "" "" ""
     if [ "$FOURK" = 1 ]; then # the partition counted in 512-byte sectors on a 4 KiB-block disk
@@ -265,8 +265,8 @@ selftest() {
 WHERE=""; [ "$KIND" = nvme4k ] && WHERE=", Windows disk on 4 KiB-block NVMe"; [ "$KIND" = recfirst ] && WHERE=", a recovery partition before the EFI partition"
 [ "$KIND" = recfirst4k ] && WHERE=", a recovery partition before the EFI partition on 4 KiB-block NVMe"
 echo "== PC firmware boot entry for AfriSovera, added and taken out$WHERE (PC track step 5) =="
-if ! selftest; then echo "PC BOOTENTRY${UP} TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC BOOTENTRY SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC BOOTENTRY${UP} TEST FAILED (grader selftest); no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC BOOTENTRY SELFTEST ONLY; no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

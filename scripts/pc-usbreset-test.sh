@@ -22,7 +22,7 @@ grade() { # grade <serial>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     local line ms
     line="$(printf '%s\n' "$S" | grep -aE '^\[xhci\] reset: .*ready [0-9]+ ms after HCRST \(first read after 1 ms, as Linux on Intel hosts(; this is one)?\)$' | head -1)"
     if [ -z "$line" ]; then

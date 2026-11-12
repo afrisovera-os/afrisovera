@@ -94,8 +94,8 @@ selftest() {
 }
 
 echo "== PC AHCI / SATA disk (PC track step 3) =="
-if ! selftest; then echo "PC AHCI TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC AHCI SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC AHCI TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC AHCI SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

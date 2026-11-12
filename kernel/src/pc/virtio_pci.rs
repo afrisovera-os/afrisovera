@@ -7,8 +7,8 @@
 //! area, and a device-config block, each found through a vendor capability and living in a
 //! BAR. This module is compiled INSIDE `virtio.rs` on the PC (a child module, so it reaches
 //! the driver's own set-up functions) and supplies the `r`/`w`/`dsb`/`init`/`lsvirtio` that
-//! the ARM build defines for itself. Every other line of the driver -- rings, packets, TCP,
-//! DHCP, sectors, PCM -- is the ARM code unchanged.
+//! the ARM build defines for itself. Every other line of the driver (rings, packets, TCP,
+//! DHCP, sectors, PCM) is the ARM code unchanged.
 //!
 //! The trick that keeps the driver unedited: each PCI device's `base` is chosen as
 //! (its device-config address - R_CONFIG), so the driver's own `base + R_CONFIG + i` byte
@@ -19,7 +19,7 @@
 //! is present (pc/e1000.rs), `init` adds an EMULATED virtio-net device whose registers this
 //! module answers itself. The driver's TX doorbell sends each queued frame through the
 //! e1000, and `emu_poll` (the local-APIC timer interrupt, and every RX doorbell) moves
-//! received frames into the driver's RX buffers and used ring -- exactly what a virtio-net
+//! received frames into the driver's RX buffers and used ring, exactly what a virtio-net
 //! device would do, so the shared TCP/IP stack runs on the Intel NIC unedited.
 
 use super::{dev_name, VIRTIO_MAGIC};
@@ -422,7 +422,7 @@ pub(super) unsafe fn w(base: u64, off: u64, v: u32) {
         R_QUEUE_NUM => wr16(c + C_Q_SIZE, v),
         // virtio-MMIO lets a driver write QueueReady = 0 before setting a queue up; on PCI
         // only 1 may be written (QEMU marks the device broken on a 0), and a queue starts
-        // disabled after reset anyway -- so a 0 is dropped here
+        // disabled after reset anyway, so a 0 is dropped here
         R_QUEUE_READY => {
             if v != 0 {
                 wr16(c + C_Q_ENABLE, v)

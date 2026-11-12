@@ -6,7 +6,7 @@
 //! drivers' `raw_read`, which has no write path.
 //!
 //! `installplan [MiB]` reads the same tables and says where AfriSovera's own partition WOULD
-//! go: the biggest free space, 1 MiB aligned, in a free table entry -- or why not (damaged
+//! go: the biggest free space, 1 MiB aligned, in a free table entry, or why not (damaged
 //! table, no free entry, not enough room). It is a plan only; it never resizes another
 //! system's partition (room is made by shrinking Windows from Windows itself).
 //!
@@ -16,7 +16,7 @@
 //!
 //! `installpart <disk> <MiB>` is the only code here that WRITES an internal disk: it adds
 //! AfriSovera's (empty, unformatted) partition as one new GPT entry in the free space the plan
-//! names -- both GPT copies, both CRCs -- and only when the disk's table is healthy, the USB
+//! names (both GPT copies, both CRCs) and only when the disk's table is healthy, the USB
 //! stick holds a backup of it that matches the disk now, and the owner types the code the plan
 //! prints (tied to the table as it is, so a changed disk or a typo writes nothing).
 //!
@@ -153,10 +153,10 @@ fn plan(gaps: &[(u64, u64)], bs: u64, want: u64, slot: usize, what: &str) -> Opt
     }
     let need = want * align;
     if best.1 == 0 {
-        crate::kprintln!("  plan: no free space of 1 MiB or more -- make room by shrinking Windows from Windows itself (Disk Management, Shrink Volume)");
+        crate::kprintln!("  plan: no free space of 1 MiB or more; make room by shrinking Windows from Windows itself (Disk Management, Shrink Volume)");
     } else if best.1 < need {
         crate::kprintln!(
-            "  plan: the largest free space holds {} MiB, less than the {} MiB asked -- make room by shrinking Windows from Windows itself (Disk Management, Shrink Volume)",
+            "  plan: the largest free space holds {} MiB, less than the {} MiB asked; make room by shrinking Windows from Windows itself (Disk Management, Shrink Volume)",
             best.1 / align,
             want
         );
@@ -189,21 +189,21 @@ fn show(rd: &mut dyn FnMut(u64, &mut [u8; 512]) -> bool, cap512: u64, bs: u64, w
     if s.iter().all(|&b| b == 0) {
         crate::kprintln!("  blank: no partition table");
         if want > 0 {
-            crate::kprintln!("  plan: blank disk -- AfriSovera can have all of it, only on the owner's word (claimdisk)");
+            crate::kprintln!("  plan: blank disk; AfriSovera can have all of it, only on the owner's word (claimdisk)");
         }
         return None;
     }
     if &s[..8] == b"AFRIVFS1" {
         crate::kprintln!("  AfriSovera's own files (AFRIVFS1, whole disk)");
         if want > 0 {
-            crate::kprintln!("  plan: already AfriSovera's -- nothing to do");
+            crate::kprintln!("  plan: already AfriSovera's; nothing to do");
         }
         return None;
     }
     if s[510] != 0x55 || s[511] != 0xAA {
         crate::kprintln!("  holds data but no partition table we know");
         if want > 0 {
-            crate::kprintln!("  plan: none -- a disk we cannot read is never changed");
+            crate::kprintln!("  plan: none; a disk we cannot read is never changed");
         }
         return None;
     }
@@ -230,7 +230,7 @@ fn show(rd: &mut dyn FnMut(u64, &mut [u8; 512]) -> bool, cap512: u64, bs: u64, w
     let Some(h) = header(rd, 1, per) else {
         crate::kprintln!("  gpt: protective MBR but the primary header is missing or damaged (CRC): not trusted");
         if want > 0 {
-            crate::kprintln!("  plan: none -- a damaged table is never changed");
+            crate::kprintln!("  plan: none; a damaged table is never changed");
         }
         return None;
     };
@@ -345,16 +345,16 @@ fn show(rd: &mut dyn FnMut(u64, &mut [u8; 512]) -> bool, cap512: u64, bs: u64, w
         );
     }
     if overlap {
-        crate::kprintln!("  WARNING: partitions overlap -- this table is not safe to change");
+        crate::kprintln!("  WARNING: partitions overlap; this table is not safe to change");
     }
     if !backup || !entries_ok {
-        crate::kprintln!("  WARNING: this GPT is damaged -- not safe to change");
+        crate::kprintln!("  WARNING: this GPT is damaged; not safe to change");
     }
     if want > 0 {
         if overlap || !backup || !entries_ok {
-            crate::kprintln!("  plan: none -- a damaged table is never changed");
+            crate::kprintln!("  plan: none; a damaged table is never changed");
         } else if free_slot == 0 {
-            crate::kprintln!("  plan: none -- all {} GPT entries are in use", n_ent);
+            crate::kprintln!("  plan: none; all {} GPT entries are in use", n_ent);
         } else if let (Some((start, len)), Some(b)) = (plan(&gaps[..ng], bs, want, free_slot, "GPT entry"), bh) {
             return Some(Plan { start, len, slot: free_slot, elba, belba: u64le(&b, 72), alt, n_ent, esz, hcrc: u32le(&h, 16) });
         }
@@ -366,11 +366,11 @@ fn show(rd: &mut dyn FnMut(u64, &mut [u8; 512]) -> bool, cap512: u64, bs: u64, w
 /// inside the first 2^32 sectors (all an MBR can address).
 fn mbr_plan(mbr: &[(u8, u64, u64); 4], blocks: u64, bs: u64, want: u64) {
     if mbr.iter().any(|e| matches!(e.0, 0x05 | 0x0f | 0x85)) {
-        crate::kprintln!("  plan: none -- this MBR has an extended partition (logical partitions are not handled yet)");
+        crate::kprintln!("  plan: none; this MBR has an extended partition (logical partitions are not handled yet)");
         return;
     }
     let Some(slot) = mbr.iter().position(|e| e.0 == 0) else {
-        crate::kprintln!("  plan: none -- all 4 MBR slots are in use");
+        crate::kprintln!("  plan: none; all 4 MBR slots are in use");
         return;
     };
     let mut used: [(u64, u64); 4] = [(0, 0); 4];
@@ -387,7 +387,7 @@ fn mbr_plan(mbr: &[(u8, u64, u64); 4], blocks: u64, bs: u64, want: u64) {
     let (mut at, mut gaps, mut ng) = (1u64, [(0u64, 0u64); 5], 0usize);
     for &(a, b) in used.iter() {
         if a < at || b >= end {
-            crate::kprintln!("  plan: none -- the MBR partitions overlap or run past the disk");
+            crate::kprintln!("  plan: none; the MBR partitions overlap or run past the disk");
             return;
         }
         if a > at {
@@ -453,17 +453,18 @@ pub fn list(want: u64) {
     if n == 0 {
         crate::kprintln!("lsparts: no NVMe, SATA, IDE-mode or eMMC disk");
     }
-    crate::kprintln!("lsparts: read only -- nothing was written");
+    crate::kprintln!("lsparts: read only; nothing was written");
     if want > 0 {
-        crate::kprintln!("installplan: a plan only -- installing will ask for the owner's word and back up the table first");
+        crate::kprintln!("installplan: a plan only; installing will ask for the owner's word and back up the table first");
     }
 }
 
 // --- `tablebackup` / `tablecheck`: the partition tables saved on a USB stick before any
 // install may change them (roadmap step 5, "with a backup of the original first"). The
 // internal disks are only READ here; the only disk written is a USB stick the PC already
-// treats as AfriSovera's (blank or AFRIVFS1 -- never the stick the PC booted from). The
-// stick's sectors 0-48 hold its files and 100 the self-test, so the backup starts at 1 MiB:
+// treats as AfriSovera's (blank or AFRIVFS1, never the stick the PC booted from). The
+// stick's sectors 0-48 hold its files, 100 the self-test and 128-871 the part of files over 512
+// bytes (claude/vfs-big), so the backup starts at 1 MiB:
 // sector BAK_AT is a directory ("AFRIPTBK", count, time), then one slot per disk: a record
 // sector (label, size, the copied sector runs, CRC32 of the data, CRC32 of the record) and
 // the copied sectors, exactly as they are on the disk.
@@ -607,7 +608,7 @@ fn table_runs(dk: Disk, cap512: u64, bs: u64) -> Result<([(u64, u64); 5], usize,
 /// disk has changed since is the way back, so it is only overwritten with `new`.
 pub fn backup(fresh: bool) {
     if !crate::xhci::msc_present() {
-        crate::kprintln!("tablebackup: no USB stick to hold the backup (plug in a blank stick or one of AfriSovera's) -- nothing written");
+        crate::kprintln!("tablebackup: no USB stick to hold the backup (plug in a blank stick or one of AfriSovera's); nothing written");
         return;
     }
     let (ds, nd) = disks();
@@ -619,7 +620,7 @@ pub fn backup(fresh: bool) {
         for i in 0..count {
             if let (l, Cmp::Changed(_)) = compare(i, &ds[..nd]) {
                 crate::kprintln!(
-                    "tablebackup: {}: the USB stick holds this disk's table from BEFORE it changed -- that copy is the way back (tablerestore), so nothing was written. To save the tables as they are now instead, type: tablebackup new",
+                    "tablebackup: {}: the USB stick holds this disk's table from BEFORE it changed; that copy is the way back (tablerestore), so nothing was written. To save the tables as they are now instead, type: tablebackup new",
                     label_str(&l)
                 );
                 return;
@@ -627,7 +628,7 @@ pub fn backup(fresh: bool) {
         }
     }
     if crate::xhci::msc_capacity() < BAK_AT + 1 + nd as u64 * BAK_SLOT {
-        crate::kprintln!("tablebackup: the USB stick is too small for the backup -- nothing written");
+        crate::kprintln!("tablebackup: the USB stick is too small for the backup; nothing written");
         return;
     }
     let now = crate::cmos::epoch() as u64;
@@ -638,7 +639,7 @@ pub fn backup(fresh: bool) {
         let (runs, nr, kind) = match table_runs(dk, cap, bs) {
             Ok(r) => r,
             Err(why) => {
-                crate::kprintln!("tablebackup: {}: {} -- skipped", label_str(&lab), why);
+                crate::kprintln!("tablebackup: {}: {}, skipped", label_str(&lab), why);
                 continue;
             }
         };
@@ -673,7 +674,7 @@ pub fn backup(fresh: bool) {
             c2 = crc_feed(c2, &s);
         }
         if !ok || c2 != crc {
-            crate::kprintln!("tablebackup: {}: writing or reading back the USB stick FAILED -- this backup is not to be trusted", label_str(&lab));
+            crate::kprintln!("tablebackup: {}: writing or reading back the USB stick FAILED, so this backup is not to be trusted", label_str(&lab));
             continue;
         }
         crate::kprintln!(
@@ -772,17 +773,17 @@ pub fn check() {
             Cmp::Damaged => crate::kprintln!("tablecheck: backup {} on the USB stick is damaged (record CRC)", i + 1),
             Cmp::Gone => crate::kprintln!("tablecheck: {}: that disk is not here now", lab),
             Cmp::Other(now, then) => crate::kprintln!("tablecheck: {}: a different disk now ({} MiB, was {} MiB)", lab, now, then),
-            Cmp::ReadFail => crate::kprintln!("tablecheck: {}: a read FAILED -- not checked", lab),
+            Cmp::ReadFail => crate::kprintln!("tablecheck: {}: a read FAILED, so it was not checked", lab),
             Cmp::DataBad => crate::kprintln!("tablecheck: {}: the copy on the USB stick is damaged (data CRC)", lab),
             Cmp::Changed(at) => crate::kprintln!(
-                "tablecheck: {}: CHANGED since the backup (first difference in sector {}) -- back it up again before any install",
+                "tablecheck: {}: CHANGED since the backup (first difference in sector {}); back it up again before any install",
                 lab,
                 at
             ),
             Cmp::Same(k) => crate::kprintln!("tablecheck: {}: unchanged since the backup ({} sector(s))", lab, k),
         }
     }
-    crate::kprintln!("tablecheck: read only -- nothing was written");
+    crate::kprintln!("tablecheck: read only; nothing was written");
 }
 
 // --- `installpart`: the one place an internal disk is written ---
@@ -859,33 +860,33 @@ fn reheader(dk: Disk, lba: u64, per: u64, ecrc: u32) -> Option<[u8; 512]> {
 }
 
 /// `installpart <disk> <MiB> [yes <code>]`: add AfriSovera's partition (empty, unformatted) to
-/// a healthy GPT disk as the plan says -- only with a matching backup on the USB stick and the
+/// a healthy GPT disk as the plan says, only with a matching backup on the USB stick and the
 /// owner's code. Without the code it shows the plan and the code, and writes nothing.
 pub fn install(which: &str, want: u64, given: Option<&str>) {
     let (ds, nd) = disks();
     let Some((dk, cap, bs)) = pick(which, &ds[..nd]) else {
-        crate::kprintln!("installpart: no disk \"{}\" here -- say nvme, sataN, ideN or emmc (see lsparts); nothing written", which);
+        crate::kprintln!("installpart: no disk \"{}\" here; say nvme, sataN, ideN or emmc (see lsparts); nothing written", which);
         return;
     };
     let lab = dk.label();
     let per = (bs / 512).max(1);
     crate::kprintln!("installpart: {}, {} MiB, AfriSovera's partition of {} MiB", label_str(&lab), cap / 2048, want);
     let Some(p) = show(&mut |k, o| dk.read(k, o), cap, bs, want) else {
-        crate::kprintln!("installpart: nothing written -- only a healthy GPT disk with room in a free entry can be changed (see the plan above)");
+        crate::kprintln!("installpart: nothing written; only a healthy GPT disk with room in a free entry can be changed (see the plan above)");
         return;
     };
     // the backup on the USB stick must be of this disk exactly as it is now
     let verdict = match backups() {
-        None => Err("there is no partition-table backup on a USB stick -- run tablebackup first"),
+        None => Err("there is no partition-table backup on a USB stick; run tablebackup first"),
         Some(count) => {
-            let mut v = Err("the USB stick's backup does not include this disk -- run tablebackup first");
+            let mut v = Err("the USB stick's backup does not include this disk; run tablebackup first");
             for i in 0..count {
                 let (l, c) = compare(i, &ds[..nd]);
                 if l == lab {
                     v = match c {
                         Cmp::Same(_) => Ok(()),
-                        Cmp::Changed(_) => Err("the table CHANGED since the backup -- put it back (tablerestore) or save it as it is now (tablebackup new) first"),
-                        _ => Err("the backup of this disk on the USB stick cannot be trusted -- run tablebackup again first"),
+                        Cmp::Changed(_) => Err("the table CHANGED since the backup; put it back (tablerestore) or save it as it is now (tablebackup new) first"),
+                        _ => Err("the backup of this disk on the USB stick cannot be trusted; run tablebackup again first"),
                     };
                 }
             }
@@ -901,7 +902,7 @@ pub fn install(which: &str, want: u64, given: Option<&str>) {
     match given {
         Some(c) if c.len() == 4 && u32::from_str_radix(c, 16).ok() == Some(want_code) => {}
         Some(_) => {
-            crate::kprintln!("installpart: that code does not fit this disk's table now -- nothing written");
+            crate::kprintln!("installpart: that code does not fit this disk's table now; nothing written");
             return;
         }
         None => {
@@ -911,11 +912,11 @@ pub fn install(which: &str, want: u64, given: Option<&str>) {
     }
     // both copies must hold the same entries before one entry is added to each
     let (Some(pc), Some(bc)) = (array_crc(dk, &p, per, p.elba, None), array_crc(dk, &p, per, p.belba, None)) else {
-        crate::kprintln!("installpart: a read FAILED -- nothing written");
+        crate::kprintln!("installpart: a read FAILED; nothing written");
         return;
     };
     if pc != bc {
-        crate::kprintln!("installpart: the two GPT copies hold different entries -- a damaged table is never changed; nothing written");
+        crate::kprintln!("installpart: the two GPT copies hold different entries; a damaged table is never changed; nothing written");
         return;
     }
     // the new entry: AfriSovera's type, a fresh random GUID, the planned blocks, the name
@@ -923,12 +924,12 @@ pub fn install(which: &str, want: u64, given: Option<&str>) {
     let (psec, bsec, eo) = (p.elba * per + off / 512, p.belba * per + off / 512, (off % 512) as usize);
     let mut s = [0u8; 512];
     if !dk.read(psec, &mut s) {
-        crate::kprintln!("installpart: a read FAILED -- nothing written");
+        crate::kprintln!("installpart: a read FAILED; nothing written");
         return;
     }
     let e = &mut s[eo..eo + p.esz as usize];
     if e[..16].iter().any(|&b| b != 0) {
-        crate::kprintln!("installpart: GPT entry {} is not free after all -- nothing written", p.slot);
+        crate::kprintln!("installpart: GPT entry {} is not free after all; nothing written", p.slot);
         return;
     }
     e.fill(0);
@@ -945,11 +946,11 @@ pub fn install(which: &str, want: u64, given: Option<&str>) {
         e[56 + 2 * i] = c;
     }
     let Some(ecrc) = array_crc(dk, &p, per, p.elba, Some((psec, &s))) else {
-        crate::kprintln!("installpart: a read FAILED -- nothing written");
+        crate::kprintln!("installpart: a read FAILED; nothing written");
         return;
     };
     let (Some(bh), Some(ph)) = (reheader(dk, p.alt, per, ecrc), reheader(dk, 1, per, ecrc)) else {
-        crate::kprintln!("installpart: a GPT header could not be read again -- nothing written");
+        crate::kprintln!("installpart: a GPT header could not be read again; nothing written");
         return;
     };
     // the backup copy first, then the primary: cut off half way, the firmware still finds a
@@ -963,7 +964,7 @@ pub fn install(which: &str, want: u64, given: Option<&str>) {
         && array_crc(dk, &p, per, p.elba, None) == Some(ecrc)
         && array_crc(dk, &p, per, p.belba, None) == Some(ecrc);
     if !back {
-        crate::kprintln!("installpart: writing or reading back FAILED -- the table as it was is on the USB stick (tablecheck)");
+        crate::kprintln!("installpart: writing or reading back FAILED; the table as it was is on the USB stick (tablecheck)");
         return;
     }
     crate::kprintln!(
@@ -999,13 +1000,13 @@ fn pick(which: &str, ds: &[(Disk, u64, u64)]) -> Option<(Disk, u64, u64)> {
 pub fn restore(which: &str, given: Option<&str>) {
     let (ds, nd) = disks();
     let Some((dk, cap, bs)) = pick(which, &ds[..nd]) else {
-        crate::kprintln!("tablerestore: no disk \"{}\" here -- say nvme or sataN (see lsparts); nothing written", which);
+        crate::kprintln!("tablerestore: no disk \"{}\" here; say nvme or sataN (see lsparts); nothing written", which);
         return;
     };
     let lab = dk.label();
     let name = label_str(&lab);
     let Some(count) = backups() else {
-        crate::kprintln!("tablerestore: no partition-table backup on a USB stick -- nothing to restore from; nothing written");
+        crate::kprintln!("tablerestore: no partition-table backup on a USB stick, so nothing to restore from; nothing written");
         return;
     };
     let mut found = None;
@@ -1022,15 +1023,15 @@ pub fn restore(which: &str, given: Option<&str>) {
     match c {
         Cmp::Changed(at) => crate::kprintln!("tablerestore: {}: CHANGED since the backup (first difference in sector {})", name, at),
         Cmp::Same(_) => {
-            crate::kprintln!("tablerestore: {}: already the same as its backup -- nothing to restore; nothing written", name);
+            crate::kprintln!("tablerestore: {}: already the same as its backup, so nothing to restore; nothing written", name);
             return;
         }
         Cmp::Other(now, then) => {
-            crate::kprintln!("tablerestore: {}: a different disk now ({} MiB, was {} MiB) -- a table is never put onto another disk; nothing written", name, now, then);
+            crate::kprintln!("tablerestore: {}: a different disk now ({} MiB, was {} MiB), and a table is never put onto another disk; nothing written", name, now, then);
             return;
         }
         _ => {
-            crate::kprintln!("tablerestore: {}: the copy on the USB stick cannot be trusted (damaged or unreadable) -- nothing written", name);
+            crate::kprintln!("tablerestore: {}: the copy on the USB stick cannot be trusted (damaged or unreadable); nothing written", name);
             return;
         }
     }
@@ -1038,7 +1039,7 @@ pub fn restore(which: &str, given: Option<&str>) {
     let base = BAK_AT + 1 + i * BAK_SLOT;
     let (mut r, mut s, mut t) = ([0u8; 512], [0u8; 512], [0u8; 512]);
     if !crate::xhci::msc_read(base, &mut r) {
-        crate::kprintln!("tablerestore: reading the USB stick FAILED -- nothing written");
+        crate::kprintln!("tablerestore: reading the USB stick FAILED; nothing written");
         return;
     }
     let nr = u32le(&r, 68) as usize;
@@ -1047,7 +1048,7 @@ pub fn restore(which: &str, given: Option<&str>) {
         3 => &[2, 1, 0],
         1 => &[0],
         _ => {
-            crate::kprintln!("tablerestore: the saved record has an unknown shape -- nothing written");
+            crate::kprintln!("tablerestore: the saved record has an unknown shape; nothing written");
             return;
         }
     };
@@ -1059,21 +1060,21 @@ pub fn restore(which: &str, given: Option<&str>) {
         k = if a.saturating_add(n) > cap { BAK_SLOT } else { k.saturating_add(n) };
     }
     if k > BAK_SLOT - 1 {
-        crate::kprintln!("tablerestore: the saved record does not fit this disk -- nothing written");
+        crate::kprintln!("tablerestore: the saved record does not fit this disk; nothing written");
         return;
     }
     // never over AfriSovera's own whole-disk files, never into a table that now lies elsewhere
     if !dk.read(0, &mut s) {
-        crate::kprintln!("tablerestore: a read FAILED -- nothing written");
+        crate::kprintln!("tablerestore: a read FAILED; nothing written");
         return;
     }
     if &s[..8] == b"AFRIVFS1" {
-        crate::kprintln!("tablerestore: {} now holds AfriSovera's own files (claimdisk) -- the old table would break them; nothing written", name);
+        crate::kprintln!("tablerestore: {} now holds AfriSovera's own files (claimdisk), and the old table would break them; nothing written", name);
         return;
     }
     if let Ok((now, nn, _)) = table_runs(dk, cap, bs) {
         if nn != nr || (0..nr).any(|j| now[j] != (runs[j].0, runs[j].1)) {
-            crate::kprintln!("tablerestore: the table on {} now lies in other sectors than the saved one -- restoring could overwrite data; nothing written", name);
+            crate::kprintln!("tablerestore: the table on {} now lies in other sectors than the saved one, so restoring could overwrite data; nothing written", name);
             return;
         }
     }
@@ -1082,7 +1083,7 @@ pub fn restore(which: &str, given: Option<&str>) {
     for &(a, n, at) in &runs[..nr] {
         for m in 0..n {
             if !dk.read(a + m, &mut t) || !crate::xhci::msc_read(at + m, &mut s) {
-                crate::kprintln!("tablerestore: a read FAILED -- nothing written");
+                crate::kprintln!("tablerestore: a read FAILED; nothing written");
                 return;
             }
             cur = crc_feed(cur, &t);
@@ -1096,7 +1097,7 @@ pub fn restore(which: &str, given: Option<&str>) {
     match given {
         Some(c) if c.len() == 4 && u32::from_str_radix(c, 16).ok() == Some(want_code) => {}
         Some(_) => {
-            crate::kprintln!("tablerestore: that code does not fit this disk's table now -- nothing written");
+            crate::kprintln!("tablerestore: that code does not fit this disk's table now; nothing written");
             return;
         }
         None => {
@@ -1117,11 +1118,11 @@ pub fn restore(which: &str, given: Option<&str>) {
         }
     }
     if !ok || !matches!(compare(i, &ds[..nd]).1, Cmp::Same(_)) {
-        crate::kprintln!("tablerestore: writing or reading back FAILED -- the saved copy is still on the USB stick; try again");
+        crate::kprintln!("tablerestore: writing or reading back FAILED; the saved copy is still on the USB stick, so try again");
         return;
     }
     crate::kprintln!(
-        "tablerestore: {}: the saved table is back -- {} sector(s) written, read back OK, tablecheck now says unchanged; no partition's own sectors were touched",
+        "tablerestore: {}: the saved table is back: {} sector(s) written, read back OK, tablecheck now says unchanged; no partition's own sectors were touched",
         name,
         written
     );
@@ -1136,7 +1137,7 @@ pub fn restore(which: &str, given: Option<&str>) {
     }
 }
 
-/// AfriSovera's own partition on a healthy GPT disk -- both headers and the entry array
+/// AfriSovera's own partition on a healthy GPT disk, both headers and the entry array
 /// CRC-checked, inside the usable area, overlapping no other entry, the only one of its type:
 /// (first 512-byte sector, 512-byte sectors). Quiet: asked by the driver at boot.
 fn ours(dk: Disk, cap512: u64, bs: u64) -> Option<(u64, u64)> {
@@ -1228,7 +1229,7 @@ pub fn format(which: &str, given: Option<&str>) {
         return;
     }
     let Some((dk, cap, bs)) = pick(which, &ds[..nd]) else {
-        crate::kprintln!("formatpart: no disk \"{}\" here -- say nvme, sataN, ideN or emmc (see lsparts); nothing written", which);
+        crate::kprintln!("formatpart: no disk \"{}\" here; say nvme, sataN, ideN or emmc (see lsparts); nothing written", which);
         return;
     };
     let lab = dk.label();
@@ -1242,58 +1243,59 @@ pub fn format(which: &str, given: Option<&str>) {
         Disk::Nvme if nv => {
             let (a, l) = crate::nvme::part();
             if l > 0 {
-                crate::kprintln!("formatpart: nvme already keeps AfriSovera's files in its partition at sector {} ({} MiB) -- nothing written", a, l / 2048);
+                crate::kprintln!("formatpart: nvme already keeps AfriSovera's files in its partition at sector {} ({} MiB); nothing written", a, l / 2048);
             } else {
-                crate::kprintln!("formatpart: nvme already holds AfriSovera's files on the whole disk (claimdisk) -- nothing written");
+                crate::kprintln!("formatpart: nvme already holds AfriSovera's files on the whole disk (claimdisk); nothing written");
             }
             return;
         }
         Disk::Sata(p) if sa.is_some_and(|x| x.0 == p) => {
             let (_, a, l) = sa.unwrap_or_default();
             if l > 0 {
-                crate::kprintln!("formatpart: {} already keeps AfriSovera's files in its partition at sector {} ({} MiB) -- nothing written", name, a, l / 2048);
+                crate::kprintln!("formatpart: {} already keeps AfriSovera's files in its partition at sector {} ({} MiB); nothing written", name, a, l / 2048);
             } else {
-                crate::kprintln!("formatpart: {} already holds AfriSovera's files on the whole disk (claimdisk) -- nothing written", name);
+                crate::kprintln!("formatpart: {} already holds AfriSovera's files on the whole disk (claimdisk); nothing written", name);
             }
             return;
         }
         Disk::Emmc if em => {
             let (a, l) = crate::sdhci::part();
             if l > 0 {
-                crate::kprintln!("formatpart: emmc already keeps AfriSovera's files in its partition at sector {} ({} MiB) -- nothing written", a, l / 2048);
+                crate::kprintln!("formatpart: emmc already keeps AfriSovera's files in its partition at sector {} ({} MiB); nothing written", a, l / 2048);
             } else {
-                crate::kprintln!("formatpart: emmc already holds AfriSovera's files on the whole disk (claimdisk) -- nothing written");
+                crate::kprintln!("formatpart: emmc already holds AfriSovera's files on the whole disk (claimdisk); nothing written");
             }
             return;
         }
         Disk::Ide(k) if id.is_some_and(|x| x.0 == k) => {
             let (_, a, l) = id.unwrap_or_default();
             if l > 0 {
-                crate::kprintln!("formatpart: {} already keeps AfriSovera's files in its partition at sector {} ({} MiB) -- nothing written", name, a, l / 2048);
+                crate::kprintln!("formatpart: {} already keeps AfriSovera's files in its partition at sector {} ({} MiB); nothing written", name, a, l / 2048);
             } else {
-                crate::kprintln!("formatpart: {} already holds AfriSovera's files on the whole disk (claimdisk) -- nothing written", name);
+                crate::kprintln!("formatpart: {} already holds AfriSovera's files on the whole disk (claimdisk); nothing written", name);
             }
             return;
         }
         Disk::Sata(_) | Disk::Emmc | Disk::Ide(_) if nv || sa.is_some() || id.is_some() || em || crate::sdhci::present() || crate::virtio_core::blk_present() => {
             // only one internal disk holds the files; formatting a second would be a disk nobody reads
-            crate::kprintln!("formatpart: the shell's files are already kept on another internal disk -- nothing written");
+            crate::kprintln!("formatpart: the shell's files are already kept on another internal disk; nothing written");
             return;
         }
         _ => {}
     }
     let Some((a, l)) = ours(dk, cap, bs) else {
-        crate::kprintln!("formatpart: {} has no AfriSovera partition in a healthy GPT -- make one with installpart first; nothing written", name);
+        crate::kprintln!("formatpart: {} has no AfriSovera partition in a healthy GPT; make one with installpart first; nothing written", name);
         return;
     };
-    // the VFS needs its superblock + two sectors per file; the disk self-test uses sector 100
+    // the VFS needs its superblock + two sectors per file; the disk self-test uses sector 100; files
+    // over 512 bytes also need sectors 128-871 (a smaller partition saves them as 512 bytes)
     if l < 128 {
-        crate::kprintln!("formatpart: AfriSovera's partition is only {} sector(s), too small -- nothing written", l);
+        crate::kprintln!("formatpart: AfriSovera's partition is only {} sector(s), too small; nothing written", l);
         return;
     }
     let mut s = [0u8; 512];
     if !dk.read(a, &mut s) {
-        crate::kprintln!("formatpart: a read FAILED -- nothing written");
+        crate::kprintln!("formatpart: a read FAILED; nothing written");
         return;
     }
     let want_code = !crc_feed(crc_feed(crc_feed(0xFFFF_FFFF, &a.to_le_bytes()), &l.to_le_bytes()), &s) & 0xFFFF;
@@ -1305,7 +1307,7 @@ pub fn format(which: &str, given: Option<&str>) {
     match given {
         Some(c) if c.len() == 4 && u32::from_str_radix(c, 16).ok() == Some(want_code) => {}
         Some(_) => {
-            crate::kprintln!("formatpart: that code does not fit this partition now -- nothing written");
+            crate::kprintln!("formatpart: that code does not fit this partition now; nothing written");
             return;
         }
         None => {
@@ -1570,13 +1572,13 @@ pub fn install_disk(which: &str, given: Option<&str>) {
         return;
     }
     let Some((dk, cap, bs)) = pick(which, &ds[..nd]) else {
-        crate::kprintln!("installdisk: no disk \"{}\" here -- say nvme, sataN, ideN or emmc (see lsparts); nothing written", which);
+        crate::kprintln!("installdisk: no disk \"{}\" here; say nvme, sataN, ideN or emmc (see lsparts); nothing written", which);
         return;
     };
     let lab = dk.label();
     let name = label_str(&lab);
     let Some(file) = crate::uefi::own_image() else {
-        crate::kprintln!("installdisk: the boot file was not kept at start-up (see the [pc] own boot file line) -- nothing written");
+        crate::kprintln!("installdisk: the boot file was not kept at start-up (see the [pc] own boot file line); nothing written");
         return;
     };
     // the shell's files must not be on this disk now (they are about to be erased), and only
@@ -1592,7 +1594,7 @@ pub fn install_disk(which: &str, given: Option<&str>) {
         Disk::Ide(_) => nv || sa.is_some() || crate::ide::present() || crate::virtio_core::blk_present(),
     };
     if busy {
-        crate::kprintln!("installdisk: the shell's files are kept on an internal disk now -- installdisk is for a disk AfriSovera does not use yet; nothing written");
+        crate::kprintln!("installdisk: the shell's files are kept on an internal disk now; installdisk is for a disk AfriSovera does not use yet; nothing written");
         return;
     }
     let per = (bs / 512).max(1);
@@ -1605,23 +1607,23 @@ pub fn install_disk(which: &str, given: Option<&str>) {
     let esp = (align, ESP_MIB * align);
     let afri = (esp.0 + esp.1, last.saturating_sub(esp.0 + esp.1) / align * align);
     if bs > 4096 || afri.1 < 256 * align {
-        crate::kprintln!("installdisk: {} is {} MiB -- too small (AfriSovera needs at least {} MiB); nothing written", name, mib(blocks), ESP_MIB + 258);
+        crate::kprintln!("installdisk: {} is {} MiB, too small (AfriSovera needs at least {} MiB); nothing written", name, mib(blocks), ESP_MIB + 258);
         return;
     }
     let Some(want_code) = disk_code(dk, cap, bs) else {
-        crate::kprintln!("installdisk: a read FAILED -- nothing written");
+        crate::kprintln!("installdisk: a read FAILED; nothing written");
         return;
     };
     match given {
         Some(c) if c.len() == 4 && u32::from_str_radix(c, 16).ok() == Some(want_code) => {}
         Some(_) => {
-            crate::kprintln!("installdisk: that code does not fit this disk as it is now -- nothing written");
+            crate::kprintln!("installdisk: that code does not fit this disk as it is now; nothing written");
             return;
         }
         None => {
             crate::kprintln!("installdisk: {}, {} MiB, {}-byte blocks. What is on it now:", name, mib(blocks), bs);
             show(&mut |k, o| dk.read(k, o), cap, bs, 0);
-            crate::kprintln!("installdisk: EVERYTHING on this disk will be ERASED -- Windows or anything else on it is lost for good.");
+            crate::kprintln!("installdisk: EVERYTHING on this disk will be ERASED; Windows or anything else on it is lost for good.");
             crate::kprintln!(
                 "installdisk: it gets an EFI system partition ({} MiB, the boot file, {} KiB) and AfriSovera's partition ({} MiB); the PC then starts AfriSovera from it with no USB stick",
                 ESP_MIB,
@@ -1639,7 +1641,7 @@ pub fn install_disk(which: &str, given: Option<&str>) {
     w.block(1, &[]);
     w.block(blocks - 1, &[]);
     if !write_esp(&mut w, esp.0, esp.1, bs, file) {
-        crate::kprintln!("installdisk: writing the EFI system partition FAILED after {} sectors -- the disk holds no usable table now", w.n);
+        crate::kprintln!("installdisk: writing the EFI system partition FAILED after {} sectors; the disk holds no usable table now", w.n);
         return;
     }
     // AfriSovera's partition: its first block cleared (formatted below)
@@ -1761,5 +1763,5 @@ pub fn install_disk(which: &str, given: Option<&str>) {
         return;
     }
     crate::kprintln!("installdisk: AfriSovera's partition formatted ({} MiB); the shell's files are kept there from now on", l / 2048);
-    crate::kprintln!("installdisk: DONE -- take the USB stick out and restart (reboot): the PC starts AfriSovera from this disk");
+    crate::kprintln!("installdisk: DONE; take the USB stick out and restart (reboot): the PC starts AfriSovera from this disk");
 }

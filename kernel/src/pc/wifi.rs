@@ -36,7 +36,7 @@ fn fam_line(f: Fam) -> &'static str {
         Fam::Rtw89 => "Linux driver rtw89; needs Realtek's firmware file loaded first",
         Fam::Rtlwifi => "Linux driver rtlwifi; needs Realtek's firmware file loaded first",
         Fam::Mt76 => "Linux driver mt76 (mt7921e); needs MediaTek's firmware files loaded first",
-        Fam::Ath9k => "Linux driver ath9k; needs NO firmware file -- the easiest chip to write a first Wi-Fi driver for",
+        Fam::Ath9k => "Linux driver ath9k; needs NO firmware file; the easiest chip to write a first Wi-Fi driver for",
         Fam::Ath10k => "Linux driver ath10k; needs Qualcomm's firmware files loaded first",
         Fam::Ath11k => "Linux driver ath11k; needs Qualcomm's firmware files loaded first",
         Fam::Brcm => "Broadcom; needs Broadcom's firmware (often only a closed driver exists)",
@@ -119,7 +119,7 @@ enum UFam {
 
 fn ufam_line(f: UFam) -> &'static str {
     match f {
-        UFam::AthHtc => "Linux driver ath9k_htc; its firmware file is OPEN source (free to ship) -- the easiest USB stick to write a first Wi-Fi driver for",
+        UFam::AthHtc => "Linux driver ath9k_htc; its firmware file is OPEN source (free to ship); the easiest USB stick to write a first Wi-Fi driver for",
         UFam::Rt2800 => "Linux driver rt2800usb; needs Ralink's firmware file (free to redistribute)",
         UFam::Mt7601 => "Linux driver mt7601u; needs MediaTek's firmware file loaded first",
         UFam::Mt76u => "Linux driver mt76 (USB); needs MediaTek's firmware files loaded first",
@@ -170,7 +170,7 @@ fn driven(v: u16, d: u16) -> Option<&'static str> {
     None
 }
 
-const OWNER: &str = "  for the owner: AfriSovera has no Wi-Fi driver yet -- connect with a network cable (an Intel or Realtek Ethernet port) or a USB Ethernet adapter; the chip named above tells us which Wi-Fi driver to write first";
+const OWNER: &str = "  for the owner: AfriSovera has no Wi-Fi driver yet; connect with a network cable (an Intel or Realtek Ethernet port) or a USB Ethernet adapter; the chip named above tells us which Wi-Fi driver to write first";
 
 /// `wifi`: every network controller on the PCI buses, named; read only.
 pub fn show() {
@@ -198,15 +198,15 @@ pub fn show() {
                 nets += 1;
                 if let Some((name, fam)) = known {
                     wifis += 1;
-                    crate::kprintln!("  {:02x}:{:02x}.{} {:04x}:{:04x} Wi-Fi: {} -- {}", b, d, f, v, dv, name, fam_line(fam));
+                    crate::kprintln!("  {:02x}:{:02x}.{} {:04x}:{:04x} Wi-Fi: {}; {}", b, d, f, v, dv, name, fam_line(fam));
                 } else if class == 0x0280 {
                     wifis += 1;
-                    crate::kprintln!("  {:02x}:{:02x}.{} {:04x}:{:04x} Wi-Fi or other network chip, not in AfriSovera's list -- tell us this id", b, d, f, v, dv);
+                    crate::kprintln!("  {:02x}:{:02x}.{} {:04x}:{:04x} Wi-Fi or other network chip, not in AfriSovera's list; tell us this id", b, d, f, v, dv);
                 } else if class == 0x0200 {
                     // an RTL8139 before the C+ (revision 0x20) has no descriptor rings: not driven
                     let old8139 = v == 0x10EC && dv == 0x8139 && cfg32(b, d, f, 0x08) & 0xFF < 0x20;
                     match if old8139 { None } else { driven(v, dv) } {
-                        Some(n) => crate::kprintln!("  {:02x}:{:02x}.{} {:04x}:{:04x} Ethernet (cable): {} -- AfriSovera drives it", b, d, f, v, dv, n),
+                        Some(n) => crate::kprintln!("  {:02x}:{:02x}.{} {:04x}:{:04x} Ethernet (cable): {}; AfriSovera drives it", b, d, f, v, dv, n),
                         None => crate::kprintln!("  {:02x}:{:02x}.{} {:04x}:{:04x} Ethernet (cable): no driver in AfriSovera yet", b, d, f, v, dv),
                     }
                 } else {
@@ -226,10 +226,10 @@ pub fn show() {
             match stick(v, p) {
                 Some((name, fam)) => {
                     sticks += 1;
-                    crate::kprintln!("  usb {:04x}:{:04x} Wi-Fi stick: {} -- {}", v, p, name, ufam_line(fam));
+                    crate::kprintln!("  usb {:04x}:{:04x} Wi-Fi stick: {}; {}", v, p, name, ufam_line(fam));
                 }
                 None => crate::kprintln!(
-                    "  usb {:04x}:{:04x} (class {:02x}/{:02x}) not a Wi-Fi stick in AfriSovera's list -- tell us this id if it is one",
+                    "  usb {:04x}:{:04x} (class {:02x}/{:02x}) not a Wi-Fi stick in AfriSovera's list; tell us this id if it is one",
                     v, p, dc, ic
                 ),
             }
@@ -280,19 +280,19 @@ pub fn lookup(arg: &str) {
     };
     if form == Some(true) {
         match stick(v, d) {
-            Some((name, fam)) => crate::kprintln!("wifi: usb {:04x}:{:04x} is {} (USB Wi-Fi stick) -- {}", v, d, name, ufam_line(fam)),
-            None => crate::kprintln!("wifi: usb {:04x}:{:04x} is not in AfriSovera's list of USB Wi-Fi sticks -- tell us this id", v, d),
+            Some((name, fam)) => crate::kprintln!("wifi: usb {:04x}:{:04x} is {} (USB Wi-Fi stick); {}", v, d, name, ufam_line(fam)),
+            None => crate::kprintln!("wifi: usb {:04x}:{:04x} is not in AfriSovera's list of USB Wi-Fi sticks; tell us this id", v, d),
         }
         return;
     }
     let usb_stick = if form.is_none() { stick(v, d) } else { None };
     if let Some((name, fam)) = chip(v, d) {
-        crate::kprintln!("wifi: {:04x}:{:04x} is {} (Wi-Fi) -- {}", v, d, name, fam_line(fam));
+        crate::kprintln!("wifi: {:04x}:{:04x} is {} (Wi-Fi); {}", v, d, name, fam_line(fam));
     } else if let Some(n) = driven(v, d) {
         crate::kprintln!("wifi: {:04x}:{:04x} is {}, a wired Ethernet chip AfriSovera drives (a network cable works)", v, d, n);
     } else if let Some((name, fam)) = usb_stick {
-        crate::kprintln!("wifi: usb {:04x}:{:04x} is {} (USB Wi-Fi stick) -- {}", v, d, name, ufam_line(fam));
+        crate::kprintln!("wifi: usb {:04x}:{:04x} is {} (USB Wi-Fi stick); {}", v, d, name, ufam_line(fam));
     } else {
-        crate::kprintln!("wifi: {:04x}:{:04x} is not in AfriSovera's list of network chips -- tell us this id", v, d);
+        crate::kprintln!("wifi: {:04x}:{:04x} is not in AfriSovera's list of network chips; tell us this id", v, d);
     }
 }

@@ -99,7 +99,7 @@ pub fn list() {
 }
 
 pub fn check() {
-    crate::kprintln!("board check: PC map -- COM1 0x3f8, CMOS RTC 0x70, fw_cfg 0x510 (I/O ports): ok");
+    crate::kprintln!("board check: PC map (COM1 0x3f8, CMOS RTC 0x70, fw_cfg 0x510, I/O ports): ok");
 }
 
 pub fn machine_selftest() {
@@ -107,5 +107,5 @@ pub fn machine_selftest() {
 }
 
 pub fn resolve_selftest() {
-    crate::kprintln!("resolve selftest: no device tree on a PC -- nothing to resolve");
+    crate::kprintln!("resolve selftest: no device tree on a PC, so nothing to resolve");
 }

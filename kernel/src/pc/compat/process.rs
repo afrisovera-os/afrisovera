@@ -6,7 +6,7 @@
 
 fn absent(what: &str) {
     crate::kprintln!(
-        "[pc] {}: not available on this PC yet -- the ARM EL0 programs are AArch64 code; the PC's own ring-3 processes ran at boot (see the [pc] ring 3 / IPC / scheduler lines)",
+        "[pc] {}: not available on this PC yet, because the ARM EL0 programs are AArch64 code; the PC's own ring-3 processes ran at boot (see the [pc] ring 3 / IPC / scheduler lines)",
         what
     );
 }

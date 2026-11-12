@@ -60,6 +60,10 @@ static mut IO: Pair = Pair { tail: 0, head: 0, phase: 1, cid: 0 };
 static mut BAR: u64 = 0;
 static mut DSTRD: u64 = 0;
 static mut PCI_AT: (u8, u8, u8) = (0, 0, 0);
+/// CAP.TO in ms: how long the controller may take to (un)set ready.
+static mut TO_MS: u64 = 500;
+/// Controller resets after an I/O command got no answer (shown by lsnvme once there was one).
+static mut RESETS: u32 = 0;
 static mut READY: bool = false; // controller up, I/O queues created
 static mut USABLE: bool = false; // namespace 1 may hold the VFS
 /// Namespace 1 is blank (sector 0 all zero): usable only after `claimdisk nvme`.
@@ -116,14 +120,19 @@ fn doorbell(q: u64, completion: bool) -> u64 {
     0x1000 + (2 * q + completion as u64) * (4 << unsafe { DSTRD })
 }
 
+/// Poll `done` for up to 5 seconds of real time (a spin count ran from a fifth of a second to
+/// seconds, depending on the CPU, and a command that runs out of it now costs a controller reset).
 fn wait(mut done: impl FnMut() -> bool) -> bool {
-    for _ in 0..50_000_000u64 {
+    let (t0, hz) = (crate::timer::cycles(), crate::timer::hz().max(1));
+    loop {
         if done() {
             return true;
         }
+        if crate::timer::cycles().wrapping_sub(t0) / (hz / 1000).max(1) > 5000 {
+            return false;
+        }
         core::hint::spin_loop();
     }
-    false
 }
 
 /// Submit one command on queue `q` (0 = admin, 1 = I/O) and poll for its completion.
@@ -144,23 +153,138 @@ fn submit(q: u64, mut cmd: [u32; 16]) -> Option<u16> {
         pair.tail = (pair.tail + 1) % QN;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         w32(doorbell(q, false), pair.tail as u32);
-        let slot = cq.add(pair.head);
-        let phase = pair.phase;
-        if !wait(|| (read_volatile(slot)[3] >> 16) & 1 == phase) {
-            crate::kprintln!("[nvme] queue {} command {:#x} timed out", q, cmd[0] & 0xFF);
-            return None;
+        // A command that timed out earlier may still complete later, in the slot this command
+        // would read first. Its status belongs to it, not to this command: take it off the queue
+        // and keep waiting, so one slow command never shifts every later status by one.
+        for _ in 0..QN {
+            let slot = cq.add(pair.head);
+            let phase = pair.phase;
+            if !wait(|| (read_volatile(slot)[3] >> 16) & 1 == phase) {
+                crate::kprintln!("[nvme] queue {} command {:#x} timed out", q, cmd[0] & 0xFF);
+                return None;
+            }
+            let e = read_volatile(slot);
+            pair.head += 1;
+            if pair.head == QN {
+                pair.head = 0;
+                pair.phase ^= 1;
+            }
+            w32(doorbell(q, true), pair.head as u32);
+            let status = ((e[3] >> 17) & 0x7FFF) as u16;
+            if e[3] & 0xFFFF == cid as u32 {
+                return Some(status);
+            }
+            crate::kprintln!(
+                "[nvme] a late completion for command id {} (status {:#x}) set aside while waiting for {}",
+                e[3] & 0xFFFF, status, cid
+            );
         }
-        let e = read_volatile(slot);
-        pair.head += 1;
-        if pair.head == QN {
-            pair.head = 0;
-            pair.phase ^= 1;
+        crate::kprintln!("[nvme] queue {} command {:#x}: no completion of its own", q, cmd[0] & 0xFF);
+        None
+    }
+}
+
+/// Wait until CSTS.RDY is `want`, up to CAP.TO; false on a timeout or a fatal status (CFS).
+fn ready_wait(want: u32) -> bool {
+    // SAFETY: scalar read of boot-time state.
+    let (t0, hz, to_ms) = (crate::timer::cycles(), crate::timer::hz().max(1), unsafe { TO_MS });
+    loop {
+        let st = r32(R_CSTS);
+        if st & 1 == want || st & 2 != 0 {
+            return st & 1 == want && st & 2 == 0;
         }
-        w32(doorbell(q, true), pair.head as u32);
-        if e[3] & 0xFFFF != cid as u32 {
-            crate::kprintln!("[nvme] completion for id {} while waiting for {}", e[3] & 0xFFFF, cid);
+        if crate::timer::cycles().wrapping_sub(t0) / (hz / 1000).max(1) > to_ms {
+            return false;
         }
-        Some(((e[3] >> 17) & 0x7FFF) as u16)
+        core::hint::spin_loop();
+    }
+}
+
+/// Reset the controller and start it again with empty admin queues. Err(1): it did not stop,
+/// Err(2): it did not become ready.
+fn start_admin() -> Result<(), u8> {
+    // fresh queues: the completion phase bits must start at 0
+    // SAFETY: the controller is not using them (it is being reset); single core.
+    unsafe {
+        core::ptr::write_bytes(addr_of_mut!(ACQ), 0, 1);
+        core::ptr::write_bytes(addr_of_mut!(IOCQ), 0, 1);
+        core::ptr::write_bytes(addr_of_mut!(ASQ), 0, 1);
+        core::ptr::write_bytes(addr_of_mut!(IOSQ), 0, 1);
+        *addr_of_mut!(ADMIN) = Pair { tail: 0, head: 0, phase: 1, cid: 0 };
+        *addr_of_mut!(IO) = Pair { tail: 0, head: 0, phase: 1, cid: 0 };
+    }
+    // Reset: disable, wait for not-ready, then point the admin queues and enable.
+    w32(R_CC, 0);
+    if !ready_wait(0) {
+        return Err(1);
+    }
+    w32(R_AQA, ((QN as u32 - 1) << 16) | (QN as u32 - 1));
+    w64(R_ASQ, addr_of!(ASQ) as u64);
+    w64(R_ACQ, addr_of!(ACQ) as u64);
+    w32(R_CC, 1 | 6 << 16 | 4 << 20); // EN, NVM command set, 4 KiB pages, 64 B SQE, 16 B CQE
+    if !ready_wait(1) {
+        return Err(2);
+    }
+    Ok(())
+}
+
+/// The I/O queue pair: completion queue 1, then submission queue 1 feeding it.
+fn make_io_queues() -> bool {
+    let mut c = cmd(OPC_CREATE_CQ, 0, addr_of!(IOCQ) as u64);
+    c[10] = ((QN as u32 - 1) << 16) | 1;
+    c[11] = 1; // physically contiguous, no interrupts (polled)
+    if submit(0, c) != Some(0) {
+        crate::kprintln!("[nvme] create I/O completion queue failed");
+        return false;
+    }
+    let mut c = cmd(OPC_CREATE_SQ, 0, addr_of!(IOSQ) as u64);
+    c[10] = ((QN as u32 - 1) << 16) | 1;
+    c[11] = 1 << 16 | 1; // completion queue 1, physically contiguous
+    if submit(0, c) != Some(0) {
+        crate::kprintln!("[nvme] create I/O submission queue failed");
+        return false;
+    }
+    true
+}
+
+/// An I/O command got no answer (a hung controller, or one that reported a fatal status):
+/// before 12 Nov every later command then waited in vain too, so the disk was lost until a
+/// restart. Now the controller is reset (CC.EN off and on, which also ends whatever it still
+/// held) and both queue pairs are made again, as Linux nvme_reset_ctrl does; the command that
+/// failed stays failed, the next one runs on the fresh queues. The read-ahead is dropped.
+fn restart(why: &str) -> bool {
+    // SAFETY: single core, kernel context; no command is in flight while this runs.
+    unsafe {
+        READY = false;
+        RA_N = 0;
+        RESETS = RESETS.saturating_add(1);
+    }
+    crate::kprintln!("[nvme] {}: resetting the controller and making its queues again (CSTS {:#x})", why, r32(R_CSTS));
+    let ok = match start_admin() {
+        Ok(()) => make_io_queues(),
+        Err(_) => false,
+    };
+    if ok {
+        // SAFETY: as above.
+        unsafe { READY = true };
+        crate::kprintln!("[nvme] controller ready again after the reset; the read-ahead was dropped");
+    } else {
+        crate::kprintln!("[nvme] the controller did not come back after the reset (CSTS {:#x}): the NVMe disk is not used until the next start", r32(R_CSTS));
+    }
+    ok
+}
+
+/// `nvmereset`: reset the controller by hand (the same path a command with no answer takes),
+/// then read block 0 to show the fresh queues work. Nothing is written.
+pub fn reset_cmd() {
+    // SAFETY: scalar reads.
+    if unsafe { BAR == 0 || !READY } {
+        crate::kprintln!("nvmereset: no ready NVMe controller");
+        return;
+    }
+    if restart("nvmereset asked for it") {
+        let ok = io(OPC_READ, 0);
+        crate::kprintln!("nvmereset: read of block 0 after the reset {}", if ok { "worked" } else { "FAILED" });
     }
 }
 
@@ -201,43 +325,18 @@ pub fn init() {
     }
     // CAP.TO: how long the controller may take to (un)set ready, in 500 ms units (real SSDs
     // can take seconds after a warm reboot)
-    let to_ms = ((cap >> 24) & 0xFF).max(1) * 500;
-    let ready_wait = |want: u32| {
-        let (t0, hz) = (crate::timer::cycles(), crate::timer::hz().max(1));
-        loop {
-            let st = r32(R_CSTS);
-            if st & 1 == want || st & 2 != 0 {
-                return st & 1 == want && st & 2 == 0;
-            }
-            if (crate::timer::cycles() - t0) / (hz / 1000).max(1) > to_ms {
-                return false;
-            }
-            core::hint::spin_loop();
+    // SAFETY: as above.
+    unsafe { TO_MS = ((cap >> 24) & 0xFF).max(1) * 500 };
+    match start_admin() {
+        Err(1) => {
+            crate::kprintln!("[nvme] controller did not stop");
+            return;
         }
-    };
-    // fresh queues: the completion phase bits must start at 0
-    // SAFETY: the controller is not using them (it is being reset).
-    unsafe {
-        core::ptr::write_bytes(addr_of_mut!(ACQ), 0, 1);
-        core::ptr::write_bytes(addr_of_mut!(IOCQ), 0, 1);
-        core::ptr::write_bytes(addr_of_mut!(ASQ), 0, 1);
-        core::ptr::write_bytes(addr_of_mut!(IOSQ), 0, 1);
-        *addr_of_mut!(ADMIN) = Pair { tail: 0, head: 0, phase: 1, cid: 0 };
-        *addr_of_mut!(IO) = Pair { tail: 0, head: 0, phase: 1, cid: 0 };
-    }
-    // Reset: disable, wait for not-ready, then point the admin queues and enable.
-    w32(R_CC, 0);
-    if !ready_wait(0) {
-        crate::kprintln!("[nvme] controller did not stop");
-        return;
-    }
-    w32(R_AQA, ((QN as u32 - 1) << 16) | (QN as u32 - 1));
-    w64(R_ASQ, addr_of!(ASQ) as u64);
-    w64(R_ACQ, addr_of!(ACQ) as u64);
-    w32(R_CC, 1 | 6 << 16 | 4 << 20); // EN, NVM command set, 4 KiB pages, 64 B SQE, 16 B CQE
-    if !ready_wait(1) {
-        crate::kprintln!("[nvme] controller did not become ready (CSTS {:#x})", r32(R_CSTS));
-        return;
+        Err(_) => {
+            crate::kprintln!("[nvme] controller did not become ready (CSTS {:#x})", r32(R_CSTS));
+            return;
+        }
+        Ok(()) => {}
     }
     let buf = addr_of!(DATA) as u64;
     // Identify controller (CNS 1): the model number at bytes 24..64.
@@ -263,19 +362,7 @@ pub fn init() {
     let fmt = (id[26] & 0xF) as usize;
     let lbads = id[128 + fmt * 4 + 2];
     let lba_bytes = 1u64 << lbads;
-    // The I/O queue pair: completion queue 1, then submission queue 1 feeding it.
-    let mut c = cmd(OPC_CREATE_CQ, 0, addr_of!(IOCQ) as u64);
-    c[10] = ((QN as u32 - 1) << 16) | 1;
-    c[11] = 1; // physically contiguous, no interrupts (polled)
-    if submit(0, c) != Some(0) {
-        crate::kprintln!("[nvme] create I/O completion queue failed");
-        return;
-    }
-    let mut c = cmd(OPC_CREATE_SQ, 0, addr_of!(IOSQ) as u64);
-    c[10] = ((QN as u32 - 1) << 16) | 1;
-    c[11] = 1 << 16 | 1; // completion queue 1, physically contiguous
-    if submit(0, c) != Some(0) {
-        crate::kprintln!("[nvme] create I/O submission queue failed");
+    if !make_io_queues() {
         return;
     }
     // SAFETY: as above.
@@ -287,9 +374,9 @@ pub fn init() {
     }
     let vs = r32(R_VS);
     // 512-byte sectors are what the VFS speaks; 1, 2 and 4 KiB blocks (4 KiB is common on real
-    // SSDs) hold several of them -- read_sector / write_sector map onto the block (see `per`)
+    // SSDs) hold several of them; read_sector / write_sector map onto the block (see `per`)
     let usable = if !matches!(lba_bytes, 512 | 1024 | 2048 | 4096) {
-        crate::kprintln!("[nvme] namespace 1 uses {}-byte blocks -- not used for storage", lba_bytes);
+        crate::kprintln!("[nvme] namespace 1 uses {}-byte blocks: not used for storage", lba_bytes);
         false
     } else {
         // an internal disk is used on its own only if it is already ours; a blank one waits
@@ -396,7 +483,10 @@ fn rw(opc: u8, lba: u64, k: u32, buf: u64) -> bool {
             crate::kprintln!("[nvme] {} of {} blocks at {} refused (status {:#x})", if opc == OPC_READ { "read" } else { "write" }, k, lba, s);
             false
         }
-        None => false,
+        None => {
+            restart("a command got no answer");
+            false
+        }
     }
 }
 
@@ -516,7 +606,10 @@ fn io(opc: u8, lba: u64) -> bool {
             crate::kprintln!("[nvme] {} of block {} failed (status {:#x})", if opc == OPC_READ { "read" } else { "write" }, lba, s);
             false
         }
-        None => false,
+        None => {
+            restart("a command got no answer");
+            false
+        }
     }
 }
 
@@ -789,7 +882,10 @@ pub fn list() {
         crate::kprintln!("  reads: {} sector(s), {} from the read-ahead, {} multi-block command(s), {} single ({})", r.0, r.1, r.2, r.3, word(mr));
         crate::kprintln!("  writes: {} sector(s), {} multi-block command(s), {} single ({})", w.0, w.1, w.2, word(mw));
         // SAFETY: scalar reads.
-        let (tr, t) = unsafe { (TRUN, TSTATS) };
+        let (tr, t, rs) = unsafe { (TRUN, TSTATS, RESETS) };
+        if rs != 0 {
+            crate::kprintln!("  controller resets (a command got no answer, or nvmereset): {}", rs);
+        }
         if tr != 0 {
             crate::kprintln!(
                 "  big copies (installdisk, bootcopy): {} run(s) in one command, {} sector(s), each read back ({})",

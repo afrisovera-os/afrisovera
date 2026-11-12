@@ -169,7 +169,7 @@ fn date() {
 }
 
 fn not_here(cmd: &str, what: &str) {
-    crate::kprintln!("{}: {} -- not present on this PC (x86-64); see 'cpuinfo'", cmd, what);
+    crate::kprintln!("{}: {} is not present on this PC (x86-64); see 'cpuinfo'", cmd, what);
 }
 
 /// Answer `line` on the PC if its ARM form needs ARM-only hardware. Returns true when it
@@ -185,6 +185,10 @@ pub fn intercept(line: &str) -> bool {
         "lsahci" => crate::ahci::list(),
         "lside" => crate::ide::list(),
         "lsnvme" => crate::nvme::list(),
+        // reset the NVMe controller by hand (the path a command with no answer takes), then read block 0
+        "nvmereset" => crate::nvme::reset_cmd(),
+        // reset a USB controller by hand and find its devices again; `xhcireset fault` tests the automatic path
+        "xhcireset" => crate::xhci::reset_cmd(_rest),
         "lsparts" => crate::gpt::list(0),
         // the firmware's boot entries as read at power-on (nothing is changed)
         "bootentries" => crate::bootent::list(),
@@ -216,7 +220,7 @@ pub fn intercept(line: &str) -> bool {
                 (Some("yes"), Some(c), None, _) => crate::esp::copy(Some(c)),
                 (Some("remove"), None, _, _) => crate::esp::remove(None),
                 (Some("remove"), Some("yes"), Some(c), None) => crate::esp::remove(Some(c)),
-                _ => crate::kprintln!("bootcopy: type bootcopy (or bootcopy remove) -- it shows what would change and the code; nothing is written without the code"),
+                _ => crate::kprintln!("bootcopy: type bootcopy (or bootcopy remove): it shows what would change and the code; nothing is written without the code"),
             }
         }
         // AfriSovera's own firmware boot entry (Boot#### at the END of BootOrder), on the owner's code; and out again
@@ -227,7 +231,7 @@ pub fn intercept(line: &str) -> bool {
                 (Some("yes"), Some(c), None, _) => crate::bootent::add(Some(c)),
                 (Some("remove"), None, _, _) => crate::bootent::remove(None),
                 (Some("remove"), Some("yes"), Some(c), None) => crate::bootent::remove(Some(c)),
-                _ => crate::kprintln!("bootentry: type bootentry (or bootentry remove) -- it shows what would change and the code; nothing is written without the code"),
+                _ => crate::kprintln!("bootentry: type bootentry (or bootentry remove): it shows what would change and the code; nothing is written without the code"),
             }
         }
         // AfriSovera started ONCE at the next restart from its own entry (BootNext), on the owner's code
@@ -236,7 +240,7 @@ pub fn intercept(line: &str) -> bool {
             match (w.next(), w.next(), w.next()) {
                 (None, _, _) => crate::bootent::next(None),
                 (Some("yes"), Some(c), None) => crate::bootent::next(Some(c)),
-                _ => crate::kprintln!("bootnext: type bootnext -- it shows what would change and the code; nothing is written without the code"),
+                _ => crate::kprintln!("bootnext: type bootnext: it shows what would change and the code; nothing is written without the code"),
             }
         }
         "installplan" => match if _rest.is_empty() { Ok(1024) } else { _rest.parse::<u64>() } {
@@ -291,7 +295,11 @@ pub fn intercept(line: &str) -> bool {
         "report" => crate::report::command(_rest),
         "lse1000" => crate::e1000::list(),
         "lsrtl" => crate::rtl8169::list(),
+        "lsusb" if _rest == "late" => crate::xhci::late_check(),
+        "lsusb" if _rest == "late0" => crate::xhci::late0_check(),
         "lsusb" => crate::xhci::list(),
+        "lsps2" if _rest == "late" => crate::ps2::late_check(),
+        "lsps2" if _rest == "cfg" => crate::ps2::cfg_check(),
         "lsps2" => crate::ps2::list(),
         "accel" => crate::ps2::accel_cmd(_rest),
         "usbaddr" => crate::xhci::addr_cmd(_rest),
@@ -303,6 +311,7 @@ pub fn intercept(line: &str) -> bool {
         }
         "history" => crate::uart::history_list(),
         "scrollback" => crate::conback::info(),
+        "lshda" if _rest == "late" => crate::hda::late_check(),
         "lshda" => crate::hda::list(),
         // the PC's own microphone (HD Audio input): record up to 3 s, then play it back
         "mic" => crate::hda::mic_cmd(_rest),
@@ -323,7 +332,7 @@ pub fn intercept(line: &str) -> bool {
                 "ide" => crate::ide::claim(),
                 "sd" | "emmc" => crate::sdhci::claim(),
                 _ => {
-                    crate::kprintln!("claimdisk: say which -- claimdisk nvme, claimdisk sata, claimdisk ide, claimdisk sd or claimdisk emmc (only a BLANK disk can be claimed)");
+                    crate::kprintln!("claimdisk: say which: claimdisk nvme, claimdisk sata, claimdisk ide, claimdisk sd or claimdisk emmc (only a BLANK disk can be claimed)");
                     return true;
                 }
             };
@@ -390,7 +399,7 @@ pub fn intercept(line: &str) -> bool {
         "gicinfo" | "giccinfo" | "gicid" => {
             // SAFETY: IA32_APIC_BASE is architectural on every x86-64 CPU.
             let base = unsafe { rdmsr(0x1B) };
-            crate::kprintln!("{}: no GIC on a PC -- interrupts go through the local APIC", cmd);
+            crate::kprintln!("{}: no GIC on a PC; interrupts go through the local APIC", cmd);
             crate::kprintln!(
                 "{}: local APIC base 0x{:x}, {} mode, globally {}",
                 cmd,

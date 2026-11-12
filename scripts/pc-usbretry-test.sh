@@ -27,7 +27,7 @@ grade() { # grade <serial>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     count() { printf '%s\n' "$S" | grep -acE "$1"; }
     has '\[xhci\] port [0-9]+: USB hub [0-9a-f]{4}:[0-9a-f]{4} ' || _f "the hub was not set up at boot"
     has '^(afrisovera> )?usb: test: the next 1 addressing try will fail at the first descriptor read \(completion code 4\)$' ||

@@ -6,5 +6,5 @@ pub fn dist_base() -> usize { 0 }
 pub fn cpu_base() -> usize { 0 }
 
 pub fn describe_bases() {
-    crate::kprintln!("gic: none on this PC -- interrupts go through the local APIC (see 'gicinfo')");
+    crate::kprintln!("gic: none on this PC; interrupts go through the local APIC (see 'gicinfo')");
 }

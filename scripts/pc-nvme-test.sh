@@ -3,9 +3,12 @@
 #
 # Boots the PC kernel (q35 + UEFI) twice with a blank 8 MiB NVMe drive next to the UEFI boot
 # disk (AHCI port 0). Boot 1 writes a file and syncs; boot 2 must read it back from the NVMe
-# drive. Also graded: the blank drive is NOT taken on its own -- an internal disk is used only
-# once the owner types `claimdisk nvme` -- the boot disk is found and LEFT ALONE,
+# drive. Also graded: the blank drive is NOT taken on its own; an internal disk is used only
+# once the owner types `claimdisk nvme`; the boot disk is found and LEFT ALONE,
 # and `lsnvme` reports the controller, the namespace and its model.
+# 12 Nov 2026: boot 1 also runs `nvmereset` after claimdisk (the controller reset a command with
+# no answer now takes): the controller must come back, read block 0, and the file written after
+# the reset must still be there in boot 2.
 # Runs the same in an ARM walk and a PC walk: it builds the PC kernel and puts the PC shim
 # (scripts/lib/pc-arch) on PATH itself.
 #   scripts/pc-nvme-test.sh              # grader selftest, then the two QEMU boots
@@ -36,6 +39,11 @@ grade() { # grade <boot1 log> <boot2 log>
     hasA '^  namespace 1: 16384 blocks of 512 B \(8 MiB\)  \(blank: claimdisk nvme to use it\)$' ||
         _f "lsnvme does not show namespace 1 as blank and unclaimed"
     hasA '^  model: QEMU NVMe Ctrl$' || _f "lsnvme does not report the model from Identify Controller"
+    hasA '^\[nvme\] nvmereset asked for it: resetting the controller and making its queues again \(CSTS 0x[0-9a-f]+\)$' ||
+        _f "boot 1: nvmereset did not reset the controller"
+    hasA '^\[nvme\] controller ready again after the reset; the read-ahead was dropped$' ||
+        _f "boot 1: the controller did not come back after nvmereset"
+    hasA '^nvmereset: read of block 0 after the reset worked$' || _f "boot 1: no read worked after nvmereset"
     hasA '^\[vfs\] synced [0-9]+ files to disk$' || _f "boot 1: the VFS never synced to the NVMe drive"
     hasB '^\[vfs\] VFS restored from disk: [0-9]+ files$' || _f "boot 2: the VFS was not restored from the NVMe drive"
     hasB '^HELLO-NVME-5NOV$' || _f "boot 2: notes.txt did not come back from the NVMe drive"
@@ -59,6 +67,10 @@ nvme: controller 00:03.0 BAR0 0xc000000000, NVMe 1.4, ready
 afrisovera> claimdisk nvme
 claimdisk: the blank nvme disk now holds AfriSovera's files
 [vfs] synced 17 files to disk
+afrisovera> nvmereset
+[nvme] nvmereset asked for it: resetting the controller and making its queues again (CSTS 0x1)
+[nvme] controller ready again after the reset; the read-ahead was dropped
+nvmereset: read of block 0 after the reset worked
 afrisovera> write notes.txt HELLO-NVME-5NOV
 [vfs] synced 18 files to disk"
 B2="[nvme] namespace 1: 16384 blocks of 512 B (8 MiB), ours (AFRIVFS1): used for storage
@@ -89,15 +101,21 @@ selftest() {
     arm not-restored red "$B1" "$(printf '%s\n' "$B2" | grep -v restored)"
     arm not-persisted red "$B1" "$(printf '%s\n' "$B2" | grep -v '^HELLO')"
     arm command-failed red "$B1" "$(printf '%s\n[nvme] read of block 3 failed (status 0x2)' "$B2")"
+    arm no-reset red "$(printf '%s
+' "$B1" | grep -v 'resetting the controller')" "$B2"
+    arm reset-not-back red "$(printf '%s
+' "$B1" | grep -v 'ready again after the reset')" "$B2"
+    arm reset-read-failed red "$(printf '%s
+' "$B1" | sed 's/after the reset worked/after the reset FAILED/')" "$B2"
     arm empty red "" ""
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 13 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 16 ]
 }
 
 echo "== PC NVMe disk (PC track step 3) =="
-if ! selftest; then echo "PC NVMe TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC NVMe SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC NVMe TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC NVMe SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }
@@ -126,11 +144,11 @@ boot() { # boot <serial port> <log> <shell commands...>
     kill "$q" 2> /dev/null
     wait "$q" 2> /dev/null
 }
-echo "  --- boot 1: lsnvme, claimdisk nvme, write notes.txt, sync ---"
-boot 4986 "$W/boot1.log" "lsnvme" "claimdisk nvme" "write notes.txt HELLO-NVME-5NOV" "sync"
+echo "  --- boot 1: lsnvme, claimdisk nvme, nvmereset, write notes.txt, sync ---"
+boot 4986 "$W/boot1.log" "lsnvme" "claimdisk nvme" "nvmereset" "write notes.txt HELLO-NVME-5NOV" "sync"
 echo "  --- boot 2: the same disk, cat notes.txt ---"
 boot 4988 "$W/boot2.log" "cat notes.txt"
-cat "$W/boot1.log" "$W/boot2.log" | tr -d '\r' | grep -aE '^\[nvme\]|^nvme:|^  (namespace|model)|^\[vfs\]|HELLO' | sed 's/^/  | /'
+cat "$W/boot1.log" "$W/boot2.log" | tr -d '\r' | grep -aE '^\[nvme\]|^nvme:|^nvmereset:|^  (namespace|model)|^\[vfs\]|HELLO' | sed 's/^/  | /'
 
 echo "  --- grading ---"
 if grade "$W/boot1.log" "$W/boot2.log"; then

@@ -52,11 +52,14 @@ wait "$QPID" 2>/dev/null
 
 grep -aE "kernel heap|arena |used  |high-water|below frames|on exhaustion|heap arena|heap: |\[ok\]|\[FAIL\]|bump checks held|managed |\[heap grow\]" "$OUT" | sed 's/^/  /'
 
-python3 - "$OUT" kernel/src/heap.rs kernel/src/shell.rs <<'PY'
+python3 - "$OUT" kernel/src/heap.rs kernel/src/shell.rs kernel/src/shell_exec_cmds.rs <<'PY'
 import re, sys
 s     = open(sys.argv[1], "rb").read().decode("latin1")
 heap  = open(sys.argv[2], encoding="utf-8").read()
 shell = open(sys.argv[3], encoding="utf-8").read()
+# since the exec split, shell::exec's arms also live in shell_exec_cmds.rs, which shell.rs
+# pulls in with include!: read both as one, as the compiler does
+shell += open(sys.argv[4], encoding="utf-8").read()
 
 def fail(msg):
     print(f"HEAP TEST FAILED ({msg})"); sys.exit(1)

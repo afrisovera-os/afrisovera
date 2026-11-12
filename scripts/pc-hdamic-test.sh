@@ -27,7 +27,7 @@ grade() { # grade <serial log>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqxE "$1"; }
+    has() { grep -aqxE "$1" <<< "$S"; }
     local P='pin [0-9]+ \((speaker|headphones|line out)\) <- DAC [0-9]+'
     local I='pin [0-9]+ \((built-in )?microphone\)( -> (mixer|selector) [0-9]+)* -> ADC [0-9]+'
     has "\[hda\] Intel ICH9 HD Audio at [0-9a-f]{2}:[0-9a-f]{2}\.[0-7] \(8086:293e\), codec 0 1af4:[0-9a-f]{4}, sound out through $P" ||

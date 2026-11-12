@@ -16,6 +16,9 @@ fn cmd_help(line: &str, cmd: &str, rest: &str) {
     crate::kprintln!("  sleep <ms>      block for ~<ms> milliseconds (timer-driven)");
     crate::kprintln!("  sysinfo         one-screen system dashboard (cores/mem/net/...)");
     crate::kprintln!("  bench           measure on-device SHA-256 throughput (hi-res timer)");
+    crate::kprintln!("  fbcon time      time one console line with a scroll");
+    crate::kprintln!("  fbcon blit      time a console-sized and a whole-screen blit");
+    crate::kprintln!("  fbcon wm        time window create and present, with clear and screen checks");
     crate::kprintln!("  rand [n]        n random 32-bit values (hardware-seeded PRNG)");
     crate::kprintln!("  uuid            generate a random v4 UUID (from the CSPRNG)");
     crate::kprintln!("  factor <n>      prime-factorize a positive integer");
@@ -2305,5 +2308,14735 @@ fn cmd_insertword(line: &str, cmd: &str, rest: &str) {
             }
         }
         _ => crate::kprintln!("usage: insertword <n> <word> <text>"),
+    }
+}
+
+/// `issemiperfect` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_issemiperfect(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n (n >= 1) is a SEMIPERFECT (pseudoperfect) number: n
+    // equals the sum of some SUBSET of its own proper divisors. 6 = 1+2+3,
+    // 12 = 2+4+6 (or 1+2+3+6), 18, 20, 24, 28 ARE (every PERFECT number is
+    // trivially semiperfect via its full divisor set); 1, 2, 3, 4, 5, 7, 8, 9,
+    // 10, 11 are NOT (an ABUNDANT number that is NOT semiperfect, like 70, is
+    // called WEIRD). 0/1 knapsack subset-sum over a reachable-sum bitset,
+    // capped at 100000 to bound the O(divisors * n) DP; distinct from perfect
+    // (sigma == 2n only) and ispractical (every 1..=n reachable, a much
+    // stronger property).
+    const CAP: u64 = 100_000;
+    match rest.trim().parse::<u64>() {
+        Ok(0) => crate::kprintln!("issemiperfect: 0 is NOT semiperfect (needs n >= 1)"),
+        Ok(n) if n <= CAP => {
+            let mut divs = [0u64; 128];
+            let mut ndiv = 0usize;
+            let mut d = 1u64;
+            while d <= n / d {
+                if n % d == 0 && d != n {
+                    if ndiv < divs.len() {
+                        divs[ndiv] = d;
+                        ndiv += 1;
+                    }
+                    let e = n / d;
+                    if e != d && e != n && ndiv < divs.len() {
+                        divs[ndiv] = e;
+                        ndiv += 1;
+                    }
+                }
+                d += 1;
+            }
+            let mut reachable = [false; (CAP as usize) + 1];
+            reachable[0] = true;
+            for i in 0..ndiv {
+                let dv = divs[i] as usize;
+                let mut s = n as usize;
+                while s >= dv {
+                    if reachable[s - dv] {
+                        reachable[s] = true;
+                    }
+                    s -= 1;
+                }
+            }
+            if reachable[n as usize] {
+                crate::kprintln!("issemiperfect: {} IS semiperfect", n);
+            } else {
+                crate::kprintln!("issemiperfect: {} is NOT semiperfect", n);
+            }
+        }
+        Ok(_) => crate::kprintln!("issemiperfect: n too large (max 100000)"),
+        Err(_) => crate::kprintln!("usage: issemiperfect <n>"),
+    }
+}
+
+/// `partition` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_partition(line: &str, cmd: &str, rest: &str) {
+    // Number of INTEGER PARTITIONS of n (ways to write n as a sum of
+    // positive integers, order-independent): p(0)=1,1,2,3,5,7,11,15,22,
+    // 30,42,... via the classic coin-change-style DP. Distinct from `bell`
+    // (SET partitions of a labelled set, which grow far faster). Honest u64
+    // overflow guard. Partition counts are MONOTONIC (p[j] <= p[nn] for
+    // j <= nn), so no intermediate exceeds the answer -- checked_add only
+    // fires when p(n) itself overflows.
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            const MAX: usize = 512;
+            let nn = n as usize;
+            if nn >= MAX {
+                // p(n) overflows u64 well before n reaches 512; also guards
+                // the fixed array.
+                crate::kprintln!("partition: p({}) overflows u64", n);
+            } else {
+                let mut p = [0u64; MAX];
+                p[0] = 1;
+                let mut overflow = false;
+                'outer: for k in 1..=nn {
+                    for j in k..=nn {
+                        match p[j].checked_add(p[j - k]) {
+                            Some(v) => p[j] = v,
+                            None => {
+                                overflow = true;
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                if overflow {
+                    crate::kprintln!("partition: p({}) overflows u64", n);
+                } else {
+                    crate::kprintln!("partition: p({}) = {}", n, p[nn]);
+                }
+            }
+        }
+        Err(_) => crate::kprintln!("usage: partition <n>"),
+    }
+}
+
+/// `bench` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_bench(line: &str, cmd: &str, rest: &str) {
+    // On-device SHA-256 throughput, timed by the hi-res physical counter.
+    const ITERS: u64 = 512;
+    const BUFSZ: usize = 4096;
+    let buf = [0x5Au8; BUFSZ];
+    let f = crate::timer::hz();
+    let mut acc = 0u8; // fold results so the loop can't be optimized away
+    let start = crate::timer::cycles();
+    for _ in 0..ITERS {
+        let h = crate::sha256::digest(&buf);
+        acc ^= h[0];
+    }
+    let end = crate::timer::cycles();
+    let cyc = end.wrapping_sub(start);
+    let us = if f > 0 { cyc.saturating_mul(1_000_000) / f } else { 0 };
+    let total_bytes = ITERS * BUFSZ as u64;
+    let mibps = if us > 0 {
+        total_bytes.saturating_mul(1_000_000) / us / (1024 * 1024)
+    } else {
+        0
+    };
+    crate::kprintln!(
+        "bench: sha256 {} iters x {} bytes = {} KiB in {} us ({} MiB/s) [chk {:#04x}]",
+        ITERS, BUFSZ, total_bytes / 1024, us, mibps, acc
+    );
+}
+
+/// `hapaxf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_hapaxf(line: &str, cmd: &str, rest: &str) {
+    // List the HAPAX words of a whole VFS FILE -- those occurring EXACTLY ONCE across the
+    // file (newlines treated as whitespace) -- in first-occurrence order, single-spaced.
+    // The file analogue of `hapax`. Distinct from wordfreqf (MOST frequent word), rarewordf
+    // (the single LEAST frequent word), and uniqwordsf (the distinct-word COUNT). Case-
+    // sensitive; the distinct-word table caps at 64. Reports "(none)" if every word repeats.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: hapaxf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("hapaxf: no such file: {}", name),
+            Some(s) => {
+                let mut words: [&str; 64] = [""; 64];
+                let mut counts = [0u32; 64];
+                let mut nw = 0usize;
+                for w in s.split_whitespace() {
+                    let mut idx = None;
+                    for i in 0..nw {
+                        if words[i] == w {
+                            idx = Some(i);
+                            break;
+                        }
+                    }
+                    match idx {
+                        Some(i) => counts[i] = counts[i].saturating_add(1),
+                        None => {
+                            if nw < words.len() {
+                                words[nw] = w;
+                                counts[nw] = 1;
+                                nw += 1;
+                            }
+                        }
+                    }
+                }
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                for i in 0..nw {
+                    if counts[i] == 1 {
+                        if len > 0 && len < buf.len() {
+                            buf[len] = b' ';
+                            len += 1;
+                        }
+                        for &c in words[i].as_bytes() {
+                            if len < buf.len() {
+                                buf[len] = c;
+                                len += 1;
+                            }
+                        }
+                    }
+                }
+                if len == 0 {
+                    crate::kprintln!("hapaxf: (none)");
+                } else {
+                    crate::kprintln!(
+                        "hapaxf: {}",
+                        core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `rwordsf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rwordsf(line: &str, cmd: &str, rest: &str) {
+    // Print each line of a VFS file with its WORD ORDER reversed -- the file
+    // analogue of rwords (inline). Distinct from revf (reverses the CHARACTERS
+    // of each line), tac (reverses the LINE order), and rev. Lines are newline-
+    // joined into one output.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: rwordsf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("rwordsf: no such file: {}", name),
+            Some(s) => {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                let mut firstline = true;
+                for line in s.lines() {
+                    if !firstline && len < buf.len() {
+                        buf[len] = b'\n';
+                        len += 1;
+                    }
+                    firstline = false;
+                    let mut toks: [&str; 64] = [""; 64];
+                    let mut nt = 0usize;
+                    for w in line.split_whitespace() {
+                        if nt < 64 {
+                            toks[nt] = w;
+                            nt += 1;
+                        }
+                    }
+                    for i in (0..nt).rev() {
+                        if i != nt - 1 && len < buf.len() {
+                            buf[len] = b' ';
+                            len += 1;
+                        }
+                        for &c in toks[i].as_bytes() {
+                            if len < buf.len() {
+                                buf[len] = c;
+                                len += 1;
+                            }
+                        }
+                    }
+                }
+                crate::kprintln!(
+                    "rwordsf: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `swapwords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_swapwords(line: &str, cmd: &str, rest: &str) {
+    // Swap the i-th and j-th (1-based) whitespace words of the text. "swapwords 1 3 a
+    // b c d" -> "c b a d". Same index, or an out-of-range index, leaves the words
+    // unchanged (output is single-spaced). Distinct from swapwordpairs (swaps ADJACENT
+    // pairs), swapfirstlast (only first<->last), and rwords (reverses ALL word order).
+    let mut parts = rest.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(is), Some(js), Some(text)) => {
+            let i = is.parse::<usize>().ok().filter(|&k| k >= 1);
+            let j = js.parse::<usize>().ok().filter(|&k| k >= 1);
+            match (i, j) {
+                (Some(i), Some(j)) => {
+                    let mut words = [""; 64];
+                    let mut nw = 0usize;
+                    for w in text.split_whitespace() {
+                        if nw < words.len() {
+                            words[nw] = w;
+                            nw += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if i <= nw && j <= nw {
+                        words.swap(i - 1, j - 1);
+                    }
+                    let mut buf = [0u8; 512];
+                    let mut len = 0usize;
+                    for wi in 0..nw {
+                        if wi > 0 && len < buf.len() {
+                            buf[len] = b' ';
+                            len += 1;
+                        }
+                        for &c in words[wi].as_bytes() {
+                            if len < buf.len() {
+                                buf[len] = c;
+                                len += 1;
+                            }
+                        }
+                    }
+                    crate::kprintln!(
+                        "swapwords: {}",
+                        core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                    );
+                }
+                _ => crate::kprintln!("usage: swapwords <i> <j> <text>"),
+            }
+        }
+        _ => crate::kprintln!("usage: swapwords <i> <j> <text>"),
+    }
+}
+
+/// `hapax` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_hapax(line: &str, cmd: &str, rest: &str) {
+    // List the HAPAX words -- those occurring EXACTLY ONCE in the inline text -- in
+    // first-occurrence order, single-spaced ("the cat the dog cat" -> "dog"). The word-
+    // level list of hapax legomena. Distinct from firstunique (first non-repeating
+    // CHARACTER), rareword (the single least-frequent word), distinctwords (lists ALL
+    // distinct words), and uniqwords (the FILE distinct-word COUNT). Case-sensitive; the
+    // distinct-word table caps at 64. Reports "(none)" if every word repeats.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: hapax <text>");
+    } else {
+        let mut words: [&str; 64] = [""; 64];
+        let mut counts = [0u32; 64];
+        let mut nw = 0usize;
+        for w in rest.split_whitespace() {
+            let mut idx = None;
+            for i in 0..nw {
+                if words[i] == w {
+                    idx = Some(i);
+                    break;
+                }
+            }
+            match idx {
+                Some(i) => counts[i] = counts[i].saturating_add(1),
+                None => {
+                    if nw < words.len() {
+                        words[nw] = w;
+                        counts[nw] = 1;
+                        nw += 1;
+                    }
+                }
+            }
+        }
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for i in 0..nw {
+            if counts[i] == 1 {
+                if len > 0 && len < buf.len() {
+                    buf[len] = b' ';
+                    len += 1;
+                }
+                for &c in words[i].as_bytes() {
+                    if len < buf.len() {
+                        buf[len] = c;
+                        len += 1;
+                    }
+                }
+            }
+        }
+        if len == 0 {
+            crate::kprintln!("hapax: (none)");
+        } else {
+            crate::kprintln!("hapax: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+        }
+    }
+}
+
+/// `rotwords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rotwords(line: &str, cmd: &str, rest: &str) {
+    // Circular LEFT-rotate the WORD sequence by n: output = words[k..] ++
+    // words[0..k] where k = n mod word_count, so n >= count wraps. "1 a b c d"
+    // -> "b c d a". The word-level analogue of rotate (which rotates CHARACTERS);
+    // distinct from rwords (which REVERSES word order) and sortbylen.
+    match rest.find(' ') {
+        Some(i) => {
+            let num_s = &rest[..i];
+            let text = &rest[i + 1..];
+            match num_s.parse::<u64>() {
+                Ok(n) => {
+                    let mut toks: [&str; 64] = [""; 64];
+                    let mut nt = 0usize;
+                    for w in text.split_whitespace() {
+                        if nt < 64 {
+                            toks[nt] = w;
+                            nt += 1;
+                        }
+                    }
+                    if nt == 0 {
+                        crate::kprintln!("usage: rotwords <n> <text>");
+                    } else {
+                        let k = (n % nt as u64) as usize;
+                        let mut buf = [0u8; 512];
+                        let mut m = 0usize;
+                        let mut first = true;
+                        for idx in (k..nt).chain(0..k) {
+                            if !first && m < buf.len() {
+                                buf[m] = b' ';
+                                m += 1;
+                            }
+                            first = false;
+                            for &c in toks[idx].as_bytes() {
+                                if m < buf.len() {
+                                    buf[m] = c;
+                                    m += 1;
+                                }
+                            }
+                        }
+                        crate::kprintln!(
+                            "rotwords: {}",
+                            core::str::from_utf8(&buf[..m]).unwrap_or("?")
+                        );
+                    }
+                }
+                Err(_) => crate::kprintln!("usage: rotwords <n> <text>"),
+            }
+        }
+        None => crate::kprintln!("usage: rotwords <n> <text>"),
+    }
+}
+
+/// `sort` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_sort(line: &str, cmd: &str, rest: &str) {
+    // Lexicographically (byte-order) sort the whitespace-separated args.
+    let mut toks: [&str; 64] = [""; 64];
+    let mut nt = 0;
+    for t in rest.split_whitespace() {
+        if nt < 64 {
+            toks[nt] = t;
+            nt += 1;
+        }
+    }
+    if nt == 0 {
+        crate::kprintln!("usage: sort <word> <word> ...");
+    } else {
+        // Insertion sort, ascending by byte order (&str < &str compares bytes).
+        for i in 1..nt {
+            let mut j = i;
+            while j > 0 && toks[j] < toks[j - 1] {
+                toks.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let push = |bytes: &[u8], buf: &mut [u8; 512], len: &mut usize| {
+            for &c in bytes {
+                if *len < buf.len() {
+                    buf[*len] = c;
+                    *len += 1;
+                }
+            }
+        };
+        push(b"sorted:", &mut buf, &mut len);
+        for t in &toks[..nt] {
+            push(b" ", &mut buf, &mut len);
+            push(t.as_bytes(), &mut buf, &mut len);
+        }
+        crate::kprintln!("{}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `sortdesc` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_sortdesc(line: &str, cmd: &str, rest: &str) {
+    // Lexicographically (byte-order) sort the whitespace-separated args DESCENDING
+    // -- the reverse of `sort` (ascending). "sortdesc c a b -> c b a", "sortdesc
+    // banana apple cherry -> cherry banana apple". Distinct from `sort` (ascending)
+    // and `sortbylen` (by word LENGTH); same spelling KEY, reversed direction.
+    let mut toks: [&str; 64] = [""; 64];
+    let mut nt = 0;
+    for t in rest.split_whitespace() {
+        if nt < 64 {
+            toks[nt] = t;
+            nt += 1;
+        }
+    }
+    if nt == 0 {
+        crate::kprintln!("usage: sortdesc <word> <word> ...");
+    } else {
+        // Insertion sort, DESCENDING by byte order (flip the comparison).
+        for i in 1..nt {
+            let mut j = i;
+            while j > 0 && toks[j] > toks[j - 1] {
+                toks.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let push = |bytes: &[u8], buf: &mut [u8; 512], len: &mut usize| {
+            for &c in bytes {
+                if *len < buf.len() {
+                    buf[*len] = c;
+                    *len += 1;
+                }
+            }
+        };
+        push(b"sorted:", &mut buf, &mut len);
+        for t in &toks[..nt] {
+            push(b" ", &mut buf, &mut len);
+            push(t.as_bytes(), &mut buf, &mut len);
+        }
+        crate::kprintln!("{}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `sortbylen` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_sortbylen(line: &str, cmd: &str, rest: &str) {
+    // STABLE-sort the whitespace-separated words by ascending LENGTH (shortest
+    // first); words of equal length keep their input order. Distinct from `sort`
+    // (alphabetical byte-order) and `sortchars` (sorts the characters within the
+    // text); a different sort KEY (word length, not spelling).
+    let mut toks: [&str; 64] = [""; 64];
+    let mut nt = 0;
+    for t in rest.split_whitespace() {
+        if nt < 64 {
+            toks[nt] = t;
+            nt += 1;
+        }
+    }
+    if nt == 0 {
+        crate::kprintln!("usage: sortbylen <word> <word> ...");
+    } else {
+        // Insertion sort keyed on length; strict `<` keeps equal-length words
+        // in input order (stable).
+        for i in 1..nt {
+            let mut j = i;
+            while j > 0 && toks[j].len() < toks[j - 1].len() {
+                toks.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let push = |bytes: &[u8], buf: &mut [u8; 512], len: &mut usize| {
+            for &c in bytes {
+                if *len < buf.len() {
+                    buf[*len] = c;
+                    *len += 1;
+                }
+            }
+        };
+        push(b"sortbylen:", &mut buf, &mut len);
+        for t in &toks[..nt] {
+            push(b" ", &mut buf, &mut len);
+            push(t.as_bytes(), &mut buf, &mut len);
+        }
+        crate::kprintln!("{}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `middleword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_middleword(line: &str, cmd: &str, rest: &str) {
+    // Emit the MIDDLE word(s) of the inline text: an odd word count gives the
+    // single middle word ("alpha beta gamma" -> "beta"), an even count gives
+    // the TWO middle words ("a b c d" -> "b c"), mirroring middlechar's even/
+    // odd convention. The word-level analogue of middlechar (which centers a
+    // character string); distinct from wordn (the Nth word by explicit index)
+    // and swapfirstlast.
+    let mut toks = [""; 64];
+    let mut n = 0usize;
+    for w in rest.split_whitespace() {
+        if n < toks.len() {
+            toks[n] = w;
+            n += 1;
+        } else {
+            break; // cap at 64 words (matches rwords/swapfirstlast)
+        }
+    }
+    if n == 0 {
+        crate::kprintln!("usage: middleword <text>");
+    } else {
+        let (lo, hi) = if n % 2 == 1 {
+            ((n - 1) / 2, (n - 1) / 2) // one middle word
+        } else {
+            (n / 2 - 1, n / 2) // two middle words
+        };
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for i in lo..=hi {
+            if i > lo && len < buf.len() {
+                buf[len] = b' ';
+                len += 1;
+            }
+            for &c in toks[i].as_bytes() {
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+        }
+        crate::kprintln!(
+            "middleword: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `hapaxcharsf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_hapaxcharsf(line: &str, cmd: &str, rest: &str) {
+    // List ALL characters that occur EXACTLY ONCE across a whole VFS FILE (case-sensitive,
+    // every byte counts including spaces/newlines), in first-occurrence order with no
+    // separator -- the file analogue of `hapaxchars`. `hapaxcharsf motd` lists the motd's
+    // once-only characters. Distinct from vowelcount/casecount (which COUNT) and uniqchars.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: hapaxcharsf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("hapaxcharsf: no such file: {}", name),
+            Some(s) => {
+                let src = s.as_bytes();
+                let mut count = [0u32; 256];
+                for &b in src {
+                    count[b as usize] = count[b as usize].saturating_add(1);
+                }
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                let mut emitted = [false; 256];
+                for &b in src {
+                    if count[b as usize] == 1 && !emitted[b as usize] && len < buf.len() {
+                        buf[len] = b;
+                        len += 1;
+                        emitted[b as usize] = true;
+                    }
+                }
+                if len == 0 {
+                    crate::kprintln!("hapaxcharsf: (none)");
+                } else {
+                    crate::kprintln!(
+                        "hapaxcharsf: {}",
+                        core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `delannoy` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_delannoy(line: &str, cmd: &str, rest: &str) {
+    // The DELANNOY number D(m,n): the number of lattice paths from (0,0) to (m,n) using
+    // steps right (1,0), up (0,1), and diagonal (1,1). Recurrence D(m,n) = D(m-1,n) +
+    // D(m,n-1) + D(m-1,n-1) with D(0,j)=D(i,0)=1. D(1,1)=3, D(2,2)=13, D(3,3)=63 (the
+    // "central" Delannoy numbers), D(3,4)=129. Related to the Schroeder numbers; distinct
+    // from binomial/catalan. Computed with a rolling u128 row; m,n capped at 30.
+    let mut it = rest.split_whitespace();
+    match (
+        it.next().and_then(|s| s.parse::<u64>().ok()),
+        it.next().and_then(|s| s.parse::<u64>().ok()),
+    ) {
+        (Some(m), Some(n)) if m <= 30 && n <= 30 => {
+            let (mi, ni) = (m as usize, n as usize);
+            let mut prev = [1u128; 31]; // row 0: D(0, j) = 1
+            for _ in 1..=mi {
+                let mut cur = [0u128; 31];
+                cur[0] = 1; // D(i, 0) = 1
+                for j in 1..=ni {
+                    cur[j] = cur[j - 1] + prev[j] + prev[j - 1];
+                }
+                prev = cur;
+            }
+            crate::kprintln!("delannoy: D({}, {}) = {}", m, n, prev[ni]);
+        }
+        (Some(_), Some(_)) => crate::kprintln!("delannoy: m,n must be <= 30"),
+        _ => crate::kprintln!("usage: delannoy <m> <n>"),
+    }
+}
+
+/// `swapwordpairs` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_swapwordpairs(line: &str, cmd: &str, rest: &str) {
+    // Swap ADJACENT whitespace-delimited WORD pairs ("alpha beta gamma delta"
+    // -> "beta alpha delta gamma"); at an odd word count the lone final word
+    // stays in place ("a b c" -> "b a c"). The word-level analogue of swappairs
+    // (which swaps adjacent CHARACTER pairs); distinct from rwords (reverses the
+    // whole word ORDER) and swapfirstlast (only the first/last words).
+    let mut toks = [""; 64];
+    let mut n = 0usize;
+    for w in rest.split_whitespace() {
+        if n < toks.len() {
+            toks[n] = w;
+            n += 1;
+        } else {
+            break; // cap at 64 words (matches rwords/swapfirstlast)
+        }
+    }
+    if n == 0 {
+        crate::kprintln!("usage: swapwordpairs <text>");
+    } else {
+        // Swap toks[0]<->toks[1], toks[2]<->toks[3], ...; odd tail unchanged.
+        let mut i = 0usize;
+        while i + 1 < n {
+            toks.swap(i, i + 1);
+            i += 2;
+        }
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for j in 0..n {
+            if j > 0 && len < buf.len() {
+                buf[len] = b' ';
+                len += 1;
+            }
+            for &c in toks[j].as_bytes() {
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+        }
+        crate::kprintln!(
+            "swapwordpairs: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `hapaxchars` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_hapaxchars(line: &str, cmd: &str, rest: &str) {
+    // List ALL characters that occur EXACTLY ONCE in the inline text (case-sensitive), in
+    // first-occurrence order, with no separator -- the character-level analogue of `hapax`
+    // (which lists once-only WORDS). "mississippi" -> "m", "hello" -> "heo", "swiss" -> "wi";
+    // "aabbcc" (every char repeats) -> "(none)". Distinct from firstunique (the FIRST such
+    // char only), uniqchars (ALL distinct bytes, keeping repeats' first copy), and
+    // firstrepeat. A 256-entry count table is scanned, then the text once more.
+    if rest.is_empty() {
+        crate::kprintln!("usage: hapaxchars <text>");
+    } else {
+        let src = rest.as_bytes();
+        let mut count = [0u32; 256];
+        for &b in src {
+            count[b as usize] = count[b as usize].saturating_add(1);
+        }
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut emitted = [false; 256];
+        for &b in src {
+            if count[b as usize] == 1 && !emitted[b as usize] && len < buf.len() {
+                buf[len] = b;
+                len += 1;
+                emitted[b as usize] = true;
+            }
+        }
+        if len == 0 {
+            crate::kprintln!("hapaxchars: (none)");
+        } else {
+            crate::kprintln!(
+                "hapaxchars: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `swapfirstlast` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_swapfirstlast(line: &str, cmd: &str, rest: &str) {
+    // Swap the FIRST and LAST whitespace-delimited words, leaving the middle
+    // words unchanged: "alpha beta gamma delta" -> "delta beta gamma alpha".
+    // The word-level analogue of swapends (which swaps the first/last
+    // CHARACTER); distinct from rwords (reverses ALL words), rotwords (rotates
+    // the word order), and swappairs (swaps adjacent char pairs). A single
+    // word is emitted unchanged.
+    let mut toks = [""; 64];
+    let mut n = 0usize;
+    for w in rest.split_whitespace() {
+        if n < toks.len() {
+            toks[n] = w;
+            n += 1;
+        } else {
+            break; // cap at 64 words (matches rwords/rotwords)
+        }
+    }
+    if n == 0 {
+        crate::kprintln!("usage: swapfirstlast <text>");
+    } else {
+        toks.swap(0, n - 1); // first <-> last (no-op when n == 1)
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for i in 0..n {
+            if i > 0 && len < buf.len() {
+                buf[len] = b' ';
+                len += 1;
+            }
+            for &c in toks[i].as_bytes() {
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+        }
+        crate::kprintln!(
+            "swapfirstlast: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `unique` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_unique(line: &str, cmd: &str, rest: &str) {
+    // Remove ALL duplicate words (keep first occurrence); distinct from dedup.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: unique <words>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut spans = [(0usize, 0usize); 64];
+        let mut count = 0usize;
+        for word in rest.split_whitespace() {
+            let wb = word.as_bytes();
+            // Already emitted?
+            let seen = spans[..count]
+                .iter()
+                .any(|&(s, l)| &buf[s..s + l] == wb);
+            if !seen && count < spans.len() {
+                if len > 0 && len < buf.len() {
+                    buf[len] = b' ';
+                    len += 1;
+                }
+                let start = len;
+                for &c in wb {
+                    if len < buf.len() {
+                        buf[len] = c;
+                        len += 1;
+                    }
+                }
+                spans[count] = (start, len - start);
+                count += 1;
+            }
+        }
+        crate::kprintln!("unique: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `distinctwords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_distinctwords(line: &str, cmd: &str, rest: &str) {
+    // Remove ALL duplicate words, keeping the FIRST occurrence of each in order ("the cat
+    // the dog cat" -> "the cat dog"). The word-level analogue of uniqchars (distinct BYTES);
+    // distinct from dedupwords (collapses only ADJACENT repeats, so "a a b a" -> "a b a"),
+    // uniqwords (the FILE distinct-word COUNT), and countdistinct (inline distinct COUNT) --
+    // this LISTS the distinct words inline, single-spaced. Case-sensitive; caps at 64 words.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: distinctwords <text>");
+    } else {
+        let mut kept: [&str; 64] = [""; 64];
+        let mut nk = 0usize;
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for w in rest.split_whitespace() {
+            let mut seen = false;
+            for i in 0..nk {
+                if kept[i] == w {
+                    seen = true;
+                    break;
+                }
+            }
+            if seen {
+                continue;
+            }
+            if nk < kept.len() {
+                kept[nk] = w;
+                nk += 1;
+            }
+            if len > 0 && len < buf.len() {
+                buf[len] = b' ';
+                len += 1;
+            }
+            for &c in w.as_bytes() {
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+        }
+        crate::kprintln!(
+            "distinctwords: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `rwords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rwords(line: &str, cmd: &str, rest: &str) {
+    // Reverse the ORDER of words (distinct from `rev`, which reverses chars).
+    let mut toks: [&str; 64] = [""; 64];
+    let mut nt = 0;
+    for w in rest.split_whitespace() {
+        if nt < 64 {
+            toks[nt] = w;
+            nt += 1;
+        }
+    }
+    if nt == 0 {
+        crate::kprintln!("usage: rwords <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut n = 0usize;
+        for i in (0..nt).rev() {
+            if i != nt - 1 && n < 512 {
+                buf[n] = b' ';
+                n += 1;
+            }
+            for &c in toks[i].as_bytes() {
+                if n < 512 {
+                    buf[n] = c;
+                    n += 1;
+                }
+            }
+        }
+        crate::kprintln!("rwords: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `bell` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_bell(line: &str, cmd: &str, rest: &str) {
+    // nth Bell number (the count of ways to PARTITION a set of n elements),
+    // computed via the Bell (Aitken) triangle: B(0)=1,1,2,5,15,52,203,877,
+    // 4140,21147,115975,... Distinct from factorial and the linear
+    // recurrences -- it comes from a 2D triangle, not a fixed-order
+    // recurrence. Honest u64 overflow guard.
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            const MAX: usize = 64;
+            let mut row = [0u64; MAX]; // row 0
+            row[0] = 1;
+            let mut rowlen = 1usize;
+            let mut overflow = false;
+            // B(n) is the LAST element of row (n-1), so we only build rows
+            // 1..n. (Building row n would compute its last element B(n+1),
+            // which can overflow before B(n) itself does.) B(0) falls out
+            // as row 0's last element with zero iterations.
+            'outer: for _ in 1..n {
+                // Defensive array bound (cannot trigger before u64 overflow
+                // at n ~ 26, but guard the fixed row anyway).
+                if rowlen + 1 >= MAX {
+                    overflow = true;
+                    break;
+                }
+                let mut newrow = [0u64; MAX];
+                // First element of the new row = last of the previous row.
+                newrow[0] = row[rowlen - 1];
+                for k in 1..=rowlen {
+                    match newrow[k - 1].checked_add(row[k - 1]) {
+                        Some(v) => newrow[k] = v,
+                        None => {
+                            overflow = true;
+                            break 'outer;
+                        }
+                    }
+                }
+                rowlen += 1;
+                row = newrow;
+            }
+            if overflow {
+                crate::kprintln!("bell: B({}) overflows u64", n);
+            } else {
+                // B(n) = last element of the last row we built (row n-1).
+                crate::kprintln!("bell: B({}) = {}", n, row[rowlen - 1]);
+            }
+        }
+        Err(_) => crate::kprintln!("usage: bell <n>"),
+    }
+}
+
+/// `stirling2` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_stirling2(line: &str, cmd: &str, rest: &str) {
+    // Stirling number of the SECOND kind S(n,k): the number of ways to partition n
+    // labeled items into k non-empty UNLABELED subsets. S(4,2)=7, S(5,3)=25, S(n,n)=1,
+    // S(n,1)=1, S(n,0)=0 for n>0, S(0,0)=1, S(n,k)=0 when k>n. Row-DP on the recurrence
+    // S(n,k)=k*S(n-1,k)+S(n-1,k-1) in u128 (checked). Summing S(n,k) over k gives the
+    // Bell number (see `bell`); distinct from ncr/npr (which count choices, not partitions).
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<u64>().ok());
+    let k = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (n, k) {
+        (Some(n), Some(k)) if n <= 60 && k <= 60 => {
+            let mut dp = [0u128; 61];
+            dp[0] = 1; // S(0,0) = 1
+            let mut overflow = false;
+            for i in 1..=n as usize {
+                let hi = i.min(60);
+                // high-to-low so dp[j-1] is still the previous row's value
+                for j in (1..=hi).rev() {
+                    let step = dp[j]
+                        .checked_mul(j as u128)
+                        .and_then(|v| v.checked_add(dp[j - 1]));
+                    match step {
+                        Some(v) => dp[j] = v,
+                        None => overflow = true,
+                    }
+                }
+                dp[0] = 0; // S(i,0) = 0 for i >= 1
+            }
+            let ans = dp[k as usize];
+            if overflow {
+                crate::kprintln!("stirling2: S({}, {}) overflowed u128", n, k);
+            } else {
+                crate::kprintln!("stirling2: S({}, {}) = {}", n, k, ans);
+            }
+        }
+        _ => crate::kprintln!("usage: stirling2 <n> <k> (n,k <= 60)"),
+    }
+}
+
+/// `sortf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_sortf(line: &str, cmd: &str, rest: &str) {
+    // Print a VFS file's lines in lexicographic (byte-order) sorted order.
+    // Distinct from `sort` (sorts args) and `tac` (reverses order).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: sortf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("sortf: no such file: {}", name),
+            Some(s) => {
+                // Fixed line-slice buffer (no heap); first 64 lines.
+                let mut lines: [&str; 64] = [""; 64];
+                let mut n = 0usize;
+                let mut truncated = false;
+                for line in s.lines() {
+                    if n < lines.len() {
+                        lines[n] = line;
+                        n += 1;
+                    } else {
+                        truncated = true;
+                    }
+                }
+                // Insertion sort, ascending byte order.
+                for i in 1..n {
+                    let mut j = i;
+                    while j > 0 && lines[j - 1] > lines[j] {
+                        lines.swap(j - 1, j);
+                        j -= 1;
+                    }
+                }
+                for line in lines.iter().take(n) {
+                    crate::kprintln!("{}", line);
+                }
+                if truncated {
+                    crate::kprintln!("sortf: (only first 64 lines sorted)");
+                }
+            }
+        }
+    }
+}
+
+/// `tac` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_tac(line: &str, cmd: &str, rest: &str) {
+    // Print a VFS file's lines in reverse order (the reverse of `cat`).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: tac <file>");
+    } else {
+        match vfs::read_raw(name) {
+            None => crate::kprintln!("tac: {} not found", name),
+            Some(bytes) => {
+                // Record each line's (start, len) span, bounded to 64 lines.
+                let mut spans = [(0usize, 0usize); 64];
+                let mut count = 0usize;
+                let mut start = 0usize;
+                let mut truncated = false;
+                for (i, &b) in bytes.iter().enumerate() {
+                    if b == b'\n' {
+                        if count < spans.len() {
+                            spans[count] = (start, i - start);
+                            count += 1;
+                        } else {
+                            truncated = true;
+                            break;
+                        }
+                        start = i + 1;
+                    }
+                }
+                // Final segment (no trailing newline) is a real line; a file
+                // ending in '\n' leaves start == bytes.len() -> skip the phantom.
+                if !truncated && start < bytes.len() {
+                    if count < spans.len() {
+                        spans[count] = (start, bytes.len() - start);
+                        count += 1;
+                    } else {
+                        truncated = true;
+                    }
+                }
+                for i in (0..count).rev() {
+                    let (s, l) = spans[i];
+                    crate::kprintln!(
+                        "tac: {}",
+                        core::str::from_utf8(&bytes[s..s + l]).unwrap_or("?")
+                    );
+                }
+                if truncated {
+                    crate::kprintln!("tac: (truncated at 64 lines)");
+                }
+            }
+        }
+    }
+}
+
+/// `eulerian` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_eulerian(line: &str, cmd: &str, rest: &str) {
+    // Eulerian numbers A(n,k): the number of permutations of 1..n with exactly k descents
+    // (positions i where p[i] > p[i+1]). Recurrence A(n,k) = (k+1)*A(n-1,k) + (n-k)*A(n-1,k-1)
+    // with A(0,0)=1; A(n,0)=1, A(n,n-1)=1, A(n,k)=0 for k>=n (n>0). A(3,1)=4, A(4,1)=11,
+    // A(4,2)=11, A(5,2)=66, A(6,3)=302. Row sums are n! -- the permutation-descent companion
+    // of stirling2/lah (subset/list counts); row-DP in u128 (overflow-checked), n,k capped
+    // at 30.
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<u64>().ok());
+    let k = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (n, k) {
+        (Some(n), Some(k)) if n <= 30 && k <= 30 => {
+            let mut dp = [0u128; 31];
+            dp[0] = 1; // A(0,0) = 1
+            let mut overflow = false;
+            for i in 1..=n as usize {
+                let hi = (i - 1).min(30);
+                // high-to-low so dp[j-1] is still the previous row's value
+                for j in (1..=hi.max(1)).rev() {
+                    let a = dp[j].checked_mul((j + 1) as u128);
+                    let b = dp[j - 1].checked_mul((i - j) as u128);
+                    match (a, b) {
+                        (Some(x), Some(y)) => match x.checked_add(y) {
+                            Some(v) => dp[j] = v,
+                            None => overflow = true,
+                        },
+                        _ => overflow = true,
+                    }
+                }
+                // A(i,0) = 1 (the identity permutation is the only one with no descents);
+                // entries at k >= i stay zero (dp starts zeroed and j caps at i-1).
+                dp[0] = 1;
+            }
+            let ans = dp[k as usize];
+            if overflow {
+                crate::kprintln!("eulerian: A({}, {}) overflowed u128", n, k);
+            } else {
+                crate::kprintln!("eulerian: A({}, {}) = {}", n, k, ans);
+            }
+        }
+        _ => crate::kprintln!("usage: eulerian <n> <k> (n,k <= 30)"),
+    }
+}
+
+/// `piglatin` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_piglatin(line: &str, cmd: &str, rest: &str) {
+    // Convert each space-separated word to Pig Latin, joined by single
+    // spaces. Lowercase everything; y is a CONSONANT; vowels = a,e,i,o,u.
+    // Per word, find the first vowel: no vowel -> word+"ay"; vowel at 0 ->
+    // word+"way"; else (leading consonant cluster of length i) ->
+    // word[i..]+word[0..i]+"ay". A word-game transform, distinct from the
+    // ciphers/case/slug utilities.
+    fn push(buf: &mut [u8], n: &mut usize, b: u8) {
+        if *n < buf.len() {
+            buf[*n] = b;
+            *n += 1;
+        }
+    }
+    let mut buf = [0u8; 512];
+    let mut n = 0usize;
+    for (wi, w) in rest.split_whitespace().enumerate() {
+        if wi > 0 {
+            push(&mut buf, &mut n, b' ');
+        }
+        // Lowercase the word (letters only) into a bounded temp.
+        let mut low = [0u8; 64];
+        let wl = w.len().min(64);
+        for (i, &b) in w.as_bytes()[..wl].iter().enumerate() {
+            low[i] = if (b'A'..=b'Z').contains(&b) { b | 0x20 } else { b };
+        }
+        // Index of the first vowel, if any.
+        let first_vowel = low[..wl]
+            .iter()
+            .position(|&c| matches!(c, b'a' | b'e' | b'i' | b'o' | b'u'));
+        match first_vowel {
+            None => {
+                for &b in &low[..wl] {
+                    push(&mut buf, &mut n, b);
+                }
+                push(&mut buf, &mut n, b'a');
+                push(&mut buf, &mut n, b'y');
+            }
+            Some(0) => {
+                for &b in &low[..wl] {
+                    push(&mut buf, &mut n, b);
+                }
+                push(&mut buf, &mut n, b'w');
+                push(&mut buf, &mut n, b'a');
+                push(&mut buf, &mut n, b'y');
+            }
+            Some(i) => {
+                for &b in &low[i..wl] {
+                    push(&mut buf, &mut n, b);
+                }
+                for &b in &low[..i] {
+                    push(&mut buf, &mut n, b);
+                }
+                push(&mut buf, &mut n, b'a');
+                push(&mut buf, &mut n, b'y');
+            }
+        }
+    }
+    if n == 0 {
+        crate::kprintln!("usage: piglatin <text>");
+    } else {
+        crate::kprintln!("piglatin: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `histogram` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_histogram(line: &str, cmd: &str, rest: &str) {
+    // Byte-frequency profile of a VFS file: total, distinct, most common.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: histogram <file>");
+    } else {
+        match vfs::read_raw(name) {
+            None => crate::kprintln!("histogram: {} not found", name),
+            Some(data) => {
+                let mut freq = [0u32; 256];
+                for &b in data {
+                    freq[b as usize] += 1;
+                }
+                let total = data.len();
+                let distinct = freq.iter().filter(|&&c| c > 0).count();
+                crate::kprintln!(
+                    "histogram: {} = {} bytes, {} distinct values",
+                    name, total, distinct
+                );
+                if total > 0 {
+                    let mut max_b = 0usize;
+                    let mut max_c = 0u32;
+                    for i in 0..256 {
+                        if freq[i] > max_c {
+                            max_c = freq[i];
+                            max_b = i;
+                        }
+                    }
+                    let ch = if (0x20..=0x7e).contains(&max_b) {
+                        max_b as u8 as char
+                    } else {
+                        '.'
+                    };
+                    crate::kprintln!(
+                        "histogram: most common byte 0x{:02x} ('{}') x {}",
+                        max_b, ch, max_c
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `tr` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_tr(line: &str, cmd: &str, rest: &str) {
+    // Translate characters (like Unix `tr`): map each char of <text> that appears
+    // in <from> to the char at the SAME position in <to>; <from> and <to> must be
+    // the same length. "tr lo LO hello world" -> "heLLO wOrLd". Distinct from
+    // replace (which swaps a whole SUBSTRING) and rot13/caesar (fixed shifts).
+    let mut parts = rest.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(from), Some(to), Some(text)) if !from.is_empty() => {
+            let fb = from.as_bytes();
+            let tb = to.as_bytes();
+            if fb.len() != tb.len() {
+                crate::kprintln!("tr: <from> and <to> must be the same length");
+            } else {
+                // 256-entry identity map, overridden for each from->to pair
+                let mut map = [0u8; 256];
+                for (i, m) in map.iter_mut().enumerate() {
+                    *m = i as u8;
+                }
+                for i in 0..fb.len() {
+                    map[fb[i] as usize] = tb[i];
+                }
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                for &c in text.as_bytes() {
+                    if len < buf.len() {
+                        buf[len] = map[c as usize];
+                        len += 1;
+                    }
+                }
+                crate::kprintln!("tr: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+            }
+        }
+        _ => crate::kprintln!("usage: tr <from> <to> <text>"),
+    }
+}
+
+/// `crt2` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_crt2(line: &str, cmd: &str, rest: &str) {
+    // Chinese Remainder Theorem for TWO congruences: find x with x = a1 (mod n1) and
+    // x = a2 (mod n2), for COPRIME moduli (gcd(n1,n2)=1), reported modulo n1*n2. "crt2 2
+    // 3 3 5" -> 8 (8 mod 3 = 2, 8 mod 5 = 3), "crt2 1 4 2 5" -> 17, "crt2 0 2 0 3" -> 0.
+    // Non-coprime moduli are rejected (no unique solution mod n1*n2). Built on the same
+    // extended-Euclid inverse as modinv; distinct from modinv (one inverse), pow, and gcd.
+    let mut it = rest.split_whitespace();
+    let a1 = it.next().and_then(|s| s.parse::<i128>().ok());
+    let n1 = it.next().and_then(|s| s.parse::<i128>().ok());
+    let a2 = it.next().and_then(|s| s.parse::<i128>().ok());
+    let n2 = it.next().and_then(|s| s.parse::<i128>().ok());
+    match (a1, n1, a2, n2) {
+        (Some(a1), Some(n1), Some(a2), Some(n2)) if n1 >= 1 && n2 >= 1 => {
+            // extended Euclid on (n1, n2): old_r ends at gcd, old_s at n1's coefficient.
+            let (mut old_r, mut r) = (n1, n2);
+            let (mut old_s, mut s) = (1i128, 0i128);
+            while r != 0 {
+                let q = old_r / r;
+                let nr = old_r - q * r;
+                old_r = r;
+                r = nr;
+                let ns = old_s - q * s;
+                old_s = s;
+                s = ns;
+            }
+            if old_r != 1 {
+                crate::kprintln!(
+                    "crt2: moduli {} and {} are not coprime (gcd {})",
+                    n1, n2, old_r
+                );
+            } else {
+                let inv = ((old_s % n2) + n2) % n2; // inverse of n1 mod n2
+                let diff = (((a2 - a1) % n2) + n2) % n2;
+                let t = diff * inv % n2;
+                let l = n1 * n2;
+                let x = (((a1 + n1 * t) % l) + l) % l;
+                crate::kprintln!("crt2: x = {} (mod {})", x, l);
+            }
+        }
+        _ => crate::kprintln!("usage: crt2 <a1> <n1> <a2> <n2> (n1,n2 >= 1)"),
+    }
+}
+
+/// `reveachf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_reveachf(line: &str, cmd: &str, rest: &str) {
+    // Print each line of a VFS file with the CHARS of each word reversed IN PLACE, keeping
+    // the word ORDER and line structure -- the file analogue of reveach (inline). Distinct
+    // from revf (reverses ALL chars of each line, so word order flips too), rwordsf
+    // (reverses the WORD order, words intact), and tac (reverses LINE order). Lines are
+    // newline-joined; single spaces between words.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: reveachf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("reveachf: no such file: {}", name),
+            Some(s) => {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                let mut firstline = true;
+                for line in s.lines() {
+                    if !firstline && len < buf.len() {
+                        buf[len] = b'\n';
+                        len += 1;
+                    }
+                    firstline = false;
+                    for (wi, w) in line.split_whitespace().enumerate() {
+                        if wi > 0 && len < buf.len() {
+                            buf[len] = b' ';
+                            len += 1;
+                        }
+                        for &c in w.as_bytes().iter().rev() {
+                            if len < buf.len() {
+                                buf[len] = c;
+                                len += 1;
+                            }
+                        }
+                    }
+                }
+                crate::kprintln!(
+                    "reveachf: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `tailwords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_tailwords(line: &str, cmd: &str, rest: &str) {
+    // Print the LAST n whitespace-delimited words of a VFS file, space-separated on
+    // one line (all of them if the file has fewer than n). The word-level tail that
+    // mirrors taillines (last n LINES), and the open-ended tail complement of
+    // rangewords (which needs an explicit a..b range). Two passes: count the words,
+    // then emit those from index total-n onward.
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<usize>().ok());
+    let file = it.next();
+    match (n, file) {
+        (Some(n), Some(file)) => match vfs::read_str(file) {
+            None => crate::kprintln!("tailwords: no such file: {}", file),
+            Some(s) => {
+                let total = s.split_whitespace().count();
+                let start = total.saturating_sub(n);
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                let mut first = true;
+                for (i, word) in s.split_whitespace().enumerate() {
+                    if i >= start {
+                        if !first && len < buf.len() {
+                            buf[len] = b' ';
+                            len += 1;
+                        }
+                        first = false;
+                        for &c in word.as_bytes() {
+                            if len < buf.len() {
+                                buf[len] = c;
+                                len += 1;
+                            }
+                        }
+                    }
+                }
+                crate::kprintln!(
+                    "tailwords: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        },
+        _ => crate::kprintln!("usage: tailwords <n> <file>"),
+    }
+}
+
+/// `rangewords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rangewords(line: &str, cmd: &str, rest: &str) {
+    // Print words A through B (1-based, inclusive) of a VFS file, space-separated on
+    // one line, counting whitespace-delimited words across ALL lines. The word-level
+    // parallel of rangelines (which selects LINES); distinct from wordn (ONE word by
+    // index) and cut (a field of each line). Indices past the end are skipped; if
+    // A > B nothing prints.
+    let mut it = rest.split_whitespace();
+    let a = it.next().and_then(|s| s.parse::<usize>().ok());
+    let b = it.next().and_then(|s| s.parse::<usize>().ok());
+    let name = it.next();
+    match (a, b, name) {
+        (Some(a), Some(b), Some(name)) if a >= 1 => match vfs::read_str(name) {
+            None => crate::kprintln!("rangewords: no such file: {}", name),
+            Some(s) => {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                let mut first = true;
+                for (i, word) in s.split_whitespace().enumerate() {
+                    let wn = i + 1;
+                    if wn >= a && wn <= b {
+                        if !first && len < buf.len() {
+                            buf[len] = b' ';
+                            len += 1;
+                        }
+                        first = false;
+                        for &c in word.as_bytes() {
+                            if len < buf.len() {
+                                buf[len] = c;
+                                len += 1;
+                            }
+                        }
+                    }
+                }
+                crate::kprintln!(
+                    "rangewords: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        },
+        _ => crate::kprintln!("usage: rangewords <a> <b> <file>"),
+    }
+}
+
+/// `setword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_setword(line: &str, cmd: &str, rest: &str) {
+    // Replace the nth (1-based) word of <text> with <new>, in place (word order and the
+    // other words unchanged). "setword 2 X a b c" -> "a X c", "setword 1 hi a b c" -> "hi
+    // b c", "setword 3 Z a b c" -> "a b Z", "setword 5 Q a b c" -> "a b c" (out-of-range
+    // no-op). The by-INDEX word replacer completing insertword/deleteword/swapwords;
+    // distinct from replaceword (which swaps a word by VALUE match).
+    let mut parts = rest.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(ns), Some(new), Some(text)) if !new.is_empty() => {
+            match ns.parse::<usize>().ok().filter(|&k| k >= 1) {
+                Some(n) => {
+                    let mut buf = [0u8; 512];
+                    let mut len = 0usize;
+                    for (i, w) in text.split_whitespace().enumerate() {
+                        if len > 0 && len < buf.len() {
+                            buf[len] = b' ';
+                            len += 1;
+                        }
+                        let emit = if i + 1 == n { new } else { w };
+                        for &c in emit.as_bytes() {
+                            if len < buf.len() {
+                                buf[len] = c;
+                                len += 1;
+                            }
+                        }
+                    }
+                    crate::kprintln!(
+                        "setword: {}",
+                        core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                    );
+                }
+                None => crate::kprintln!("usage: setword <n> <new> <text>"),
+            }
+        }
+        _ => crate::kprintln!("usage: setword <n> <new> <text>"),
+    }
+}
+
+/// `wordrange` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wordrange(line: &str, cmd: &str, rest: &str) {
+    // Emit words a..b (1-based, INCLUSIVE) of the inline text, space-separated. The
+    // upper bound clamps to the word count; if a is past the end the result is "(none)".
+    // "wordrange 2 4 a b c d e" -> "b c d", "wordrange 1 2 a b c d" -> "a b", "wordrange 3
+    // 10 a b c" -> "c" (b clamped), "wordrange 5 6 a b c" -> "(none)". The INLINE analogue
+    // of rangewords (words a..b of a FILE); distinct from truncatewords/lastwords/wordat.
+    let mut parts = rest.splitn(3, ' ');
+    let a = parts.next().and_then(|s| s.parse::<usize>().ok());
+    let b = parts.next().and_then(|s| s.parse::<usize>().ok());
+    let text = parts.next();
+    match (a, b, text) {
+        (Some(a), Some(b), Some(text)) if a >= 1 => {
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            let mut first = true;
+            for (i, w) in text.split_whitespace().enumerate() {
+                let idx = i + 1; // 1-based
+                if idx >= a && idx <= b {
+                    if !first && len < buf.len() {
+                        buf[len] = b' ';
+                        len += 1;
+                    }
+                    first = false;
+                    for &c in w.as_bytes() {
+                        if len < buf.len() {
+                            buf[len] = c;
+                            len += 1;
+                        }
+                    }
+                }
+            }
+            if len == 0 {
+                crate::kprintln!("wordrange: (none)");
+            } else {
+                crate::kprintln!(
+                    "wordrange: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+        _ => crate::kprintln!("usage: wordrange <a> <b> <text>"),
+    }
+}
+
+/// `duplicatewords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_duplicatewords(line: &str, cmd: &str, rest: &str) {
+    // List the words that occur MORE THAN ONCE in the inline text, each emitted once, in
+    // first-occurrence order. "duplicatewords a b a c b" -> "a b", "duplicatewords the cat
+    // the dog the" -> "the", "duplicatewords a b c" -> "(none)" (all unique). Case-
+    // sensitive, whitespace-delimited. Distinct from dedupwords (collapses ADJACENT
+    // duplicates), uniqwords (COUNTS distinct in a FILE), and countdistinct.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: duplicatewords <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut emitted = 0usize;
+        // O(w^2): a word is emitted iff it's a FIRST occurrence AND recurs later.
+        for (i, t) in rest.split_whitespace().enumerate() {
+            let is_first = rest.split_whitespace().take(i).all(|u| u != t);
+            let has_later = rest.split_whitespace().skip(i + 1).any(|u| u == t);
+            if is_first && has_later {
+                if emitted > 0 && len < buf.len() {
+                    buf[len] = b' ';
+                    len += 1;
+                }
+                emitted += 1;
+                for &c in t.as_bytes() {
+                    if len < buf.len() {
+                        buf[len] = c;
+                        len += 1;
+                    }
+                }
+            }
+        }
+        if emitted == 0 {
+            crate::kprintln!("duplicatewords: (none)");
+        } else {
+            crate::kprintln!(
+                "duplicatewords: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `replacelast` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_replacelast(line: &str, cmd: &str, rest: &str) {
+    // Replace only the LAST occurrence of a substring with another -- the mirror of
+    // replacefirst (and the tail complement of replace, which swaps ALL). "replacelast o
+    // 0 foo boo" -> "foo bo0", "replacelast ss SS mississippi" -> "missiSSippi". An absent
+    // substring leaves the text unchanged. Same <from> <to> <text> parse as replace.
+    let mut parts = rest.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(from), Some(to), Some(text)) if !from.is_empty() => match text.rfind(from) {
+            None => crate::kprintln!("replacelast: {}", text),
+            Some(i) => {
+                let src = text.as_bytes();
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                for &c in &src[..i] {
+                    if len < buf.len() {
+                        buf[len] = c;
+                        len += 1;
+                    }
+                }
+                for &c in to.as_bytes() {
+                    if len < buf.len() {
+                        buf[len] = c;
+                        len += 1;
+                    }
+                }
+                for &c in &src[i + from.len()..] {
+                    if len < buf.len() {
+                        buf[len] = c;
+                        len += 1;
+                    }
+                }
+                crate::kprintln!(
+                    "replacelast: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        },
+        _ => crate::kprintln!("usage: replacelast <from> <to> <text>"),
+    }
+}
+
+/// `lah` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_lah(line: &str, cmd: &str, rest: &str) {
+    // Unsigned LAH numbers L(n,k): the number of ways to partition n labeled items into k
+    // non-empty ORDERED lists. Recurrence L(n,k) = L(n-1,k-1) + (n+k-1)*L(n-1,k), with
+    // L(0,0)=1, L(n,1)=n!, L(n,n)=1, and L(n,k)=0 when k>n or k<1 (n>0). L(4,2)=36, L(3,2)=6,
+    // L(4,3)=12, L(5,3)=120. The ordered-list companion of stirling2 (unordered subsets);
+    // row-DP in u128 (overflow-checked), n,k capped at 30.
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<u64>().ok());
+    let k = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (n, k) {
+        (Some(n), Some(k)) if n <= 30 && k <= 30 => {
+            let mut dp = [0u128; 31];
+            dp[0] = 1; // L(0,0) = 1
+            let mut overflow = false;
+            for i in 1..=n as usize {
+                let hi = i.min(30);
+                // high-to-low so dp[j-1] is still the previous row's value
+                for j in (1..=hi).rev() {
+                    let mult = (i + j - 1) as u128;
+                    let step = dp[j]
+                        .checked_mul(mult)
+                        .and_then(|v| v.checked_add(dp[j - 1]));
+                    match step {
+                        Some(v) => dp[j] = v,
+                        None => overflow = true,
+                    }
+                }
+                dp[0] = 0; // L(i,0) = 0 for i >= 1
+            }
+            let ans = dp[k as usize];
+            if overflow {
+                crate::kprintln!("lah: L({}, {}) overflowed u128", n, k);
+            } else {
+                crate::kprintln!("lah: L({}, {}) = {}", n, k, ans);
+            }
+        }
+        _ => crate::kprintln!("usage: lah <n> <k> (n,k <= 30)"),
+    }
+}
+
+/// `overlay` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_overlay(line: &str, cmd: &str, rest: &str) {
+    // Overwrite the characters of <text> starting at 1-based position <pos> with <str>,
+    // in place (replacing rather than shifting) -- the overwrite complement of insert.
+    // "overlay 3 XY hello" -> "heXYo", "overlay 1 AB hello" -> "ABllo"; writing past the
+    // end extends the text ("overlay 4 ZZZZ abc" -> "abcZZZZ"). Distinct from insert
+    // (which SHIFTS the tail right) and replace (which matches a SUBSTRING to swap).
+    let mut parts = rest.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(ps), Some(ov), Some(text)) => {
+            match ps.parse::<usize>().ok().filter(|&k| k >= 1) {
+                Some(pos) => {
+                    let b = text.as_bytes();
+                    let ob = ov.as_bytes();
+                    let idx = (pos - 1).min(b.len());
+                    let tail = (idx + ob.len()).min(b.len());
+                    let mut buf = [0u8; 512];
+                    let mut n = 0usize;
+                    for &c in &b[..idx] {
+                        if n < buf.len() {
+                            buf[n] = c;
+                            n += 1;
+                        }
+                    }
+                    for &c in ob {
+                        if n < buf.len() {
+                            buf[n] = c;
+                            n += 1;
+                        }
+                    }
+                    for &c in &b[tail..] {
+                        if n < buf.len() {
+                            buf[n] = c;
+                            n += 1;
+                        }
+                    }
+                    crate::kprintln!(
+                        "overlay: {}",
+                        core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                    );
+                }
+                None => crate::kprintln!("usage: overlay <pos> <str> <text>"),
+            }
+        }
+        _ => crate::kprintln!("usage: overlay <pos> <str> <text>"),
+    }
+}
+
+/// `headwords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_headwords(line: &str, cmd: &str, rest: &str) {
+    // Print the FIRST n whitespace-delimited words of a VFS file, space-separated on
+    // one line (all of them if the file has fewer than n). The word-level head that
+    // mirrors headlines (first n LINES) and is the open-ended head complement of
+    // tailwords (last n words) and rangewords (which needs an explicit a..b range).
+    // Single pass: emit words while index < n.
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<usize>().ok());
+    let file = it.next();
+    match (n, file) {
+        (Some(n), Some(file)) => match vfs::read_str(file) {
+            None => crate::kprintln!("headwords: no such file: {}", file),
+            Some(s) => {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                let mut first = true;
+                for (i, word) in s.split_whitespace().enumerate() {
+                    if i >= n {
+                        break;
+                    }
+                    if !first && len < buf.len() {
+                        buf[len] = b' ';
+                        len += 1;
+                    }
+                    first = false;
+                    for &c in word.as_bytes() {
+                        if len < buf.len() {
+                            buf[len] = c;
+                            len += 1;
+                        }
+                    }
+                }
+                crate::kprintln!(
+                    "headwords: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        },
+        _ => crate::kprintln!("usage: headwords <n> <file>"),
+    }
+}
+
+/// `firstunique` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_firstunique(line: &str, cmd: &str, rest: &str) {
+    // Report the FIRST non-repeating character of the inline text -- the first
+    // byte that appears exactly once (case-sensitive). "swiss" -> w, "leetcode"
+    // -> l; "aabbcc" has none. A classic interview problem. Distinct from
+    // uniqchars (which lists the DISTINCT bytes in order) and squeeze/collapse
+    // (adjacent-run collapse). A 256-entry count table is scanned twice.
+    if rest.is_empty() {
+        crate::kprintln!("usage: firstunique <text>");
+    } else {
+        let src = rest.as_bytes();
+        let mut count = [0u32; 256];
+        for &b in src {
+            count[b as usize] = count[b as usize].saturating_add(1);
+        }
+        let mut found = false;
+        for &b in src {
+            if count[b as usize] == 1 {
+                let ch = [b];
+                crate::kprintln!(
+                    "firstunique: {}",
+                    core::str::from_utf8(&ch).unwrap_or("?")
+                );
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            crate::kprintln!("firstunique: (no unique character)");
+        }
+    }
+}
+
+/// `stirling1` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_stirling1(line: &str, cmd: &str, rest: &str) {
+    // Unsigned Stirling numbers of the FIRST kind c(n,k): the number of permutations of
+    // n elements having exactly k CYCLES. Recurrence c(n,k) = c(n-1,k-1) + (n-1)*c(n-1,k),
+    // with c(0,0)=1, c(n,0)=0 for n>0, c(0,k)=0 for k>0, c(n,k)=0 when k>n. c(4,2)=11,
+    // c(5,2)=50, c(3,1)=2, c(n,1)=(n-1)!, c(n,n)=1. The cycle-count companion of stirling2
+    // (subsets)/lah (ordered lists)/eulerian (descents) -- together the permutation
+    // triangle family. Row-DP in u128 (overflow-checked), n,k capped at 30.
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<u64>().ok());
+    let k = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (n, k) {
+        (Some(n), Some(k)) if n <= 30 && k <= 30 => {
+            let mut dp = [0u128; 31];
+            dp[0] = 1; // c(0,0) = 1
+            let mut overflow = false;
+            for i in 1..=n as usize {
+                let hi = i.min(30);
+                // high-to-low so dp[j-1] is still the previous row's value
+                for j in (1..=hi).rev() {
+                    let step = dp[j]
+                        .checked_mul((i - 1) as u128)
+                        .and_then(|v| v.checked_add(dp[j - 1]));
+                    match step {
+                        Some(v) => dp[j] = v,
+                        None => overflow = true,
+                    }
+                }
+                dp[0] = 0; // c(i,0) = 0 for i >= 1
+            }
+            let ans = dp[k as usize];
+            if overflow {
+                crate::kprintln!("stirling1: c({}, {}) overflowed u128", n, k);
+            } else {
+                crate::kprintln!("stirling1: c({}, {}) = {}", n, k, ans);
+            }
+        }
+        _ => crate::kprintln!("usage: stirling1 <n> <k> (n,k <= 30)"),
+    }
+}
+
+/// `lastwords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_lastwords(line: &str, cmd: &str, rest: &str) {
+    // Emit the LAST n whitespace-delimited WORDS of the inline text (all of them if
+    // fewer than n), space-separated. "lastwords 2 a b c d" -> "c d", "lastwords 1 hello
+    // world" -> "world", "lastwords 0 a b c" -> "" (empty). The inline word-tail mirroring
+    // truncatewords (which keeps the FIRST n words); distinct from tailwords (last n words
+    // of a FILE) and lastn (last n CHARS). Counts the words, then emits from index total-n.
+    let r = rest.trim_start();
+    let parsed = r
+        .find(' ')
+        .and_then(|sp| r[..sp].parse::<usize>().ok().map(|k| (k, &r[sp + 1..])));
+    match parsed {
+        None => crate::kprintln!("usage: lastwords <n> <text>"),
+        Some((n, text)) => {
+            let total = text.split_whitespace().count();
+            let start = total.saturating_sub(n);
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            let mut first = true;
+            for (i, w) in text.split_whitespace().enumerate() {
+                if i >= start {
+                    if !first && len < buf.len() {
+                        buf[len] = b' ';
+                        len += 1;
+                    }
+                    first = false;
+                    for &c in w.as_bytes() {
+                        if len < buf.len() {
+                            buf[len] = c;
+                            len += 1;
+                        }
+                    }
+                }
+            }
+            crate::kprintln!(
+                "lastwords: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `insert` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_insert(line: &str, cmd: &str, rest: &str) {
+    // Insert <str> into <text> at 1-based character position <pos> (before the pos-th
+    // char): pos=1 prepends, and a pos past the end appends. "insert 3 XY hello" ->
+    // "heXYllo", "insert 1 >> abc" -> ">>abc", "insert 9 ! ab" -> "ab!" (clamped to the
+    // end). Byte-indexed (= character positions for ASCII). The constructive complement
+    // of substr (which EXTRACTS a slice); distinct from replace (which overwrites).
+    let mut parts = rest.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(ps), Some(ins), Some(text)) => {
+            match ps.parse::<usize>().ok().filter(|&k| k >= 1) {
+                Some(pos) => {
+                    let bytes = text.as_bytes();
+                    let idx = (pos - 1).min(bytes.len());
+                    let mut buf = [0u8; 512];
+                    let mut n = 0usize;
+                    for &c in &bytes[..idx] {
+                        if n < buf.len() {
+                            buf[n] = c;
+                            n += 1;
+                        }
+                    }
+                    for &c in ins.as_bytes() {
+                        if n < buf.len() {
+                            buf[n] = c;
+                            n += 1;
+                        }
+                    }
+                    for &c in &bytes[idx..] {
+                        if n < buf.len() {
+                            buf[n] = c;
+                            n += 1;
+                        }
+                    }
+                    crate::kprintln!(
+                        "insert: {}",
+                        core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                    );
+                }
+                None => crate::kprintln!("usage: insert <pos> <str> <text>"),
+            }
+        }
+        _ => crate::kprintln!("usage: insert <pos> <str> <text>"),
+    }
+}
+
+/// `base64` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_base64(line: &str, cmd: &str, rest: &str) {
+    const ALPHA: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if let Some(b64) = rest.strip_prefix("-d ") {
+        // Decode: map each base64 char to 6 bits, accumulate into bytes.
+        let mut out = [0u8; 256];
+        let mut n = 0;
+        let mut acc = 0u32;
+        let mut bits = 0;
+        for &c in b64.trim().as_bytes() {
+            let v = match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => continue, // skip '=' padding and whitespace
+            };
+            acc = (acc << 6) | v as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                if n < out.len() {
+                    out[n] = (acc >> bits) as u8;
+                    n += 1;
+                }
+            }
+        }
+        crate::kprintln!("[base64] {}", core::str::from_utf8(&out[..n]).unwrap_or("(binary)"));
+    } else if rest.is_empty() {
+        crate::kprintln!("usage: base64 <text>  |  base64 -d <base64>");
+    } else {
+        // Encode the argument bytes.
+        let data = rest.as_bytes();
+        let data = &data[..data.len().min(192)];
+        let mut out = [0u8; 256];
+        let mut n = 0;
+        let mut i = 0;
+        while i < data.len() {
+            let b0 = data[i] as u32;
+            let b1 = if i + 1 < data.len() { data[i + 1] as u32 } else { 0 };
+            let b2 = if i + 2 < data.len() { data[i + 2] as u32 } else { 0 };
+            let triple = (b0 << 16) | (b1 << 8) | b2;
+            out[n] = ALPHA[(triple >> 18) as usize & 63];
+            out[n + 1] = ALPHA[(triple >> 12) as usize & 63];
+            out[n + 2] = if i + 1 < data.len() { ALPHA[(triple >> 6) as usize & 63] } else { b'=' };
+            out[n + 3] = if i + 2 < data.len() { ALPHA[triple as usize & 63] } else { b'=' };
+            n += 4;
+            i += 3;
+        }
+        crate::kprintln!("[base64] {}", core::str::from_utf8(&out[..n]).unwrap_or("?"));
+    }
+}
+
+/// `cmp` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_cmp(line: &str, cmd: &str, rest: &str) {
+    // Compare two VFS files byte-by-byte: identical / first-diff / length-diff.
+    let mut it = rest.split_whitespace();
+    match (it.next(), it.next()) {
+        (Some(f1), Some(f2)) => {
+            let a = vfs::read_raw(f1);
+            let b = vfs::read_raw(f2);
+            match (a, b) {
+                (None, _) => crate::kprintln!("cmp: {} not found", f1),
+                (_, None) => crate::kprintln!("cmp: {} not found", f2),
+                (Some(a), Some(b)) => {
+                    let mut diff = None;
+                    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                        if x != y {
+                            diff = Some((i, *x, *y));
+                            break;
+                        }
+                    }
+                    if let Some((i, x, y)) = diff {
+                        crate::kprintln!(
+                            "cmp: {} {} differ at byte {} ({:#04x} vs {:#04x})",
+                            f1, f2, i, x, y
+                        );
+                    } else if a.len() == b.len() {
+                        crate::kprintln!("cmp: {} {} are identical ({} bytes)", f1, f2, a.len());
+                    } else {
+                        crate::kprintln!(
+                            "cmp: {} {} differ in length ({} vs {} bytes; shorter is a prefix)",
+                            f1, f2, a.len(), b.len()
+                        );
+                    }
+                }
+            }
+        }
+        _ => crate::kprintln!("usage: cmp <file1> <file2>"),
+    }
+}
+
+/// `una1z26` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_una1z26(line: &str, cmd: &str, rest: &str) {
+    // Decode an A1Z26-ciphered string back to letters -- the inverse of `a1z26`. Numbers 1-26
+    // (joined by '-' within a word, words separated by spaces) become their lowercase letters;
+    // words stay space-separated. "1-2-3" -> "abc", "8-5-12-12-15 23-15-18-12-4" -> "hello
+    // world", "15-19" -> "os". A number out of range (0 or >26) or a non-numeric part becomes
+    // '?'. So una1z26(a1z26(x)) restores x (letters, lowercased).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: una1z26 <numbers>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut first_word = true;
+        for word in rest.split_whitespace() {
+            if !first_word && len < buf.len() {
+                buf[len] = b' ';
+                len += 1;
+            }
+            first_word = false;
+            for part in word.split('-') {
+                if part.is_empty() {
+                    continue;
+                }
+                let mut num: u32 = 0;
+                let mut valid = true;
+                for &c in part.as_bytes() {
+                    if c.is_ascii_digit() {
+                        num = num * 10 + (c - b'0') as u32;
+                    } else {
+                        valid = false;
+                        break;
+                    }
+                }
+                let ch = if valid && (1..=26).contains(&num) {
+                    b'a' + (num - 1) as u8
+                } else {
+                    b'?'
+                };
+                if len < buf.len() {
+                    buf[len] = ch;
+                    len += 1;
+                }
+            }
+        }
+        crate::kprintln!(
+            "una1z26: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `capitalizeword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_capitalizeword(line: &str, cmd: &str, rest: &str) {
+    // Title-case only the nth (1-based) word: uppercase its first letter and lowercase the
+    // rest, leaving the other words and the word ORDER intact. "capitalizeword 1 hELLO
+    // world -> Hello world", "capitalizeword 2 one tWO three -> one Two three",
+    // "capitalizeword 2 AB cd ef -> AB Cd ef"; an out-of-range n is a no-op. Distinct from
+    // upperword (ALL caps), title (EVERY word), and capitalize (first letter of the TEXT).
+    let r = rest.trim_start();
+    let parsed = r
+        .find(' ')
+        .and_then(|sp| r[..sp].parse::<usize>().ok().filter(|&k| k >= 1).map(|k| (k, &r[sp + 1..])));
+    match parsed {
+        None => crate::kprintln!("usage: capitalizeword <n> <text>"),
+        Some((k, text)) => {
+            let mut buf = [0u8; 512];
+            let mut n = 0usize;
+            for (wi, w) in text.split_whitespace().enumerate() {
+                if wi > 0 && n < buf.len() {
+                    buf[n] = b' ';
+                    n += 1;
+                }
+                let cap = wi + 1 == k;
+                for (ci, &c) in w.as_bytes().iter().enumerate() {
+                    if n < buf.len() {
+                        buf[n] = if cap {
+                            if ci == 0 {
+                                c.to_ascii_uppercase()
+                            } else {
+                                c.to_ascii_lowercase()
+                            }
+                        } else {
+                            c
+                        };
+                        n += 1;
+                    }
+                }
+            }
+            crate::kprintln!(
+                "capitalizeword: {}",
+                core::str::from_utf8(&buf[..n]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `join` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_join(line: &str, cmd: &str, rest: &str) {
+    // Join the whitespace-separated words of <text> with <sep> between them. "join - a
+    // b c" -> "a-b-c", "join :: hello world" -> "hello::world". The general word-joiner:
+    // slug/kebab/snake use FIXED separators (and case folding), this uses an arbitrary
+    // literal <sep>. The constructive inverse of the split family (nthfield/before/after
+    // break ON a separator; join builds a delimited string FROM words).
+    let (sep, text) = match rest.find(' ') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    if sep.is_empty() || text.is_empty() {
+        crate::kprintln!("usage: join <sep> <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for (wi, w) in text.split_whitespace().enumerate() {
+            if wi > 0 {
+                for &c in sep.as_bytes() {
+                    if len < buf.len() {
+                        buf[len] = c;
+                        len += 1;
+                    }
+                }
+            }
+            for &c in w.as_bytes() {
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+        }
+        crate::kprintln!("join: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `replacefirst` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_replacefirst(line: &str, cmd: &str, rest: &str) {
+    // Replace only the FIRST occurrence of a substring with another -- whereas `replace`
+    // swaps ALL. "replacefirst o 0 foo boo" -> "f0o boo" (only the first o); an absent
+    // substring leaves the text unchanged. Distinct from replace (all occurrences) and
+    // tr (per-character translation). Same <from> <to> <text> parse as replace.
+    let mut parts = rest.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(from), Some(to), Some(text)) if !from.is_empty() => {
+            let fb = from.as_bytes();
+            let tb = to.as_bytes();
+            let src = text.as_bytes();
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            let mut i = 0usize;
+            let mut done = false; // stop replacing after the first hit
+            while i < src.len() {
+                if !done && i + fb.len() <= src.len() && &src[i..i + fb.len()] == fb {
+                    for &c in tb {
+                        if len < buf.len() {
+                            buf[len] = c;
+                            len += 1;
+                        }
+                    }
+                    i += fb.len();
+                    done = true;
+                } else {
+                    if len < buf.len() {
+                        buf[len] = src[i];
+                        len += 1;
+                    }
+                    i += 1;
+                }
+            }
+            crate::kprintln!(
+                "replacefirst: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+        _ => crate::kprintln!("usage: replacefirst <from> <to> <text>"),
+    }
+}
+
+/// `joinlines` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_joinlines(line: &str, cmd: &str, rest: &str) {
+    // Join ALL lines of a VFS file with an arbitrary <sep> between them -- the general
+    // separator form of unwrap (which always joins with a single space). "joinlines -
+    // about.txt" joins its two lines with a hyphen; a single-line file prints unchanged.
+    // Distinct from tac (reverses line ORDER) and join (joins inline WORDS, not lines).
+    let (sep, name) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim()),
+        None => (rest, ""),
+    };
+    if sep.is_empty() || name.is_empty() {
+        crate::kprintln!("usage: joinlines <sep> <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("joinlines: no such file: {}", name),
+            Some(s) => {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                let mut first = true;
+                for line in s.lines() {
+                    if !first {
+                        for &c in sep.as_bytes() {
+                            if len < buf.len() {
+                                buf[len] = c;
+                                len += 1;
+                            }
+                        }
+                    }
+                    first = false;
+                    for &c in line.as_bytes() {
+                        if len < buf.len() {
+                            buf[len] = c;
+                            len += 1;
+                        }
+                    }
+                }
+                crate::kprintln!(
+                    "joinlines: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `replace` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_replace(line: &str, cmd: &str, rest: &str) {
+    // Replace all non-overlapping occurrences of a substring with another.
+    let mut parts = rest.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(from), Some(to), Some(text)) if !from.is_empty() => {
+            let fb = from.as_bytes();
+            let tb = to.as_bytes();
+            let src = text.as_bytes();
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            let mut i = 0usize;
+            while i < src.len() {
+                if i + fb.len() <= src.len() && &src[i..i + fb.len()] == fb {
+                    for &c in tb {
+                        if len < buf.len() {
+                            buf[len] = c;
+                            len += 1;
+                        }
+                    }
+                    i += fb.len();
+                } else {
+                    if len < buf.len() {
+                        buf[len] = src[i];
+                        len += 1;
+                    }
+                    i += 1;
+                }
+            }
+            crate::kprintln!("replace: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+        }
+        _ => crate::kprintln!("usage: replace <from> <to> <text>"),
+    }
+}
+
+/// `pluralize` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_pluralize(line: &str, cmd: &str, rest: &str) {
+    // Naive English pluralization of each whitespace-separated word:
+    //   * ends in s/x/z, or "ch"/"sh"  -> append "es"  (box->boxes, dish->dishes)
+    //   * ends in a consonant + 'y'     -> the 'y' becomes "ies"  (city->cities)
+    //   * otherwise                     -> append "s"   (cat->cats, day->days)
+    // A deterministic per-word transform (the stem's case is preserved); distinct
+    // from title/mock/reveach and from the number spellers roman/ordinal.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: pluralize <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut first = true;
+        for w in rest.split_whitespace() {
+            if !first && len < buf.len() {
+                buf[len] = b' ';
+                len += 1;
+            }
+            first = false;
+            let b = w.as_bytes();
+            let n = b.len();
+            let lc = |x: u8| -> u8 { if x.is_ascii_uppercase() { x + 32 } else { x } };
+            let last = lc(b[n - 1]);
+            let prev = if n >= 2 { lc(b[n - 2]) } else { 0 };
+            let is_vowel = |x: u8| matches!(x, b'a' | b'e' | b'i' | b'o' | b'u');
+            let es = last == b's'
+                || last == b'x'
+                || last == b'z'
+                || (n >= 2 && prev == b'c' && last == b'h')
+                || (n >= 2 && prev == b's' && last == b'h');
+            let ies = last == b'y' && n >= 2 && !is_vowel(prev);
+            let stem_len = if ies { n - 1 } else { n };
+            for &c in &b[..stem_len] {
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+            let suf: &[u8] = if ies { b"ies" } else if es { b"es" } else { b"s" };
+            for &c in suf {
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+        }
+        crate::kprintln!(
+            "pluralize: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `reverseword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_reverseword(line: &str, cmd: &str, rest: &str) {
+    // Reverse the CHARS of only the nth (1-based) word, leaving the other words and the
+    // word ORDER intact. "reverseword 1 hello world" -> "olleh world", "reverseword 2 abc
+    // def" -> "abc fed", "reverseword 2 ab cd ef" -> "ab dc ef"; an out-of-range n is a
+    // no-op. Distinct from reveach (reverses EVERY word), rwords (reverses word ORDER),
+    // and revmiddle (keeps first+last). Reuses the wrap/center <n> <text> parse.
+    let r = rest.trim_start();
+    let parsed = r
+        .find(' ')
+        .and_then(|sp| r[..sp].parse::<usize>().ok().filter(|&k| k >= 1).map(|k| (k, &r[sp + 1..])));
+    match parsed {
+        None => crate::kprintln!("usage: reverseword <n> <text>"),
+        Some((k, text)) => {
+            let mut buf = [0u8; 512];
+            let mut n = 0usize;
+            for (wi, w) in text.split_whitespace().enumerate() {
+                if wi > 0 && n < buf.len() {
+                    buf[n] = b' ';
+                    n += 1;
+                }
+                if wi + 1 == k {
+                    for &c in w.as_bytes().iter().rev() {
+                        if n < buf.len() {
+                            buf[n] = c;
+                            n += 1;
+                        }
+                    }
+                } else {
+                    for &c in w.as_bytes() {
+                        if n < buf.len() {
+                            buf[n] = c;
+                            n += 1;
+                        }
+                    }
+                }
+            }
+            crate::kprintln!(
+                "reverseword: {}",
+                core::str::from_utf8(&buf[..n]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `swapchar` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_swapchar(line: &str, cmd: &str, rest: &str) {
+    // Swap the i-th and j-th (1-based) CHARACTERS of the text (byte-indexed). "swapchar 1
+    // 5 hello" -> "oellh", "swapchar 2 4 abcde" -> "adcbe", "swapchar 1 1 abc" -> "abc"
+    // (same index), "swapchar 3 9 abc" -> "abc" (an out-of-range index leaves it
+    // unchanged). The char-level analogue of swapwords (swap words by index); distinct
+    // from swappairs (swaps ADJACENT chars in pairs) and reverse.
+    let mut parts = rest.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(is), Some(js), Some(text)) => {
+            let i = is.parse::<usize>().ok().filter(|&k| k >= 1);
+            let j = js.parse::<usize>().ok().filter(|&k| k >= 1);
+            match (i, j) {
+                (Some(i), Some(j)) => {
+                    let mut buf = [0u8; 512];
+                    let b = text.as_bytes();
+                    let n = b.len().min(buf.len());
+                    buf[..n].copy_from_slice(&b[..n]);
+                    if i <= n && j <= n {
+                        buf.swap(i - 1, j - 1);
+                    }
+                    crate::kprintln!(
+                        "swapchar: {}",
+                        core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                    );
+                }
+                _ => crate::kprintln!("usage: swapchar <i> <j> <text>"),
+            }
+        }
+        _ => crate::kprintln!("usage: swapchar <i> <j> <text>"),
+    }
+}
+
+/// `append` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_append(line: &str, cmd: &str, rest: &str) {
+    // Append text to a file (complements `write`, which overwrites).
+    let (name, content) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim()),
+        None => (rest, ""),
+    };
+    if name.is_empty() {
+        crate::kprintln!("usage: append <file> <text>");
+    } else {
+        // Copy the current content into a local buffer first (read_raw
+        // borrows the file's own storage; writing back over it directly
+        // would be an overlapping copy).
+        let mut buf = [0u8; 512];
+        let mut n = 0;
+        if let Some(existing) = vfs::read_raw(name) {
+            n = existing.len().min(512);
+            buf[..n].copy_from_slice(&existing[..n]);
+        }
+        let add = content.as_bytes();
+        let a = add.len().min(512 - n);
+        buf[n..n + a].copy_from_slice(&add[..a]);
+        if vfs::write(name, &buf[..n + a]) {
+            crate::kprintln!("appended {} bytes to {} ({} total)", a, name, n + a);
+        } else {
+            crate::kprintln!("append: failed (name too long or filesystem full)");
+        }
+    }
+}
+
+/// `replaceword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_replaceword(line: &str, cmd: &str, rest: &str) {
+    // Replace each WHOLE-WORD occurrence of <old> with <new> (whitespace-delimited,
+    // case-sensitive). "replaceword cat dog cat category" -> "dog category" (only the
+    // whole word "cat" is swapped -- "category" is untouched). Distinct from replace (a
+    // raw SUBSTRING swap anywhere) and tr (per-character): this respects word boundaries.
+    let mut parts = rest.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(old), Some(new), Some(text)) if !old.is_empty() => {
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            let mut first = true;
+            for w in text.split_whitespace() {
+                if !first && len < buf.len() {
+                    buf[len] = b' ';
+                    len += 1;
+                }
+                first = false;
+                let emit = if w == old { new } else { w };
+                for &c in emit.as_bytes() {
+                    if len < buf.len() {
+                        buf[len] = c;
+                        len += 1;
+                    }
+                }
+            }
+            crate::kprintln!(
+                "replaceword: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+        _ => crate::kprintln!("usage: replaceword <old> <new> <text>"),
+    }
+}
+
+/// `oddlines` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_oddlines(line: &str, cmd: &str, rest: &str) {
+    // Print the ODD-numbered lines (1st, 3rd, 5th, ... 1-based) of a VFS file,
+    // newline-joined. about.txt (2 lines) -> line 1 only; motd (1 line) -> its
+    // single line. Distinct from head/tail (which cut by BYTE), headlines/
+    // taillines (the first/last N lines), and `line` (one line by index): this
+    // selects lines by PARITY. Its complement would be the even-numbered lines.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: oddlines <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("oddlines: no such file: {}", name),
+            Some(s) => {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                let mut first = true;
+                for (i, line) in s.lines().enumerate() {
+                    if i % 2 == 0 {
+                        // 0-based even index == 1-based ODD line
+                        if !first && len < buf.len() {
+                            buf[len] = b'\n';
+                            len += 1;
+                        }
+                        first = false;
+                        for &b in line.as_bytes() {
+                            if len < buf.len() {
+                                buf[len] = b;
+                                len += 1;
+                            }
+                        }
+                    }
+                }
+                crate::kprintln!(
+                    "oddlines: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `evenlines` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_evenlines(line: &str, cmd: &str, rest: &str) {
+    // Print the EVEN-numbered lines (2nd, 4th, 6th, ... 1-based) of a VFS file,
+    // newline-joined -- the complement of oddlines. about.txt (2 lines) -> line 2
+    // only; motd (1 line) -> nothing (it has no even line). A line-PARITY selector
+    // distinct from head/tail (BYTE cut), headlines/taillines (first/last N), and
+    // `line` (one line by index).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: evenlines <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("evenlines: no such file: {}", name),
+            Some(s) => {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                let mut first = true;
+                for (i, line) in s.lines().enumerate() {
+                    if i % 2 == 1 {
+                        // 0-based odd index == 1-based EVEN line
+                        if !first && len < buf.len() {
+                            buf[len] = b'\n';
+                            len += 1;
+                        }
+                        first = false;
+                        for &b in line.as_bytes() {
+                            if len < buf.len() {
+                                buf[len] = b;
+                                len += 1;
+                            }
+                        }
+                    }
+                }
+                crate::kprintln!(
+                    "evenlines: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `revmiddle` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_revmiddle(line: &str, cmd: &str, rest: &str) {
+    // Reverse the MIDDLE characters of each word, keeping the FIRST and LAST in
+    // place (classic typoglycemia -- still readable): "hello" -> "hlleo", "world"
+    // -> "wlrod", "own your device" -> "own yuor dcivee". Words of length <= 2 have
+    // no interior and are unchanged (a 3-letter word's single middle char reverses
+    // to itself). Distinct from reveach (reverses the WHOLE word), firstlast (keeps
+    // ONLY the first+last char), and rwords (reverses word ORDER).
+    let mut buf = [0u8; 512];
+    let mut n = 0usize;
+    for (wi, w) in rest.split_whitespace().enumerate() {
+        if wi > 0 && n < buf.len() {
+            buf[n] = b' ';
+            n += 1;
+        }
+        let b = w.as_bytes();
+        let m = b.len();
+        if m <= 2 {
+            for &c in b {
+                if n < buf.len() {
+                    buf[n] = c;
+                    n += 1;
+                }
+            }
+        } else {
+            if n < buf.len() {
+                buf[n] = b[0];
+                n += 1;
+            }
+            // interior b[m-2] down to b[1] (reversed middle)
+            let mut i = m - 2;
+            loop {
+                if n < buf.len() {
+                    buf[n] = b[i];
+                    n += 1;
+                }
+                if i == 1 {
+                    break;
+                }
+                i -= 1;
+            }
+            if n < buf.len() {
+                buf[n] = b[m - 1];
+                n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        crate::kprintln!("usage: revmiddle <text>");
+    } else {
+        crate::kprintln!("revmiddle: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `rotatef` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rotatef(line: &str, cmd: &str, rest: &str) {
+    // Circular LEFT-rotate the raw BYTES of a whole VFS file by n: output =
+    // bytes[k..] ++ bytes[0..k] where k = n mod len. The file analogue of
+    // rotate (inline text); distinct from rotlines (rotates whole LINES, not
+    // raw bytes) and rotwords (rotates the WORD sequence, inline only).
+    // Embedded newlines are just data here, rotated along with everything
+    // else, so line boundaries generally shift/merge unlike rotlines.
+    match rest.find(' ') {
+        Some(i) => {
+            let num_s = &rest[..i];
+            let name = rest[i + 1..].trim();
+            match num_s.parse::<u64>() {
+                Ok(n) => {
+                    if name.is_empty() {
+                        crate::kprintln!("usage: rotatef <n> <file>");
+                    } else {
+                        match vfs::read_raw(name) {
+                            None => crate::kprintln!("rotatef: {} not found", name),
+                            Some(bytes) => {
+                                let len = bytes.len();
+                                if len == 0 {
+                                    crate::kprintln!("rotatef: {} is empty", name);
+                                } else {
+                                    let k = (n % len as u64) as usize;
+                                    let mut buf = [0u8; 512];
+                                    let mut m = 0usize;
+                                    for &b in
+                                        bytes[k..].iter().chain(bytes[..k].iter())
+                                    {
+                                        if m < buf.len() {
+                                            buf[m] = b;
+                                            m += 1;
+                                        }
+                                    }
+                                    crate::kprintln!(
+                                        "rotatef: {}",
+                                        core::str::from_utf8(&buf[..m]).unwrap_or("?")
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => crate::kprintln!("usage: rotatef <n> <file>"),
+            }
+        }
+        None => crate::kprintln!("usage: rotatef <n> <file>"),
+    }
+}
+
+/// `lowerword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_lowerword(line: &str, cmd: &str, rest: &str) {
+    // Lowercase only the nth (1-based) word, leaving the other words and the word ORDER
+    // intact -- the direct complement of upperword. "lowerword 1 HELLO WORLD -> hello
+    // WORLD", "lowerword 2 ONE TWO THREE -> ONE two THREE", "lowerword 2 AB CD EF -> AB cd
+    // EF"; an out-of-range n is a no-op. Distinct from whisper (lowercases the WHOLE text).
+    let r = rest.trim_start();
+    let parsed = r
+        .find(' ')
+        .and_then(|sp| r[..sp].parse::<usize>().ok().filter(|&k| k >= 1).map(|k| (k, &r[sp + 1..])));
+    match parsed {
+        None => crate::kprintln!("usage: lowerword <n> <text>"),
+        Some((k, text)) => {
+            let mut buf = [0u8; 512];
+            let mut n = 0usize;
+            for (wi, w) in text.split_whitespace().enumerate() {
+                if wi > 0 && n < buf.len() {
+                    buf[n] = b' ';
+                    n += 1;
+                }
+                let lower = wi + 1 == k;
+                for &c in w.as_bytes() {
+                    if n < buf.len() {
+                        buf[n] = if lower { c.to_ascii_lowercase() } else { c };
+                        n += 1;
+                    }
+                }
+            }
+            crate::kprintln!(
+                "lowerword: {}",
+                core::str::from_utf8(&buf[..n]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `upperword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_upperword(line: &str, cmd: &str, rest: &str) {
+    // Uppercase only the nth (1-based) word, leaving the other words and the word ORDER
+    // intact. "upperword 1 hello world" -> "HELLO world", "upperword 2 one two three" ->
+    // "one TWO three", "upperword 3 x y z" -> "x y Z"; an out-of-range n is a no-op.
+    // Distinct from shout (uppercases the WHOLE text), title (capitalizes each word's
+    // first letter), and capitalize (only the first letter of the text).
+    let r = rest.trim_start();
+    let parsed = r
+        .find(' ')
+        .and_then(|sp| r[..sp].parse::<usize>().ok().filter(|&k| k >= 1).map(|k| (k, &r[sp + 1..])));
+    match parsed {
+        None => crate::kprintln!("usage: upperword <n> <text>"),
+        Some((k, text)) => {
+            let mut buf = [0u8; 512];
+            let mut n = 0usize;
+            for (wi, w) in text.split_whitespace().enumerate() {
+                if wi > 0 && n < buf.len() {
+                    buf[n] = b' ';
+                    n += 1;
+                }
+                let upper = wi + 1 == k;
+                for &c in w.as_bytes() {
+                    if n < buf.len() {
+                        buf[n] = if upper { c.to_ascii_uppercase() } else { c };
+                        n += 1;
+                    }
+                }
+            }
+            crate::kprintln!(
+                "upperword: {}",
+                core::str::from_utf8(&buf[..n]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `everynthword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_everynthword(line: &str, cmd: &str, rest: &str) {
+    // Keep every nth WORD of the text (word positions 0, n, 2n, ... -- a stride-n
+    // decimation of the word sequence, equivalent to words[::n]). "everynthword 2 a
+    // b c d e f" -> "a c e", "everynthword 3 a b c d e f g" -> "a d g", "everynthword
+    // 1 a b c" -> "a b c". The word-level analogue of everynth (which strides CHARS);
+    // distinct from wordn (a single word) and rangewords/wordrange (a contiguous span).
+    let r = rest.trim_start();
+    let parsed = r.find(' ').and_then(|sp| {
+        r[..sp].parse::<usize>().ok().filter(|&k| k >= 1).map(|k| (k, &r[sp + 1..]))
+    });
+    match parsed {
+        None => crate::kprintln!("usage: everynthword <n> <text>"),
+        Some((n, text)) => {
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            for (i, w) in text.split_whitespace().enumerate() {
+                if i % n == 0 {
+                    if len > 0 && len < buf.len() {
+                        buf[len] = b' ';
+                        len += 1;
+                    }
+                    for &c in w.as_bytes() {
+                        if len < buf.len() {
+                            buf[len] = c;
+                            len += 1;
+                        }
+                    }
+                }
+            }
+            if len == 0 {
+                crate::kprintln!("everynthword: (none)");
+            } else {
+                crate::kprintln!(
+                    "everynthword: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `unwrap` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_unwrap(line: &str, cmd: &str, rest: &str) {
+    // Join ALL lines of a VFS file into a SINGLE line, separating them with one
+    // space -- the inverse of `wrap` (which breaks one long line into many at a
+    // width). Word/line ORDER is preserved; only the line breaks are removed.
+    // Distinct from tac (reverses line ORDER), rwordsf (reverses word order per
+    // line), and revf (reverses chars per line). A one-line file prints unchanged.
+    match rest.split_whitespace().next() {
+        None => crate::kprintln!("usage: unwrap <file>"),
+        Some(name) => match vfs::read_str(name) {
+            None => crate::kprintln!("unwrap: no such file: {}", name),
+            Some(s) => {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                let mut first = true;
+                for line in s.lines() {
+                    if !first && len < buf.len() {
+                        buf[len] = b' ';
+                        len += 1;
+                    }
+                    first = false;
+                    for &c in line.as_bytes() {
+                        if len < buf.len() {
+                            buf[len] = c;
+                            len += 1;
+                        }
+                    }
+                }
+                crate::kprintln!(
+                    "unwrap: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        },
+    }
+}
+
+/// `deleteword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_deleteword(line: &str, cmd: &str, rest: &str) {
+    // Delete the nth (1-based) word of the text, space-separated -- the complement of
+    // insertword. "deleteword 2 a b c" -> "a c", "deleteword 1 a b c" -> "b c",
+    // "deleteword 3 a b c" -> "a b"; an out-of-range index leaves the text unchanged.
+    // Distinct from swapwords, truncatewords (keep the FIRST n), and dedupwords.
+    let r = rest.trim_start();
+    let parsed = r
+        .find(' ')
+        .and_then(|sp| r[..sp].parse::<usize>().ok().filter(|&k| k >= 1).map(|k| (k, &r[sp + 1..])));
+    match parsed {
+        None => crate::kprintln!("usage: deleteword <n> <text>"),
+        Some((n, text)) => {
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            let mut first = true;
+            for (i, w) in text.split_whitespace().enumerate() {
+                if i + 1 == n {
+                    continue;
+                }
+                if !first && len < buf.len() {
+                    buf[len] = b' ';
+                    len += 1;
+                }
+                first = false;
+                for &c in w.as_bytes() {
+                    if len < buf.len() {
+                        buf[len] = c;
+                        len += 1;
+                    }
+                }
+            }
+            crate::kprintln!(
+                "deleteword: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `wordsperline` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wordsperline(line: &str, cmd: &str, rest: &str) {
+    // List the number of whitespace-separated words in EACH line of a VFS
+    // file, space-separated (about.txt -> "8 14", motd -> "9"). The whole-
+    // file companion of linewords (which reports ONE line by index); distinct
+    // from wc (whole-file totals), linelen (a line's BYTE length), and
+    // wordlengths (per-WORD lengths of inline text).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: wordsperline <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("wordsperline: no such file: {}", name),
+            Some(s) => {
+                fn push(buf: &mut [u8], len: &mut usize, b: u8) {
+                    if *len < buf.len() {
+                        buf[*len] = b;
+                        *len += 1;
+                    }
+                }
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                let mut first = true;
+                for line in s.lines() {
+                    if !first {
+                        push(&mut buf, &mut len, b' ');
+                    }
+                    first = false;
+                    // Decimal digits of this line's word count, reversed then emitted.
+                    let mut tmp = [0u8; 20];
+                    let mut ti = 0usize;
+                    let mut v = line.split_whitespace().count();
+                    if v == 0 {
+                        tmp[ti] = b'0';
+                        ti += 1;
+                    } else {
+                        while v > 0 {
+                            tmp[ti] = b'0' + (v % 10) as u8;
+                            ti += 1;
+                            v /= 10;
+                        }
+                    }
+                    while ti > 0 {
+                        ti -= 1;
+                        push(&mut buf, &mut len, tmp[ti]);
+                    }
+                }
+                crate::kprintln!(
+                    "wordsperline: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `wrap` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wrap(line: &str, cmd: &str, rest: &str) {
+    // Greedy word-wrap text to a column width; print each wrapped line.
+    let r = rest.trim_start();
+    let parsed = r.find(' ').and_then(|sp| {
+        r[..sp].parse::<usize>().ok().filter(|&w| w > 0).map(|w| (w, &r[sp + 1..]))
+    });
+    match parsed {
+        None => crate::kprintln!("usage: wrap <width> <text>"),
+        Some((width, text)) => {
+            let mut buf = [0u8; 512];
+            let mut len = 0usize; // current line length in bytes
+            let flush = |buf: &[u8], len: usize| {
+                if len > 0 {
+                    crate::kprintln!(
+                        "wrap: {}",
+                        core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                    );
+                }
+            };
+            for w in text.split_whitespace() {
+                let wb = w.as_bytes();
+                if len == 0 {
+                    // start a fresh line with this word
+                    for &c in wb {
+                        if len < 512 {
+                            buf[len] = c;
+                            len += 1;
+                        }
+                    }
+                } else if len + 1 + wb.len() <= width {
+                    // fits: append " " + word
+                    if len < 512 {
+                        buf[len] = b' ';
+                        len += 1;
+                    }
+                    for &c in wb {
+                        if len < 512 {
+                            buf[len] = c;
+                            len += 1;
+                        }
+                    }
+                } else {
+                    // does not fit: flush the line, start a new one
+                    flush(&buf, len);
+                    len = 0;
+                    for &c in wb {
+                        if len < 512 {
+                            buf[len] = c;
+                            len += 1;
+                        }
+                    }
+                }
+            }
+            flush(&buf, len);
+        }
+    }
+}
+
+/// `mode` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_mode(line: &str, cmd: &str, rest: &str) {
+    // Mode (most-frequent value) of a list; smallest value wins on ties.
+    let mut a = [0u64; 64];
+    let mut n = 0usize;
+    let mut bad = false;
+    for tok in rest.split_whitespace() {
+        match tok.parse::<u64>() {
+            Ok(v) if n < a.len() => {
+                a[n] = v;
+                n += 1;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                bad = true;
+                break;
+            }
+        }
+    }
+    if bad || n == 0 {
+        crate::kprintln!("usage: mode <n1> <n2> ...");
+    } else {
+        // Insertion sort the first n in place.
+        for i in 1..n {
+            let key = a[i];
+            let mut j = i;
+            while j > 0 && a[j - 1] > key {
+                a[j] = a[j - 1];
+                j -= 1;
+            }
+            a[j] = key;
+        }
+        // Longest run of equal values; strictly-greater keeps the first (smallest).
+        let mut best_val = a[0];
+        let mut best_count = 0u32;
+        let mut cur_val = a[0];
+        let mut cur_count = 0u32;
+        for &x in &a[..n] {
+            if x == cur_val {
+                cur_count += 1;
+            } else {
+                cur_val = x;
+                cur_count = 1;
+            }
+            if cur_count > best_count {
+                best_count = cur_count;
+                best_val = cur_val;
+            }
+        }
+        crate::kprintln!(
+            "mode: {} (appears {} times of {} values)",
+            best_val, best_count, n
+        );
+    }
+}
+
+/// `rotate` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rotate(line: &str, cmd: &str, rest: &str) {
+    // Circular LEFT-rotate the characters (bytes) of the text by n positions:
+    // output = text[k..] ++ text[0..k] where k = n mod len. Distinct from caesar
+    // (shifts letter VALUES), rev (reverses), and swappairs/swapends (rearrange
+    // pairs/ends) -- this cyclically shifts character POSITIONS. "2 hello" ->
+    // "llohe"; n >= len wraps (k = n mod len), so "7 abc" -> "bca".
+    match rest.find(' ') {
+        Some(i) => {
+            let num_s = &rest[..i];
+            let text = &rest[i + 1..];
+            match num_s.parse::<u64>() {
+                Ok(n) => {
+                    let bytes = text.as_bytes();
+                    let len = bytes.len();
+                    if len == 0 {
+                        crate::kprintln!("usage: rotate <n> <text>");
+                    } else {
+                        let k = (n % len as u64) as usize;
+                        let mut buf = [0u8; 512];
+                        let mut m = 0usize;
+                        for &b in bytes[k..].iter().chain(bytes[..k].iter()) {
+                            if m < buf.len() {
+                                buf[m] = b;
+                                m += 1;
+                            }
+                        }
+                        crate::kprintln!(
+                            "rotate: {}",
+                            core::str::from_utf8(&buf[..m]).unwrap_or("?")
+                        );
+                    }
+                }
+                Err(_) => crate::kprintln!("usage: rotate <n> <text>"),
+            }
+        }
+        None => crate::kprintln!("usage: rotate <n> <text>"),
+    }
+}
+
+/// `camel` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_camel(line: &str, cmd: &str, rest: &str) {
+    // Join space-separated words into camelCase: first word all lowercase,
+    // every subsequent word's first letter uppercased, all else lowercased,
+    // spaces removed. Distinct from slug (hyphen-joins + lowercases), title
+    // (keeps spaces, capitalizes each word), and capitalize (only the very
+    // first letter of the whole text).
+    let mut buf = [0u8; 512];
+    let mut n = 0usize;
+    for (wi, w) in rest.split_whitespace().enumerate() {
+        for (ci, &c) in w.as_bytes().iter().enumerate() {
+            let mut ch = if c.is_ascii_uppercase() { c + 32 } else { c };
+            if ci == 0 && wi > 0 && ch.is_ascii_lowercase() {
+                ch -= 32; // uppercase the first letter of non-first words
+            }
+            if n < buf.len() {
+                buf[n] = ch;
+                n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        crate::kprintln!("usage: camel <text>");
+    } else {
+        crate::kprintln!("camel: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `abbreviate` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_abbreviate(line: &str, cmd: &str, rest: &str) {
+    // Truncate EACH whitespace-delimited word to its first <n> characters (words shorter
+    // than n pass through unchanged), single-spaced. "abbreviate 3 hello world" -> "hel
+    // wor", "abbreviate 1 one two three" -> "o t t", "abbreviate 5 hi there" -> "hi there",
+    // "abbreviate 2 abcdef" -> "ab". Distinct from firstn (a prefix of the WHOLE text),
+    // truncatewords (the first n WORDS), and trunc (whole-text cut with an ellipsis).
+    let r = rest.trim_start();
+    let parsed = r
+        .find(' ')
+        .and_then(|sp| r[..sp].parse::<usize>().ok().map(|k| (k, &r[sp + 1..])));
+    match parsed {
+        None => crate::kprintln!("usage: abbreviate <n> <text>"),
+        Some((n, text)) => {
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            let mut first = true;
+            for w in text.split_whitespace() {
+                if !first && len < buf.len() {
+                    buf[len] = b' ';
+                    len += 1;
+                }
+                first = false;
+                for &c in w.as_bytes().iter().take(n) {
+                    if len < buf.len() {
+                        buf[len] = c;
+                        len += 1;
+                    }
+                }
+            }
+            crate::kprintln!(
+                "abbreviate: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `redact` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_redact(line: &str, cmd: &str, rest: &str) {
+    // Mask each word's INTERIOR with '*', keeping the FIRST and LAST character (a partial
+    // reveal). "hello world" -> "h***o w***d", "cat" -> "c*t", "hi" -> "hi" (len <= 2 has
+    // no interior), "a" -> "a". Distinct from censor (keeps ONLY the first char) and mask
+    // (masks EVERY alphanumeric regardless of word boundaries).
+    let mut buf = [0u8; 512];
+    let mut n = 0usize;
+    let mut first = true;
+    for w in rest.split_whitespace() {
+        if !first && n < buf.len() {
+            buf[n] = b' ';
+            n += 1;
+        }
+        first = false;
+        let b = w.as_bytes();
+        let last = b.len().saturating_sub(1);
+        for (j, &c) in b.iter().enumerate() {
+            // Keep the first and last char; star the interior (words of len <= 2 have none).
+            let ch = if j == 0 || j == last { c } else { b'*' };
+            if n < buf.len() {
+                buf[n] = ch;
+                n += 1;
+            }
+        }
+    }
+    if first {
+        crate::kprintln!("usage: redact <text>");
+    } else {
+        crate::kprintln!("redact: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `numberwords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_numberwords(line: &str, cmd: &str, rest: &str) {
+    // Prefix each whitespace-delimited word with its 1-based index and a
+    // colon, space-separated: "alpha beta gamma" -> "1:alpha 2:beta 3:gamma".
+    // The inline-word analogue of nl (which numbers a FILE's lines); distinct
+    // from wordlengths (per-word LENGTHS), wordn (the Nth word), and acronym.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: numberwords <text>");
+    } else {
+        fn push(buf: &mut [u8], len: &mut usize, b: u8) {
+            if *len < buf.len() {
+                buf[*len] = b;
+                *len += 1;
+            }
+        }
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for (i, word) in rest.split_whitespace().enumerate() {
+            if i > 0 {
+                push(&mut buf, &mut len, b' ');
+            }
+            // Decimal digits of the 1-based index, reversed then emitted.
+            let mut tmp = [0u8; 20];
+            let mut ti = 0usize;
+            let mut v = i + 1;
+            while v > 0 {
+                tmp[ti] = b'0' + (v % 10) as u8;
+                ti += 1;
+                v /= 10;
+            }
+            while ti > 0 {
+                ti -= 1;
+                push(&mut buf, &mut len, tmp[ti]);
+            }
+            push(&mut buf, &mut len, b':');
+            for &c in word.as_bytes() {
+                push(&mut buf, &mut len, c);
+            }
+        }
+        crate::kprintln!(
+            "numberwords: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `charsperline` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_charsperline(line: &str, cmd: &str, rest: &str) {
+    // List the character (byte) length of EACH line of a VFS file, space-
+    // separated (motd -> "63", about.txt -> "64 63"). The char
+    // analogue of wordsperline (which counts WORDS per line); distinct from
+    // linelen (ONE line by index), wc (whole-file totals), and charcount
+    // (whole-file character total). A trailing newline is not counted (lines()
+    // strips line terminators).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: charsperline <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("charsperline: no such file: {}", name),
+            Some(s) => {
+                fn push(buf: &mut [u8], len: &mut usize, b: u8) {
+                    if *len < buf.len() {
+                        buf[*len] = b;
+                        *len += 1;
+                    }
+                }
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                let mut first = true;
+                for line in s.lines() {
+                    if !first {
+                        push(&mut buf, &mut len, b' ');
+                    }
+                    first = false;
+                    // Decimal digits of this line's byte length, reversed then emitted.
+                    let mut tmp = [0u8; 20];
+                    let mut ti = 0usize;
+                    let mut v = line.as_bytes().len();
+                    if v == 0 {
+                        tmp[ti] = b'0';
+                        ti += 1;
+                    } else {
+                        while v > 0 {
+                            tmp[ti] = b'0' + (v % 10) as u8;
+                            ti += 1;
+                            v /= 10;
+                        }
+                    }
+                    while ti > 0 {
+                        ti -= 1;
+                        push(&mut buf, &mut len, tmp[ti]);
+                    }
+                }
+                crate::kprintln!(
+                    "charsperline: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `capitalizelast` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_capitalizelast(line: &str, cmd: &str, rest: &str) {
+    // Uppercase the LAST character of each whitespace-separated word (when it
+    // is a lowercase ASCII letter), leaving every other character unchanged:
+    // "hello world" -> "hellO worlD". The end-of-word mirror of title (which
+    // capitalizes the FIRST letter of each word); distinct from capitalize
+    // (only the whole string's first letter), vowelcase, and sentencecap.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: capitalizelast <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut first = true;
+        for w in rest.split_whitespace() {
+            if !first && len < buf.len() {
+                buf[len] = b' ';
+                len += 1;
+            }
+            first = false;
+            let b = w.as_bytes();
+            let last = b.len() - 1; // w is non-empty (split_whitespace)
+            for (j, &c) in b.iter().enumerate() {
+                let out = if j == last && c.is_ascii_lowercase() {
+                    c - 32
+                } else {
+                    c
+                };
+                if len < buf.len() {
+                    buf[len] = out;
+                    len += 1;
+                }
+            }
+        }
+        crate::kprintln!(
+            "capitalizelast: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `median` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_median(line: &str, cmd: &str, rest: &str) {
+    // Median of a list of integers: parse -> sort -> middle (even = integer avg).
+    let mut a = [0u64; 64];
+    let mut n = 0usize;
+    let mut bad = false;
+    for tok in rest.split_whitespace() {
+        match tok.parse::<u64>() {
+            Ok(v) if n < a.len() => {
+                a[n] = v;
+                n += 1;
+            }
+            Ok(_) => {} // beyond 64: ignore extras
+            Err(_) => {
+                bad = true;
+                break;
+            }
+        }
+    }
+    if bad || n == 0 {
+        crate::kprintln!("usage: median <n1> <n2> ...");
+    } else {
+        // Insertion sort the first n in place.
+        for i in 1..n {
+            let key = a[i];
+            let mut j = i;
+            while j > 0 && a[j - 1] > key {
+                a[j] = a[j - 1];
+                j -= 1;
+            }
+            a[j] = key;
+        }
+        let med = if n % 2 == 1 {
+            a[n / 2]
+        } else {
+            ((a[n / 2 - 1] as u128 + a[n / 2] as u128) / 2) as u64
+        };
+        crate::kprintln!("median: {} (of {} values)", med, n);
+    }
+}
+
+/// `revf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_revf(line: &str, cmd: &str, rest: &str) {
+    // Print each line of a VFS file with its characters reversed (the Unix
+    // `rev` command, on a file). Distinct from `rev` (inline args) and `tac`
+    // (reverses line ORDER). Byte-order reversal (ASCII).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: revf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("revf: no such file: {}", name),
+            Some(s) => {
+                for line in s.lines() {
+                    let b = line.as_bytes();
+                    let mut buf = [0u8; 512];
+                    let n = b.len().min(buf.len());
+                    for i in 0..n {
+                        buf[i] = b[n - 1 - i];
+                    }
+                    crate::kprintln!(
+                        "{}",
+                        core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `altwords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_altwords(line: &str, cmd: &str, rest: &str) {
+    // Alternate WORD case: uppercase every even-indexed word (0-based) and
+    // lowercase every odd-indexed word: "hello world foo" -> "HELLO world FOO".
+    // The word-level analogue of mock (which alternates by LETTER); distinct
+    // from title (each word title-cased) and shout/whisper (ALL up / ALL down).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: altwords <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut n = 0usize;
+        for (wi, w) in rest.split_whitespace().enumerate() {
+            if wi > 0 && n < buf.len() {
+                buf[n] = b' ';
+                n += 1;
+            }
+            let upper = wi % 2 == 0;
+            for &c in w.as_bytes() {
+                let ch = if upper {
+                    if c.is_ascii_lowercase() { c - 32 } else { c }
+                } else if c.is_ascii_uppercase() {
+                    c + 32
+                } else {
+                    c
+                };
+                if n < buf.len() {
+                    buf[n] = ch;
+                    n += 1;
+                }
+            }
+        }
+        crate::kprintln!(
+            "altwords: {}",
+            core::str::from_utf8(&buf[..n]).unwrap_or("?")
+        );
+    }
+}
+
+/// `removeword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_removeword(line: &str, cmd: &str, rest: &str) {
+    // Remove every WHOLE-WORD occurrence of <word> from the text (whitespace-delimited,
+    // case-sensitive), closing the gaps. "removeword the the cat the dog" -> "cat dog",
+    // "removeword a a b a c a" -> "b c", "removeword x a b c" -> "a b c" (no match),
+    // "removeword cat cat category cat" -> "category" (substring-safe; "category" kept),
+    // "removeword only only" -> "" (empty). Distinct from deleteword (removes the nth
+    // word by INDEX), replaceword (SWAPS a word), and delete (removes CHARS in a set).
+    let (word, text) = match rest.find(' ') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest.trim(), ""),
+    };
+    if word.is_empty() {
+        crate::kprintln!("usage: removeword <word> <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut first = true;
+        for w in text.split_whitespace() {
+            if w == word {
+                continue; // drop this whole word
+            }
+            if !first && len < buf.len() {
+                buf[len] = b' ';
+                len += 1;
+            }
+            first = false;
+            for &c in w.as_bytes() {
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+        }
+        crate::kprintln!(
+            "removeword: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `wordlensf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wordlensf(line: &str, cmd: &str, rest: &str) {
+    // Output the byte length of each whitespace-delimited word of a VFS FILE,
+    // space-separated (counting across ALL lines). The file analogue of wordlengths
+    // (which lists per-word lengths of INLINE text), mirroring how charcount is the
+    // file analogue of countchar. Distinct from charsperline (per-LINE char counts),
+    // wordsperline (per-line word counts), and avgwordlen (the MEAN word length).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: wordlensf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("wordlensf: no such file: {}", name),
+            Some(s) => {
+                fn push(buf: &mut [u8], len: &mut usize, b: u8) {
+                    if *len < buf.len() {
+                        buf[*len] = b;
+                        *len += 1;
+                    }
+                }
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                let mut first = true;
+                for word in s.split_whitespace() {
+                    if !first {
+                        push(&mut buf, &mut len, b' ');
+                    }
+                    first = false;
+                    let mut tmp = [0u8; 20];
+                    let mut ti = 0usize;
+                    let mut v = word.as_bytes().len();
+                    if v == 0 {
+                        tmp[ti] = b'0';
+                        ti += 1;
+                    } else {
+                        while v > 0 {
+                            tmp[ti] = b'0' + (v % 10) as u8;
+                            ti += 1;
+                            v /= 10;
+                        }
+                    }
+                    while ti > 0 {
+                        ti -= 1;
+                        push(&mut buf, &mut len, tmp[ti]);
+                    }
+                }
+                crate::kprintln!(
+                    "wordlensf: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `sortwordchars` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_sortwordchars(line: &str, cmd: &str, rest: &str) {
+    // Sort the BYTES within each word ascending, keeping the word ORDER and single
+    // spaces: "hello world" -> "ehllo dlorw". This is the per-word canonical form
+    // used to group anagrams. Distinct from `sortchars` (sorts ALL chars of the whole
+    // text, ignoring word boundaries), `sort` (orders WORDS lexicographically), and
+    // `reveach` (reverses each word's chars). Byte sort, so ASCII upper < lower.
+    let mut buf = [0u8; 512];
+    let mut n = 0usize;
+    for (wi, w) in rest.split_whitespace().enumerate() {
+        if wi > 0 && n < buf.len() {
+            buf[n] = b' ';
+            n += 1;
+        }
+        let start = n;
+        for &c in w.as_bytes() {
+            if n < buf.len() {
+                buf[n] = c;
+                n += 1;
+            }
+        }
+        buf[start..n].sort_unstable();
+    }
+    if n == 0 {
+        crate::kprintln!("usage: sortwordchars <text>");
+    } else {
+        crate::kprintln!(
+            "sortwordchars: {}",
+            core::str::from_utf8(&buf[..n]).unwrap_or("?")
+        );
+    }
+}
+
+/// `truncatewords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_truncatewords(line: &str, cmd: &str, rest: &str) {
+    // Emit the first <n> whitespace-delimited WORDS of a run of text (single-
+    // spaced). If the text has fewer than n words, all of its words are emitted.
+    // Reuses the `<n> <text>` parse of firstn/lastn. Distinct from firstn (the
+    // first n CHARS), trunc (a char-prefix + ellipsis), wordn (the Nth word
+    // alone), and firstword (per-line first word of a FILE): this keeps whole
+    // leading words.
+    let r = rest.trim_start();
+    let parsed = r.find(' ').and_then(|sp| {
+        r[..sp].parse::<usize>().ok().filter(|&k| k > 0).map(|k| (k, &r[sp + 1..]))
+    });
+    match parsed {
+        None => crate::kprintln!("usage: truncatewords <n> <text>"),
+        Some((n, text)) => {
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            let mut count = 0usize;
+            for word in text.split_whitespace() {
+                if count >= n {
+                    break;
+                }
+                if count > 0 && len < buf.len() {
+                    buf[len] = b' ';
+                    len += 1;
+                }
+                for &c in word.as_bytes() {
+                    if len < buf.len() {
+                        buf[len] = c;
+                        len += 1;
+                    }
+                }
+                count += 1;
+            }
+            crate::kprintln!(
+                "truncatewords: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `reveach` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_reveach(line: &str, cmd: &str, rest: &str) {
+    // Reverse the CHARS of each word IN PLACE, keeping the word ORDER (and
+    // single spaces). Distinct from `rev` (reverses the ENTIRE string incl.
+    // word order), `rwords` (reverses word ORDER, words intact), and `revf`
+    // (per-LINE chars in a VFS file).
+    let mut buf = [0u8; 512];
+    let mut n = 0usize;
+    for (wi, w) in rest.split_whitespace().enumerate() {
+        if wi > 0 && n < buf.len() {
+            buf[n] = b' ';
+            n += 1;
+        }
+        for &c in w.as_bytes().iter().rev() {
+            if n < buf.len() {
+                buf[n] = c;
+                n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        crate::kprintln!("usage: reveach <text>");
+    } else {
+        crate::kprintln!("reveach: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `traincase` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_traincase(line: &str, cmd: &str, rest: &str) {
+    // Train-Case (a.k.a. HTTP-Header-Case): capitalize each whitespace-separated
+    // word (first letter upper, the rest lower) and join with hyphens --
+    // "hello world" -> "Hello-World", "content type" -> "Content-Type". It is
+    // `title` joined by hyphens instead of spaces. Distinct from kebab
+    // (all-lowercase, hyphen), title (spaces), pascal (no separator), and snake
+    // (underscores).
+    let mut buf = [0u8; 512];
+    let mut n = 0usize;
+    let mut first = true;
+    for w in rest.split_whitespace() {
+        if !first && n < buf.len() {
+            buf[n] = b'-';
+            n += 1;
+        }
+        for (j, &c) in w.as_bytes().iter().enumerate() {
+            let ch = if j == 0 {
+                if c.is_ascii_lowercase() { c - 32 } else { c }
+            } else if c.is_ascii_uppercase() {
+                c + 32
+            } else {
+                c
+            };
+            if n < buf.len() {
+                buf[n] = ch;
+                n += 1;
+            }
+        }
+        first = false;
+    }
+    if first {
+        crate::kprintln!("usage: traincase <text>");
+    } else {
+        crate::kprintln!("traincase: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `numeronym` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_numeronym(line: &str, cmd: &str, rest: &str) {
+    // Abbreviate each word to a NUMERONYM: first letter + count of the
+    // middle letters + last letter. e.g. internationalization -> i18n,
+    // accessibility -> a11y, kubernetes -> k8s. Words shorter than 3 chars
+    // pass through unchanged. Distinct from acronym (initials only), the
+    // case/separator transforms (slug/kebab/snake), and per-char maps.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: numeronym <text>");
+    } else {
+        // Inner fn (no capture) so the final &buf[..len] read does not
+        // conflict with a mutable-borrowing closure (cf. the reveach fix).
+        fn push(buf: &mut [u8], len: &mut usize, b: u8) {
+            if *len < buf.len() {
+                buf[*len] = b;
+                *len += 1;
+            }
+        }
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut first_word = true;
+        for word in rest.split_whitespace() {
+            if !first_word {
+                push(&mut buf, &mut len, b' ');
+            }
+            first_word = false;
+            let w = word.as_bytes();
+            if w.len() < 3 {
+                for &b in w {
+                    push(&mut buf, &mut len, b);
+                }
+            } else {
+                push(&mut buf, &mut len, w[0]);
+                // Middle-letter count as decimal digits (build into a small
+                // temp then emit in order; counts fit in 3 digits here).
+                let mut tmp = [0u8; 3];
+                let mut ti = 0usize;
+                let mut v = (w.len() - 2) as u32;
+                if v == 0 {
+                    tmp[ti] = b'0';
+                    ti += 1;
+                } else {
+                    while v > 0 {
+                        tmp[ti] = b'0' + (v % 10) as u8;
+                        ti += 1;
+                        v /= 10;
+                    }
+                }
+                while ti > 0 {
+                    ti -= 1;
+                    push(&mut buf, &mut len, tmp[ti]);
+                }
+                push(&mut buf, &mut len, w[w.len() - 1]);
+            }
+        }
+        crate::kprintln!(
+            "numeronym: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `censor` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_censor(line: &str, cmd: &str, rest: &str) {
+    // Mask each whitespace-separated word for privacy: keep its FIRST character
+    // and replace every other character with '*'. "hello world" -> "h**** w****",
+    // "a bb ccc" -> "a b* c**". Distinct from disemvowel/strippunct (which FILTER
+    // characters out) and numeronym (which abbreviates with a middle COUNT, i18n).
+    let mut buf = [0u8; 512];
+    let mut n = 0usize;
+    let mut first = true;
+    for w in rest.split_whitespace() {
+        if !first && n < buf.len() {
+            buf[n] = b' ';
+            n += 1;
+        }
+        first = false;
+        for (j, &c) in w.as_bytes().iter().enumerate() {
+            let ch = if j == 0 { c } else { b'*' };
+            if n < buf.len() {
+                buf[n] = ch;
+                n += 1;
+            }
+        }
+    }
+    if first {
+        crate::kprintln!("usage: censor <text>");
+    } else {
+        crate::kprintln!("censor: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `wordvalue` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wordvalue(line: &str, cmd: &str, rest: &str) {
+    // Output the ALPHABETIC VALUE of each whitespace-delimited word, space-
+    // separated: each letter adds its 1-based position (a/A=1 .. z/Z=26) and
+    // non-letters count 0. "abc" -> "6", "hello world" -> "52 72". Distinct
+    // from wordlengths (per-word byte LENGTHS), digitsum (digits of a number),
+    // and letterfreq (the most common letter). A gematria-style word score.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: wordvalue <text>");
+    } else {
+        fn push(buf: &mut [u8], len: &mut usize, b: u8) {
+            if *len < buf.len() {
+                buf[*len] = b;
+                *len += 1;
+            }
+        }
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut first = true;
+        for word in rest.split_whitespace() {
+            if !first {
+                push(&mut buf, &mut len, b' ');
+            }
+            first = false;
+            let mut sum = 0u32;
+            for &c in word.as_bytes() {
+                let l = c | 0x20;
+                if (b'a'..=b'z').contains(&l) {
+                    sum += (l - b'a' + 1) as u32;
+                }
+            }
+            // decimal digits of the sum (>= 0), built reversed then emitted
+            let mut tmp = [0u8; 20];
+            let mut ti = 0usize;
+            let mut v = sum;
+            if v == 0 {
+                tmp[ti] = b'0';
+                ti += 1;
+            } else {
+                while v > 0 {
+                    tmp[ti] = b'0' + (v % 10) as u8;
+                    ti += 1;
+                    v /= 10;
+                }
+            }
+            while ti > 0 {
+                ti -= 1;
+                push(&mut buf, &mut len, tmp[ti]);
+            }
+        }
+        crate::kprintln!(
+            "wordvalue: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `title` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_title(line: &str, cmd: &str, rest: &str) {
+    // Title-case each word: capitalize the first letter, lowercase the rest.
+    let mut buf = [0u8; 512];
+    let mut n = 0usize;
+    let mut first = true;
+    for w in rest.split_whitespace() {
+        if !first && n < 512 {
+            buf[n] = b' ';
+            n += 1;
+        }
+        for (j, &c) in w.as_bytes().iter().enumerate() {
+            let ch = if j == 0 {
+                if c.is_ascii_lowercase() { c - 32 } else { c }
+            } else if c.is_ascii_uppercase() {
+                c + 32
+            } else {
+                c
+            };
+            if n < 512 {
+                buf[n] = ch;
+                n += 1;
+            }
+        }
+        first = false;
+    }
+    if first {
+        crate::kprintln!("usage: title <text>");
+    } else {
+        crate::kprintln!("title: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `stutter` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_stutter(line: &str, cmd: &str, rest: &str) {
+    // Prefix each whitespace-separated word with its first character and a
+    // hyphen: "hello world" -> "h-hello w-world". A playful transform in the
+    // spirit of mock/leet; distinct from initials (first chars joined), acronym
+    // (initials uppercased), and numeronym (first + middle count + last).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: stutter <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut first = true;
+        for w in rest.split_whitespace() {
+            if !first && len < buf.len() {
+                buf[len] = b' ';
+                len += 1;
+            }
+            first = false;
+            let b = w.as_bytes();
+            // first char + '-' + the whole word
+            if len < buf.len() {
+                buf[len] = b[0];
+                len += 1;
+            }
+            if len < buf.len() {
+                buf[len] = b'-';
+                len += 1;
+            }
+            for &c in b {
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+        }
+        crate::kprintln!(
+            "stutter: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `wordvowels` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wordvowels(line: &str, cmd: &str, rest: &str) {
+    // Output the number of ASCII vowels (a,e,i,o,u, both cases; y counts as a
+    // CONSONANT) in each whitespace-delimited word, space-separated: "hello world"
+    // -> "2 1", "sky" -> "0". The per-word companion of vowels (which gives the
+    // WHOLE-text vowel/consonant totals); distinct from wordlengths (byte lengths),
+    // wordvalue (a=1..z=26 gematria), and syllables (count of maximal vowel RUNS).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: wordvowels <text>");
+    } else {
+        fn push(buf: &mut [u8], len: &mut usize, b: u8) {
+            if *len < buf.len() {
+                buf[*len] = b;
+                *len += 1;
+            }
+        }
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut first = true;
+        for word in rest.split_whitespace() {
+            if !first {
+                push(&mut buf, &mut len, b' ');
+            }
+            first = false;
+            let mut v = 0usize;
+            for &x in word.as_bytes() {
+                if matches!(x | 0x20, b'a' | b'e' | b'i' | b'o' | b'u') {
+                    v += 1;
+                }
+            }
+            let mut tmp = [0u8; 20];
+            let mut ti = 0usize;
+            if v == 0 {
+                tmp[ti] = b'0';
+                ti += 1;
+            } else {
+                while v > 0 {
+                    tmp[ti] = b'0' + (v % 10) as u8;
+                    ti += 1;
+                    v /= 10;
+                }
+            }
+            while ti > 0 {
+                ti -= 1;
+                push(&mut buf, &mut len, tmp[ti]);
+            }
+        }
+        crate::kprintln!(
+            "wordvowels: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `firstchars` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_firstchars(line: &str, cmd: &str, rest: &str) {
+    // Concatenate the FIRST character of each (non-empty) line of a VFS file
+    // into one string (about.txt -> "AA", motd -> "W"). The line-level analogue
+    // of initials (which takes the first char of each WORD); distinct from
+    // firstword (the first WORD of each line, tagged by line number) and charat
+    // (a byte at an explicit index). Blank lines contribute nothing.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: firstchars <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("firstchars: no such file: {}", name),
+            Some(s) => {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                for l in s.lines() {
+                    if let Some(&c) = l.as_bytes().first() {
+                        if len < buf.len() {
+                            buf[len] = c;
+                            len += 1;
+                        }
+                    }
+                }
+                crate::kprintln!(
+                    "firstchars: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `lastchars` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_lastchars(line: &str, cmd: &str, rest: &str) {
+    // Concatenate the LAST character of each (non-empty) line of a VFS file
+    // into one string (about.txt -> ",.", motd -> "."). The mirror of
+    // firstchars (the first char of each line); distinct from lastword (the
+    // last WORD of each line, tagged by line number) and charat (a byte at an
+    // explicit index). Blank lines contribute nothing.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: lastchars <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("lastchars: no such file: {}", name),
+            Some(s) => {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                for l in s.lines() {
+                    if let Some(&c) = l.as_bytes().last() {
+                        if len < buf.len() {
+                            buf[len] = c;
+                            len += 1;
+                        }
+                    }
+                }
+                crate::kprintln!(
+                    "lastchars: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `uniqchars` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_uniqchars(line: &str, cmd: &str, rest: &str) {
+    // Remove DUPLICATE bytes from the inline text, keeping the FIRST
+    // occurrence of each and its original order ("mississippi"->"misp",
+    // "hello"->"helo"). Distinct from squeeze (collapses only ADJACENT
+    // runs of one char), sortchars (sorts), dedup (list args), and chars
+    // (per-char list). A 256-entry `seen` table tracks bytes emitted.
+    if rest.is_empty() {
+        crate::kprintln!("usage: uniqchars <text>");
+    } else {
+        let src = rest.as_bytes();
+        let n = src.len().min(512);
+        let mut seen = [false; 256];
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for i in 0..n {
+            let b = src[i];
+            if !seen[b as usize] {
+                seen[b as usize] = true;
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        crate::kprintln!(
+            "uniqchars: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `pascal` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_pascal(line: &str, cmd: &str, rest: &str) {
+    // Join space-separated words into PascalCase (UpperCamelCase): EVERY
+    // word's first letter uppercased, all else lowercased, spaces removed.
+    // Distinct from camel (which lowercases the FIRST word), title (keeps
+    // spaces), slug (hyphenates), and capitalize (only the very first
+    // letter of the whole text).
+    let mut buf = [0u8; 512];
+    let mut n = 0usize;
+    for w in rest.split_whitespace() {
+        for (ci, &c) in w.as_bytes().iter().enumerate() {
+            let mut ch = if c.is_ascii_uppercase() { c + 32 } else { c };
+            if ci == 0 && ch.is_ascii_lowercase() {
+                ch -= 32; // uppercase the first letter of EVERY word
+            }
+            if n < buf.len() {
+                buf[n] = ch;
+                n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        crate::kprintln!("usage: pascal <text>");
+    } else {
+        crate::kprintln!("pascal: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `a1z26` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_a1z26(line: &str, cmd: &str, rest: &str) {
+    // A1Z26 cipher: replace each ASCII letter with its 1-26 alphabet position (case-folded),
+    // joining the numbers WITHIN a word with '-' and separating words with a space; non-letter
+    // bytes inside a word are skipped. "abc" -> "1-2-3", "hello world" -> "8-5-12-12-15
+    // 23-15-18-12-4", "OS" -> "15-19". A simple substitution distinct from bacon (5-bit A/B),
+    // leet (letter->digit lookalikes), and the letter-rotation ciphers.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: a1z26 <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut first_word = true;
+        for word in rest.split_whitespace() {
+            if !first_word && len < buf.len() {
+                buf[len] = b' ';
+                len += 1;
+            }
+            first_word = false;
+            let mut first_letter = true;
+            for &b in word.as_bytes() {
+                if b.is_ascii_alphabetic() {
+                    if !first_letter && len < buf.len() {
+                        buf[len] = b'-';
+                        len += 1;
+                    }
+                    first_letter = false;
+                    let num = (b | 0x20) - b'a' + 1; // 1..=26
+                    if num >= 10 && len < buf.len() {
+                        buf[len] = b'0' + num / 10;
+                        len += 1;
+                    }
+                    if len < buf.len() {
+                        buf[len] = b'0' + num % 10;
+                        len += 1;
+                    }
+                }
+            }
+        }
+        crate::kprintln!("a1z26: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `acronymf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_acronymf(line: &str, cmd: &str, rest: &str) {
+    // The acronym of a VFS FILE: the first character of each whitespace-delimited word,
+    // uppercased and joined with no separator (across ALL lines). The file analogue of
+    // `acronym`, mirroring how swapcasef is the file analogue of swapcase and wordfreq is
+    // the file version of topword. `acronymf motd -> WTAO-ASCO`. Distinct from `acronym`
+    // (INLINE args), `initials` (first chars with ORIGINAL case), and `lastletters`.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: acronymf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("acronymf: no such file: {}", name),
+            Some(s) => {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                for word in s.split_whitespace() {
+                    let first = word.as_bytes()[0];
+                    let up = if first.is_ascii_lowercase() {
+                        first - 32
+                    } else {
+                        first
+                    };
+                    if len < buf.len() {
+                        buf[len] = up;
+                        len += 1;
+                    }
+                }
+                crate::kprintln!(
+                    "acronymf: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `caesarf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_caesarf(line: &str, cmd: &str, rest: &str) {
+    // Caesar cipher over a whole VFS FILE: shift every ASCII letter by <shift> (rot-N),
+    // wrapping within its case; non-letters pass through. The file analogue of caesar and
+    // the parameterized generalization of rot13f (which is the fixed shift 13). `caesarf 3
+    // motd` shifts by 3; a negative or >26 shift is normalized ((shift%26+26)%26). Distinct
+    // from caesar (INLINE args), rot13f (fixed 13), atbashf (a different cipher), swapcasef.
+    let a = rest.trim();
+    match a.find(' ') {
+        None => crate::kprintln!("usage: caesarf <shift> <file>"),
+        Some(sp) => match a[..sp].parse::<i64>() {
+            Ok(shift) => {
+                let name = a[sp + 1..].trim();
+                match vfs::read_str(name) {
+                    None => crate::kprintln!("caesarf: no such file: {}", name),
+                    Some(s) => {
+                        let k = (((shift % 26) + 26) % 26) as u8;
+                        let src = s.as_bytes();
+                        let n = src.len().min(512);
+                        let mut buf = [0u8; 512];
+                        for i in 0..n {
+                            buf[i] = match src[i] {
+                                b'A'..=b'Z' => b'A' + (src[i] - b'A' + k) % 26,
+                                b'a'..=b'z' => b'a' + (src[i] - b'a' + k) % 26,
+                                other => other,
+                            };
+                        }
+                        crate::kprintln!(
+                            "caesarf: {}",
+                            core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                        );
+                    }
+                }
+            }
+            Err(_) => crate::kprintln!("usage: caesarf <shift> <file>"),
+        },
+    }
+}
+
+/// `spelldigits` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_spelldigits(line: &str, cmd: &str, rest: &str) {
+    // Spell each decimal DIGIT of n in English words, space-separated (as you would read
+    // a PIN or phone number). "spelldigits 123 -> one two three", "spelldigits 907 -> nine
+    // zero seven", "spelldigits 2026 -> two zero two six", "spelldigits 0 -> zero",
+    // "spelldigits 5 -> five". Distinct from cardinal (spells the WHOLE number, 123 -> one
+    // hundred twenty-three), numberwords (indexes words), roman, and ordinal.
+    const NAMES: [&str; 10] = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    ];
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            // Collect digits most-significant-first (n == 0 is the single digit 0).
+            let mut digits = [0u8; 20];
+            let mut cnt = 0usize;
+            let mut x = n;
+            if x == 0 {
+                digits[0] = 0;
+                cnt = 1;
+            } else {
+                while x > 0 {
+                    digits[cnt] = (x % 10) as u8;
+                    cnt += 1;
+                    x /= 10;
+                }
+            }
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            for i in (0..cnt).rev() {
+                if len > 0 && len < buf.len() {
+                    buf[len] = b' ';
+                    len += 1;
+                }
+                for &c in NAMES[digits[i] as usize].as_bytes() {
+                    if len < buf.len() {
+                        buf[len] = c;
+                        len += 1;
+                    }
+                }
+            }
+            crate::kprintln!(
+                "spelldigits: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+        Err(_) => crate::kprintln!("usage: spelldigits <n>"),
+    }
+}
+
+/// `vigenere` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_vigenere(line: &str, cmd: &str, rest: &str) {
+    // Repeating-key Vigenere polyalphabetic cipher (encode).
+    let (key, text) = match rest.find(' ') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    if key.is_empty() || text.is_empty() {
+        crate::kprintln!("usage: vigenere <key> <text>");
+    } else if !key.bytes().all(|b| b.is_ascii_alphabetic()) {
+        crate::kprintln!("vigenere: key must be letters");
+    } else {
+        let kb = key.as_bytes();
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut ki = 0usize;
+        for &c in text.as_bytes() {
+            let out = if c.is_ascii_uppercase() {
+                let shift = (kb[ki % kb.len()] | 0x20) - b'a';
+                ki += 1;
+                b'A' + (c - b'A' + shift) % 26
+            } else if c.is_ascii_lowercase() {
+                let shift = (kb[ki % kb.len()] | 0x20) - b'a';
+                ki += 1;
+                b'a' + (c - b'a' + shift) % 26
+            } else {
+                c
+            };
+            if len < buf.len() {
+                buf[len] = out;
+                len += 1;
+            }
+        }
+        crate::kprintln!("vigenere: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `unvigenere` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_unvigenere(line: &str, cmd: &str, rest: &str) {
+    // Repeating-key Vigenere polyalphabetic cipher (DECODE) -- the inverse of `vigenere`.
+    // Each letter is shifted DOWN by the key letter's value (subtract mod 26); the key index
+    // advances only on letters, non-letters pass through, exactly as in vigenere. So
+    // unvigenere(key, vigenere(key, text)) == text. `unvigenere lemon LXFOPVEFRNHR` ->
+    // "ATTACKATDAWN", `unvigenere b bcd` -> "abc".
+    let (key, text) = match rest.find(' ') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    if key.is_empty() || text.is_empty() {
+        crate::kprintln!("usage: unvigenere <key> <text>");
+    } else if !key.bytes().all(|b| b.is_ascii_alphabetic()) {
+        crate::kprintln!("unvigenere: key must be letters");
+    } else {
+        let kb = key.as_bytes();
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut ki = 0usize;
+        for &c in text.as_bytes() {
+            let out = if c.is_ascii_uppercase() {
+                let shift = (kb[ki % kb.len()] | 0x20) - b'a';
+                ki += 1;
+                b'A' + (c - b'A' + 26 - shift) % 26
+            } else if c.is_ascii_lowercase() {
+                let shift = (kb[ki % kb.len()] | 0x20) - b'a';
+                ki += 1;
+                b'a' + (c - b'a' + 26 - shift) % 26
+            } else {
+                c
+            };
+            if len < buf.len() {
+                buf[len] = out;
+                len += 1;
+            }
+        }
+        crate::kprintln!(
+            "unvigenere: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `charrange` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_charrange(line: &str, cmd: &str, rest: &str) {
+    // Extract the substring from char a to char b (1-based, INCLUSIVE), byte-indexed. The
+    // upper bound b clamps to the string length; if a is past the end the result is
+    // "(none)". "charrange 2 4 hello" -> "ell", "charrange 1 3 world" -> "wor", "charrange
+    // 3 10 abc" -> "c" (b clamped), "charrange 6 8 hello" -> "(none)". The char-level
+    // analogue of wordrange (words a..b); an endpoint-based complement to substr (pos+len).
+    let mut parts = rest.splitn(3, ' ');
+    let a = parts.next().and_then(|s| s.parse::<usize>().ok());
+    let b = parts.next().and_then(|s| s.parse::<usize>().ok());
+    let text = parts.next();
+    match (a, b, text) {
+        (Some(a), Some(b), Some(text)) if a >= 1 => {
+            let bytes = text.as_bytes();
+            let mut buf = [0u8; 512];
+            let mut n = 0usize;
+            let mut i = a - 1; // 1-based -> 0-based
+            while i < bytes.len() && i < b {
+                if n < buf.len() {
+                    buf[n] = bytes[i];
+                    n += 1;
+                }
+                i += 1;
+            }
+            if n == 0 {
+                crate::kprintln!("charrange: (none)");
+            } else {
+                crate::kprintln!(
+                    "charrange: {}",
+                    core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                );
+            }
+        }
+        _ => crate::kprintln!("usage: charrange <a> <b> <text>"),
+    }
+}
+
+/// `trunc` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_trunc(line: &str, cmd: &str, rest: &str) {
+    // Truncate text to <n> bytes, appending an ".." ellipsis marker ONLY if
+    // the text was actually longer than n; text of length <= n is emitted
+    // unchanged (no marker). Output is delimited by [ ]. Reuses the wrap/
+    // center `<n> <text>` parse. Distinct from firstn (a bare char-prefix
+    // with NO marker) and wrap (breaks text across lines).
+    let r = rest.trim_start();
+    let parsed = r.find(' ').and_then(|sp| {
+        r[..sp].parse::<usize>().ok().filter(|&k| k > 0).map(|k| (k, &r[sp + 1..]))
+    });
+    match parsed {
+        None => crate::kprintln!("usage: trunc <n> <text>"),
+        Some((n, text)) => {
+            let bytes = text.as_bytes();
+            if bytes.len() <= n {
+                crate::kprintln!("trunc: [{}]", text);
+            } else {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                for &b in &bytes[..n] {
+                    if len < buf.len() {
+                        buf[len] = b;
+                        len += 1;
+                    }
+                }
+                // append the ".." ellipsis marker (bounded by the buffer)
+                for _ in 0..2 {
+                    if len < buf.len() {
+                        buf[len] = b'.';
+                        len += 1;
+                    }
+                }
+                crate::kprintln!(
+                    "trunc: [{}]",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `uniqwords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_uniqwords(line: &str, cmd: &str, rest: &str) {
+    // Count the DISTINCT whitespace-delimited words in a VFS file (case-
+    // sensitive; punctuation kept as part of the token). Distinct from wc
+    // (total counts), wordfreq (the most common word), histogram (byte
+    // frequency), and dedup/unique (which remove duplicate LINES).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: uniqwords <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("uniqwords: no such file: {}", name),
+            Some(s) => {
+                let mut total = 0usize;
+                let mut distinct = 0usize;
+                // A token is distinct iff no EARLIER token equals it (first
+                // occurrence wins). O(w^2) -- fine for the tiny VFS files.
+                for (i, t) in s.split_whitespace().enumerate() {
+                    total += 1;
+                    let mut seen = false;
+                    for u in s.split_whitespace().take(i) {
+                        if u == t {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if !seen {
+                        distinct += 1;
+                    }
+                }
+                if total == 0 {
+                    crate::kprintln!("uniqwords: {} = 0 words", name);
+                } else {
+                    crate::kprintln!(
+                        "uniqwords: {} = {} distinct of {} words",
+                        name, distinct, total
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `interleave` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_interleave(line: &str, cmd: &str, rest: &str) {
+    // Weave the characters of two whitespace-separated words: a0 b0 a1 b1 ...,
+    // appending the TAIL of the longer word once the shorter is exhausted.
+    // "abc xyz" -> "axbycz"; "ab wxyz" -> "awbxyz"; "abcd xy" -> "axbycd".
+    // Distinct from anagram (compares two words' letter multisets), swappairs
+    // (swaps adjacent pairs of ONE word), and rotate (cyclic shift).
+    let mut it = rest.split_whitespace();
+    match (it.next(), it.next()) {
+        (Some(a), Some(b)) => {
+            let ab = a.as_bytes();
+            let bb = b.as_bytes();
+            let mut buf = [0u8; 512];
+            let mut n = 0usize;
+            let maxlen = ab.len().max(bb.len());
+            for i in 0..maxlen {
+                if i < ab.len() && n < buf.len() {
+                    buf[n] = ab[i];
+                    n += 1;
+                }
+                if i < bb.len() && n < buf.len() {
+                    buf[n] = bb[i];
+                    n += 1;
+                }
+            }
+            crate::kprintln!(
+                "interleave: {}",
+                core::str::from_utf8(&buf[..n]).unwrap_or("?")
+            );
+        }
+        _ => crate::kprintln!("usage: interleave <word1> <word2>"),
+    }
+}
+
+/// `unpolybius` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_unpolybius(line: &str, cmd: &str, rest: &str) {
+    // Decode Polybius-square row-col codes back to letters -- the inverse of `polybius`.
+    // Each space-separated token is a two-digit code: row (1-5) then column (1-5) in the
+    // 5x5 grid over the 25-letter alphabet (a..z with j removed; 24 decodes to 'i' since
+    // I/J share a cell). "11 12 13" -> "abc", "23 15 31 31 34" -> "hello", "24 11 55 55"
+    // -> "iazz", "34 43" -> "os". A malformed token (wrong length, digit out of 1-5, or a
+    // non-digit) becomes '?'. So unpolybius(polybius(x)) restores x (lowercased, J->I).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: unpolybius <codes>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for word in rest.split_whitespace() {
+            let wb = word.as_bytes();
+            let ch = if wb.len() == 2
+                && (b'1'..=b'5').contains(&wb[0])
+                && (b'1'..=b'5').contains(&wb[1])
+            {
+                let idx = (wb[0] - b'1') as usize * 5 + (wb[1] - b'1') as usize;
+                // index in the 25-letter alphabet (a..z with j removed)
+                if idx < 9 {
+                    b'a' + idx as u8
+                } else {
+                    b'a' + idx as u8 + 1 // skip 'j'
+                }
+            } else {
+                b'?'
+            };
+            if len < buf.len() {
+                buf[len] = ch;
+                len += 1;
+            }
+        }
+        crate::kprintln!(
+            "unpolybius: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `firstlast` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_firstlast(line: &str, cmd: &str, rest: &str) {
+    // Keep the FIRST and LAST character of each whitespace-separated word,
+    // space-separated ("hello world" -> "ho wd", "own your device" -> "on yr
+    // de"). A single-character word repeats it ("a" -> "aa"). The typoglycemia
+    // abbreviation; distinct from initials (first char of each word joined),
+    // lastletters (last char), and numeronym (first + middle count + last).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: firstlast <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut first = true;
+        for w in rest.split_whitespace() {
+            if !first && len < buf.len() {
+                buf[len] = b' ';
+                len += 1;
+            }
+            first = false;
+            let b = w.as_bytes();
+            if len < buf.len() {
+                buf[len] = b[0]; // first char
+                len += 1;
+            }
+            if len < buf.len() {
+                buf[len] = b[b.len() - 1]; // last char (== first for 1-char words)
+                len += 1;
+            }
+        }
+        crate::kprintln!(
+            "firstlast: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `wordlengths` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wordlengths(line: &str, cmd: &str, rest: &str) {
+    // Output the byte length of each whitespace-delimited word, space-
+    // separated. e.g. "hello world" -> "5 5". Distinct from numeronym
+    // (first+middlecount+last abbreviation), wc (file counts), acronym
+    // (initials), and wordn (the Nth word) -- this lists per-word lengths.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: wordlengths <text>");
+    } else {
+        // Inner fn (no capture) so the final &buf[..len] read is clean.
+        fn push(buf: &mut [u8], len: &mut usize, b: u8) {
+            if *len < buf.len() {
+                buf[*len] = b;
+                *len += 1;
+            }
+        }
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut first = true;
+        for word in rest.split_whitespace() {
+            if !first {
+                push(&mut buf, &mut len, b' ');
+            }
+            first = false;
+            // Decimal digits of the word's byte length (>= 1), built into a
+            // small temp in reverse then emitted in order.
+            let mut tmp = [0u8; 20];
+            let mut ti = 0usize;
+            let mut v = word.as_bytes().len();
+            if v == 0 {
+                tmp[ti] = b'0';
+                ti += 1;
+            } else {
+                while v > 0 {
+                    tmp[ti] = b'0' + (v % 10) as u8;
+                    ti += 1;
+                    v /= 10;
+                }
+            }
+            while ti > 0 {
+                ti -= 1;
+                push(&mut buf, &mut len, tmp[ti]);
+            }
+        }
+        crate::kprintln!(
+            "wordlengths: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `pmap` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_pmap(line: &str, cmd: &str, rest: &str) {
+    // Read-only map of the system's memory layout (documents the address
+    // space + MMIO for a takeover dev; complements sysinfo/board).
+    let frames = frame::total_frames();
+    crate::kprintln!("pmap: memory map");
+    crate::kprintln!("  kernel image   @ 0x40000000  (ELF load base / entry)");
+    // The arena states its own range and its relation to the frames (2.734):
+    // it is part of the image the managed range starts *above*, not a region
+    // carved out of it, and that is the reason no frame can overlap it.
+    crate::kprintln!(
+        "  heap reserved  {:#010x}..{:#010x}  {} bytes of .bss (below the managed base)",
+        heap::base(), heap::end(), heap::size()
+    );
+    // 2.740: and the rest of the arena, which is not a range — it is however many
+    // frames the heap has taken out of the managed pool below. Printed next to the
+    // reservation so `pmap` and `mem` cannot describe two different arenas.
+    crate::kprintln!(
+        "  heap grown     {} bytes in {} frame(s) from the pool below — arena is {} / {} bytes used",
+        heap::grown(), heap::grown_frames(), heap::used(), heap::arena()
+    );
+    crate::kprintln!(
+        "  phys frames    {} x 4KiB = {} MiB total, {} used ({} of them the heap's)",
+        frames, frames * 4 / 1024, frame::used_frames(), heap::grown_frames()
+    );
+    // Where translation stops, from the file that programs the MMU (2.733) —
+    // the cause of the ceiling `frame` reports as its first bound.
+    crate::paging::describe();
+    crate::kprintln!("  wasm lin mem   64 KiB (sandbox linear memory)");
+    crate::kprintln!("  EL0 user code  @ 0x80000000  (per-process, RX)");
+    crate::kprintln!("  EL0 user stack @ 0x80200000  (per-process, RW/XN)");
+    crate::kprintln!("  device MMIO:");
+    crate::kprintln!("    UART (PL011) @ {:#010x}", crate::board::UART_BASE);
+    crate::kprintln!("    GIC dist     @ {:#010x}", crate::board::GIC_DIST_BASE);
+    crate::kprintln!("    GIC cpu      @ {:#010x}", crate::board::GIC_CPU_BASE);
+    crate::kprintln!("    RTC (PL031)  @ {:#010x}", crate::board::RTC_BASE);
+    crate::kprintln!("    GPIO (PL061) @ {:#010x}", crate::board::GPIO_BASE);
+    crate::kprintln!("    fw_cfg       @ {:#010x}", crate::board::FWCFG_BASE);
+    crate::kprintln!("    virtio-mmio  @ {:#010x}", crate::board::VIRTIO_MMIO_BASE);
+    crate::kprintln!(
+        "pmap: kernel@0x40000000, heap {}/{} (grown {} B), {} frames, wasm 64KiB, 7 MMIO devices",
+        heap::used(), heap::arena(), heap::grown(), frames
+    );
+}
+
+/// `doublewords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_doublewords(line: &str, cmd: &str, rest: &str) {
+    // Repeat each whitespace-separated word twice, space-separated: "hello
+    // world" -> "hello hello world world". The word-level analogue of double
+    // (which repeats each CHARACTER twice); distinct from repeat (the WHOLE
+    // text n times), reveach (reverses each word), and rwords (reverses order).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: doublewords <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut first = true;
+        for w in rest.split_whitespace() {
+            for _ in 0..2 {
+                if !first && len < buf.len() {
+                    buf[len] = b' ';
+                    len += 1;
+                }
+                first = false;
+                for &c in w.as_bytes() {
+                    if len < buf.len() {
+                        buf[len] = c;
+                        len += 1;
+                    }
+                }
+            }
+        }
+        crate::kprintln!(
+            "doublewords: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `dedupwords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_dedupwords(line: &str, cmd: &str, rest: &str) {
+    // Collapse consecutive DUPLICATE words into one, single-spaced ("the the cat
+    // cat cat sat" -> "the cat sat"). Only ADJACENT repeats are removed, so a
+    // word that recurs later is kept ("a a b a" -> "a b a"). The word-level
+    // analogue of squeeze (adjacent char runs); distinct from uniqwords (the FILE
+    // distinct-word count), countdistinct (inline distinct count), and collapse
+    // (whitespace runs).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: dedupwords <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut prev: &str = "";
+        let mut first = true;
+        for w in rest.split_whitespace() {
+            if !first && w == prev {
+                continue; // skip a word identical to the previous kept one
+            }
+            if !first && len < buf.len() {
+                buf[len] = b' ';
+                len += 1;
+            }
+            first = false;
+            for &c in w.as_bytes() {
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+            prev = w;
+        }
+        crate::kprintln!(
+            "dedupwords: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `dedup` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_dedup(line: &str, cmd: &str, rest: &str) {
+    // Collapse ADJACENT duplicate words to one (like `uniq` on words).
+    let mut buf = [0u8; 512];
+    let mut n = 0usize;
+    let mut prev: &str = "";
+    let mut first = true;
+    for w in rest.split_whitespace() {
+        if !first && w == prev {
+            continue;
+        }
+        if !first && n < 512 {
+            buf[n] = b' ';
+            n += 1;
+        }
+        for &c in w.as_bytes() {
+            if n < 512 {
+                buf[n] = c;
+                n += 1;
+            }
+        }
+        prev = w;
+        first = false;
+    }
+    if first {
+        crate::kprintln!("usage: dedup <words...>");
+    } else {
+        crate::kprintln!("dedup: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `center` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_center(line: &str, cmd: &str, rest: &str) {
+    // Center a single run of text inside a field of <width> columns and
+    // print it delimited by [ ] so the padding is unambiguous. Padding
+    // splits pad/2 on the left, the remainder (extra column on odd pad)
+    // on the right -- matching Python's str.center. If the text is already
+    // at least <width> bytes it is emitted unchanged. Distinct from boxed
+    // (draws a +/-/| box), underline (adds a rule line), spaceout (inserts
+    // spaces BETWEEN chars), and wrap (breaks text across lines).
+    let r = rest.trim_start();
+    let parsed = r.find(' ').and_then(|sp| {
+        r[..sp].parse::<usize>().ok().filter(|&w| w > 0).map(|w| (w, &r[sp + 1..]))
+    });
+    match parsed {
+        None => crate::kprintln!("usage: center <width> <text>"),
+        Some((width, text)) => {
+            let n = text.as_bytes().len();
+            if n >= width {
+                crate::kprintln!("center: [{}]", text);
+            } else {
+                let pad = width - n;
+                let left = pad / 2;
+                let right = pad - left;
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                for _ in 0..left {
+                    if len < buf.len() {
+                        buf[len] = b' ';
+                        len += 1;
+                    }
+                }
+                for &c in text.as_bytes() {
+                    if len < buf.len() {
+                        buf[len] = c;
+                        len += 1;
+                    }
+                }
+                for _ in 0..right {
+                    if len < buf.len() {
+                        buf[len] = b' ';
+                        len += 1;
+                    }
+                }
+                crate::kprintln!(
+                    "center: [{}]",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `sortchars` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_sortchars(line: &str, cmd: &str, rest: &str) {
+    // Sort the BYTES of the inline text ascending (ASCII value) -- a
+    // permutation of the input chars. Distinct from `sort` (sorts LINES of
+    // a VFS file / a list of NUMBERS), `rev` (reverses, no sort), and
+    // squeeze/dedup (remove repeats). Spaces sort before letters (0x20).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: sortchars <text>");
+    } else {
+        let src = rest.as_bytes();
+        let len = src.len().min(512);
+        let mut buf = [0u8; 512];
+        buf[..len].copy_from_slice(&src[..len]);
+        // In-place insertion sort (no heap).
+        for i in 1..len {
+            let key = buf[i];
+            let mut j = i;
+            while j > 0 && buf[j - 1] > key {
+                buf[j] = buf[j - 1];
+                j -= 1;
+            }
+            buf[j] = key;
+        }
+        crate::kprintln!(
+            "sortchars: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `unbits` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_unbits(line: &str, cmd: &str, rest: &str) {
+    // Decode space-separated 8-bit binary groups back to text -- the
+    // inverse of `bits`. e.g. "01001000 01101001" -> "Hi". Completes the
+    // encode/decode pair like unhex/hex, demorse/morse, unrle/rle.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: unbits <binary>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut ok = true;
+        for tok in rest.split_whitespace() {
+            match u8::from_str_radix(tok, 2) {
+                Ok(byte) => {
+                    if len < buf.len() {
+                        buf[len] = byte;
+                        len += 1;
+                    }
+                }
+                Err(_) => {
+                    crate::kprintln!("unbits: invalid binary group '{}'", tok);
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            crate::kprintln!("unbits: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+        }
+    }
+}
+
+/// `rarewordf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rarewordf(line: &str, cmd: &str, rest: &str) {
+    // The LEAST frequent whitespace-delimited word in a VFS file (case-sensitive;
+    // punctuation kept as part of the token), with its count and the total; ties resolve
+    // to the FIRST such word by occurrence. The complement of `wordfreq` (most common word
+    // in a FILE) and the file analogue of `rareword` (inline). about.txt -> "AfriSovera:"
+    // (1 of 22) while wordfreq gives "the" (2 of 22). Distinct from minword (shortest word).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: rarewordf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("rarewordf: no such file: {}", name),
+            Some(s) => {
+                let mut total = 0usize;
+                let mut best: &str = "";
+                let mut best_count = usize::MAX;
+                // O(w^2) over the tokens -- fine for the tiny VFS files here; the first
+                // word reaching the LOWEST count wins (ties keep the earliest occurrence).
+                for (i, t) in s.split_whitespace().enumerate() {
+                    total += 1;
+                    if s.split_whitespace().take(i).any(|u| u == t) {
+                        continue;
+                    }
+                    let c = s.split_whitespace().filter(|u| *u == t).count();
+                    if c < best_count {
+                        best_count = c;
+                        best = t;
+                    }
+                }
+                if total == 0 {
+                    crate::kprintln!("rarewordf: (empty)");
+                } else {
+                    crate::kprintln!(
+                        "rarewordf: least common word '{}' ({} of {})",
+                        best, best_count, total
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `debacon` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_debacon(line: &str, cmd: &str, rest: &str) {
+    // Decode a Baconian-ciphered string back to letters -- the inverse of `bacon`. A/B
+    // characters are consumed in groups of 5, each group -> its lowercase letter (AAAAA=a,
+    // ..., BBAAB=z); any OTHER byte first flushes a partial (<5) A/B run verbatim, then
+    // passes through. So debacon(bacon(x)) restores x (case-folded to lowercase).
+    // "AAAAAAAAABAAABA" -> "abc", "AABBBABAAA" -> "hi", "AAAAA!AAAAB" -> "a!b". A 5-bit code
+    // in 26..31 (no letter) decodes to '?'.
+    if rest.is_empty() {
+        crate::kprintln!("usage: debacon <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut group = [0u8; 5];
+        let mut gn = 0usize;
+        for &b in rest.as_bytes() {
+            if b == b'A' || b == b'B' {
+                group[gn] = b;
+                gn += 1;
+                if gn == 5 {
+                    let mut val = 0u8;
+                    for &c in &group {
+                        val = (val << 1) | if c == b'B' { 1 } else { 0 };
+                    }
+                    if len < buf.len() {
+                        buf[len] = if val <= 25 { b'a' + val } else { b'?' };
+                        len += 1;
+                    }
+                    gn = 0;
+                }
+            } else {
+                // flush a partial A/B run verbatim, then the passthrough byte
+                for i in 0..gn {
+                    if len < buf.len() {
+                        buf[len] = group[i];
+                        len += 1;
+                    }
+                }
+                gn = 0;
+                if len < buf.len() {
+                    buf[len] = b;
+                    len += 1;
+                }
+            }
+        }
+        for i in 0..gn {
+            if len < buf.len() {
+                buf[len] = group[i];
+                len += 1;
+            }
+        }
+        crate::kprintln!(
+            "debacon: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `initials` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_initials(line: &str, cmd: &str, rest: &str) {
+    // The first character of each whitespace-separated word, joined with
+    // NO separator and the ORIGINAL case preserved ("the quick brown fox"
+    // -> "tqbf", "AfriSovera OS project" -> "AOp"). Distinct from acronym,
+    // which UPPERCASES the initials ("TQBF"), and from numeronym (first +
+    // count + last per word).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: initials <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for word in rest.split_whitespace() {
+            if len < buf.len() {
+                buf[len] = word.as_bytes()[0]; // case preserved, as-is
+                len += 1;
+            }
+        }
+        crate::kprintln!(
+            "initials: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `lastletters` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_lastletters(line: &str, cmd: &str, rest: &str) {
+    // The LAST character of each whitespace-separated word, joined with NO
+    // separator and the ORIGINAL case preserved ("hello world" -> "od",
+    // "own your device" -> "nre", "AfriSovera OS" -> "aS"). The mirror of
+    // initials (which takes the FIRST character of each word); distinct from
+    // acronym (first char, UPPERCASED) and numeronym (first + count + last).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: lastletters <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for word in rest.split_whitespace() {
+            let b = word.as_bytes();
+            if len < buf.len() {
+                buf[len] = b[b.len() - 1]; // last byte, case preserved
+                len += 1;
+            }
+        }
+        crate::kprintln!(
+            "lastletters: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `caesar` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_caesar(line: &str, cmd: &str, rest: &str) {
+    // Caesar cipher: shift ASCII letters by N (rot-N), non-letters pass through.
+    let a = rest.trim();
+    match a.find(' ') {
+        None => crate::kprintln!("usage: caesar <shift> <text>"),
+        Some(sp) => match a[..sp].parse::<i64>() {
+            Ok(shift) => {
+                let k = (((shift % 26) + 26) % 26) as u8;
+                let text = a[sp + 1..].as_bytes();
+                let n = text.len().min(512);
+                let mut buf = [0u8; 512];
+                for i in 0..n {
+                    let b = text[i];
+                    buf[i] = match b {
+                        b'A'..=b'Z' => b'A' + (b - b'A' + k) % 26,
+                        b'a'..=b'z' => b'a' + (b - b'a' + k) % 26,
+                        _ => b,
+                    };
+                }
+                crate::kprintln!("caesar: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+            }
+            Err(_) => crate::kprintln!("usage: caesar <shift> <text>"),
+        },
+    }
+}
+
+/// `chunk` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_chunk(line: &str, cmd: &str, rest: &str) {
+    // Split the text into fixed-width groups of n characters (bytes), separated
+    // by a single space -- "3 abcdefgh" -> "abc def gh"; a final short group is
+    // kept. Distinct from wrap (greedy WORD-wrap to a column width) and spaceout
+    // (a space between EVERY character, i.e. the n == 1 case of chunk).
+    let r = rest.trim_start();
+    let parsed = r.find(' ').and_then(|sp| {
+        r[..sp].parse::<usize>().ok().filter(|&n| n > 0).map(|n| (n, &r[sp + 1..]))
+    });
+    match parsed {
+        None => crate::kprintln!("usage: chunk <n> <text>"),
+        Some((n, text)) => {
+            let src = text.as_bytes();
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            for (i, &c) in src.iter().enumerate() {
+                if i > 0 && i % n == 0 && len < buf.len() {
+                    buf[len] = b' ';
+                    len += 1;
+                }
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+            crate::kprintln!("chunk: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+        }
+    }
+}
+
+/// `schroeder` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_schroeder(line: &str, cmd: &str, rest: &str) {
+    // The LARGE SCHROEDER numbers S(n): 1, 2, 6, 22, 90, 394, 1806, 8558, 41586, ... --
+    // the number of lattice paths from (0,0) to (n,n) using steps E, N, and NE that never
+    // rise above the diagonal. Built from the exact integer convolution recurrence
+    // S(0)=1, S(n) = S(n-1) + sum_{k=0}^{n-1} S(k)*S(n-1-k). S(4)=90, S(6)=1806,
+    // S(10)=1037718. Distinct from catalan/motzkin/bell; u128 accumulation, n capped at 30.
+    match rest.trim().parse::<u64>() {
+        Ok(n) if n <= 30 => {
+            let mut s = [0u128; 31];
+            s[0] = 1;
+            for m in 1..=(n as usize) {
+                let mut conv: u128 = 0;
+                for k in 0..m {
+                    conv += s[k] * s[m - 1 - k];
+                }
+                s[m] = s[m - 1] + conv;
+            }
+            crate::kprintln!("schroeder: S({}) = {}", n, s[n as usize]);
+        }
+        Ok(_) => crate::kprintln!("schroeder: n too large (max 30)"),
+        Err(_) => crate::kprintln!("usage: schroeder <n>"),
+    }
+}
+
+/// `deletechar` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_deletechar(line: &str, cmd: &str, rest: &str) {
+    // Delete the kth CHARACTER (1-based, byte-indexed) of <text>, closing the gap.
+    // "deletechar 3 hello" -> "helo", "deletechar 1 abc" -> "bc", "deletechar 3 abc" ->
+    // "ab", "deletechar 5 abc" -> "abc" (k past the end leaves the text unchanged). The
+    // position-based single-char removal complementing insert (insert at pos) and overlay
+    // (overwrite at pos); distinct from delete (removes ALL chars in a SET anywhere).
+    let r = rest.trim_start();
+    let parsed = r
+        .find(' ')
+        .and_then(|sp| r[..sp].parse::<usize>().ok().filter(|&k| k >= 1).map(|k| (k, &r[sp + 1..])));
+    match parsed {
+        None => crate::kprintln!("usage: deletechar <k> <text>"),
+        Some((k, text)) => {
+            let b = text.as_bytes();
+            let mut buf = [0u8; 512];
+            let mut n = 0usize;
+            for (i, &c) in b.iter().enumerate() {
+                if i + 1 == k {
+                    continue; // skip the kth char
+                }
+                if n < buf.len() {
+                    buf[n] = c;
+                    n += 1;
+                }
+            }
+            crate::kprintln!(
+                "deletechar: {}",
+                core::str::from_utf8(&buf[..n]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `squeeze` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_squeeze(line: &str, cmd: &str, rest: &str) {
+    // Collapse consecutive runs of a given char to one (like `tr -s`).
+    let r = rest.trim_start();
+    match r.find(' ') {
+        None => crate::kprintln!("usage: squeeze <char> <text>"),
+        Some(sp) => {
+            let tok = &r[..sp];
+            if tok.is_empty() {
+                crate::kprintln!("usage: squeeze <char> <text>");
+            } else {
+                let ch = tok.as_bytes()[0];
+                let src = r[sp + 1..].as_bytes();
+                let mut buf = [0u8; 512];
+                let mut n = 0usize;
+                let mut prev: i32 = -1;
+                for &b in src {
+                    if b == ch && prev == ch as i32 {
+                        continue;
+                    }
+                    if n < 512 {
+                        buf[n] = b;
+                        n += 1;
+                    }
+                    prev = b as i32;
+                }
+                crate::kprintln!(
+                    "squeeze: {}",
+                    core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `rot18f` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rot18f(line: &str, cmd: &str, rest: &str) {
+    // Apply the ROT18 cipher (ROT13 letters + ROT5 digits, one pass) to a whole VFS FILE;
+    // other bytes (incl whitespace/line breaks) pass through. Self-inverse like rot18. The
+    // file analogue of rot18, completing the rot13f/atbashf/caesarf/rot47f/leetf cipher-file
+    // family with the combined letters+digits cipher. `rot18f motd` -> the motd enciphered.
+    // Distinct from rot18 (INLINE args), rot13f (letters only), rot5 (no file form).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: rot18f <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("rot18f: no such file: {}", name),
+            Some(s) => {
+                let src = s.as_bytes();
+                let n = src.len().min(512);
+                let mut buf = [0u8; 512];
+                for i in 0..n {
+                    buf[i] = match src[i] {
+                        b'A'..=b'Z' => b'A' + (src[i] - b'A' + 13) % 26,
+                        b'a'..=b'z' => b'a' + (src[i] - b'a' + 13) % 26,
+                        b'0'..=b'9' => b'0' + (src[i] - b'0' + 5) % 10,
+                        other => other,
+                    };
+                }
+                crate::kprintln!(
+                    "rot18f: {}",
+                    core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `delete` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_delete(line: &str, cmd: &str, rest: &str) {
+    // Remove ALL occurrences of any character in the <chars> set from <text>, anywhere
+    // (like Unix `tr -d`). "delete l hello" -> "heo", "delete aeiou hello world" ->
+    // "hll wrld", "delete 0 a0b0c0" -> "abc". Distinct from trim (which strips only the
+    // ENDS), strippunct/despace (fixed char CLASSES), and replace/tr (which swap or
+    // translate rather than delete). A generalization of disemvowel (= delete aeiou).
+    let (chars, text) = match rest.find(' ') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    if chars.is_empty() || text.is_empty() {
+        crate::kprintln!("usage: delete <chars> <text>");
+    } else {
+        let set = chars.as_bytes();
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &c in text.as_bytes() {
+            if !set.contains(&c) && len < buf.len() {
+                buf[len] = c;
+                len += 1;
+            }
+        }
+        crate::kprintln!(
+            "delete: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `everynth` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_everynth(line: &str, cmd: &str, rest: &str) {
+    // Keep every nth character of the text (positions 0, n, 2n, ... -- a stride-n
+    // decimation, equivalent to Python's text[::n]). "everynth 2 abcdef" -> "ace",
+    // "everynth 3 abcdefghi" -> "adg", "everynth 1 abc" -> "abc". Distinct from firstn
+    // (a PREFIX), chunk (fixed-size GROUPS), and spaceout (INSERTS spaces between chars).
+    let r = rest.trim_start();
+    let parsed = r.find(' ').and_then(|sp| {
+        r[..sp].parse::<usize>().ok().filter(|&k| k >= 1).map(|k| (k, &r[sp + 1..]))
+    });
+    match parsed {
+        None => crate::kprintln!("usage: everynth <n> <text>"),
+        Some((n, text)) => {
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            for (i, &c) in text.as_bytes().iter().enumerate() {
+                if i % n == 0 && len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+            crate::kprintln!(
+                "everynth: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `mask` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_mask(line: &str, cmd: &str, rest: &str) {
+    // Replace each ALPHANUMERIC character of <text> with the mask character (the first
+    // char of <mask>), leaving spaces and punctuation intact -- a structure-preserving
+    // redactor. "mask * hello world" -> "***** *****", "mask # hello, world!" ->
+    // "#####, #####!", "mask x a1 b2" -> "xx xx". Distinct from censor (which masks each
+    // WORD but keeps its FIRST char), disemvowel/strippunct (which REMOVE chars), and tr.
+    let (m, text) = match rest.find(' ') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    if m.is_empty() || text.is_empty() {
+        crate::kprintln!("usage: mask <char> <text>");
+    } else {
+        let mc = m.as_bytes()[0];
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in text.as_bytes() {
+            let out = if b.is_ascii_alphanumeric() { mc } else { b };
+            if len < buf.len() {
+                buf[len] = out;
+                len += 1;
+            }
+        }
+        crate::kprintln!("mask: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `morse` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_morse(line: &str, cmd: &str, rest: &str) {
+    // Encode text to International Morse code (letters/digits; ASCII output).
+    fn morse_of(c: u8) -> Option<&'static str> {
+        // Uppercase ASCII letter or digit -> its Morse symbols.
+        let c = if c.is_ascii_lowercase() { c - 32 } else { c };
+        Some(match c {
+            b'A' => ".-", b'B' => "-...", b'C' => "-.-.", b'D' => "-..",
+            b'E' => ".", b'F' => "..-.", b'G' => "--.", b'H' => "....",
+            b'I' => "..", b'J' => ".---", b'K' => "-.-", b'L' => ".-..",
+            b'M' => "--", b'N' => "-.", b'O' => "---", b'P' => ".--.",
+            b'Q' => "--.-", b'R' => ".-.", b'S' => "...", b'T' => "-",
+            b'U' => "..-", b'V' => "...-", b'W' => ".--", b'X' => "-..-",
+            b'Y' => "-.--", b'Z' => "--..",
+            b'0' => "-----", b'1' => ".----", b'2' => "..---", b'3' => "...--",
+            b'4' => "....-", b'5' => ".....", b'6' => "-....", b'7' => "--...",
+            b'8' => "---..", b'9' => "----.",
+            _ => return None,
+        })
+    }
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: morse <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let push = |buf: &mut [u8; 512], len: &mut usize, bytes: &[u8]| {
+            for &b in bytes {
+                if *len < buf.len() {
+                    buf[*len] = b;
+                    *len += 1;
+                }
+            }
+        };
+        for &c in rest.trim().as_bytes() {
+            if c == b' ' {
+                // Word gap: collapse any pending letter-space, then " / ".
+                while len > 0 && buf[len - 1] == b' ' {
+                    len -= 1;
+                }
+                push(&mut buf, &mut len, b" / ");
+            } else if let Some(code) = morse_of(c) {
+                push(&mut buf, &mut len, code.as_bytes());
+                push(&mut buf, &mut len, b" ");
+            }
+            // other punctuation ignored
+        }
+        // Trim a trailing separator space.
+        while len > 0 && buf[len - 1] == b' ' {
+            len -= 1;
+        }
+        crate::kprintln!("morse: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `demorse` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_demorse(line: &str, cmd: &str, rest: &str) {
+    // Decode International Morse code back to text (the inverse of `morse`).
+    // Inverts morse's exact format: letter-codes separated by single spaces,
+    // words by " / ". Case is NOT preserved (morse uppercases its input), so
+    // letters decode to lowercase. Unknown codes -> '?'.
+    fn letter_of(code: &str) -> u8 {
+        match code {
+            ".-" => b'a', "-..." => b'b', "-.-." => b'c', "-.." => b'd',
+            "." => b'e', "..-." => b'f', "--." => b'g', "...." => b'h',
+            ".." => b'i', ".---" => b'j', "-.-" => b'k', ".-.." => b'l',
+            "--" => b'm', "-." => b'n', "---" => b'o', ".--." => b'p',
+            "--.-" => b'q', ".-." => b'r', "..." => b's', "-" => b't',
+            "..-" => b'u', "...-" => b'v', ".--" => b'w', "-..-" => b'x',
+            "-.--" => b'y', "--.." => b'z',
+            "-----" => b'0', ".----" => b'1', "..---" => b'2', "...--" => b'3',
+            "....-" => b'4', "....." => b'5', "-...." => b'6', "--..." => b'7',
+            "---.." => b'8', "----." => b'9',
+            _ => b'?',
+        }
+    }
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: demorse <morse>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        // split_whitespace naturally turns morse's " / " word gap into a
+        // standalone "/" token and each letter-code into its own token.
+        for tok in rest.split_whitespace() {
+            let ch = if tok == "/" { b' ' } else { letter_of(tok) };
+            if len < buf.len() {
+                buf[len] = ch;
+                len += 1;
+            }
+        }
+        crate::kprintln!("demorse: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `hash` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_hash(line: &str, cmd: &str, rest: &str) {
+    // Expose the (FIPS-validated) SHA stack: hash any file's bytes.
+    if rest.is_empty() {
+        crate::kprintln!("usage: hash <file>");
+    } else {
+        match vfs::read_raw(rest) {
+            Some(data) => {
+                let d256 = crate::sha256::digest(data);
+                let mut hx = [0u8; 64];
+                crate::sha256::to_hex(&d256, &mut hx);
+                crate::kprintln!("[hash] {} ({} bytes)", rest, data.len());
+                crate::kprintln!("  sha256 {}", core::str::from_utf8(&hx).unwrap_or("?"));
+                let d512 = crate::sha512::digest(data);
+                let mut hx5 = [0u8; 128];
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                for (i, &b) in d512.iter().enumerate() {
+                    hx5[i * 2] = HEX[(b >> 4) as usize];
+                    hx5[i * 2 + 1] = HEX[(b & 0xf) as usize];
+                }
+                crate::kprintln!("  sha512 {}", core::str::from_utf8(&hx5).unwrap_or("?"));
+            }
+            None => crate::kprintln!("[hash] no such file: {}", rest),
+        }
+    }
+}
+
+/// `rot13f` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rot13f(line: &str, cmd: &str, rest: &str) {
+    // Apply the ROT13 letter cipher to a whole VFS FILE: shift every ASCII letter by 13,
+    // wrapping within its case; non-letters (incl whitespace/line breaks) pass through.
+    // Like rot13 it is SELF-INVERSE (rot13f of rot13f-output recovers the file). The file
+    // analogue of rot13, mirroring how swapcasef is the file analogue of swapcase. `rot13f
+    // motd` -> the motd enciphered. Distinct from rot13 (INLINE args), swapcasef, shoutf.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: rot13f <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("rot13f: no such file: {}", name),
+            Some(s) => {
+                let src = s.as_bytes();
+                let n = src.len().min(512);
+                let mut buf = [0u8; 512];
+                for i in 0..n {
+                    buf[i] = match src[i] {
+                        b'A'..=b'Z' => b'A' + (src[i] - b'A' + 13) % 26,
+                        b'a'..=b'z' => b'a' + (src[i] - b'a' + 13) % 26,
+                        other => other,
+                    };
+                }
+                crate::kprintln!(
+                    "rot13f: {}",
+                    core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `rle` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rle(line: &str, cmd: &str, rest: &str) {
+    // Run-length encode text: each run emitted as <char><decimal-count>.
+    if rest.is_empty() {
+        crate::kprintln!("usage: rle <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let push = |buf: &mut [u8; 512], len: &mut usize, b: u8| {
+            if *len < buf.len() {
+                buf[*len] = b;
+                *len += 1;
+            }
+        };
+        let push_num = |buf: &mut [u8; 512], len: &mut usize, mut n: u32| {
+            // Write n as decimal (n >= 1 always here).
+            let mut digits = [0u8; 10];
+            let mut d = 0usize;
+            while n > 0 {
+                digits[d] = b'0' + (n % 10) as u8;
+                n /= 10;
+                d += 1;
+            }
+            while d > 0 {
+                d -= 1;
+                push(buf, len, digits[d]);
+            }
+        };
+        let bytes = rest.as_bytes();
+        let mut run_char = bytes[0];
+        let mut count: u32 = 0;
+        for &b in bytes {
+            if b == run_char {
+                count += 1;
+            } else {
+                push(&mut buf, &mut len, run_char);
+                push_num(&mut buf, &mut len, count);
+                run_char = b;
+                count = 1;
+            }
+        }
+        // Emit the final run.
+        push(&mut buf, &mut len, run_char);
+        push_num(&mut buf, &mut len, count);
+        crate::kprintln!("rle: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `mockf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_mockf(line: &str, cmd: &str, rest: &str) {
+    // Alternating "mocking" case over a whole VFS FILE: toggle the case of each ASCII
+    // letter, starting lowercase (letter 0 lower, 1 upper, ...); non-letters (including
+    // whitespace and line breaks) pass through unchanged and do NOT consume a toggle, so
+    // the alternation continues seamlessly across words and lines. The file analogue of
+    // `mock`, mirroring how swapcasef is the file analogue of swapcase. Distinct from
+    // shoutf/whisperf (single-case), swapcasef (flips), and altwords (per-WORD case).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: mockf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("mockf: no such file: {}", name),
+            Some(s) => {
+                let src = s.as_bytes();
+                let n = src.len().min(512);
+                let mut buf = [0u8; 512];
+                let mut i: u32 = 0; // count of letters seen so far (the toggle)
+                for j in 0..n {
+                    let b = src[j];
+                    let low = b | 0x20;
+                    buf[j] = if (b'a'..=b'z').contains(&low) {
+                        let r = if i % 2 == 0 { low } else { low - 32 };
+                        i += 1;
+                        r
+                    } else {
+                        b
+                    };
+                }
+                crate::kprintln!(
+                    "mockf: {}",
+                    core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `rjust` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rjust(line: &str, cmd: &str, rest: &str) {
+    // Right-justify a run of text in a field of <width> columns by
+    // left-padding with spaces, printed delimited by [ ] so the padding is
+    // unambiguous. Text already at least <width> bytes is emitted
+    // unchanged. Matches Python str.rjust. Distinct from center (pads BOTH
+    // sides to a width), indent (a FIXED n spaces, not up to a width), and
+    // spaceout (inserts spaces BETWEEN characters). Reuses the wrap/center
+    // `<width> <text>` parse.
+    let r = rest.trim_start();
+    let parsed = r.find(' ').and_then(|sp| {
+        r[..sp].parse::<usize>().ok().filter(|&w| w > 0).map(|w| (w, &r[sp + 1..]))
+    });
+    match parsed {
+        None => crate::kprintln!("usage: rjust <width> <text>"),
+        Some((width, text)) => {
+            let n = text.as_bytes().len();
+            let pad = if n >= width { 0 } else { width - n };
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            for _ in 0..pad {
+                if len < buf.len() {
+                    buf[len] = b' ';
+                    len += 1;
+                }
+            }
+            for &c in text.as_bytes() {
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+            crate::kprintln!(
+                "rjust: [{}]",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `ljust` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_ljust(line: &str, cmd: &str, rest: &str) {
+    // Left-justify a run of text in a field of <width> columns by RIGHT-
+    // padding with spaces, printed delimited by [ ] so the padding is
+    // unambiguous. Text already at least <width> bytes is emitted unchanged.
+    // Matches Python str.ljust. The mirror of rjust (which left-pads);
+    // distinct from center (pads BOTH sides) and indent (a FIXED n spaces).
+    // Reuses the wrap/center/rjust `<width> <text>` parse.
+    let r = rest.trim_start();
+    let parsed = r.find(' ').and_then(|sp| {
+        r[..sp].parse::<usize>().ok().filter(|&w| w > 0).map(|w| (w, &r[sp + 1..]))
+    });
+    match parsed {
+        None => crate::kprintln!("usage: ljust <width> <text>"),
+        Some((width, text)) => {
+            let n = text.as_bytes().len();
+            let pad = if n >= width { 0 } else { width - n };
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            for &c in text.as_bytes() {
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+            for _ in 0..pad {
+                if len < buf.len() {
+                    buf[len] = b' ';
+                    len += 1;
+                }
+            }
+            crate::kprintln!(
+                "ljust: [{}]",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `zfill` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_zfill(line: &str, cmd: &str, rest: &str) {
+    // Left-pad a run of text with ZEROS ('0') to a field of <width> columns,
+    // printed delimited by [ ] so the padding is unambiguous. Text already
+    // at least <width> bytes is emitted unchanged. This is a SIGN-AGNOSTIC
+    // zero-fill: it does not special-case a leading '-'/'+' the way Python
+    // str.zfill does, so it just prepends zeros. Distinct from rjust/indent/
+    // ljust (which pad with SPACES). Reuses the wrap/center/rjust `<width>
+    // <text>` parse -- the rjust template with '0' instead of ' '.
+    let r = rest.trim_start();
+    let parsed = r.find(' ').and_then(|sp| {
+        r[..sp].parse::<usize>().ok().filter(|&w| w > 0).map(|w| (w, &r[sp + 1..]))
+    });
+    match parsed {
+        None => crate::kprintln!("usage: zfill <width> <text>"),
+        Some((width, text)) => {
+            let n = text.as_bytes().len();
+            let pad = if n >= width { 0 } else { width - n };
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            for _ in 0..pad {
+                if len < buf.len() {
+                    buf[len] = b'0';
+                    len += 1;
+                }
+            }
+            for &c in text.as_bytes() {
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+            crate::kprintln!(
+                "zfill: [{}]",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `hexdump` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_hexdump(line: &str, cmd: &str, rest: &str) {
+    // Classic hex + ASCII dump of a file (first 256 bytes).
+    let name = match rest.find(' ') {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    if name.is_empty() {
+        crate::kprintln!("usage: hexdump <file>");
+    } else {
+        match vfs::read_raw(name) {
+            None => crate::kprintln!("hexdump: no such file: {}", name),
+            Some(data) => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let total = data.len();
+                let shown = total.min(256);
+                let mut off = 0;
+                while off < shown {
+                    let end = (off + 16).min(shown);
+                    // offset (4 hex digits)
+                    let mut line = [0u8; 80];
+                    let mut p = 0;
+                    for sh in [12, 8, 4, 0] {
+                        line[p] = HEX[((off >> sh) & 0xf) as usize];
+                        p += 1;
+                    }
+                    line[p] = b' ';
+                    line[p + 1] = b' ';
+                    p += 2;
+                    // hex bytes
+                    for i in off..off + 16 {
+                        if i < end {
+                            let b = data[i];
+                            line[p] = HEX[(b >> 4) as usize];
+                            line[p + 1] = HEX[(b & 0xf) as usize];
+                        } else {
+                            line[p] = b' ';
+                            line[p + 1] = b' ';
+                        }
+                        line[p + 2] = b' ';
+                        p += 3;
+                    }
+                    // ascii gutter
+                    line[p] = b'|';
+                    p += 1;
+                    for i in off..end {
+                        let b = data[i];
+                        line[p] = if (0x20..=0x7e).contains(&b) { b } else { b'.' };
+                        p += 1;
+                    }
+                    line[p] = b'|';
+                    p += 1;
+                    crate::kprintln!("{}", core::str::from_utf8(&line[..p]).unwrap_or("?"));
+                    off = end;
+                }
+                if total > shown {
+                    crate::kprintln!("... ({} more bytes)", total - shown);
+                }
+            }
+        }
+    }
+}
+
+/// `factor` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_factor(line: &str, cmd: &str, rest: &str) {
+    // Prime-factorize a positive integer by trial division (u64-scale).
+    match rest.trim().parse::<u64>() {
+        Ok(n) if n >= 2 => {
+            // Accumulate "factor: N = f f f" into a fixed buffer, then print once.
+            let mut buf = [0u8; 320];
+            let mut len = 0usize;
+            let push = |bytes: &[u8], buf: &mut [u8; 320], len: &mut usize| {
+                for &c in bytes {
+                    if *len < buf.len() {
+                        buf[*len] = c;
+                        *len += 1;
+                    }
+                }
+            };
+            // Decimal-render a u64 into a small scratch, then append it.
+            let emit = |v: u64, buf: &mut [u8; 320], len: &mut usize| {
+                let mut tmp = [0u8; 20];
+                let mut ti = tmp.len();
+                let mut x = v;
+                if x == 0 {
+                    ti -= 1;
+                    tmp[ti] = b'0';
+                }
+                while x > 0 {
+                    ti -= 1;
+                    tmp[ti] = b'0' + (x % 10) as u8;
+                    x /= 10;
+                }
+                push(&tmp[ti..], buf, len);
+            };
+            push(b"factor: ", &mut buf, &mut len);
+            emit(n, &mut buf, &mut len);
+            push(b" =", &mut buf, &mut len);
+            let mut m = n;
+            while m % 2 == 0 {
+                push(b" 2", &mut buf, &mut len);
+                m /= 2;
+            }
+            let mut d: u64 = 3;
+            while d <= m / d {
+                while m % d == 0 {
+                    push(b" ", &mut buf, &mut len);
+                    emit(d, &mut buf, &mut len);
+                    m /= d;
+                }
+                d += 2;
+            }
+            if m > 1 {
+                push(b" ", &mut buf, &mut len);
+                emit(m, &mut buf, &mut len);
+            }
+            crate::kprintln!("{}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+        }
+        _ => crate::kprintln!("usage: factor <n>  (integer >= 2)"),
+    }
+}
+
+/// `swapcasef` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_swapcasef(line: &str, cmd: &str, rest: &str) {
+    // Invert the case of every ASCII letter in a VFS FILE (other bytes pass through) --
+    // the file analogue of swapcase, mirroring how revf is the file analogue of rev.
+    // "swapcasef motd" -> the motd with every letter's case flipped. Distinct from
+    // swapcase (INLINE args), shout/whisper (single-case), and casecount (COUNTS case).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: swapcasef <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("swapcasef: no such file: {}", name),
+            Some(s) => {
+                let src = s.as_bytes();
+                let n = src.len().min(512);
+                let mut buf = [0u8; 512];
+                for i in 0..n {
+                    buf[i] = match src[i] {
+                        b'A'..=b'Z' => src[i] + 32,
+                        b'a'..=b'z' => src[i] - 32,
+                        other => other,
+                    };
+                }
+                crate::kprintln!(
+                    "swapcasef: {}",
+                    core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `shoutf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_shoutf(line: &str, cmd: &str, rest: &str) {
+    // Uppercase EVERY ASCII letter of a VFS FILE (other bytes pass through) -- the file
+    // analogue of shout, mirroring how swapcasef is the file analogue of swapcase. Unlike
+    // swapcasef (which FLIPS each letter's case) this forces all-uppercase regardless of
+    // the original case. `shoutf motd` -> the motd in ALL CAPS. Distinct from shout
+    // (INLINE args), swapcasef (flips), titlef (word-initial only), and `whisperf` would
+    // be the lowercase file counterpart.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: shoutf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("shoutf: no such file: {}", name),
+            Some(s) => {
+                let src = s.as_bytes();
+                let n = src.len().min(512);
+                let mut buf = [0u8; 512];
+                for i in 0..n {
+                    buf[i] = match src[i] {
+                        b'a'..=b'z' => src[i] - 32,
+                        other => other,
+                    };
+                }
+                crate::kprintln!(
+                    "shoutf: {}",
+                    core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `whisperf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_whisperf(line: &str, cmd: &str, rest: &str) {
+    // Lowercase EVERY ASCII letter of a VFS FILE (other bytes pass through) -- the file
+    // analogue of whisper and the lowercase counterpart of shoutf, mirroring how swapcasef
+    // is the file analogue of swapcase. Unlike swapcasef (which FLIPS each letter's case)
+    // this forces all-lowercase regardless of the original. `whisperf motd` -> the motd in
+    // all lowercase. Distinct from whisper (INLINE args), swapcasef (flips), and titlef.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: whisperf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("whisperf: no such file: {}", name),
+            Some(s) => {
+                let src = s.as_bytes();
+                let n = src.len().min(512);
+                let mut buf = [0u8; 512];
+                for i in 0..n {
+                    buf[i] = match src[i] {
+                        b'A'..=b'Z' => src[i] + 32,
+                        other => other,
+                    };
+                }
+                crate::kprintln!(
+                    "whisperf: {}",
+                    core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `atbashf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_atbashf(line: &str, cmd: &str, rest: &str) {
+    // Apply the Atbash substitution cipher (A<->Z, case-preserving) to a whole VFS FILE;
+    // non-letters (incl whitespace/line breaks) pass through. Like atbash it is SELF-
+    // INVERSE. The file analogue of atbash, mirroring how rot13f is the file analogue of
+    // rot13 and swapcasef of swapcase. `atbashf motd` -> the motd enciphered. Distinct
+    // from atbash (INLINE args), rot13f (a DIFFERENT cipher), swapcasef, and shoutf.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: atbashf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("atbashf: no such file: {}", name),
+            Some(s) => {
+                let src = s.as_bytes();
+                let n = src.len().min(512);
+                let mut buf = [0u8; 512];
+                for i in 0..n {
+                    buf[i] = if src[i].is_ascii_uppercase() {
+                        b'Z' - (src[i] - b'A')
+                    } else if src[i].is_ascii_lowercase() {
+                        b'z' - (src[i] - b'a')
+                    } else {
+                        src[i]
+                    };
+                }
+                crate::kprintln!(
+                    "atbashf: {}",
+                    core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `repeatword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_repeatword(line: &str, cmd: &str, rest: &str) {
+    // Repeat a run of text <n> times joined by SINGLE SPACES: "repeatword 3 hi" -> "hi hi
+    // hi", "repeatword 1 x" -> "x", "repeatword 4 ab" -> "ab ab ab ab". n=0 -> empty. The
+    // space-joined form of repeat (which concatenates with NO separator); distinct also
+    // from repeateach (each CHAR n times) and doublewords (each word exactly twice).
+    // Output capped at a fixed [u8; 512] buffer (large n stops cleanly, no overflow).
+    let r = rest.trim_start();
+    let parsed = r
+        .find(' ')
+        .and_then(|sp| r[..sp].parse::<usize>().ok().map(|k| (k, &r[sp + 1..])));
+    match parsed {
+        None => crate::kprintln!("usage: repeatword <n> <text>"),
+        Some((k, text)) => {
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            'outer: for i in 0..k {
+                if i > 0 {
+                    if len < buf.len() {
+                        buf[len] = b' ';
+                        len += 1;
+                    } else {
+                        break 'outer;
+                    }
+                }
+                for &b in text.as_bytes() {
+                    if len < buf.len() {
+                        buf[len] = b;
+                        len += 1;
+                    } else {
+                        break 'outer;
+                    }
+                }
+            }
+            crate::kprintln!(
+                "repeatword: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `substr` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_substr(line: &str, cmd: &str, rest: &str) {
+    // Extract the substring of <text> beginning at 1-based character position <start>
+    // and running for <len> characters (byte-indexed, equal to chars for ASCII input).
+    // "substr 2 3 hello" -> "ell". A start past the end yields the empty string; a len
+    // running past the end simply takes whatever remains ("substr 3 10 hello" -> "llo").
+    // Distinct from firstn (first n chars from the START), lastn (from the END), charat
+    // (a single char at a position), and middlechar (the middle char).
+    let r = rest.trim_start();
+    let parsed = r.find(' ').and_then(|s1| {
+        let start = r[..s1].parse::<usize>().ok().filter(|&k| k >= 1)?;
+        let rem = r[s1 + 1..].trim_start();
+        let s2 = rem.find(' ')?;
+        let len = rem[..s2].parse::<usize>().ok()?;
+        Some((start, len, &rem[s2 + 1..]))
+    });
+    match parsed {
+        None => crate::kprintln!("usage: substr <start> <len> <text>"),
+        Some((start, len, text)) => {
+            let bytes = text.as_bytes();
+            let from = start - 1; // start >= 1 guaranteed by the filter above
+            let mut buf = [0u8; 512];
+            let mut n = 0usize;
+            let mut i = from;
+            while i < bytes.len() && i < from + len {
+                if n < buf.len() {
+                    buf[n] = bytes[i];
+                    n += 1;
+                }
+                i += 1;
+            }
+            crate::kprintln!("substr: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+        }
+    }
+}
+
+/// `railfence` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_railfence(line: &str, cmd: &str, rest: &str) {
+    // Rail-fence (zigzag) TRANSPOSITION cipher with 3 rails: write the bytes
+    // in a zigzag down and up across 3 rails, then read off rail-by-rail
+    // (top first). For 3 rails the rail of position i follows the period-4
+    // pattern 0,1,2,1,0,1,2,1,... Unlike caesar/atbash/rot47/vigenere/leet
+    // (substitution -- they MAP chars), this REORDERS them: the output is a
+    // pure permutation of the input bytes (length-preserving), spaces kept.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: railfence <text>");
+    } else {
+        let bytes = rest.as_bytes();
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for r in 0u32..3 {
+            for (i, &b) in bytes.iter().enumerate() {
+                let c = (i as u32) % 4;
+                let rail = if c <= 2 { c } else { 4 - c };
+                if rail == r && len < buf.len() {
+                    buf[len] = b;
+                    len += 1;
+                }
+            }
+        }
+        crate::kprintln!(
+            "railfence: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `capitalizef` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_capitalizef(line: &str, cmd: &str, rest: &str) {
+    // Uppercase ONLY the first alphabetic character found in a whole VFS FILE,
+    // scanning from the start and skipping any leading non-letters until the first
+    // letter is found; every other byte (remaining letters, digits, punctuation,
+    // newlines) is left completely unchanged -- the file analogue of `capitalize`
+    // (INLINE text), mirroring how titlef/swapcasef/shoutf/whisperf are to their
+    // inline counterparts. "capitalizef motd" -> motd unchanged (already starts
+    // 'W'). Distinct from titlef (EVERY word) and shoutf/whisperf (ALL letters
+    // forced one case).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: capitalizef <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("capitalizef: no such file: {}", name),
+            Some(s) => {
+                let src = s.as_bytes();
+                let n = src.len().min(512);
+                let mut buf = [0u8; 512];
+                let mut done = false;
+                for i in 0..n {
+                    let c = src[i];
+                    buf[i] = if !done && c.is_ascii_lowercase() {
+                        done = true;
+                        c - 32 // to uppercase
+                    } else {
+                        if c.is_ascii_alphabetic() {
+                            done = true; // a leading uppercase letter counts as "first"
+                        }
+                        c
+                    };
+                }
+                crate::kprintln!(
+                    "capitalizef: {}",
+                    core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `decapitalizef` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_decapitalizef(line: &str, cmd: &str, rest: &str) {
+    // Lowercase ONLY the first alphabetic character found in a whole VFS FILE,
+    // scanning from the start and skipping any leading non-letters until the first
+    // letter is found; every other byte (remaining letters, digits, punctuation,
+    // newlines) is left completely unchanged -- the file analogue of `decapitalize`
+    // (INLINE text), the exact inverse of `capitalizef`. "decapitalizef motd" ->
+    // motd's leading 'W' becomes 'w', rest unchanged. Distinct from whisperf (ALL
+    // letters forced lower) and capitalizef (uppercases instead).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: decapitalizef <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("decapitalizef: no such file: {}", name),
+            Some(s) => {
+                let src = s.as_bytes();
+                let n = src.len().min(512);
+                let mut buf = [0u8; 512];
+                let mut done = false;
+                for i in 0..n {
+                    let c = src[i];
+                    buf[i] = if !done && c.is_ascii_uppercase() {
+                        done = true;
+                        c + 32 // to lowercase
+                    } else {
+                        if c.is_ascii_alphabetic() {
+                            done = true; // a leading lowercase letter counts as "first"
+                        }
+                        c
+                    };
+                }
+                crate::kprintln!(
+                    "decapitalizef: {}",
+                    core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `sentencecasef` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_sentencecasef(line: &str, cmd: &str, rest: &str) {
+    // Sentence-case a whole VFS FILE: uppercase the FIRST alphabetic character found
+    // (scanning from the start, skipping any leading non-letters) and lowercase EVERY
+    // other letter in the file; non-letters (digits, punctuation, newlines) pass through
+    // unchanged -- the file analogue of `sentencecase` (inline), combining capitalizef's
+    // first-letter scan with decapitalizef-style whole-file rewriting. Distinct from
+    // capitalizef/decapitalizef (which touch only the first letter and leave the rest of
+    // the file untouched).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: sentencecasef <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("sentencecasef: no such file: {}", name),
+            Some(s) => {
+                let src = s.as_bytes();
+                let n = src.len().min(512);
+                let mut buf = [0u8; 512];
+                let mut seen = false;
+                for i in 0..n {
+                    let c = src[i];
+                    buf[i] = if c.is_ascii_alphabetic() {
+                        if !seen {
+                            seen = true;
+                            if c.is_ascii_lowercase() { c - 32 } else { c } // first -> upper
+                        } else if c.is_ascii_uppercase() {
+                            c + 32 // rest -> lower
+                        } else {
+                            c
+                        }
+                    } else {
+                        c
+                    };
+                }
+                crate::kprintln!(
+                    "sentencecasef: {}",
+                    core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `titlef` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_titlef(line: &str, cmd: &str, rest: &str) {
+    // Title-case every whitespace-delimited word of a VFS FILE: capitalize the first
+    // letter of each word, lowercase the rest, passing through whitespace and other
+    // bytes (so line breaks and punctuation are preserved). The file analogue of
+    // `title`, mirroring how swapcasef is the file analogue of swapcase and revf of
+    // rev. Distinct from `title` (INLINE args), shout/whisper (single-case whole text),
+    // and capitalize (only the FIRST word). Byte-level: only the first byte of each
+    // whitespace-run is a capitalization site, matching title's per-word index-0 rule.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: titlef <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("titlef: no such file: {}", name),
+            Some(s) => {
+                let src = s.as_bytes();
+                let n = src.len().min(512);
+                let mut buf = [0u8; 512];
+                let mut start = true; // at the first byte of a whitespace-delimited word
+                for i in 0..n {
+                    let c = src[i];
+                    if c.is_ascii_whitespace() {
+                        buf[i] = c;
+                        start = true;
+                    } else {
+                        buf[i] = if start {
+                            if c.is_ascii_lowercase() { c - 32 } else { c }
+                        } else if c.is_ascii_uppercase() {
+                            c + 32
+                        } else {
+                            c
+                        };
+                        start = false;
+                    }
+                }
+                crate::kprintln!(
+                    "titlef: {}",
+                    core::str::from_utf8(&buf[..n]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `rng` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rng(line: &str, cmd: &str, rest: &str) {
+    // The generator's state: HMAC_DRBG boot KAT, strong sources and their health, reseeds, and
+    // `rng secret` = one fail-closed draw (what the mesh uses for keys and ephemerals).
+    if rest.trim() == "secret" {
+        let mut b = [0u8; 16];
+        match crate::rng::fill_secret(&mut b) {
+            Ok(()) => crate::kprintln!(
+                "[rng] secret OK {:02x}{:02x}{:02x}{:02x}...",
+                b[0], b[1], b[2], b[3]
+            ),
+            Err(e) => crate::kprintln!("[rng] secret REFUSED: {:?}", e),
+        }
+    }
+    let s = crate::rng::status();
+    crate::kprintln!(
+        "[rng] HMAC_DRBG-SHA256 kat={} seeded={} strong_bytes={} reseeds={} secret_ok={} secret_refused={}",
+        if s.kat_ok { "PASS" } else { "FAIL" },
+        s.seeded,
+        s.last_strong,
+        s.reseeds,
+        s.secret_ok,
+        s.secret_refused
+    );
+    for (i, name) in crate::rng::source_names().iter().enumerate() {
+        crate::kprintln!(
+            "[rng] source {}: {} samples={}",
+            name,
+            if !s.present[i] {
+                "absent"
+            } else if s.healthy[i] {
+                "healthy"
+            } else {
+                "FAILED-health"
+            },
+            s.samples[i]
+        );
+    }
+}
+
+/// `sysinfo` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_sysinfo(line: &str, cmd: &str, rest: &str) {
+    // Read-only dashboard aggregating real kernel state in one view.
+    let frames = frame::total_frames();
+    let t = sched::ticks();
+    let mut files = 0;
+    for i in 0..vfs::MAX_FILES {
+        if vfs::is_used(i) {
+            files += 1;
+        }
+    }
+    crate::kprintln!("===== AfriSovera OS : sysinfo =====");
+    crate::kprintln!("  os       : Mansa microkernel (Rust, capability-secured)");
+    crate::kprintln!("  board    : {}", crate::board::NAME);
+    crate::kprintln!("  cores    : {} online", crate::cores_online());
+    crate::kprintln!(
+        "  heap     : {} / {} bytes used ({} B reserved + {} B grown from frames)",
+        heap::used(), heap::arena(), heap::size(), heap::grown()
+    );
+    crate::kprintln!("  memory   : {} frames ({} MiB of 4KiB RAM)", frames, frames * 4 / 1024);
+    crate::kprintln!("  uptime   : {} ticks (~{} s)", t, t / 100);
+    crate::kprintln!("  uart rx  : {} irqs (interrupt-driven input)", crate::uart::rx_irq_count());
+    crate::kprintln!("  devices  : {} registered", asili::count());
+    if crate::virtio::net_present() {
+        let ip = crate::virtio::dhcp_ip();
+        if ip != [0u8; 4] {
+            crate::kprintln!(
+                "  network  : virtio-net, DHCP lease {}.{}.{}.{}",
+                ip[0], ip[1], ip[2], ip[3]
+            );
+        } else {
+            crate::kprintln!("  network  : virtio-net up (no DHCP lease)");
+        }
+    } else {
+        crate::kprintln!("  network  : none");
+    }
+    crate::kprintln!("  files    : {} in RAM filesystem", files);
+    crate::kprintln!("===================================");
+}
+
+/// `unhex` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_unhex(line: &str, cmd: &str, rest: &str) {
+    // Decode a hex string to text (inverse of hexdump). Optional spaces OK.
+    fn hexval(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let t = rest.trim();
+    if t.is_empty() {
+        crate::kprintln!("usage: unhex <hexstring>");
+    } else {
+        let mut out = [0u8; 256];
+        let mut n = 0usize;
+        let mut hi: Option<u8> = None; // pending high nibble
+        let mut bad = false;
+        for &c in t.as_bytes() {
+            if c == b' ' || c == b'\t' {
+                continue;
+            }
+            match hexval(c) {
+                Some(v) => match hi {
+                    None => hi = Some(v),
+                    Some(h) => {
+                        if n < out.len() {
+                            out[n] = (h << 4) | v;
+                            n += 1;
+                        }
+                        hi = None;
+                    }
+                },
+                None => {
+                    bad = true;
+                    break;
+                }
+            }
+        }
+        if bad || hi.is_some() {
+            // Invalid char, or an odd number of hex digits (dangling nibble).
+            crate::kprintln!("unhex: invalid hex");
+        } else {
+            // Render printable ASCII as-is; non-printables become '.'.
+            let mut disp = [0u8; 256];
+            for i in 0..n {
+                disp[i] = if (0x20..=0x7e).contains(&out[i]) { out[i] } else { b'.' };
+            }
+            crate::kprintln!("unhex: {}", core::str::from_utf8(&disp[..n]).unwrap_or("?"));
+        }
+    }
+}
+
+/// `boxed` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_boxed(line: &str, cmd: &str, rest: &str) {
+    // Draw a 3-line ASCII box around a single line of inline text using
+    // +, -, and |. For text of byte length n: top/bottom = '+' + '-'*(n+2) +
+    // '+'; middle = '| ' + text + ' |'. A presentational transform -- no
+    // other command frames text (ciphers map chars, case/separator
+    // transforms change case, wrap breaks long lines, numeronym abbreviates).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: boxed <text>");
+    } else {
+        let text = rest;
+        let n = text.as_bytes().len();
+        // Build the border '+' + (n+2) '-' + '+' once, print it top & bottom.
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        if len < buf.len() {
+            buf[len] = b'+';
+            len += 1;
+        }
+        for _ in 0..(n + 2) {
+            if len < buf.len() {
+                buf[len] = b'-';
+                len += 1;
+            }
+        }
+        if len < buf.len() {
+            buf[len] = b'+';
+            len += 1;
+        }
+        let border = core::str::from_utf8(&buf[..len]).unwrap_or("?");
+        crate::kprintln!("{}", border);
+        crate::kprintln!("| {} |", text);
+        crate::kprintln!("{}", border);
+    }
+}
+
+/// `countdistinct` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_countdistinct(line: &str, cmd: &str, rest: &str) {
+    // Count the DISTINCT whitespace-delimited words in the INLINE text
+    // ("N distinct of M words"), case-sensitive, punctuation kept. The inline
+    // analogue of uniqwords (which reads a VFS FILE); distinct from countword
+    // (occurrences of ONE word), countword's TOTAL companion, and unique (which
+    // REMOVES duplicate words rather than counting). O(w^2), fine for a line.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: countdistinct <text>");
+    } else {
+        let mut total = 0usize;
+        let mut distinct = 0usize;
+        for (i, t) in rest.split_whitespace().enumerate() {
+            total += 1;
+            // First occurrence wins: distinct iff no earlier token equals it.
+            let mut seen = false;
+            for u in rest.split_whitespace().take(i) {
+                if u == t {
+                    seen = true;
+                    break;
+                }
+            }
+            if !seen {
+                distinct += 1;
+            }
+        }
+        crate::kprintln!("countdistinct: {} distinct of {} words", distinct, total);
+    }
+}
+
+/// `verify` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_verify(line: &str, cmd: &str, rest: &str) {
+    // AfriStore integrity: recompute an app's SHA-256 and compare to the
+    // manifest. `verify <app> tamper` hashes a modified copy to show a
+    // single changed byte is caught.
+    let mut parts = rest.split_whitespace();
+    let name = parts.next().unwrap_or("");
+    let tamper = parts.next() == Some("tamper");
+    match vfs::read_full(name) {
+        Some(data) => match crate::integrity::expected(name) {
+            Some(exp) => {
+                let got = if tamper {
+                    crate::integrity::hash_tampered(data)
+                } else {
+                    crate::sha256::digest(data)
+                };
+                let mut eh = [0u8; 64];
+                let mut gh = [0u8; 64];
+                crate::sha256::to_hex(&exp, &mut eh);
+                crate::sha256::to_hex(&got, &mut gh);
+                crate::kprintln!("verify {}{}", name, if tamper { " (tampered copy)" } else { "" });
+                crate::kprintln!("  manifest: {}", core::str::from_utf8(&eh).unwrap_or("?"));
+                crate::kprintln!("  computed: {}", core::str::from_utf8(&gh).unwrap_or("?"));
+                if got == exp {
+                    crate::kprintln!("  => integrity OK (bytes match the manifest)");
+                } else {
+                    crate::kprintln!("  => TAMPERED - hash mismatch, app would be rejected");
+                }
+            }
+            None => crate::kprintln!("verify: {} not in the integrity manifest", name),
+        },
+        None => crate::kprintln!("verify: no such file: {}", name),
+    }
+}
+
+/// `indent` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_indent(line: &str, cmd: &str, rest: &str) {
+    // Left-pad a run of text with <n> leading spaces and print it
+    // delimited by [ ] so the indentation is unambiguous. Distinct from
+    // center (pads BOTH sides to a field width), spaceout (inserts spaces
+    // BETWEEN characters), and wrap (breaks text across lines). Reuses the
+    // wrap/center `<n> <text>` parse. The indent is clamped so the padded
+    // line always fits the fixed [u8; 512] buffer.
+    let r = rest.trim_start();
+    let parsed = r.find(' ').and_then(|sp| {
+        r[..sp].parse::<usize>().ok().map(|w| (w, &r[sp + 1..]))
+    });
+    match parsed {
+        None => crate::kprintln!("usage: indent <n> <text>"),
+        Some((n, text)) => {
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            for _ in 0..n {
+                if len < buf.len() {
+                    buf[len] = b' ';
+                    len += 1;
+                }
+            }
+            for &c in text.as_bytes() {
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+            crate::kprintln!(
+                "indent: [{}]",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `rot47f` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rot47f(line: &str, cmd: &str, rest: &str) {
+    // ROT47 cipher over a whole VFS FILE: rotate every printable ASCII byte (33..=126) by
+    // 47, other bytes (spaces, newlines, control) passing through -- the file analogue of
+    // `rot47` and SELF-INVERSE (applying it twice restores the file). Joins the file-cipher
+    // family rot13f/atbashf/caesarf/leetf. `rot47f motd` -> the motd in rot47. Distinct from
+    // those letter-only ciphers: rot47 also maps digits and punctuation.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: rot47f <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("rot47f: no such file: {}", name),
+            Some(s) => {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                for &c in s.as_bytes() {
+                    let out = if (33..=126).contains(&c) {
+                        33 + (c - 33 + 47) % 94
+                    } else {
+                        c
+                    };
+                    if len < buf.len() {
+                        buf[len] = out;
+                        len += 1;
+                    }
+                }
+                crate::kprintln!(
+                    "rot47f: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `disemvowelf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_disemvowelf(line: &str, cmd: &str, rest: &str) {
+    // Remove ALL ASCII vowels (a,e,i,o,u -- both cases) from a whole VFS FILE,
+    // keeping consonants, digits, punctuation, spaces, and line structure -- the
+    // file analogue of `disemvowel` (which takes INLINE args). Non-vowel bytes
+    // (including newlines) pass through unchanged. `disemvowelf motd` -> the motd
+    // with its vowels stripped. Distinct from vowelsonly (keeps only vowels),
+    // whisperf/shoutf (case), and squeeze/despace (whitespace).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: disemvowelf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("disemvowelf: no such file: {}", name),
+            Some(s) => {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                for &b in s.as_bytes() {
+                    let low = b | 0x20; // fold case for the vowel test
+                    let is_vowel = matches!(low, b'a' | b'e' | b'i' | b'o' | b'u')
+                        && (b'a'..=b'z').contains(&low);
+                    if !is_vowel && len < buf.len() {
+                        buf[len] = b;
+                        len += 1;
+                    }
+                }
+                crate::kprintln!(
+                    "disemvowelf: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `vowelsonlyf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_vowelsonlyf(line: &str, cmd: &str, rest: &str) {
+    // Keep ONLY the ASCII vowels (a,e,i,o,u -- both cases) of a whole VFS FILE, dropping
+    // consonants, digits, punctuation, spaces, and newlines -- the file analogue of
+    // vowelsonly and the exact COMPLEMENT of disemvowelf (which DROPS vowels). Since it
+    // drops newlines too, a multi-line file collapses to one run of vowels. No vowels ->
+    // "(none)". Distinct from vowelcount (which COUNTS a file's vowels).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: vowelsonlyf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("vowelsonlyf: no such file: {}", name),
+            Some(s) => {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                for &b in s.as_bytes() {
+                    let low = b | 0x20; // fold case for the vowel test
+                    let is_vowel = matches!(low, b'a' | b'e' | b'i' | b'o' | b'u')
+                        && (b'a'..=b'z').contains(&low);
+                    if is_vowel && len < buf.len() {
+                        buf[len] = b;
+                        len += 1;
+                    }
+                }
+                if len == 0 {
+                    crate::kprintln!("vowelsonlyf: (none)");
+                } else {
+                    crate::kprintln!(
+                        "vowelsonlyf: {}",
+                        core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `repeatto` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_repeatto(line: &str, cmd: &str, rest: &str) {
+    // Repeat the text CYCLICALLY until the output is exactly <width> characters long (the
+    // pattern may be cut mid-way). "repeatto 10 ab" -> "ababababab", "repeatto 7 abc" ->
+    // "abcabca", "repeatto 3 hello" -> "hel", "repeatto 5 x" -> "xxxxx". Useful for rulers
+    // / fills. Distinct from repeat (whole TEXT n times), repeateach (each CHAR n times),
+    // and firstn (a prefix of the text as-is). Reuses the `<n> <text>` parse.
+    let r = rest.trim_start();
+    let parsed = r
+        .find(' ')
+        .and_then(|sp| r[..sp].parse::<usize>().ok().map(|k| (k, &r[sp + 1..])));
+    match parsed {
+        None => crate::kprintln!("usage: repeatto <width> <text>"),
+        Some((w, text)) => {
+            let src = text.as_bytes();
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            if !src.is_empty() {
+                while len < w && len < buf.len() {
+                    buf[len] = src[len % src.len()];
+                    len += 1;
+                }
+            }
+            crate::kprintln!(
+                "repeatto: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `repeateach` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_repeateach(line: &str, cmd: &str, rest: &str) {
+    // Repeat each character of the text <n> times: "repeateach 3 abc" -> "aaabbbccc",
+    // "repeateach 1 hello" -> "hello", "repeateach 0 abc" -> "" (empty). The general
+    // form of double (which is exactly n=2). Every byte (spaces included) is repeated;
+    // distinct from repeat (whole TEXT n times) and spaceout (inserts a space between
+    // chars without repeating). Reuses the `<n> <text>` parse of firstn/lastn.
+    let r = rest.trim_start();
+    let parsed = r
+        .find(' ')
+        .and_then(|sp| r[..sp].parse::<usize>().ok().map(|k| (k, &r[sp + 1..])));
+    match parsed {
+        None => crate::kprintln!("usage: repeateach <n> <text>"),
+        Some((n, text)) => {
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            for &b in text.as_bytes() {
+                for _ in 0..n {
+                    if len < buf.len() {
+                        buf[len] = b;
+                        len += 1;
+                    }
+                }
+            }
+            crate::kprintln!(
+                "repeateach: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `mirror` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_mirror(line: &str, cmd: &str, rest: &str) {
+    // Append the REVERSE of the text to itself, building an (even-length)
+    // palindrome: "abc" -> "abccba", "ab" -> "abba", "a" -> "aa". Distinct from
+    // rev (reverses the WHOLE string, no append), double (repeats each CHAR
+    // twice -> "aabbcc"), palindrome (CLASSIFIES rather than builds), and repeat
+    // (repeats the whole string n times).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: mirror <text>");
+    } else {
+        let src = rest.as_bytes();
+        let n = src.len();
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in src {
+            if len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        for i in (0..n).rev() {
+            if len < buf.len() {
+                buf[len] = src[i];
+                len += 1;
+            }
+        }
+        crate::kprintln!(
+            "mirror: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `repeat` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_repeat(line: &str, cmd: &str, rest: &str) {
+    // Repeat a whole run of text <n> times, concatenated. e.g. repeat 3 ab
+    // -> "ababab". The output is capped at a fixed [u8; 512] buffer, so a
+    // large n simply stops filling once the buffer is full (no overflow, no
+    // heap). Reuses the wrap/center `<n> <text>` parse. Distinct from double
+    // (repeats each CHARACTER twice, not the whole string n times).
+    let r = rest.trim_start();
+    let parsed = r.find(' ').and_then(|sp| {
+        r[..sp].parse::<usize>().ok().filter(|&k| k > 0).map(|k| (k, &r[sp + 1..]))
+    });
+    match parsed {
+        None => crate::kprintln!("usage: repeat <n> <text>"),
+        Some((k, text)) => {
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            'outer: for _ in 0..k {
+                for &b in text.as_bytes() {
+                    if len < buf.len() {
+                        buf[len] = b;
+                        len += 1;
+                    } else {
+                        break 'outer; // buffer full: stop cleanly
+                    }
+                }
+            }
+            crate::kprintln!(
+                "repeat: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `leetf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_leetf(line: &str, cmd: &str, rest: &str) {
+    // Convert a whole VFS FILE to "leetspeak" via the same fixed letter->digit
+    // substitution as `leet` (a->4, e->3, i->1, o->0, s->5, t->7, case-insensitive
+    // on the match); every other byte -- other letters (case preserved), digits,
+    // spaces, punctuation, newlines -- passes through unchanged. The file analogue
+    // of `leet`, joining rot13f/atbashf/caesarf/mockf/disemvowelf. `leetf motd` ->
+    // the motd in l33t. Distinct from those ciphers/case transforms.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: leetf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("leetf: no such file: {}", name),
+            Some(s) => {
+                let mut buf = [0u8; 512];
+                let mut len = 0usize;
+                for &b in s.as_bytes() {
+                    let out = match b | 0x20 {
+                        b'a' => b'4',
+                        b'e' => b'3',
+                        b'i' => b'1',
+                        b'o' => b'0',
+                        b's' => b'5',
+                        b't' => b'7',
+                        _ => b, // keep the ORIGINAL byte (preserves case/punctuation)
+                    };
+                    if len < buf.len() {
+                        buf[len] = out;
+                        len += 1;
+                    }
+                }
+                crate::kprintln!(
+                    "leetf: {}",
+                    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `bits` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_bits(line: &str, cmd: &str, rest: &str) {
+    // Show each character of the inline text as its 8-bit binary, space-
+    // separated. e.g. "Hi" -> "01001000 01101001". Distinct from hex
+    // (base-16), base64/base32 (base encodings), base (numeric base of a
+    // NUMBER), gray (Gray code of a NUMBER), and popcount (bit COUNT).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: bits <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for (idx, &b) in rest.as_bytes().iter().enumerate() {
+            if idx > 0 && len < buf.len() {
+                buf[len] = b' ';
+                len += 1;
+            }
+            for i in (0..8).rev() {
+                if len < buf.len() {
+                    buf[len] = b'0' + ((b >> i) & 1);
+                    len += 1;
+                }
+            }
+        }
+        crate::kprintln!("bits: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `nato` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_nato(line: &str, cmd: &str, rest: &str) {
+    // Spell text in the NATO phonetic alphabet (letters + digits).
+    fn nato_of(c: u8) -> Option<&'static str> {
+        let c = if c.is_ascii_lowercase() { c - 32 } else { c };
+        Some(match c {
+            b'A' => "Alpha", b'B' => "Bravo", b'C' => "Charlie", b'D' => "Delta",
+            b'E' => "Echo", b'F' => "Foxtrot", b'G' => "Golf", b'H' => "Hotel",
+            b'I' => "India", b'J' => "Juliett", b'K' => "Kilo", b'L' => "Lima",
+            b'M' => "Mike", b'N' => "November", b'O' => "Oscar", b'P' => "Papa",
+            b'Q' => "Quebec", b'R' => "Romeo", b'S' => "Sierra", b'T' => "Tango",
+            b'U' => "Uniform", b'V' => "Victor", b'W' => "Whiskey", b'X' => "Xray",
+            b'Y' => "Yankee", b'Z' => "Zulu",
+            b'0' => "Zero", b'1' => "One", b'2' => "Two", b'3' => "Three",
+            b'4' => "Four", b'5' => "Five", b'6' => "Six", b'7' => "Seven",
+            b'8' => "Eight", b'9' => "Nine",
+            _ => return None,
+        })
+    }
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: nato <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let push = |buf: &mut [u8; 512], len: &mut usize, bytes: &[u8]| {
+            for &b in bytes {
+                if *len < buf.len() {
+                    buf[*len] = b;
+                    *len += 1;
+                }
+            }
+        };
+        for &c in rest.trim().as_bytes() {
+            if let Some(word) = nato_of(c) {
+                if len > 0 {
+                    push(&mut buf, &mut len, b" ");
+                }
+                push(&mut buf, &mut len, word.as_bytes());
+            }
+            // unencodable bytes (spaces/punctuation) ignored
+        }
+        crate::kprintln!("nato: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `topword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_topword(line: &str, cmd: &str, rest: &str) {
+    // The MOST FREQUENT whitespace-delimited word in the inline text, with its count;
+    // ties resolve to the FIRST such word by occurrence. "topword a b a c a" -> "a (3)",
+    // "topword the cat the dog" -> "the (2)", "topword x y z" -> "x (1)" (all tie -> first),
+    // "topword hi hi bye bye hi" -> "hi (3)". Case-sensitive. The inline analogue of
+    // wordfreq (most common word in a FILE); distinct from duplicatewords and countword.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: topword <text>");
+    } else {
+        let mut best: &str = "";
+        let mut best_count = 0usize;
+        // O(w^2): count each word; keep the first word reaching the highest count.
+        for (i, w) in rest.split_whitespace().enumerate() {
+            // Only evaluate a word at its FIRST occurrence (so ties keep the earliest).
+            if rest.split_whitespace().take(i).any(|u| u == w) {
+                continue;
+            }
+            let c = rest.split_whitespace().filter(|u| *u == w).count();
+            if c > best_count {
+                best_count = c;
+                best = w;
+            }
+        }
+        crate::kprintln!("topword: {} ({})", best, best_count);
+    }
+}
+
+/// `rareword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rareword(line: &str, cmd: &str, rest: &str) {
+    // The LEAST FREQUENT whitespace-delimited word in the inline text, with its count;
+    // ties resolve to the FIRST such word by occurrence. "rareword a b a c a" -> "b (1)"
+    // (a=3, b=1, c=1 -> first min is b), "rareword x y z" -> "x (1)" (all tie -> first),
+    // "rareword one two two three three" -> "one (1)". Case-sensitive. The complement of
+    // topword (most frequent); distinct from duplicatewords and countword.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: rareword <text>");
+    } else {
+        let mut best: &str = "";
+        let mut best_count = usize::MAX;
+        // O(w^2): count each word; keep the first word reaching the LOWEST count.
+        for (i, w) in rest.split_whitespace().enumerate() {
+            // Only evaluate a word at its FIRST occurrence (so ties keep the earliest).
+            if rest.split_whitespace().take(i).any(|u| u == w) {
+                continue;
+            }
+            let c = rest.split_whitespace().filter(|u| *u == w).count();
+            if c < best_count {
+                best_count = c;
+                best = w;
+            }
+        }
+        crate::kprintln!("rareword: {} ({})", best, best_count);
+    }
+}
+
+/// `modinv` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_modinv(line: &str, cmd: &str, rest: &str) {
+    // Modular multiplicative inverse: the x in [0, m) with a*x = 1 (mod m), found via
+    // the EXTENDED Euclidean algorithm. An inverse exists iff gcd(a, m) = 1; otherwise
+    // this reports "no inverse". "modinv 3 11" -> 4 (3*4 = 12 = 1 mod 11). Distinct from
+    // pow (modular EXPONENTIATION) and gcd (which prints gcd + lcm). Bezout coefficients
+    // are carried in i128 so the intermediate signed values don't wrap for u64 inputs.
+    let mut it = rest.split_whitespace();
+    let a = it.next().and_then(|s| s.parse::<u64>().ok());
+    let m = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (a, m) {
+        (Some(a), Some(m)) if m >= 2 => {
+            // extended Euclid on (a mod m, m): old_r ends at gcd, old_s at a's coeff
+            let (mut old_r, mut r) = ((a % m) as i128, m as i128);
+            let (mut old_s, mut s) = (1i128, 0i128);
+            while r != 0 {
+                let q = old_r / r;
+                let nr = old_r - q * r;
+                old_r = r;
+                r = nr;
+                let ns = old_s - q * s;
+                old_s = s;
+                s = ns;
+            }
+            if old_r != 1 {
+                crate::kprintln!(
+                    "modinv: no inverse of {} mod {} (gcd = {})",
+                    a, m, old_r
+                );
+            } else {
+                let mm = m as i128;
+                let inv = ((old_s % mm) + mm) % mm;
+                crate::kprintln!("modinv: inverse of {} mod {} is {}", a, m, inv);
+            }
+        }
+        _ => crate::kprintln!("usage: modinv <a> <m> (m >= 2)"),
+    }
+}
+
+/// `unrle` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_unrle(line: &str, cmd: &str, rest: &str) {
+    // Decode run-length encoding back to text -- the inverse of `rle`,
+    // which emits <char><decimal-count> pairs (every run counted). Reads a
+    // literal char then its following decimal digits as the count, and
+    // repeats the char that many times. NOTE: char+count RLE is only
+    // unambiguously decodable when the source text had no digits (a digit
+    // in the source is indistinguishable from a count digit). Unknown/
+    // missing count -> 1. Bounded output buffer.
+    let inb = rest.trim().as_bytes();
+    if inb.is_empty() {
+        crate::kprintln!("usage: unrle <rle>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut i = 0usize;
+        while i < inb.len() {
+            let ch = inb[i];
+            i += 1;
+            // Read the (possibly multi-digit) decimal count.
+            let mut count: u32 = 0;
+            let mut got_digit = false;
+            while i < inb.len() && inb[i].is_ascii_digit() {
+                count = count.saturating_mul(10).saturating_add((inb[i] - b'0') as u32);
+                got_digit = true;
+                i += 1;
+            }
+            if !got_digit {
+                count = 1; // malformed: a char with no count -> emit once
+            }
+            for _ in 0..count {
+                if len < buf.len() {
+                    buf[len] = ch;
+                    len += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        crate::kprintln!("unrle: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `polybius` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_polybius(line: &str, cmd: &str, rest: &str) {
+    // Polybius square cipher: encode each letter as its row-column coordinates in the 5x5
+    // grid (A=11, B=12, ..., E=15, F=21, ..., with I and J sharing 24, ..., Z=55), space-
+    // separated; non-letters are skipped. Case-folded. "abc" -> "11 12 13", "hello" -> "23
+    // 15 31 31 34", "jazz" -> "24 11 55 55" (J folds to I). A classic coordinate cipher,
+    // distinct from bacon (5-bit A/B), a1z26 (1-26), and the rotation ciphers.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: polybius <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut first = true;
+        for &b in rest.as_bytes() {
+            if b.is_ascii_alphabetic() {
+                let mut c = b | 0x20; // fold case
+                if c == b'j' {
+                    c = b'i'; // I and J share a cell
+                }
+                // index in the 25-letter alphabet (a..z with j removed)
+                let idx = if c <= b'i' {
+                    (c - b'a') as usize
+                } else {
+                    (c - b'a') as usize - 1
+                };
+                let row = idx / 5 + 1;
+                let col = idx % 5 + 1;
+                if !first && len < buf.len() {
+                    buf[len] = b' ';
+                    len += 1;
+                }
+                first = false;
+                if len < buf.len() {
+                    buf[len] = b'0' + row as u8;
+                    len += 1;
+                }
+                if len < buf.len() {
+                    buf[len] = b'0' + col as u8;
+                    len += 1;
+                }
+            }
+        }
+        crate::kprintln!("polybius: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `spaceout` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_spaceout(line: &str, cmd: &str, rest: &str) {
+    // Insert a single space BETWEEN each character (letter-spacing / spread
+    // text). e.g. "abc" -> "a b c". The conceptual inverse of despace
+    // (which removes whitespace); distinct from squeeze (collapses repeats)
+    // and the case/cipher transforms.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: spaceout <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for (i, &b) in rest.as_bytes().iter().enumerate() {
+            if i > 0 && len < buf.len() {
+                buf[len] = b' ';
+                len += 1;
+            }
+            if len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        crate::kprintln!(
+            "spaceout: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `rangelines` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rangelines(line: &str, cmd: &str, rest: &str) {
+    // Print lines A through B (1-based, inclusive) of a VFS file, one per output
+    // line. An arbitrary line-range selector: distinct from headlines (first N),
+    // taillines (last N), line (ONE line by index), and oddlines/evenlines (by
+    // parity). Indices past the end are simply skipped; if A > B nothing prints.
+    let mut it = rest.split_whitespace();
+    let a = it.next().and_then(|s| s.parse::<usize>().ok());
+    let b = it.next().and_then(|s| s.parse::<usize>().ok());
+    let name = it.next();
+    match (a, b, name) {
+        (Some(a), Some(b), Some(name)) if a >= 1 => match vfs::read_str(name) {
+            None => crate::kprintln!("rangelines: no such file: {}", name),
+            Some(s) => {
+                for (i, line) in s.lines().enumerate() {
+                    let ln = i + 1;
+                    if ln >= a && ln <= b {
+                        crate::kprintln!("rangelines: {}", line);
+                    }
+                }
+            }
+        },
+        _ => crate::kprintln!("usage: rangelines <a> <b> <file>"),
+    }
+}
+
+/// `swappairs` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_swappairs(line: &str, cmd: &str, rest: &str) {
+    // Swap ADJACENT character pairs across the whole inline text
+    // ("abcd"->"badc", "abcde"->"badce" -- a lone final char at an odd
+    // length stays in place). Spaces are just characters and get swapped
+    // like any other byte. Distinct from rev (reverses the ENTIRE
+    // string), reveach (reverses each word's chars), and rwords
+    // (reverses word ORDER).
+    if rest.is_empty() {
+        crate::kprintln!("usage: swappairs <text>");
+    } else {
+        let src = rest.as_bytes();
+        let n = src.len().min(512);
+        let mut buf = [0u8; 512];
+        let mut i = 0usize;
+        while i < n {
+            if i + 1 < n {
+                buf[i] = src[i + 1];
+                buf[i + 1] = src[i];
+                i += 2;
+            } else {
+                buf[i] = src[i];
+                i += 1;
+            }
+        }
+        crate::kprintln!("swappairs: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `wordfreq` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wordfreq(line: &str, cmd: &str, rest: &str) {
+    // The most frequent whitespace-delimited word in a VFS file (case-
+    // sensitive; punctuation kept as part of the token). Distinct from
+    // histogram (BYTE frequency), mode (most common NUMBER in a list),
+    // wordn (the Nth word), and wc (counts).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: wordfreq <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("wordfreq: no such file: {}", name),
+            Some(s) => {
+                let mut total = 0usize;
+                let mut best: &str = "";
+                let mut best_count = 0usize;
+                // O(w^2) over the tokens -- fine for the tiny VFS files here.
+                for t in s.split_whitespace() {
+                    total += 1;
+                    let mut c = 0usize;
+                    for u in s.split_whitespace() {
+                        if u == t {
+                            c += 1;
+                        }
+                    }
+                    if c > best_count {
+                        best_count = c;
+                        best = t;
+                    }
+                }
+                if total == 0 {
+                    crate::kprintln!("wordfreq: (empty)");
+                } else {
+                    crate::kprintln!(
+                        "wordfreq: most common word '{}' ({} of {})",
+                        best, best_count, total
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `mem` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_mem(line: &str, cmd: &str, rest: &str) {
+    let frames = frame::total_frames();
+    // `arena()` and not `size()` since 2.740: the arena is the `.bss` reservation
+    // plus every frame the heap has since grown into it, and a total quoting the
+    // reservation would describe a smaller arena that no longer exists.
+    crate::kprintln!(
+        "heap:   {} / {} bytes used ({} B high-water, arena {} KiB @ {:#010x} = {} KiB reserved + {} KiB grown)",
+        heap::used(),
+        heap::arena(),
+        heap::high_water(),
+        heap::arena() / 1024,
+        heap::base(),
+        heap::size() / 1024,
+        heap::grown() / 1024
+    );
+    // 2.737 measured what the machine handed back; 2.739 hands it out again, so
+    // the figure above is no longer a number that can only rise. The bump cursor
+    // beside it is the one that still can.
+    crate::kprintln!(
+        "        {} B returned in {} block(s), {} B of it free again ({} reuse(s), bump at {} B)",
+        heap::freed(),
+        heap::frees(),
+        heap::list_free(),
+        heap::reused(),
+        heap::bump()
+    );
+    // 2.740: the same frames, from both sides. The heap's growth comes OUT of this
+    // pool, so a used count that ignored it would read as the machine having more
+    // RAM than it has — which is exactly the double-count `used_frames` exists to
+    // make checkable.
+    crate::kprintln!(
+        "frames: {} total ({} MiB of 4KiB physical frames), {} used — {} of them the heap's arena",
+        frames,
+        frames * 4 / 1024,
+        frame::used_frames(),
+        heap::grown_frames()
+    );
+}
+
+/// `rev` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rev(line: &str, cmd: &str, rest: &str) {
+    // Reverse the argument text in byte order (correct for ASCII input).
+    let b = rest.as_bytes();
+    if b.is_empty() {
+        crate::kprintln!("usage: rev <text>");
+    } else {
+        let n = b.len().min(512);
+        let mut buf = [0u8; 512];
+        for i in 0..n {
+            buf[i] = b[n - 1 - i];
+        }
+        crate::kprintln!("rev: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `swapcase` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_swapcase(line: &str, cmd: &str, rest: &str) {
+    // Invert the case of each ASCII letter; other bytes pass through.
+    if rest.is_empty() {
+        crate::kprintln!("usage: swapcase <text>");
+    } else {
+        let src = rest.as_bytes();
+        let n = src.len().min(512);
+        let mut buf = [0u8; 512];
+        for i in 0..n {
+            buf[i] = match src[i] {
+                b'A'..=b'Z' => src[i] + 32,
+                b'a'..=b'z' => src[i] - 32,
+                other => other,
+            };
+        }
+        crate::kprintln!("swapcase: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `shout` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_shout(line: &str, cmd: &str, rest: &str) {
+    // Uppercase EVERY ASCII letter of the inline text; other bytes pass
+    // through. Distinct from swapcase (flips case), title/capitalize
+    // (word-initial only), and mock (alternating case) -- there was no
+    // plain uppercaser. See `whisper` for the lowercase counterpart.
+    if rest.is_empty() {
+        crate::kprintln!("usage: shout <text>");
+    } else {
+        let src = rest.as_bytes();
+        let n = src.len().min(512);
+        let mut buf = [0u8; 512];
+        for i in 0..n {
+            buf[i] = match src[i] {
+                b'a'..=b'z' => src[i] - 32,
+                other => other,
+            };
+        }
+        crate::kprintln!("shout: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `whisper` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_whisper(line: &str, cmd: &str, rest: &str) {
+    // Lowercase EVERY ASCII letter of the inline text; other bytes pass
+    // through. The lowercase counterpart of `shout`; distinct from
+    // swapcase (flips), title/capitalize (word-initial), mock (alternating).
+    if rest.is_empty() {
+        crate::kprintln!("usage: whisper <text>");
+    } else {
+        let src = rest.as_bytes();
+        let n = src.len().min(512);
+        let mut buf = [0u8; 512];
+        for i in 0..n {
+            buf[i] = match src[i] {
+                b'A'..=b'Z' => src[i] + 32,
+                other => other,
+            };
+        }
+        crate::kprintln!("whisper: {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+}
+
+/// `cut` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_cut(line: &str, cmd: &str, rest: &str) {
+    // Extract the Nth (1-based) whitespace-delimited field of each line of a VFS file.
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<usize>().ok());
+    let name = it.next();
+    match (n, name) {
+        (Some(n), Some(name)) if n >= 1 => match crate::vfs::read_raw(name) {
+            Some(data) => {
+                let text = core::str::from_utf8(data).unwrap_or("");
+                for line in text.split('\n') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    match line.split_whitespace().nth(n - 1) {
+                        Some(f) => crate::kprintln!("cut: {}", f),
+                        None => crate::kprintln!("cut: (none)"),
+                    }
+                }
+            }
+            None => crate::kprintln!("cut: {} not found", name),
+        },
+        _ => crate::kprintln!("usage: cut <field> <file>"),
+    }
+}
+
+/// `ncr` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_ncr(line: &str, cmd: &str, rest: &str) {
+    // Binomial coefficient C(n, r) via the exact incremental formula (u128).
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<u64>().ok());
+    let r = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (n, r) {
+        (Some(n), Some(r)) => {
+            if r > n {
+                crate::kprintln!("ncr: C({}, {}) = 0", n, r);
+            } else {
+                // Loop over the smaller of r / (n-r); keep r for the label.
+                let k = r.min(n - r);
+                let mut res: u128 = 1;
+                let mut overflow = false;
+                for i in 1..=k {
+                    // res = res * (n - k + i) / i is exact at each step.
+                    match res.checked_mul((n - k + i) as u128) {
+                        Some(v) => res = v / (i as u128),
+                        None => {
+                            overflow = true;
+                            break;
+                        }
+                    }
+                }
+                if overflow {
+                    crate::kprintln!("ncr: C({}, {}) overflows (n too large)", n, r);
+                } else {
+                    crate::kprintln!("ncr: C({}, {}) = {}", n, r, res);
+                }
+            }
+        }
+        _ => crate::kprintln!("usage: ncr <n> <r>"),
+    }
+}
+
+/// `swapends` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_swapends(line: &str, cmd: &str, rest: &str) {
+    // Swap the FIRST and LAST character of the inline text, delimited by [ ]
+    // ("abcd" -> "dbca", "hello" -> "oellh"); a single character (or empty)
+    // is emitted unchanged. Distinct from swappairs (swaps every ADJACENT
+    // pair), rev (reverses the WHOLE string), and swapcase (inverts case).
+    if rest.is_empty() {
+        crate::kprintln!("usage: swapends <text>");
+    } else {
+        let src = rest.as_bytes();
+        let n = src.len();
+        let mut buf = [0u8; 512];
+        let len = n.min(512);
+        for i in 0..len {
+            buf[i] = src[i];
+        }
+        if len >= 2 {
+            buf.swap(0, len - 1); // swap first <-> last
+        }
+        crate::kprintln!(
+            "swapends: [{}]",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `hex` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_hex(line: &str, cmd: &str, rest: &str) {
+    // Encode inline text to lowercase hex bytes (inverse of unhex).
+    if rest.is_empty() {
+        crate::kprintln!("usage: hex <text>");
+    } else {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &byte in rest.as_bytes() {
+            if len + 1 < buf.len() {
+                buf[len] = DIGITS[(byte >> 4) as usize];
+                buf[len + 1] = DIGITS[(byte & 0xf) as usize];
+                len += 2;
+            }
+        }
+        crate::kprintln!("hex: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `rot18` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rot18(line: &str, cmd: &str, rest: &str) {
+    // ROT18 = ROT13 (letters) + ROT5 (digits) applied in ONE pass: shift
+    // each ASCII letter by 13 (wrapping within case) AND each digit by 5
+    // (wrapping 0-9); other bytes pass through. Because both halves are
+    // self-inverse over disjoint sets, rot18 is SELF-INVERSE too. Distinct
+    // from rot13 (letters only) and rot5 (digits only) -- it does both.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: rot18 <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            let out = match b {
+                b'A'..=b'Z' => b'A' + (b - b'A' + 13) % 26,
+                b'a'..=b'z' => b'a' + (b - b'a' + 13) % 26,
+                b'0'..=b'9' => b'0' + (b - b'0' + 5) % 10,
+                _ => b,
+            };
+            if len < buf.len() {
+                buf[len] = out;
+                len += 1;
+            }
+        }
+        crate::kprintln!("rot18: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `uncamel` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_uncamel(line: &str, cmd: &str, rest: &str) {
+    // Split a camelCase / PascalCase / snake_case / kebab-case identifier into
+    // space-separated LOWERCASE words: insert a space before each uppercase
+    // letter that follows a lowercase letter, treat '_' and '-' as separators,
+    // and lowercase everything. "helloWorld" -> "hello world", "AfriSoveraOS"
+    // -> "afri sovera os". The INVERSE of the case-JOINERS camel/pascal/snake/
+    // kebab (which remove spaces); acronym runs (OS) stay glued.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: uncamel <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut prev = 0u8;
+        for &c in rest.trim().as_bytes() {
+            if c == b'_' || c == b'-' {
+                if len < buf.len() {
+                    buf[len] = b' ';
+                    len += 1;
+                }
+                prev = b' ';
+                continue;
+            }
+            if c.is_ascii_uppercase() && prev.is_ascii_lowercase() && len < buf.len() {
+                buf[len] = b' ';
+                len += 1;
+            }
+            let lc = if c.is_ascii_uppercase() { c + 32 } else { c };
+            if len < buf.len() {
+                buf[len] = lc;
+                len += 1;
+            }
+            prev = c;
+        }
+        crate::kprintln!(
+            "uncamel: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `underline` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_underline(line: &str, cmd: &str, rest: &str) {
+    // Print the text, then on the next line a rule of '=' the same byte
+    // length (a Markdown-style heading underline). Distinct from boxed
+    // (2.276), which draws a full 3-line +/-/| box around the text.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: underline <text>");
+    } else {
+        let text = rest;
+        let n = text.as_bytes().len();
+        crate::kprintln!("{}", text);
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for _ in 0..n {
+            if len < buf.len() {
+                buf[len] = b'=';
+                len += 1;
+            }
+        }
+        let rule = core::str::from_utf8(&buf[..len]).unwrap_or("?");
+        crate::kprintln!("{}", rule);
+    }
+}
+
+/// `rot13` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rot13(line: &str, cmd: &str, rest: &str) {
+    // ROT13 letter cipher: shift every ASCII letter by 13, wrapping within
+    // its case; non-letters pass through. It is SELF-INVERSE (rot13(rot13
+    // (x))==x). Unlike caesar (which needs a numeric shift ARGUMENT), rot13
+    // is the fixed, argument-free convenience form.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: rot13 <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            let out = match b {
+                b'A'..=b'Z' => b'A' + (b - b'A' + 13) % 26,
+                b'a'..=b'z' => b'a' + (b - b'a' + 13) % 26,
+                _ => b,
+            };
+            if len < buf.len() {
+                buf[len] = out;
+                len += 1;
+            }
+        }
+        crate::kprintln!("rot13: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `rot5` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rot5(line: &str, cmd: &str, rest: &str) {
+    // ROT5 DIGIT cipher: shift every ASCII digit by 5, wrapping within
+    // 0-9 (0<->5, 1<->6, 2<->7, 3<->8, 4<->9); letters and everything
+    // else pass through. Like rot13 for digits, it is SELF-INVERSE
+    // (rot5(rot5(x))==x). Distinct from rot13 (letters), rot47 (all
+    // printable), and caesar (a letter shift needing an argument).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: rot5 <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            let out = match b {
+                b'0'..=b'9' => b'0' + (b - b'0' + 5) % 10,
+                _ => b,
+            };
+            if len < buf.len() {
+                buf[len] = out;
+                len += 1;
+            }
+        }
+        crate::kprintln!("rot5: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `bacon` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_bacon(line: &str, cmd: &str, rest: &str) {
+    // Baconian cipher: encode each ASCII letter as its 5-bit A/B code (26-letter variant,
+    // case-folded: a/A=AAAAA, b=AAAAB, c=AAABA, ..., z=BBAAB); non-letters pass through
+    // unchanged. Codes are fixed-width so they concatenate without a separator. "abc" ->
+    // "AAAAAAAAABAAABA", "hi" -> "AABBBABAAA", "OS" -> "ABBBABAABA". A classic steganographic
+    // substitution, distinct from the letter-rotation (caesar/atbash/rot13) and phonetic
+    // (nato/morse) codes already present.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: bacon <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            if b.is_ascii_alphabetic() {
+                let idx = (b | 0x20) - b'a'; // 0..=25, case-folded
+                let mut bit = 4i32;
+                while bit >= 0 {
+                    if len < buf.len() {
+                        buf[len] = if (idx >> bit) & 1 == 1 { b'B' } else { b'A' };
+                        len += 1;
+                    }
+                    bit -= 1;
+                }
+            } else if len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        crate::kprintln!("bacon: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `mock` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_mock(line: &str, cmd: &str, rest: &str) {
+    // Alternating "mocking" case: toggle the case of each ASCII letter,
+    // starting lowercase (letter 0 lower, letter 1 upper, ...); non-letters
+    // pass through unchanged and do NOT consume a toggle. Distinct from
+    // swapcase (swaps existing case), title (capitalizes word starts), and
+    // capitalize (only the first letter).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: mock <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut i: u32 = 0; // count of letters seen so far (the toggle)
+        for &b in rest.as_bytes() {
+            let low = b | 0x20;
+            let out = if (b'a'..=b'z').contains(&low) {
+                let r = if i % 2 == 0 { low } else { low - 32 };
+                i += 1;
+                r
+            } else {
+                b
+            };
+            if len < buf.len() {
+                buf[len] = out;
+                len += 1;
+            }
+        }
+        crate::kprintln!("mock: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `grepn` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_grepn(line: &str, cmd: &str, rest: &str) {
+    // Print each MATCHING line of a file prefixed with its 1-based line
+    // number (like grep -n). Completes the grep/grepv/grepn trio.
+    let (pat, file) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim()),
+        None => (rest, ""),
+    };
+    if pat.is_empty() || file.is_empty() {
+        crate::kprintln!("usage: grepn <pattern> <file>");
+    } else {
+        match vfs::read_str(file) {
+            None => crate::kprintln!("grepn: no such file: {}", file),
+            Some(s) => {
+                let mut hits = 0;
+                for (i, line) in s.lines().enumerate() {
+                    if line.contains(pat) {
+                        crate::kprintln!("{}: {}", i + 1, line);
+                        hits += 1;
+                    }
+                }
+                if hits == 0 {
+                    crate::kprintln!("(no matches)");
+                }
+            }
+        }
+    }
+}
+
+/// `rot47` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rot47(line: &str, cmd: &str, rest: &str) {
+    // ROT47 cipher: rotate printable ASCII (33..=126) by 47; self-inverse.
+    if rest.is_empty() {
+        crate::kprintln!("usage: rot47 <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &c in rest.as_bytes() {
+            let out = if (33..=126).contains(&c) {
+                33 + (c - 33 + 47) % 94
+            } else {
+                c
+            };
+            if len < buf.len() {
+                buf[len] = out;
+                len += 1;
+            }
+        }
+        crate::kprintln!("rot47: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `atbash` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_atbash(line: &str, cmd: &str, rest: &str) {
+    // Atbash substitution cipher (A<->Z, case-preserving; self-inverse).
+    if rest.is_empty() {
+        crate::kprintln!("usage: atbash <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &c in rest.as_bytes() {
+            let mapped = if c.is_ascii_uppercase() {
+                b'Z' - (c - b'A')
+            } else if c.is_ascii_lowercase() {
+                b'z' - (c - b'a')
+            } else {
+                c
+            };
+            if len < buf.len() {
+                buf[len] = mapped;
+                len += 1;
+            }
+        }
+        crate::kprintln!("atbash: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `vowelcase` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_vowelcase(line: &str, cmd: &str, rest: &str) {
+    // Uppercase every ASCII vowel and lowercase every other letter,
+    // leaving non-letters unchanged: "hello world" -> "hEllO wOrld".
+    // Highlights the vowels by case. Distinct from mock (ALTERNATING
+    // case by letter index), swapcase (FLIPs each letter's case),
+    // shout/whisper (ALL up / ALL down), and title/capitalize
+    // (word-start / first-letter only).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: vowelcase <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            let low = b | 0x20;
+            let out = if (b'a'..=b'z').contains(&low) {
+                if matches!(low, b'a' | b'e' | b'i' | b'o' | b'u') {
+                    low - 32 // vowel -> uppercase
+                } else {
+                    low // consonant -> lowercase
+                }
+            } else {
+                b
+            };
+            if len < buf.len() {
+                buf[len] = out;
+                len += 1;
+            }
+        }
+        crate::kprintln!(
+            "vowelcase: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `consonantcase` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_consonantcase(line: &str, cmd: &str, rest: &str) {
+    // Uppercase every ASCII consonant and lowercase every vowel, leaving non-letters
+    // unchanged: "hello world" -> "HeLLo WoRLD" -- the exact complement of vowelcase
+    // (which uppercases the VOWELS instead). Distinct from mock (ALTERNATING by index),
+    // swapcase (FLIPs each letter), shout/whisper (ALL up / ALL down), and title.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: consonantcase <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            let low = b | 0x20;
+            let out = if (b'a'..=b'z').contains(&low) {
+                if matches!(low, b'a' | b'e' | b'i' | b'o' | b'u') {
+                    low // vowel -> lowercase
+                } else {
+                    low - 32 // consonant -> uppercase
+                }
+            } else {
+                b
+            };
+            if len < buf.len() {
+                buf[len] = out;
+                len += 1;
+            }
+        }
+        crate::kprintln!(
+            "consonantcase: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `consonantsonly` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_consonantsonly(line: &str, cmd: &str, rest: &str) {
+    // Keep ONLY the ASCII consonants (letters that are NOT vowels),
+    // dropping vowels, digits, punctuation, and spaces. Rounds out the
+    // vowel/consonant/letter/digit filter family; distinct from
+    // disemvowel (which keeps consonants BUT ALSO punctuation+spaces),
+    // lettersonly (keeps ALL letters incl vowels), and vowelsonly (keeps
+    // only vowels). No consonants -> "(none)".
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: consonantsonly <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            let low = b | 0x20; // fold case for the vowel test
+            let is_letter = (b'a'..=b'z').contains(&low);
+            let is_vowel = matches!(low, b'a' | b'e' | b'i' | b'o' | b'u') && is_letter;
+            if is_letter && !is_vowel && len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        if len == 0 {
+            crate::kprintln!("consonantsonly: (none)");
+        } else {
+            crate::kprintln!(
+                "consonantsonly: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `leet` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_leet(line: &str, cmd: &str, rest: &str) {
+    // Convert text to "leetspeak" via a fixed letter->digit substitution:
+    // a->4, e->3, i->1, o->0, s->5, t->7 (case-insensitive on the match);
+    // every other byte -- other letters (case preserved), spaces,
+    // punctuation -- passes through unchanged. Distinct from `mock`
+    // (alternates case), `swapcase` (inverts case), `disemvowel` (removes
+    // vowels), and the letter ciphers `caesar`/`atbash`/`rot47`.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: leet <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            let out = match b | 0x20 {
+                b'a' => b'4',
+                b'e' => b'3',
+                b'i' => b'1',
+                b'o' => b'0',
+                b's' => b'5',
+                b't' => b'7',
+                _ => b, // keep the ORIGINAL byte (preserves case/punctuation)
+            };
+            if len < buf.len() {
+                buf[len] = out;
+                len += 1;
+            }
+        }
+        crate::kprintln!("leet: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `capitalize` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_capitalize(line: &str, cmd: &str, rest: &str) {
+    // Uppercase ONLY the first alphabetic character of the string, leaving
+    // everything else unchanged. Distinct from title (every word) and
+    // swapcase (all letters).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: capitalize <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut done = false;
+        for &x in rest.as_bytes() {
+            if len >= buf.len() {
+                break;
+            }
+            let out = if !done && x.is_ascii_lowercase() {
+                done = true;
+                x - 32 // to uppercase
+            } else {
+                if x.is_ascii_alphabetic() {
+                    done = true; // a leading uppercase letter counts as "first"
+                }
+                x
+            };
+            buf[len] = out;
+            len += 1;
+        }
+        crate::kprintln!(
+            "capitalize: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `decapitalize` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_decapitalize(line: &str, cmd: &str, rest: &str) {
+    // Lowercase ONLY the first alphabetic character of the string, leaving everything
+    // else unchanged -- the exact inverse of `capitalize`. "Hello WORLD" -> "hello WORLD",
+    // "HELLO" -> "hELLO", "hello" -> "hello" (already lower), "123Abc" -> "123abc".
+    // Distinct from whisper (lowercases ALL letters), swapcase (flips every letter), and
+    // sentencecase (caps first + lowercases the rest).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: decapitalize <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut done = false;
+        for &x in rest.as_bytes() {
+            if len >= buf.len() {
+                break;
+            }
+            let out = if !done && x.is_ascii_uppercase() {
+                done = true;
+                x + 32 // to lowercase
+            } else {
+                if x.is_ascii_alphabetic() {
+                    done = true; // a leading lowercase letter counts as "first"
+                }
+                x
+            };
+            buf[len] = out;
+            len += 1;
+        }
+        crate::kprintln!(
+            "decapitalize: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `sentencecase` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_sentencecase(line: &str, cmd: &str, rest: &str) {
+    // Sentence-case: uppercase the FIRST alphabetic character of the whole
+    // string and lowercase EVERY other letter (non-letters pass through).
+    // Distinct from capitalize (only the first letter changes, the rest is
+    // left untouched -- "hello WORLD" -> "Hello WORLD"), title (capitalizes
+    // every word -> "Hello World"), and whisper (all-lowercase, no leading cap).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: sentencecase <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut seen = false;
+        for &x in rest.as_bytes() {
+            if len >= buf.len() {
+                break;
+            }
+            let out = if x.is_ascii_alphabetic() {
+                if !seen {
+                    seen = true;
+                    if x.is_ascii_lowercase() { x - 32 } else { x } // first -> upper
+                } else if x.is_ascii_uppercase() {
+                    x + 32 // rest -> lower
+                } else {
+                    x
+                }
+            } else {
+                x
+            };
+            buf[len] = out;
+            len += 1;
+        }
+        crate::kprintln!(
+            "sentencecase: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `dlog` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_dlog(line: &str, cmd: &str, rest: &str) {
+    // Discrete LOGARITHM: the smallest x >= 0 with g^x = h (mod p) for a prime p, or a report
+    // that no such x exists. Computed by walking the powers of g (g^0, g^1, ...) and stopping
+    // at the first that equals h -- so the answer is the least non-negative exponent. dlog 3
+    // 4 7 = 4 (3^4=81=4 mod 7), dlog 2 3 5 = 3 (2^3=8=3), dlog 3 1 7 = 0, dlog 2 5 7 = none
+    // (2 has order 3 mod 7: {1,2,4}). Companion of primitiveroot/order; requires a prime
+    // modulus (max 1000000).
+    fn is_prime(n: u64) -> bool {
+        if n < 2 {
+            return false;
+        }
+        if n % 2 == 0 {
+            return n == 2;
+        }
+        let mut i = 3u64;
+        while i * i <= n {
+            if n % i == 0 {
+                return false;
+            }
+            i += 2;
+        }
+        true
+    }
+    let mut it = rest.split_whitespace();
+    match (
+        it.next().and_then(|s| s.parse::<u64>().ok()),
+        it.next().and_then(|s| s.parse::<u64>().ok()),
+        it.next().and_then(|s| s.parse::<u64>().ok()),
+    ) {
+        (Some(g0), Some(h0), Some(p)) if p >= 2 && p <= 1_000_000 && is_prime(p) => {
+            let g = g0 % p;
+            let h = h0 % p;
+            let mut cur = 1u64 % p; // g^0
+            let mut found: Option<u64> = None;
+            let mut x = 0u64;
+            while x < p {
+                if cur == h {
+                    found = Some(x);
+                    break;
+                }
+                cur = ((cur as u128 * g as u128) % p as u128) as u64;
+                x += 1;
+            }
+            match found {
+                Some(x) => crate::kprintln!(
+                    "dlog: {}^{} = {} (mod {})  ->  x = {}",
+                    g0, x, h0, p, x
+                ),
+                None => crate::kprintln!(
+                    "dlog: no x with {}^x = {} (mod {})",
+                    g0, h0, p
+                ),
+            }
+        }
+        (Some(_), Some(_), Some(p)) if p < 2 || !is_prime(p) => {
+            crate::kprintln!("dlog: {} is not prime (need a prime modulus)", p);
+        }
+        (Some(_), Some(_), Some(_)) => {
+            crate::kprintln!("dlog: modulus too large (max 1000000)")
+        }
+        _ => crate::kprintln!("usage: dlog <g> <h> <p>"),
+    }
+}
+
+/// `col` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_col(line: &str, cmd: &str, rest: &str) {
+    // Extract the Nth (1-based) CHARACTER (column) of each line of a VFS file, one
+    // per output line. The character analogue of `cut` (which extracts a whitespace
+    // FIELD), and the file/per-line analogue of `charat` (one char of inline text).
+    // A line shorter than N reports "(none)". Distinct from `charsperline` (counts).
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<usize>().ok());
+    let name = it.next();
+    match (n, name) {
+        (Some(n), Some(name)) if n >= 1 => match crate::vfs::read_raw(name) {
+            Some(data) => {
+                let text = core::str::from_utf8(data).unwrap_or("");
+                for line in text.split('\n') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    match line.as_bytes().get(n - 1) {
+                        Some(&c) => crate::kprintln!("col: {}", c as char),
+                        None => crate::kprintln!("col: (none)"),
+                    }
+                }
+            }
+            None => crate::kprintln!("col: {} not found", name),
+        },
+        _ => crate::kprintln!("usage: col <n> <file>"),
+    }
+}
+
+/// `ls` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_ls(line: &str, cmd: &str, rest: &str) {
+    let long = rest.trim() == "-l";
+    let mut n = 0;
+    for i in 0..vfs::MAX_FILES {
+        if vfs::is_used(i) {
+            let name = vfs::name_of(i);
+            if long {
+                let mtime = vfs::mtime_of(name).unwrap_or(0);
+                if mtime > 0 {
+                    let (y, mo, d, hh, mm, ss) = epoch_to_utc(mtime as u64);
+                    crate::kprintln!(
+                        "{:>6}  {:04}-{:02}-{:02} {:02}:{:02}:{:02}  {}",
+                        vfs::size_of(i), y, mo, d, hh, mm, ss, name
+                    );
+                } else {
+                    crate::kprintln!(
+                        "{:>6}  (unwritten---------)  {}",
+                        vfs::size_of(i), name
+                    );
+                }
+            } else {
+                crate::kprintln!("{:>6}  {}", vfs::size_of(i), name);
+            }
+            n += 1;
+        }
+    }
+    if n == 0 {
+        crate::kprintln!("(no files)");
+    }
+}
+
+/// `disemvowel` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_disemvowel(line: &str, cmd: &str, rest: &str) {
+    // Remove ALL ASCII vowels (a,e,i,o,u -- both cases) from the inline
+    // text, keeping consonants, spaces, and punctuation. A distinct classic
+    // transform: `vowels` COUNTS vowels/consonants, `squeeze` collapses
+    // adjacent repeats, `dedup` removes duplicate lines, `mock` alternates
+    // case -- none of them REMOVE vowels.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: disemvowel <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            let low = b | 0x20; // fold case for the vowel test
+            let is_vowel =
+                matches!(low, b'a' | b'e' | b'i' | b'o' | b'u') && (b'a'..=b'z').contains(&low);
+            if !is_vowel && len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        crate::kprintln!(
+            "disemvowel: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `vowelsonly` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_vowelsonly(line: &str, cmd: &str, rest: &str) {
+    // Keep ONLY the ASCII vowels (a,e,i,o,u -- both cases), dropping
+    // consonants, digits, punctuation, and spaces. The exact COMPLEMENT
+    // of disemvowel (which DROPS vowels and keeps everything else);
+    // distinct also from `vowels` (which COUNTS them) and the other
+    // inline filters (digitsonly/lettersonly/alnum). No vowels -> "(none)".
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: vowelsonly <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            let low = b | 0x20; // fold case for the vowel test
+            let is_vowel = matches!(low, b'a' | b'e' | b'i' | b'o' | b'u')
+                && (b'a'..=b'z').contains(&low);
+            if is_vowel && len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        if len == 0 {
+            crate::kprintln!("vowelsonly: (none)");
+        } else {
+            crate::kprintln!(
+                "vowelsonly: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `double` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_double(line: &str, cmd: &str, rest: &str) {
+    // Repeat each character of the inline text twice. e.g. "abc" ->
+    // "aabbcc". Distinct from spaceout (inserts a space BETWEEN chars,
+    // does not repeat), sortchars (sorts), and the case/cipher transforms.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: double <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            for _ in 0..2 {
+                if len < buf.len() {
+                    buf[len] = b;
+                    len += 1;
+                }
+            }
+        }
+        crate::kprintln!(
+            "double: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `sentencecap` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_sentencecap(line: &str, cmd: &str, rest: &str) {
+    // Capitalize the first alphabetic character of EACH sentence -- the start
+    // of the text and any letter following a `.`, `!`, or `?` terminator --
+    // leaving every other character untouched: "hello world. foo bar" ->
+    // "Hello world. Foo bar". Unlike sentencecase (which caps only the very
+    // first letter and LOWERCASES the rest), sentencecap leaves mid-sentence
+    // text as-is ("hello WORLD. ok" -> "Hello WORLD. Ok"), so it is capitalize
+    // applied per-sentence rather than title (which caps every word).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: sentencecap <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut start = true;
+        for &x in rest.as_bytes() {
+            if len >= buf.len() {
+                break;
+            }
+            let out = if x.is_ascii_alphabetic() {
+                if start {
+                    start = false;
+                    if x.is_ascii_lowercase() { x - 32 } else { x }
+                } else {
+                    x
+                }
+            } else {
+                if x == b'.' || x == b'!' || x == b'?' {
+                    start = true;
+                }
+                x
+            };
+            buf[len] = out;
+            len += 1;
+        }
+        crate::kprintln!(
+            "sentencecap: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `dotacronym` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_dotacronym(line: &str, cmd: &str, rest: &str) {
+    // The DOTTED acronym of the inline text: the first character of each whitespace-
+    // separated word, uppercased and joined with '.' plus a trailing '.' ("as soon as
+    // possible" -> "A.S.A.P.", "the united states" -> "T.U.S."). The style-guide form of
+    // `acronym` (which joins the initials with NO separator, e.g. "ASAP") -- distinct also
+    // from `initials` (original case, no dots) and `abbreviate`.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: dotacronym <words>");
+    } else {
+        let mut buf = [0u8; 256];
+        let mut len = 0usize;
+        for word in rest.split_whitespace() {
+            let first = word.as_bytes()[0];
+            let up = if first.is_ascii_lowercase() {
+                first - 32
+            } else {
+                first
+            };
+            if len + 1 < buf.len() {
+                buf[len] = up;
+                len += 1;
+                buf[len] = b'.';
+                len += 1;
+            }
+        }
+        crate::kprintln!(
+            "dotacronym: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `collapse` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_collapse(line: &str, cmd: &str, rest: &str) {
+    // Collapse a run of ANY adjacent duplicate character down to a single
+    // one ("aaabbc"->"abc", "mississippi"->"misisipi"). It emits each byte
+    // only when it differs from the previously emitted byte. Distinct from
+    // squeeze (collapses runs of ONE GIVEN char, needs a char argument),
+    // uniqchars (removes ALL later duplicates across the whole string, not
+    // just adjacent ones -- "mississippi"->"misp"), and sortchars (sorts).
+    if rest.is_empty() {
+        crate::kprintln!("usage: collapse <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        let mut prev: i32 = -1; // no previous byte yet
+        for &b in rest.as_bytes() {
+            if b as i32 != prev {
+                if len < buf.len() {
+                    buf[len] = b;
+                    len += 1;
+                }
+                prev = b as i32;
+            }
+        }
+        crate::kprintln!(
+            "collapse: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `gcd` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_gcd(line: &str, cmd: &str, rest: &str) {
+    // GCD (Euclid) + LCM of two integers.
+    let mut it = rest.split_whitespace();
+    let a = it.next().and_then(|s| s.parse::<u64>().ok());
+    let b = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let (mut x, mut y) = (a, b);
+            while y != 0 {
+                let t = y;
+                y = x % y;
+                x = t;
+            }
+            let g = x;
+            crate::kprintln!("gcd({}, {}) = {}", a, b, g);
+            // LCM = a/g*b (divide first to shrink the product). Guard the
+            // multiply: two large coprime inputs overflow u64, which used to
+            // be a reachable KERNEL PANIC ("multiply with overflow") from the
+            // shell -- report it honestly instead of crashing.
+            if g == 0 || a == 0 || b == 0 {
+                crate::kprintln!("lcm({}, {}) = 0", a, b);
+            } else {
+                match (a / g).checked_mul(b) {
+                    Some(l) => crate::kprintln!("lcm({}, {}) = {}", a, b, l),
+                    None => crate::kprintln!("lcm({}, {}) overflows u64", a, b),
+                }
+            }
+        }
+        _ => crate::kprintln!("usage: gcd <a> <b>"),
+    }
+}
+
+/// `digitsonly` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_digitsonly(line: &str, cmd: &str, rest: &str) {
+    // Keep ONLY the ASCII digit bytes of the inline text, dropping every
+    // other byte ("ab12cd34"->"1234", "phone: 555-0199"->"5550199").
+    // A filter, distinct from disemvowel (drops vowels), despace (drops
+    // whitespace), squeeze (collapses runs), and uniqchars (dedup). If
+    // the input has no digits, reports "(none)".
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: digitsonly <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            if b.is_ascii_digit() && len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        if len == 0 {
+            crate::kprintln!("digitsonly: (none)");
+        } else {
+            crate::kprintln!(
+                "digitsonly: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `stripdigits` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_stripdigits(line: &str, cmd: &str, rest: &str) {
+    // DROP the ASCII digit bytes of the inline text, keeping every other byte
+    // ("ab12cd34"->"abcd", "phone: 555-0199"->"phone: -"). The exact complement
+    // of digitsonly (which KEEPS only digits); a filter alongside strippunct
+    // (drops punctuation), disemvowel (drops vowels), and despace (drops spaces).
+    // If every byte was a digit, reports "(none)".
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: stripdigits <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            if !b.is_ascii_digit() && len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        if len == 0 {
+            crate::kprintln!("stripdigits: (none)");
+        } else {
+            crate::kprintln!(
+                "stripdigits: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `lettersonly` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_lettersonly(line: &str, cmd: &str, rest: &str) {
+    // Keep ONLY the ASCII letter bytes of the inline text, dropping every
+    // other byte ("ab12cd34"->"abcd", "phone: 555-0199"->"phone").
+    // The letter-keeping mirror of digitsonly; distinct from disemvowel
+    // (drops only vowels, keeps punctuation/spaces), despace (drops
+    // whitespace), and squeeze. If the input has no letters, reports
+    // "(none)".
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: lettersonly <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            if b.is_ascii_alphabetic() && len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        if len == 0 {
+            crate::kprintln!("lettersonly: (none)");
+        } else {
+            crate::kprintln!(
+                "lettersonly: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `uppersonly` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_uppersonly(line: &str, cmd: &str, rest: &str) {
+    // Keep ONLY the UPPERCASE ASCII letters (A-Z) of the inline text, dropping lowercase
+    // letters, digits, punctuation, and spaces -- an "extract the capitals" filter
+    // ("AfriSovera OS project" -> "ASOS", "Hello, World!" -> "HW"). Distinct from
+    // lettersonly (keeps BOTH cases), vowelsonly/consonantsonly (by vowel class), and
+    // shout (which UPPERCASES everything rather than filtering). No uppercase -> "(none)".
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: uppersonly <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            if b.is_ascii_uppercase() && len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        if len == 0 {
+            crate::kprintln!("uppersonly: (none)");
+        } else {
+            crate::kprintln!(
+                "uppersonly: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `lowersonly` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_lowersonly(line: &str, cmd: &str, rest: &str) {
+    // Keep ONLY the LOWERCASE ASCII letters (a-z) of the inline text, dropping uppercase
+    // letters, digits, punctuation, and spaces -- the exact case mirror of uppersonly
+    // ("AfriSovera OS project" -> "frioveraproject", "Hello, World!" -> "elloorld").
+    // Distinct from lettersonly (keeps BOTH cases), vowelsonly/consonantsonly (by vowel
+    // class), and whisper (which LOWERCASES everything rather than filtering). No lowercase
+    // -> "(none)".
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: lowersonly <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            if b.is_ascii_lowercase() && len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        if len == 0 {
+            crate::kprintln!("lowersonly: (none)");
+        } else {
+            crate::kprintln!(
+                "lowersonly: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `alnum` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_alnum(line: &str, cmd: &str, rest: &str) {
+    // Keep ONLY the ASCII alphanumeric bytes of the inline text (letters
+    // AND digits), dropping punctuation, spaces, and symbols
+    // ("phone: 555-0199"->"phone5550199", "a-b_c 1!2"->"abc12"). The
+    // union of lettersonly + digitsonly; distinct from each (keeps BOTH),
+    // from disemvowel (drops only vowels), and despace. No alnum bytes
+    // report "(none)".
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: alnum <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            if b.is_ascii_alphanumeric() && len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        if len == 0 {
+            crate::kprintln!("alnum: (none)");
+        } else {
+            crate::kprintln!(
+                "alnum: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `strippunct` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_strippunct(line: &str, cmd: &str, rest: &str) {
+    // Drop ASCII punctuation and symbols from the inline text, KEEPING
+    // letters, digits, AND spaces ("phone: 555-0199"->"phone 5550199",
+    // "a-b_c 1!2"->"abc 12"). Distinct from alnum (which ALSO drops the
+    // spaces) and despace (which drops spaces, keeps punctuation). No
+    // kept bytes report "(none)".
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: strippunct <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            if (b.is_ascii_alphanumeric() || b == b' ') && len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        if len == 0 {
+            crate::kprintln!("strippunct: (none)");
+        } else {
+            crate::kprintln!(
+                "strippunct: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `punctonly` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_punctonly(line: &str, cmd: &str, rest: &str) {
+    // Keep ONLY ASCII punctuation/symbol bytes (!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~),
+    // dropping letters, digits, and spaces -- the exact COMPLEMENT of strippunct
+    // (which DROPS punctuation and keeps alphanumerics + spaces), paralleling how
+    // vowelsonly complements disemvowel. "phone: 555-0199"->":-", "a-b_c 1!2"->"-_!".
+    // Distinct from punctcount (which COUNTS them) and alnum (keeps alphanumerics).
+    // No punctuation reports "(none)".
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: punctonly <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            if b.is_ascii_punctuation() && len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        if len == 0 {
+            crate::kprintln!("punctonly: (none)");
+        } else {
+            crate::kprintln!(
+                "punctonly: {}",
+                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `despace` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_despace(line: &str, cmd: &str, rest: &str) {
+    // Remove ALL ASCII whitespace (spaces, tabs) from the inline text,
+    // concatenating the remaining characters. Distinct from disemvowel
+    // (removes VOWELS, keeps spaces), squeeze (collapses adjacent repeats),
+    // slug/kebab/snake (which REPLACE spaces with -/_ separators), and
+    // dedup (removes duplicate LINES).
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: despace <text>");
+    } else {
+        let mut buf = [0u8; 512];
+        let mut len = 0usize;
+        for &b in rest.as_bytes() {
+            if !b.is_ascii_whitespace() && len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        crate::kprintln!(
+            "despace: {}",
+            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+        );
+    }
+}
+
+/// `firstword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_firstword(line: &str, cmd: &str, rest: &str) {
+    // Print the FIRST whitespace-separated word of EACH line of a VFS
+    // file, tagged by 1-based line number. Distinct from wordn (the Nth
+    // word of the WHOLE file), line (a line's full content), head (whole
+    // leading lines), and maxword/minword (longest/shortest word). A
+    // blank/whitespace-only line reports "(none)".
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: firstword <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("firstword: no such file: {}", name),
+            Some(s) => {
+                let mut no = 0usize;
+                for l in s.lines() {
+                    no += 1;
+                    match l.split_whitespace().next() {
+                        Some(w) => crate::kprintln!("firstword: line {}: {}", no, w),
+                        None => crate::kprintln!("firstword: line {}: (none)", no),
+                    }
+                }
+                if no == 0 {
+                    crate::kprintln!("firstword: {} is empty", name);
+                }
+            }
+        }
+    }
+}
+
+/// `lastword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_lastword(line: &str, cmd: &str, rest: &str) {
+    // Print the LAST whitespace-separated word of EACH line of a VFS
+    // file, tagged by 1-based line number -- the mirror of firstword.
+    // Distinct from wordn (the Nth word of the WHOLE file), line (a
+    // line's full content), tail (whole trailing lines), and
+    // maxword/minword. A blank/whitespace-only line reports "(none)".
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: lastword <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("lastword: no such file: {}", name),
+            Some(s) => {
+                let mut no = 0usize;
+                for l in s.lines() {
+                    no += 1;
+                    match l.split_whitespace().last() {
+                        Some(w) => crate::kprintln!("lastword: line {}: {}", no, w),
+                        None => crate::kprintln!("lastword: line {}: (none)", no),
+                    }
+                }
+                if no == 0 {
+                    crate::kprintln!("lastword: {} is empty", name);
+                }
+            }
+        }
+    }
+}
+
+/// `isfactorion` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_isfactorion(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is a FACTORION: n equals the sum of the factorials
+    // of its decimal digits. The only base-10 factorions are 1 (=1!), 2
+    // (=2!), 145 (=1!+4!+5!), and 40585 (=4!+0!+5!+8!+5!). Uses a fixed
+    // 0..=9 factorial table (0! = 1) and a digit walk. Distinct from
+    // armstrong (sum of digit^digit-count) and isdisarium (sum of
+    // digit^position) -- this sums FACTORIALS, not powers.
+    const FACT: [u128; 10] =
+        [1, 1, 2, 6, 24, 120, 720, 5040, 40320, 362880];
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            // Sum the digit factorials; saturating so no input can panic
+            // (the max for a 20-digit n is 20*9! which fits u128 easily).
+            let mut sum: u128 = 0;
+            let mut x = n;
+            if x == 0 {
+                sum = FACT[0]; // the single digit 0 contributes 0! = 1
+            } else {
+                while x > 0 {
+                    let d = (x % 10) as usize;
+                    sum = sum.saturating_add(FACT[d]);
+                    x /= 10;
+                }
+            }
+            if sum == n as u128 {
+                crate::kprintln!(
+                    "isfactorion: {} IS a factorion (sum of digit factorials = {})",
+                    n, sum
+                );
+            } else {
+                crate::kprintln!(
+                    "isfactorion: {} is NOT a factorion (sum of digit factorials = {})",
+                    n, sum
+                );
+            }
+        }
+        Err(_) => crate::kprintln!("usage: isfactorion <n>"),
+    }
+}
+
+/// `headlines` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_headlines(line: &str, cmd: &str, rest: &str) {
+    // Print the first N LINES of a VFS file (the whole file if it has fewer).
+    // The line-oriented companion of head/tail (which cut by BYTE); distinct
+    // from `line` (one line by index) and firstchars (first char of each line).
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<usize>().ok());
+    let file = it.next();
+    match (n, file) {
+        (Some(n), Some(file)) => match vfs::read_raw(file) {
+            None => crate::kprintln!("headlines: {} not found", file),
+            Some(data) => {
+                // cut just before the Nth newline (n == 0 -> nothing)
+                let mut end = if n == 0 { 0 } else { data.len() };
+                let mut seen = 0usize;
+                for (i, &b) in data.iter().enumerate() {
+                    if b == b'\n' {
+                        seen += 1;
+                        if seen == n {
+                            end = i;
+                            break;
+                        }
+                    }
+                }
+                crate::kprintln!(
+                    "headlines: {}",
+                    core::str::from_utf8(&data[..end]).unwrap_or("?")
+                );
+            }
+        },
+        _ => crate::kprintln!("usage: headlines <n> <file>"),
+    }
+}
+
+/// `strings` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_strings(line: &str, cmd: &str, rest: &str) {
+    // Extract maximal printable-ASCII runs (min length 4) from a VFS file.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: strings <file>");
+    } else {
+        match vfs::read_raw(name) {
+            None => crate::kprintln!("strings: {} not found", name),
+            Some(bytes) => {
+                let mut buf = [0u8; 256];
+                let mut len = 0usize;
+                let mut emitted = 0u32;
+                let mut truncated = false;
+                // Flush the current run if it is long enough to report.
+                for &b in bytes {
+                    let printable = (0x20..=0x7e).contains(&b);
+                    if printable {
+                        if len < buf.len() {
+                            buf[len] = b;
+                            len += 1;
+                        }
+                    } else {
+                        if len >= 4 {
+                            if emitted >= 64 {
+                                truncated = true;
+                                break;
+                            }
+                            crate::kprintln!(
+                                "strings: {}",
+                                core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                            );
+                            emitted += 1;
+                        }
+                        len = 0;
+                    }
+                }
+                // Trailing run at end of file.
+                if !truncated && len >= 4 {
+                    if emitted >= 64 {
+                        truncated = true;
+                    } else {
+                        crate::kprintln!(
+                            "strings: {}",
+                            core::str::from_utf8(&buf[..len]).unwrap_or("?")
+                        );
+                    }
+                }
+                if truncated {
+                    crate::kprintln!("strings: (truncated at 64 runs)");
+                }
+            }
+        }
+    }
+}
+
+/// `anagram` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_anagram(line: &str, cmd: &str, rest: &str) {
+    // Are two words anagrams? (same letter multiset, case-insensitive,
+    // ignoring non-letters). Distinct from hamming (per-position diff).
+    let mut it = rest.split_whitespace();
+    match (it.next(), it.next()) {
+        (Some(a), Some(b)) => {
+            let mut ca = [0i32; 26];
+            let mut cb = [0i32; 26];
+            for &x in a.as_bytes() {
+                let l = x | 0x20;
+                if (b'a'..=b'z').contains(&l) {
+                    ca[(l - b'a') as usize] += 1;
+                }
+            }
+            for &x in b.as_bytes() {
+                let l = x | 0x20;
+                if (b'a'..=b'z').contains(&l) {
+                    cb[(l - b'a') as usize] += 1;
+                }
+            }
+            crate::kprintln!("anagram: {}", if ca == cb { "YES" } else { "NO" });
+        }
+        _ => crate::kprintln!("usage: anagram <word1> <word2>"),
+    }
+}
+
+/// `ascii` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_ascii(line: &str, cmd: &str, rest: &str) {
+    // Reference util: map a code point <-> its printable-ASCII glyph.
+    fn ctrl_name(n: u8) -> &'static str {
+        match n {
+            0 => "NUL",
+            9 => "TAB",
+            10 => "LF",
+            13 => "CR",
+            27 => "ESC",
+            127 => "DEL",
+            _ => "CTRL",
+        }
+    }
+    let t = rest.trim();
+    if t.is_empty() {
+        crate::kprintln!("usage: ascii <0-127 | single-char>");
+    } else if let Ok(n) = t.parse::<u64>() {
+        if n <= 127 {
+            let b = n as u8;
+            if (32..=126).contains(&b) {
+                crate::kprintln!("ascii: {} = '{}'  0x{:02x}  0o{:03o}", n, b as char, b, b);
+            } else {
+                crate::kprintln!(
+                    "ascii: {} = {}  0x{:02x} (non-printable)",
+                    n,
+                    ctrl_name(b),
+                    b
+                );
+            }
+        } else {
+            crate::kprintln!("usage: ascii <0-127 | single-char>");
+        }
+    } else if t.len() == 1 && (33..=126).contains(&t.as_bytes()[0]) {
+        let b = t.as_bytes()[0];
+        crate::kprintln!("ascii: '{}' = {}  0x{:02x}  0o{:03o}", b as char, b, b, b);
+    } else {
+        crate::kprintln!("usage: ascii <0-127 | single-char>");
+    }
+}
+
+/// `uartflags` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_uartflags(line: &str, cmd: &str, rest: &str) {
+    // Read the PL011 UART control/line-control/flag registers over MMIO.
+    let base = crate::board::UART_BASE;
+    // SAFETY: read-only MMIO of the PL011 registers (present on both boards).
+    let rd = |off: usize| unsafe { core::ptr::read_volatile((base + off) as *const u32) };
+    let fr = rd(0x018); // UARTFR (flag register)
+    let lcrh = rd(0x02c); // UARTLCR_H (line control)
+    let cr = rd(0x030); // UARTCR (control)
+    let on = |b: bool| if b { "on" } else { "off" };
+    let yn = |b: bool| if b { "yes" } else { "no" };
+    let wlen = 5 + ((lcrh >> 5) & 0x3);
+    crate::kprintln!(
+        "uartflags: UARTCR = 0x{:08x} (UARTEN={} TXE={} RXE={})",
+        cr,
+        on(cr & 1 != 0),
+        on(cr & (1 << 8) != 0),
+        on(cr & (1 << 9) != 0)
+    );
+    crate::kprintln!(
+        "uartflags: UARTLCR_H = 0x{:08x} (WLEN={} bits  FEN={})",
+        lcrh,
+        wlen,
+        yn(lcrh & (1 << 4) != 0)
+    );
+    crate::kprintln!(
+        "uartflags: UARTFR = 0x{:08x} (TXFE={} RXFE={} BUSY={})",
+        fr,
+        yn(fr & (1 << 7) != 0),
+        yn(fr & (1 << 4) != 0),
+        yn(fr & (1 << 3) != 0)
+    );
+}
+
+/// `polygonal` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_polygonal(line: &str, cmd: &str, rest: &str) {
+    // The nth s-gonal (polygonal) number P(s,n) = n + (s-2)*n*(n-1)/2, generalizing the
+    // figurate family to any number of sides s >= 3: P(3,n)=triangular, P(4,n)=square,
+    // P(5,n)=pentagonal, P(6,n)=hexagonal, ... "polygonal 3 5" -> 15, "polygonal 4 5" ->
+    // 25, "polygonal 5 5" -> 35, "polygonal 6 4" -> 28, "polygonal 10 3" -> 27. Computed
+    // in u128 (checked); n(n-1) is even so the /2 is exact. Distinct from the per-shape
+    // MEMBERSHIP tests (triangular..decagonal), which classify rather than compute.
+    let mut it = rest.split_whitespace();
+    let s = it.next().and_then(|x| x.parse::<u64>().ok());
+    let n = it.next().and_then(|x| x.parse::<u64>().ok());
+    match (s, n) {
+        (Some(s), Some(n)) if s >= 3 && n >= 1 => {
+            let a = n as u128;
+            let term = ((s - 2) as u128)
+                .checked_mul(a)
+                .and_then(|v| v.checked_mul(a - 1))
+                .map(|v| v / 2);
+            match term.and_then(|t| t.checked_add(a)) {
+                Some(p) => crate::kprintln!("polygonal: P({}, {}) = {}", s, n, p),
+                None => crate::kprintln!("polygonal: P({}, {}) overflowed u128", s, n),
+            }
+        }
+        _ => crate::kprintln!("usage: polygonal <s> <n> (s >= 3, n >= 1)"),
+    }
+}
+
+/// `minword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_minword(line: &str, cmd: &str, rest: &str) {
+    // The shortest whitespace-delimited word (by byte length; FIRST wins
+    // ties) in a VFS FILE, with its length -- the min-twin of `maxword`
+    // (2.295). Distinct from `shortestword` (which scans INLINE TEXT typed
+    // as an argument), `wordfreq` (most COMMON word), and wc (counts).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: minword <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("minword: no such file: {}", name),
+            Some(s) => {
+                // Option seed so an empty string cannot falsely win as shortest.
+                let mut best: Option<&str> = None;
+                for t in s.split_whitespace() {
+                    match best {
+                        None => best = Some(t),
+                        Some(b) if t.as_bytes().len() < b.as_bytes().len() => best = Some(t),
+                        _ => {}
+                    }
+                }
+                match best {
+                    None => crate::kprintln!("minword: {} = (no words)", name),
+                    Some(w) => crate::kprintln!(
+                        "minword: {} = shortest word '{}' ({} chars)",
+                        name, w, w.as_bytes().len()
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// `ifconfig` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_ifconfig(line: &str, cmd: &str, rest: &str) {
+    // Consolidated read-only view of the virtio-net interface state.
+    if !crate::virtio::net_present() {
+        crate::kprintln!("ifconfig: no network interface (virtio-net not present)");
+    } else {
+        let m = crate::virtio::net_mac();
+        let ip = crate::virtio::dhcp_ip();
+        crate::kprintln!("ifconfig: virtio-net");
+        crate::kprintln!("  status  up");
+        crate::kprintln!(
+            "  mac     {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            m[0], m[1], m[2], m[3], m[4], m[5]
+        );
+        if ip == [0u8; 4] {
+            crate::kprintln!("  inet    (no DHCP lease - run 'net dhcp')");
+        } else {
+            crate::kprintln!("  inet    {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+        }
+        // Gateway/DNS are the QEMU user-net defaults (a real deployment
+        // would learn these from DHCP options).
+        crate::kprintln!("  gateway 10.0.2.2   (user-net default)");
+        crate::kprintln!("  dns     10.0.2.3   (user-net default)");
+        if ip == [0u8; 4] {
+            crate::kprintln!("ifconfig: virtio-net up, inet none, gw 10.0.2.2");
+        } else {
+            crate::kprintln!(
+                "ifconfig: virtio-net up, inet {}.{}.{}.{}, gw 10.0.2.2",
+                ip[0], ip[1], ip[2], ip[3]
+            );
+        }
+    }
+}
+
+/// `catalan` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_catalan(line: &str, cmd: &str, rest: &str) {
+    // nth Catalan number via the exact incremental recurrence in u128:
+    // C(0)=1, C(k) = C(k-1) * 2*(2k-1) / (k+1). Guards u128 overflow.
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let mut c: u128 = 1;
+            let mut steps = 0u64;
+            let mut overflow = false;
+            for k in 1..=n as u128 {
+                match c.checked_mul(2 * (2 * k - 1)) {
+                    Some(v) => {
+                        c = v / (k + 1);
+                        steps += 1;
+                    }
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+            }
+            if overflow {
+                crate::kprintln!("catalan: C({}) overflows u128 after {} steps", n, steps);
+            } else {
+                crate::kprintln!("catalan: C({}) = {}", n, c);
+            }
+        }
+        _ => crate::kprintln!("usage: catalan <n>"),
+    }
+}
+
+/// `npr` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_npr(line: &str, cmd: &str, rest: &str) {
+    // Permutations P(n, r) = n! / (n-r)! = n*(n-1)*...*(n-r+1) -- the number of ORDERED
+    // arrangements of r items chosen from n. P(5,2)=20, P(5,0)=1, P(5,5)=120, P(10,3)=
+    // 720, P(3,5)=0 (r>n). The ordered companion of ncr (unordered combinations); the
+    // exact falling-factorial product is accumulated in u128 with checked_mul.
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<u64>().ok());
+    let r = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (n, r) {
+        (Some(n), Some(r)) => {
+            if r > n {
+                crate::kprintln!("npr: P({}, {}) = 0", n, r);
+            } else {
+                let mut res: u128 = 1;
+                let mut overflow = false;
+                for i in 0..r {
+                    match res.checked_mul((n - i) as u128) {
+                        Some(v) => res = v,
+                        None => {
+                            overflow = true;
+                            break;
+                        }
+                    }
+                }
+                if overflow {
+                    crate::kprintln!("npr: P({}, {}) overflows (n too large)", n, r);
+                } else {
+                    crate::kprintln!("npr: P({}, {}) = {}", n, r, res);
+                }
+            }
+        }
+        _ => crate::kprintln!("usage: npr <n> <r>"),
+    }
+}
+
+/// `stat` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_stat(line: &str, cmd: &str, rest: &str) {
+    // Size + last-modified time (from the RTC stamp) of a file.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: stat <file>");
+    } else if let Some(data) = vfs::read_raw(name) {
+        let mtime = vfs::mtime_of(name).unwrap_or(0);
+        if mtime == 0 {
+            crate::kprintln!(
+                "stat {}: {} bytes, modified unknown (not written at runtime)",
+                name, data.len()
+            );
+        } else {
+            let (y, mo, d, hh, mm, ss) = epoch_to_utc(mtime as u64);
+            crate::kprintln!(
+                "stat {}: {} bytes, modified {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                name, data.len(), y, mo, d, hh, mm, ss
+            );
+        }
+    } else {
+        crate::kprintln!("stat: no such file: {}", name);
+    }
+}
+
+/// `lcm3` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_lcm3(line: &str, cmd: &str, rest: &str) {
+    // LCM of THREE integers via lcm(lcm(a, b), c), accumulated in u128 with an overflow
+    // guard -- the three-argument extension of the lcm printed by gcd. "lcm3 4 6 8 -> 24",
+    // "lcm3 2 3 5 -> 30", "lcm3 6 10 15 -> 30", "lcm3 4 5 6 -> 60", "lcm3 1 1 1 -> 1". Any
+    // zero argument yields 0. A product that overflows u128 is reported, not a crash.
+    fn gcd128(mut x: u128, mut y: u128) -> u128 {
+        while y != 0 {
+            let t = y;
+            y = x % y;
+            x = t;
+        }
+        x
+    }
+    fn lcm128(a: u128, b: u128) -> Option<u128> {
+        if a == 0 || b == 0 {
+            return Some(0);
+        }
+        let g = gcd128(a, b);
+        (a / g).checked_mul(b) // divide first to shrink the product
+    }
+    let mut it = rest.split_whitespace();
+    let a = it.next().and_then(|s| s.parse::<u64>().ok());
+    let b = it.next().and_then(|s| s.parse::<u64>().ok());
+    let c = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (a, b, c) {
+        (Some(a), Some(b), Some(c)) => {
+            let r =
+                lcm128(a as u128, b as u128).and_then(|ab| lcm128(ab, c as u128));
+            match r {
+                Some(v) => crate::kprintln!("lcm3({}, {}, {}) = {}", a, b, c, v),
+                None => crate::kprintln!("lcm3({}, {}, {}) overflows u128", a, b, c),
+            }
+        }
+        _ => crate::kprintln!("usage: lcm3 <a> <b> <c>"),
+    }
+}
+
+/// `order` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_order(line: &str, cmd: &str, rest: &str) {
+    // Multiplicative order of a modulo n: the least k >= 1 with a^k = 1 (mod n). It
+    // exists iff gcd(a, n) = 1 (otherwise "no order"); when it exists it divides phi(n).
+    // "order 2 7" -> 3 (2^3 = 8 = 1 mod 7), "order 3 7" -> 6, "order 2 4" -> no order
+    // (gcd 2). Companion of modinv/jacobi; n capped at 1000000 (the loop is O(order)).
+    let mut it = rest.split_whitespace();
+    let a0 = it.next().and_then(|s| s.parse::<u64>().ok());
+    let n0 = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (a0, n0) {
+        (Some(a), Some(n)) if n >= 2 && n <= 1_000_000 => {
+            // gcd(a, n)
+            let (mut x, mut y) = (a % n, n);
+            while y != 0 {
+                let t = y;
+                y = x % y;
+                x = t;
+            }
+            if x != 1 {
+                crate::kprintln!("order: no order (gcd({}, {}) = {})", a, n, x);
+            } else {
+                let am = (a % n) as u128;
+                let mut cur = am;
+                let mut k = 1u64;
+                while cur != 1 {
+                    cur = (cur * am) % (n as u128);
+                    k += 1;
+                }
+                crate::kprintln!("order: ord({} mod {}) = {}", a, n, k);
+            }
+        }
+        _ => crate::kprintln!("usage: order <a> <n> (2 <= n <= 1000000)"),
+    }
+}
+
+/// `isar1` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_isar1(line: &str, cmd: &str, rest: &str) {
+    // Decode ID_AA64ISAR1_EL1 (Instruction Set Attribute Register 1): a second
+    // set of advertised ISA extensions (pointer auth, JSCVT, LRCPC, FCMA, DPB).
+    // Complements `isar` (ID_AA64ISAR0_EL1).
+    let isar1: u64;
+    // SAFETY: ID_AA64ISAR1_EL1 is a standard AArch64 ID register readable at EL1.
+    unsafe { #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("mrs {}, id_aa64isar1_el1", out(reg) isar1); #[cfg(not(target_arch = "aarch64"))] { isar1 = crate::shell_pc::sysreg("id_aa64isar1_el1"); }
+    }
+    let dpb = ((isar1 >> 0) & 0xf) as u32;
+    let apa = ((isar1 >> 4) & 0xf) as u32;
+    let api = ((isar1 >> 8) & 0xf) as u32;
+    let jscvt = ((isar1 >> 12) & 0xf) as u32;
+    let fcma = ((isar1 >> 16) & 0xf) as u32;
+    let lrcpc = ((isar1 >> 20) & 0xf) as u32;
+    let gpa = ((isar1 >> 24) & 0xf) as u32;
+    let gpi = ((isar1 >> 28) & 0xf) as u32;
+    let sb = ((isar1 >> 36) & 0xf) as u32;
+    crate::kprintln!("isar1: ID_AA64ISAR1_EL1 = 0x{:016x}", isar1);
+    crate::kprintln!(
+        "isar1: DPB={} APA={} API={} JSCVT={} FCMA={} LRCPC={}",
+        dpb, apa, api, jscvt, fcma, lrcpc
+    );
+    let mut buf = [0u8; 128];
+    let mut len = 0usize;
+    let mut add = |name: &str| {
+        let b = name.as_bytes();
+        if len > 0 && len < buf.len() {
+            buf[len] = b' ';
+            len += 1;
+        }
+        for &c in b {
+            if len < buf.len() {
+                buf[len] = c;
+                len += 1;
+            }
+        }
+    };
+    if dpb != 0 { add("DPB"); }
+    if apa != 0 || api != 0 { add("PAuth"); }
+    if jscvt != 0 { add("JSCVT"); }
+    if fcma != 0 { add("FCMA"); }
+    if lrcpc != 0 { add("LRCPC"); }
+    if gpa != 0 || gpi != 0 { add("GenAuth"); }
+    if sb != 0 { add("SB"); }
+    if len == 0 {
+        crate::kprintln!("isar1: present: (none)");
+    } else {
+        crate::kprintln!("isar1: present: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `linewords` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_linewords(line: &str, cmd: &str, rest: &str) {
+    // Report the number of whitespace-separated words in the Nth (1-based)
+    // line of a VFS file. Distinct from wc (WHOLE-file word count), wordn
+    // (the Nth WORD's content), linelen (the Nth line's BYTE length), and
+    // line (the Nth line's content).
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<usize>().ok());
+    let name = it.next();
+    match (n, name) {
+        (Some(n), Some(name)) if n >= 1 => match vfs::read_str(name) {
+            None => crate::kprintln!("linewords: no such file: {}", name),
+            Some(s) => match s.lines().nth(n - 1) {
+                Some(l) => crate::kprintln!(
+                    "linewords: line {} has {} words",
+                    n,
+                    l.split_whitespace().count()
+                ),
+                None => crate::kprintln!("linewords: file has fewer than {} lines", n),
+            },
+        },
+        _ => crate::kprintln!("usage: linewords <n> <file>"),
+    }
+}
+
+/// `avglen` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_avglen(line: &str, cmd: &str, rest: &str) {
+    // Report the average line length (line bytes / line count, excluding the
+    // '\n') of a VFS file. Distinct from wc, which shows the raw totals only.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: avglen <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("avglen: no such file: {}", name),
+            Some(s) => {
+                let mut lines = 0u64;
+                let mut bytes = 0u64;
+                for line in s.lines() {
+                    lines += 1;
+                    bytes += line.len() as u64;
+                }
+                if lines == 0 {
+                    crate::kprintln!("avglen: {} is empty", name);
+                } else {
+                    crate::kprintln!(
+                        "avglen: {} lines, {} bytes, average {} bytes/line",
+                        lines,
+                        bytes,
+                        bytes / lines
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `leyland` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_leyland(line: &str, cmd: &str, rest: &str) {
+    // The Leyland number L(x, y) = x^y + y^x in u128 (x, y >= 1). L(2,3)=17,
+    // L(2,4)=32, L(3,2)=17 (symmetric), L(10,10)=20000000000. Each power is
+    // built with checked_mul (a base of 0 or 1 short-circuits so a huge exponent
+    // can never loop), and a large pair reports overflow honestly. Distinct from
+    // pow (modular b^e mod m), cullen/woodall (n*2^n +- 1), and thabit (3*2^n-1).
+    fn ipow(base: u128, exp: u128) -> Option<u128> {
+        if base <= 1 {
+            // 0^0 = 1; 0^e = 0 for e >= 1; 1^e = 1 -- all without looping
+            return Some(if base == 0 && exp == 0 { 1 } else { base });
+        }
+        let mut acc = 1u128;
+        let mut e = 0u128;
+        while e < exp {
+            acc = acc.checked_mul(base)?;
+            e += 1;
+        }
+        Some(acc)
+    }
+    let mut it = rest.split_whitespace();
+    let x = it.next().and_then(|s| s.parse::<u64>().ok());
+    let y = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (x, y) {
+        (Some(x), Some(y)) => {
+            let xy = ipow(x as u128, y as u128);
+            let yx = ipow(y as u128, x as u128);
+            match xy.and_then(|a| yx.and_then(|b| a.checked_add(b))) {
+                Some(v) => crate::kprintln!("leyland: L({}, {}) = {}", x, y, v),
+                None => crate::kprintln!("leyland: L({}, {}) overflows u128", x, y),
+            }
+        }
+        _ => crate::kprintln!("usage: leyland <x> <y>"),
+    }
+}
+
+/// `pfr` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_pfr(line: &str, cmd: &str, rest: &str) {
+    // Decode ID_AA64PFR0_EL1 (Processor Feature Register 0): implemented
+    // exception levels + AArch32 capability, FP/AdvSIMD/GIC-sysreg support.
+    let pfr: u64;
+    // SAFETY: ID_AA64PFR0_EL1 is a standard AArch64 ID register readable at EL1.
+    unsafe { #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr); #[cfg(not(target_arch = "aarch64"))] { pfr = crate::shell_pc::sysreg("id_aa64pfr0_el1"); }
+    }
+    let el = |f: u64| match f {
+        0 => "not-impl",
+        1 => "AArch64",
+        2 => "AArch64+32",
+        _ => "?",
+    };
+    let simd = |f: u64| match f {
+        0 | 1 => "yes",
+        0xf => "no",
+        _ => "?",
+    };
+    let el0 = pfr & 0xf;
+    let el1 = (pfr >> 4) & 0xf;
+    let el2 = (pfr >> 8) & 0xf;
+    let el3 = (pfr >> 12) & 0xf;
+    let fp = (pfr >> 16) & 0xf;
+    let advsimd = (pfr >> 20) & 0xf;
+    let gic = (pfr >> 24) & 0xf;
+    crate::kprintln!("pfr: ID_AA64PFR0_EL1 = 0x{:016x}", pfr);
+    crate::kprintln!(
+        "pfr: EL0={} EL1={} EL2={} EL3={}",
+        el(el0), el(el1), el(el2), el(el3)
+    );
+    crate::kprintln!(
+        "pfr: FP={} AdvSIMD={} GICsysreg={}",
+        simd(fp),
+        simd(advsimd),
+        if gic == 0 { "no" } else { "yes (v3+ sysreg)" }
+    );
+}
+
+/// `constcase` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_constcase(line: &str, cmd: &str, rest: &str) {
+    // Convert text to CONSTANT_CASE (SCREAMING_SNAKE_CASE): identical hump-
+    // splitting + separator collapsing to snake, but every letter is
+    // UPPERCASED and words are joined by '_'. Distinct from snake (lowercase),
+    // kebab/traincase (hyphens), dotcase ('.'), pascal/camel (no separator).
+    // The conventional spelling for C/Rust constants and env-var names.
+    let inb = rest.as_bytes();
+    let mut buf = [0u8; 256];
+    let mut len = 0usize;
+    for i in 0..inb.len() {
+        let c = inb[i];
+        if (b'A'..=b'Z').contains(&c) {
+            // Split a camelCase hump: uppercase preceded by a lowercase letter
+            // gets a separating '_' (unless one is already there).
+            if i > 0 && (b'a'..=b'z').contains(&inb[i - 1]) && len > 0 && buf[len - 1] != b'_'
+            {
+                if len < buf.len() {
+                    buf[len] = b'_';
+                    len += 1;
+                }
+            }
+            if len < buf.len() {
+                buf[len] = c;
+                len += 1;
+            }
+        } else if (b'a'..=b'z').contains(&c) {
+            if len < buf.len() {
+                buf[len] = c & !0x20; // UPPERCASE
+                len += 1;
+            }
+        } else if (b'0'..=b'9').contains(&c) {
+            if len < buf.len() {
+                buf[len] = c;
+                len += 1;
+            }
+        } else {
+            // Non-alphanumeric -> single '_' (collapse runs, suppress leading).
+            if len > 0 && buf[len - 1] != b'_' && len < buf.len() {
+                buf[len] = b'_';
+                len += 1;
+            }
+        }
+    }
+    // Strip a trailing '_'.
+    while len > 0 && buf[len - 1] == b'_' {
+        len -= 1;
+    }
+    if len == 0 {
+        crate::kprintln!("usage: constcase <text>");
+    } else {
+        crate::kprintln!("constcase: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `titlecountf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_titlecountf(line: &str, cmd: &str, rest: &str) {
+    // Count the TITLE-CASE words of a whole VFS FILE -- those whose first character is an
+    // uppercase ASCII letter and which contain NO other uppercase letter -- across all lines
+    // (newlines are whitespace). The file analogue of `titlecount`. `titlecountf motd`
+    // reports how many of the motd's words are title case. Distinct from casecount (a
+    // per-LETTER upper/lower tally) and titlef (which REWRITES a file to title case).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: titlecountf <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("titlecountf: no such file: {}", name),
+            Some(s) => {
+                let mut total = 0u32;
+                let mut title = 0u32;
+                for w in s.split_whitespace() {
+                    total += 1;
+                    let b = w.as_bytes();
+                    if b[0].is_ascii_uppercase() {
+                        let mut ok = true;
+                        for &c in &b[1..] {
+                            if c.is_ascii_uppercase() {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            title += 1;
+                        }
+                    }
+                }
+                crate::kprintln!(
+                    "titlecountf: {} of {} words are title case",
+                    title, total
+                );
+            }
+        }
+    }
+}
+
+/// `weekday` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_weekday(line: &str, cmd: &str, rest: &str) {
+    // Pure-compute Gregorian day-of-week via Zeller's congruence (no RTC read).
+    let mut it = rest.split_whitespace();
+    let y = it.next().and_then(|s| s.parse::<u64>().ok());
+    let mo = it.next().and_then(|s| s.parse::<u64>().ok());
+    let d = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (y, mo, d) {
+        (Some(year0), Some(month0), Some(day))
+            if year0 >= 1 && (1..=12).contains(&month0) && (1..=31).contains(&day) =>
+        {
+            // Jan/Feb count as months 13/14 of the prior year in Zeller's formula.
+            let mut year = year0;
+            let mut month = month0;
+            let q = day;
+            if month < 3 {
+                month += 12;
+                year -= 1;
+            }
+            let m = month;
+            let k = year % 100;
+            let j = year / 100;
+            let h = (q + 13 * (m + 1) / 5 + k + k / 4 + j / 4 + 5 * j) % 7;
+            // Zeller: 0=Saturday, 1=Sunday, ..., 6=Friday.
+            const NAMES: [&str; 7] = [
+                "Saturday",
+                "Sunday",
+                "Monday",
+                "Tuesday",
+                "Wednesday",
+                "Thursday",
+                "Friday",
+            ];
+            crate::kprintln!(
+                "weekday: {}-{:02}-{:02} is {}",
+                year0,
+                month0,
+                day,
+                NAMES[h as usize]
+            );
+        }
+        _ => crate::kprintln!("usage: weekday <year> <month> <day>"),
+    }
+}
+
+/// `frombase` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_frombase(line: &str, cmd: &str, rest: &str) {
+    // Parse <digits> as a base-<base> integer (base 2..=36) and print its decimal value --
+    // the general radix reader (any base), where `base` only reads dec/0x/0b/0o and `unhex`
+    // only base 16. Case-insensitive letters are digit values 10..35. frombase 1010 2 = 10,
+    // frombase ff 16 = 255, frombase 777 8 = 511, frombase z 36 = 35; a digit out of range
+    // for the base (e.g. frombase 129 8) is rejected.
+    let mut it = rest.split_whitespace();
+    let digits = it.next();
+    let base = it.next().and_then(|s| s.parse::<u32>().ok());
+    match (digits, base) {
+        (Some(d), Some(b)) if (2..=36).contains(&b) && !d.is_empty() => {
+            let mut val: u128 = 0;
+            let mut ok = true;
+            let mut overflow = false;
+            for &c in d.as_bytes() {
+                let dv = if c.is_ascii_digit() {
+                    (c - b'0') as u32
+                } else if c.is_ascii_alphabetic() {
+                    ((c | 0x20) - b'a') as u32 + 10
+                } else {
+                    ok = false;
+                    break;
+                };
+                if dv >= b {
+                    ok = false;
+                    break;
+                }
+                val = val * b as u128 + dv as u128;
+                if val > u64::MAX as u128 {
+                    overflow = true;
+                    break;
+                }
+            }
+            if !ok {
+                crate::kprintln!("frombase: '{}' is not a valid base-{} number", d, b);
+            } else if overflow {
+                crate::kprintln!("frombase: value overflows u64");
+            } else {
+                crate::kprintln!("frombase: {} (base {}) = {}", d, b, val as u64);
+            }
+        }
+        (Some(_), Some(b)) => {
+            crate::kprintln!("frombase: base must be 2..=36 (got {})", b)
+        }
+        _ => crate::kprintln!("usage: frombase <digits> <base>"),
+    }
+}
+
+/// `isar` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_isar(line: &str, cmd: &str, rest: &str) {
+    // Decode ID_AA64ISAR0_EL1 (Instruction Set Attribute Register 0): which
+    // ISA extensions this CPU advertises (crypto, CRC32, LSE atomics, RDM).
+    let isar: u64;
+    // SAFETY: ID_AA64ISAR0_EL1 is a standard AArch64 ID register readable at EL1.
+    unsafe { #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) isar); #[cfg(not(target_arch = "aarch64"))] { isar = crate::shell_pc::sysreg("id_aa64isar0_el1"); }
+    }
+    let aes = ((isar >> 4) & 0xf) as u32;
+    let sha1 = ((isar >> 8) & 0xf) as u32;
+    let sha2 = ((isar >> 12) & 0xf) as u32;
+    let crc32 = ((isar >> 16) & 0xf) as u32;
+    let atomic = ((isar >> 20) & 0xf) as u32;
+    let rdm = ((isar >> 24) & 0xf) as u32;
+    crate::kprintln!("isar: ID_AA64ISAR0_EL1 = 0x{:016x}", isar);
+    crate::kprintln!(
+        "isar: AES={} SHA1={} SHA2={} CRC32={} Atomic={} RDM={}",
+        aes, sha1, sha2, crc32, atomic, rdm
+    );
+    let mut buf = [0u8; 128];
+    let mut len = 0usize;
+    let mut add = |name: &str| {
+        let b = name.as_bytes();
+        if len > 0 && len < buf.len() {
+            buf[len] = b' ';
+            len += 1;
+        }
+        for &c in b {
+            if len < buf.len() {
+                buf[len] = c;
+                len += 1;
+            }
+        }
+    };
+    if aes != 0 { add("AES"); }
+    if sha1 != 0 { add("SHA1"); }
+    if sha2 != 0 { add("SHA2"); }
+    if crc32 != 0 { add("CRC32"); }
+    if atomic != 0 { add("Atomic"); }
+    if rdm != 0 { add("RDM"); }
+    if len == 0 {
+        crate::kprintln!("isar: present: (none)");
+    } else {
+        crate::kprintln!("isar: present: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `snake` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_snake(line: &str, cmd: &str, rest: &str) {
+    // Convert text to snake_case, completing the case-convention trio:
+    // slug uses hyphens and does NOT split camelCase; camel joins with no
+    // separator; snake uses underscores AND splits camelCase humps while
+    // keeping acronym runs intact. Lowercase words joined by single '_'.
+    let inb = rest.as_bytes();
+    let mut buf = [0u8; 256];
+    let mut len = 0usize;
+    for i in 0..inb.len() {
+        let c = inb[i];
+        if (b'A'..=b'Z').contains(&c) {
+            // Split a camelCase hump: uppercase preceded by a lowercase
+            // letter gets a separating '_' (unless one is already there).
+            if i > 0 && (b'a'..=b'z').contains(&inb[i - 1]) && len > 0 && buf[len - 1] != b'_'
+            {
+                if len < buf.len() {
+                    buf[len] = b'_';
+                    len += 1;
+                }
+            }
+            if len < buf.len() {
+                buf[len] = c | 0x20; // lowercase
+                len += 1;
+            }
+        } else if (b'a'..=b'z').contains(&c) || (b'0'..=b'9').contains(&c) {
+            if len < buf.len() {
+                buf[len] = c;
+                len += 1;
+            }
+        } else {
+            // Non-alphanumeric -> single '_' (collapse runs, suppress leading).
+            if len > 0 && buf[len - 1] != b'_' && len < buf.len() {
+                buf[len] = b'_';
+                len += 1;
+            }
+        }
+    }
+    // Strip a trailing '_'.
+    while len > 0 && buf[len - 1] == b'_' {
+        len -= 1;
+    }
+    if len == 0 {
+        crate::kprintln!("usage: snake <text>");
+    } else {
+        crate::kprintln!("snake: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `kebab` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_kebab(line: &str, cmd: &str, rest: &str) {
+    // Convert text to kebab-case: identical to snake_case but joined by
+    // HYPHENS instead of underscores. Distinct from slug (hyphens but does
+    // NOT split camelCase humps) and snake (underscores + hump split):
+    // kebab uses hyphens AND splits humps. Completes slug/kebab/snake/
+    // camel/pascal. Lowercase words joined by single '-'.
+    let inb = rest.as_bytes();
+    let mut buf = [0u8; 256];
+    let mut len = 0usize;
+    for i in 0..inb.len() {
+        let c = inb[i];
+        if (b'A'..=b'Z').contains(&c) {
+            // Split a camelCase hump: uppercase preceded by a lowercase
+            // letter gets a separating '-' (unless one is already there).
+            if i > 0 && (b'a'..=b'z').contains(&inb[i - 1]) && len > 0 && buf[len - 1] != b'-'
+            {
+                if len < buf.len() {
+                    buf[len] = b'-';
+                    len += 1;
+                }
+            }
+            if len < buf.len() {
+                buf[len] = c | 0x20; // lowercase
+                len += 1;
+            }
+        } else if (b'a'..=b'z').contains(&c) || (b'0'..=b'9').contains(&c) {
+            if len < buf.len() {
+                buf[len] = c;
+                len += 1;
+            }
+        } else {
+            // Non-alphanumeric -> single '-' (collapse runs, suppress leading).
+            if len > 0 && buf[len - 1] != b'-' && len < buf.len() {
+                buf[len] = b'-';
+                len += 1;
+            }
+        }
+    }
+    // Strip a trailing '-'.
+    while len > 0 && buf[len - 1] == b'-' {
+        len -= 1;
+    }
+    if len == 0 {
+        crate::kprintln!("usage: kebab <text>");
+    } else {
+        crate::kprintln!("kebab: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `dotcase` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_dotcase(line: &str, cmd: &str, rest: &str) {
+    // Convert text to dot.case: identical to snake_case / kebab-case but joined
+    // by DOTS instead of underscores / hyphens. Lowercases, splits camelCase
+    // humps, and collapses runs of non-alphanumerics to a single '.'. Completes
+    // the separator trio -- snake='_', kebab='-', dotcase='.' -- and is distinct
+    // from slug (hyphens, does NOT split humps) and camel/pascal (no separator).
+    let inb = rest.as_bytes();
+    let mut buf = [0u8; 256];
+    let mut len = 0usize;
+    for i in 0..inb.len() {
+        let c = inb[i];
+        if (b'A'..=b'Z').contains(&c) {
+            // Split a camelCase hump: uppercase preceded by a lowercase letter
+            // gets a separating '.' (unless one is already there).
+            if i > 0 && (b'a'..=b'z').contains(&inb[i - 1]) && len > 0 && buf[len - 1] != b'.'
+            {
+                if len < buf.len() {
+                    buf[len] = b'.';
+                    len += 1;
+                }
+            }
+            if len < buf.len() {
+                buf[len] = c | 0x20; // lowercase
+                len += 1;
+            }
+        } else if (b'a'..=b'z').contains(&c) || (b'0'..=b'9').contains(&c) {
+            if len < buf.len() {
+                buf[len] = c;
+                len += 1;
+            }
+        } else {
+            // Non-alphanumeric -> single '.' (collapse runs, suppress leading).
+            if len > 0 && buf[len - 1] != b'.' && len < buf.len() {
+                buf[len] = b'.';
+                len += 1;
+            }
+        }
+    }
+    // Strip a trailing '.'.
+    while len > 0 && buf[len - 1] == b'.' {
+        len -= 1;
+    }
+    if len == 0 {
+        crate::kprintln!("usage: dotcase <text>");
+    } else {
+        crate::kprintln!("dotcase: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `acronym` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_acronym(line: &str, cmd: &str, rest: &str) {
+    // Initials of each whitespace-separated word, joined + uppercased.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: acronym <words>");
+    } else {
+        let mut buf = [0u8; 128];
+        let mut len = 0usize;
+        for word in rest.split_whitespace() {
+            let first = word.as_bytes()[0];
+            let up = if first.is_ascii_lowercase() {
+                first - 32
+            } else {
+                first
+            };
+            if len < buf.len() {
+                buf[len] = up;
+                len += 1;
+            }
+        }
+        crate::kprintln!("acronym: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `linefromend` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_linefromend(line: &str, cmd: &str, rest: &str) {
+    // Print the Nth (1-based) line counting from the END of a VFS file: "linefromend 1
+    // <file>" is the LAST line, "linefromend 2 <file>" the second-to-last, and so on.
+    // The line-level mirror of line (Nth from the START); distinct from taillines (the
+    // last n lines together) and tail (a byte range). n past the line count is reported.
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<usize>().ok());
+    let name = it.next();
+    match (n, name) {
+        (Some(n), Some(name)) if n >= 1 => match vfs::read_str(name) {
+            None => crate::kprintln!("linefromend: no such file: {}", name),
+            Some(s) => {
+                let total = s.lines().count();
+                if n <= total {
+                    // Nth from end = (total - n)th from start (0-based).
+                    let l = s.lines().nth(total - n).unwrap_or("");
+                    crate::kprintln!("{}", l);
+                } else {
+                    crate::kprintln!("linefromend: file has fewer than {} lines", n);
+                }
+            }
+        },
+        _ => crate::kprintln!("usage: linefromend <n> <file>"),
+    }
+}
+
+/// `wordindex` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wordindex(line: &str, cmd: &str, rest: &str) {
+    // The 1-based index of the FIRST whole-word occurrence of <word> in the inline text,
+    // or "not found". "wordindex cat the cat sat" -> 2, "wordindex the the cat sat" -> 1.
+    // The inverse of wordat (which returns the word AT an index); distinct from indexof (a
+    // substring's byte POSITION) and countword (occurrence COUNT). Whole-word, case-sensitive.
+    let (word, text) = match rest.find(' ') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    if word.is_empty() || text.is_empty() {
+        crate::kprintln!("usage: wordindex <word> <text>");
+    } else {
+        let mut found = 0usize;
+        for (i, w) in text.split_whitespace().enumerate() {
+            if w == word {
+                found = i + 1;
+                break;
+            }
+        }
+        if found > 0 {
+            crate::kprintln!("wordindex: {}", found);
+        } else {
+            crate::kprintln!("wordindex: not found");
+        }
+    }
+}
+
+/// `avgwordlen` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_avgwordlen(line: &str, cmd: &str, rest: &str) {
+    // Report the average WORD length (sum of word byte lengths / word count)
+    // of a VFS file. The word-level companion of avglen (average LINE length);
+    // distinct from wc (raw totals), wordlengths (the per-word list of INLINE
+    // text), and longestword/shortestword.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: avgwordlen <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("avgwordlen: no such file: {}", name),
+            Some(s) => {
+                let mut words = 0u64;
+                let mut bytes = 0u64;
+                for w in s.split_whitespace() {
+                    words += 1;
+                    bytes += w.len() as u64;
+                }
+                if words == 0 {
+                    crate::kprintln!("avgwordlen: {} has no words", name);
+                } else {
+                    crate::kprintln!(
+                        "avgwordlen: {} words, {} bytes, average {} bytes/word",
+                        words,
+                        bytes,
+                        bytes / words
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `pentanacci` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_pentanacci(line: &str, cmd: &str, rest: &str) {
+    // nth pentanacci (P0=P1=P2=P3=0, P4=1; a FIVE-term recurrence P(n)=P(n-1)+
+    // P(n-2)+P(n-3)+P(n-4)+P(n-5), OEIS A001591): 0,0,0,0,1,1,2,4,8,16,31,61,120,...
+    // Extends the fib(2)/tribonacci(3)/tetranacci(4) family with a 5-wide rolling
+    // window. u128 with an honest checked-add overflow guard (grows ~1.9659^n).
+    match rest.trim().parse::<u64>() {
+        Ok(n) if n <= 3 => crate::kprintln!("pentanacci: P({}) = 0", n),
+        Ok(4) => crate::kprintln!("pentanacci: P(4) = 1"),
+        Ok(n) => {
+            let mut a: u128 = 0; // P(k-5)
+            let mut b: u128 = 0; // P(k-4)
+            let mut c: u128 = 0; // P(k-3)
+            let mut d: u128 = 0; // P(k-2)
+            let mut e: u128 = 1; // P(k-1), starting at k = 4
+            let mut overflow = false;
+            for _ in 5..=n {
+                match a
+                    .checked_add(b)
+                    .and_then(|x| x.checked_add(c))
+                    .and_then(|x| x.checked_add(d))
+                    .and_then(|x| x.checked_add(e))
+                {
+                    Some(s) => {
+                        a = b;
+                        b = c;
+                        c = d;
+                        d = e;
+                        e = s;
+                    }
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+            }
+            if overflow {
+                crate::kprintln!("pentanacci: P({}) overflows u128", n);
+            } else {
+                crate::kprintln!("pentanacci: P({}) = {}", n, e);
+            }
+        }
+        Err(_) => crate::kprintln!("usage: pentanacci <n>"),
+    }
+}
+
+/// `maxword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_maxword(line: &str, cmd: &str, rest: &str) {
+    // The longest whitespace-delimited word (by byte length; FIRST wins
+    // ties) in a VFS FILE, with its length. Distinct from `longestword`
+    // (which scans INLINE TEXT typed as an argument), `wordfreq` (most
+    // COMMON word), `wordlengths` (lists all inline word lengths), and wc.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: maxword <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("maxword: no such file: {}", name),
+            Some(s) => {
+                let mut best: &str = "";
+                let mut best_len = 0usize;
+                for t in s.split_whitespace() {
+                    if t.as_bytes().len() > best_len {
+                        best_len = t.as_bytes().len();
+                        best = t;
+                    }
+                }
+                if best_len == 0 {
+                    crate::kprintln!("maxword: {} = (no words)", name);
+                } else {
+                    crate::kprintln!(
+                        "maxword: {} = longest word '{}' ({} chars)",
+                        name, best, best_len
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `dtb` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_dtb(line: &str, cmd: &str, rest: &str) {
+    // Report what the device tree told us about the machine.
+    let dt = crate::fdt::info();
+    if dt.valid {
+        let src = if dt.reference { "bundled reference (firmware passed none)" } else { "live (from firmware)" };
+        crate::kprintln!("device tree: {}", src);
+        crate::kprintln!("  model: '{}'", crate::fdt::model());
+        crate::kprintln!(
+            "  RAM {:#x}..{:#x} ({} MiB)",
+            dt.ram_base,
+            dt.ram_base + dt.ram_size,
+            dt.ram_size / (1024 * 1024)
+        );
+        // Peripheral bases discovered from the tree, checked against board::.
+        let uok = if dt.uart_base == crate::board::UART_BASE as u64 { "matches board" } else { "DIFFERS from board" };
+        let gok = if dt.gic_base == crate::board::GIC_DIST_BASE as u64 { "matches board" } else { "DIFFERS from board" };
+        if dt.uart_base != 0 {
+            crate::kprintln!("  UART @ {:#x} ({})", dt.uart_base, uok);
+        }
+        if dt.gic_base != 0 {
+            crate::kprintln!("  GIC  @ {:#x} ({})", dt.gic_base, gok);
+        }
+    } else {
+        crate::kprintln!("device tree: none/invalid (using board defaults)");
+    }
+}
+
+/// `nl` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_nl(line: &str, cmd: &str, rest: &str) {
+    // Number the lines of a VFS file (like `cat -n` / `nl`), bounded output.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: nl <file>");
+    } else {
+        match vfs::read_raw(name) {
+            None => crate::kprintln!("nl: {} not found", name),
+            Some(bytes) => {
+                // A trailing newline yields a phantom empty final segment; skip it
+                // so a file ending in '\n' does not print a blank numbered line.
+                let total = bytes.split(|&b| b == b'\n').count();
+                let ends_nl = bytes.last() == Some(&b'\n');
+                let mut ln = 0u32;
+                for (i, line) in bytes.split(|&b| b == b'\n').enumerate() {
+                    if ends_nl && i + 1 == total {
+                        break;
+                    }
+                    if ln >= 200 {
+                        crate::kprintln!("nl: (truncated at 200 lines)");
+                        break;
+                    }
+                    ln += 1;
+                    crate::kprintln!(
+                        "nl: {:>4}  {}",
+                        ln,
+                        core::str::from_utf8(line).unwrap_or("?")
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `nthfield` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_nthfield(line: &str, cmd: &str, rest: &str) {
+    // Extract the Nth (1-based) field of the INLINE text split on an arbitrary separator
+    // <sep>. "nthfield 2 : a:b:c" -> "b", "nthfield 3 - 2024-01-15" -> "15". With no
+    // <sep> present the whole text is field 1; an out-of-range index reports "(none)".
+    // Unlike cut (Nth WHITESPACE field of a FILE line), this takes an arbitrary separator
+    // on inline text, and unlike before/after/between (which act on the FIRST separator)
+    // it selects an indexed field across all separators.
+    let mut parts = rest.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(ns), Some(sep), Some(text)) if !sep.is_empty() => {
+            match ns.parse::<usize>().ok().filter(|&k| k >= 1) {
+                Some(n) => match text.split(sep).nth(n - 1) {
+                    Some(f) => crate::kprintln!("nthfield: {}", f),
+                    None => crate::kprintln!("nthfield: (none)"),
+                },
+                None => crate::kprintln!("usage: nthfield <n> <sep> <text>"),
+            }
+        }
+        _ => crate::kprintln!("usage: nthfield <n> <sep> <text>"),
+    }
+}
+
+/// `count` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_count(line: &str, cmd: &str, rest: &str) {
+    // Count non-overlapping occurrences of a needle substring in a haystack.
+    let r = rest.trim_start();
+    match r.find(' ') {
+        None => crate::kprintln!("usage: count <needle> <haystack>"),
+        Some(sp) => {
+            let needle = &r[..sp];
+            let hay = &r[sp + 1..];
+            if needle.is_empty() {
+                crate::kprintln!("usage: count <needle> <haystack>");
+            } else {
+                let nb = needle.as_bytes();
+                let hb = hay.as_bytes();
+                let mut i = 0usize;
+                let mut c = 0usize;
+                while i + nb.len() <= hb.len() {
+                    if &hb[i..i + nb.len()] == nb {
+                        c += 1;
+                        i += nb.len();
+                    } else {
+                        i += 1;
+                    }
+                }
+                crate::kprintln!(
+                    "count: {} occurrence(s) of \"{}\" in {} bytes",
+                    c,
+                    needle,
+                    hb.len()
+                );
+            }
+        }
+    }
+}
+
+/// `hexanacci` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_hexanacci(line: &str, cmd: &str, rest: &str) {
+    // nth hexanacci (H0=H1=H2=H3=H4=0, H5=1; a SIX-term recurrence H(n)=H(n-1)+
+    // H(n-2)+H(n-3)+H(n-4)+H(n-5)+H(n-6), OEIS A001592): 0,0,0,0,0,1,1,2,4,8,16,32,
+    // 63,125,... Extends the fib(2)/tribonacci(3)/tetranacci(4)/pentanacci(5) family
+    // with a 6-wide rolling window. u128 with an honest checked-add overflow guard.
+    match rest.trim().parse::<u64>() {
+        Ok(n) if n <= 4 => crate::kprintln!("hexanacci: H({}) = 0", n),
+        Ok(5) => crate::kprintln!("hexanacci: H(5) = 1"),
+        Ok(n) => {
+            // rolling window of the last six terms H(k-6..k-1), starting at k = 5
+            let mut w: [u128; 6] = [0, 0, 0, 0, 0, 1];
+            let mut overflow = false;
+            for _ in 6..=n {
+                let mut s: u128 = 0;
+                for &x in w.iter() {
+                    match s.checked_add(x) {
+                        Some(v) => s = v,
+                        None => {
+                            overflow = true;
+                            break;
+                        }
+                    }
+                }
+                if overflow {
+                    break;
+                }
+                w = [w[1], w[2], w[3], w[4], w[5], s];
+            }
+            if overflow {
+                crate::kprintln!("hexanacci: H({}) overflows u128", n);
+            } else {
+                crate::kprintln!("hexanacci: H({}) = {}", n, w[5]);
+            }
+        }
+        Err(_) => crate::kprintln!("usage: hexanacci <n>"),
+    }
+}
+
+/// `pow` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_pow(line: &str, cmd: &str, rest: &str) {
+    // Modular exponentiation base^exp mod m by square-and-multiply.
+    let mut it = rest.split_whitespace();
+    let base = it.next().and_then(|s| s.parse::<u64>().ok());
+    let exp = it.next().and_then(|s| s.parse::<u64>().ok());
+    let modulus = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (base, exp, modulus) {
+        (Some(base), Some(exp), Some(modulus)) => {
+            if modulus == 0 {
+                crate::kprintln!("pow: modulus must be > 0");
+            } else {
+                let m = modulus as u128;
+                let mut result: u128 = 1 % m;
+                let mut b = (base as u128) % m;
+                let mut e = exp;
+                while e > 0 {
+                    if e & 1 == 1 {
+                        result = result * b % m;
+                    }
+                    b = b * b % m;
+                    e >>= 1;
+                }
+                crate::kprintln!("pow: {}^{} mod {} = {}", base, exp, modulus, result as u64);
+            }
+        }
+        _ => crate::kprintln!("usage: pow <base> <exp> <mod>"),
+    }
+}
+
+/// `slug` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_slug(line: &str, cmd: &str, rest: &str) {
+    // Convert text to a URL-friendly slug: lowercase letters, keep digits,
+    // collapse every run of non-alphanumerics to a single '-', trim hyphens.
+    let t = rest.trim();
+    if t.is_empty() {
+        crate::kprintln!("usage: slug <text>");
+    } else {
+        let mut buf = [0u8; 256];
+        let mut len = 0usize;
+        let mut prev_hyphen = true; // suppress a leading hyphen
+        for &x in t.as_bytes() {
+            let c = x | 0x20;
+            if (b'a'..=b'z').contains(&c) {
+                if len < buf.len() {
+                    buf[len] = c;
+                    len += 1;
+                    prev_hyphen = false;
+                }
+            } else if (b'0'..=b'9').contains(&x) {
+                if len < buf.len() {
+                    buf[len] = x;
+                    len += 1;
+                    prev_hyphen = false;
+                }
+            } else if !prev_hyphen {
+                if len < buf.len() {
+                    buf[len] = b'-';
+                    len += 1;
+                    prev_hyphen = true;
+                }
+            }
+        }
+        // Strip a trailing hyphen.
+        if len > 0 && buf[len - 1] == b'-' {
+            len -= 1;
+        }
+        crate::kprintln!("slug: {}", core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+    }
+}
+
+/// `hamming` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_hamming(line: &str, cmd: &str, rest: &str) {
+    // Hamming distance: count of positions where two equal-length strings differ.
+    let mut it = rest.split_whitespace();
+    match (it.next(), it.next()) {
+        (Some(a), Some(b)) => {
+            if a.len() != b.len() {
+                crate::kprintln!("hamming: length mismatch ({} vs {})", a.len(), b.len());
+            } else {
+                let d = a
+                    .bytes()
+                    .zip(b.bytes())
+                    .filter(|(x, y)| x != y)
+                    .count();
+                crate::kprintln!("hamming: {} vs {} = {}", a, b, d);
+            }
+        }
+        _ => crate::kprintln!("usage: hamming <a> <b>"),
+    }
+}
+
+/// `commonprefix` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_commonprefix(line: &str, cmd: &str, rest: &str) {
+    // The longest common PREFIX of two whitespace-separated strings. "commonprefix hello
+    // help" -> "hel", "commonprefix foobar foo" -> "foo", "commonprefix abc xyz" -> ""
+    // (empty). Byte-wise comparison from the start. Distinct from stripprefix (removes a
+    // KNOWN prefix if present) and before (splits on a separator) -- this DISCOVERS the
+    // shared leading run of two strings.
+    let mut it = rest.split_whitespace();
+    match (it.next(), it.next()) {
+        (Some(a), Some(b)) => {
+            let ab = a.as_bytes();
+            let bb = b.as_bytes();
+            let mut i = 0usize;
+            while i < ab.len() && i < bb.len() && ab[i] == bb[i] {
+                i += 1;
+            }
+            crate::kprintln!(
+                "commonprefix: {}",
+                core::str::from_utf8(&ab[..i]).unwrap_or("?")
+            );
+        }
+        _ => crate::kprintln!("usage: commonprefix <a> <b>"),
+    }
+}
+
+/// `maxline` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_maxline(line: &str, cmd: &str, rest: &str) {
+    // Report which line is the LONGEST in a VFS file (its 1-based line
+    // number + byte length), ties resolving to the FIRST. The line-level
+    // analog of `longestword` (word-level); distinct from linelen (a
+    // SPECIFIC line's length), avglen (AVERAGE), and wc (whole-file totals).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: maxline <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("maxline: no such file: {}", name),
+            Some(s) => {
+                let mut best_len = 0usize;
+                let mut best_no = 0usize;
+                let mut no = 0usize;
+                for l in s.lines() {
+                    no += 1;
+                    // Seed on the first line even if length 0; strict >
+                    // keeps the FIRST line on a tie.
+                    if best_no == 0 || l.len() > best_len {
+                        best_len = l.len();
+                        best_no = no;
+                    }
+                }
+                if best_no == 0 {
+                    crate::kprintln!("maxline: {} is empty", name);
+                } else {
+                    crate::kprintln!(
+                        "maxline: line {} is longest ({} bytes)",
+                        best_no,
+                        best_len
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `minline` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_minline(line: &str, cmd: &str, rest: &str) {
+    // Report which line is the SHORTEST in a VFS file (its 1-based line
+    // number + byte length), ties resolving to the FIRST. The min-analog of
+    // `maxline`; distinct from linelen (a SPECIFIC line's length), avglen
+    // (AVERAGE), and wc (whole-file totals).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: minline <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("minline: no such file: {}", name),
+            Some(s) => {
+                let mut best_len = 0usize;
+                let mut best_no = 0usize;
+                let mut no = 0usize;
+                for l in s.lines() {
+                    no += 1;
+                    // Seed on the first line; strict < keeps the FIRST line
+                    // on a tie.
+                    if best_no == 0 || l.len() < best_len {
+                        best_len = l.len();
+                        best_no = no;
+                    }
+                }
+                if best_no == 0 {
+                    crate::kprintln!("minline: {} is empty", name);
+                } else {
+                    crate::kprintln!(
+                        "minline: line {} is shortest ({} bytes)",
+                        best_no,
+                        best_len
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `letterfreq` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_letterfreq(line: &str, cmd: &str, rest: &str) {
+    // The most common ASCII LETTER (case-insensitive; A-Z folded to a-z) in
+    // a VFS file, with its count and the total letter count. Distinct from
+    // histogram (most common BYTE incl spaces/punct), wordfreq (most common
+    // WORD), charcount (a specific char), vowelcount (vowels vs letters),
+    // and mode (most common NUMBER).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: letterfreq <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("letterfreq: no such file: {}", name),
+            Some(s) => {
+                let mut freq = [0u32; 26];
+                let mut total = 0u32;
+                for b in s.bytes() {
+                    if b.is_ascii_alphabetic() {
+                        freq[((b | 0x20) - b'a') as usize] += 1;
+                        total += 1;
+                    }
+                }
+                if total == 0 {
+                    crate::kprintln!("letterfreq: {} = (no letters)", name);
+                } else {
+                    // Argmax over a-z, first index (alphabetically first) wins ties.
+                    let mut max_i = 0usize;
+                    let mut max_c = 0u32;
+                    for i in 0..26 {
+                        if freq[i] > max_c {
+                            max_c = freq[i];
+                            max_i = i;
+                        }
+                    }
+                    crate::kprintln!(
+                        "letterfreq: {} = most common letter '{}' ({} of {})",
+                        name,
+                        (b'a' + max_i as u8) as char,
+                        max_c,
+                        total
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `pochhammer` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_pochhammer(line: &str, cmd: &str, rest: &str) {
+    // Rising factorial (Pochhammer symbol) (n)^(k) = n*(n+1)*...*(n+k-1) -- the product of k
+    // consecutive integers starting at n. pochhammer(3,4)=3*4*5*6=360, pochhammer(2,3)=24,
+    // pochhammer(5,0)=1 (empty product), pochhammer(1,5)=120 (=5!). The RISING companion of
+    // npr, which is the FALLING factorial n*(n-1)*...*(n-k+1); distinct from factorial and
+    // ncr. The exact product is accumulated in u128 with checked_mul.
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<u64>().ok());
+    let k = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (n, k) {
+        (Some(n), Some(k)) => {
+            let mut res: u128 = 1;
+            let mut overflow = false;
+            for i in 0..k {
+                match res.checked_mul((n + i) as u128) {
+                    Some(v) => res = v,
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+            }
+            if overflow {
+                crate::kprintln!("pochhammer: ({})^({}) overflows (too large)", n, k);
+            } else {
+                crate::kprintln!("pochhammer: ({})^({}) = {}", n, k, res);
+            }
+        }
+        _ => crate::kprintln!("usage: pochhammer <n> <k>"),
+    }
+}
+
+/// `head` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_head(line: &str, cmd: &str, rest: &str) {
+    // Print the first N bytes of a VFS file (whole file if N exceeds size).
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<usize>().ok());
+    let file = it.next();
+    match (n, file) {
+        (Some(n), Some(file)) => match vfs::read_raw(file) {
+            None => crate::kprintln!("head: {} not found", file),
+            Some(data) => {
+                let end = data.len().min(n);
+                crate::kprintln!(
+                    "head: {}",
+                    core::str::from_utf8(&data[..end]).unwrap_or("?")
+                );
+            }
+        },
+        _ => crate::kprintln!("usage: head <n> <file>"),
+    }
+}
+
+/// `grep` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_grep(line: &str, cmd: &str, rest: &str) {
+    // Print the lines of a file that contain a substring.
+    let (pat, file) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim()),
+        None => (rest, ""),
+    };
+    if pat.is_empty() || file.is_empty() {
+        crate::kprintln!("usage: grep <pattern> <file>");
+    } else {
+        match vfs::read_str(file) {
+            None => crate::kprintln!("grep: no such file: {}", file),
+            Some(s) => {
+                let mut hits = 0;
+                for line in s.lines() {
+                    if line.contains(pat) {
+                        crate::kprintln!("{}", line);
+                        hits += 1;
+                    }
+                }
+                if hits == 0 {
+                    crate::kprintln!("(no matches)");
+                }
+            }
+        }
+    }
+}
+
+/// `grepi` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_grepi(line: &str, cmd: &str, rest: &str) {
+    // Case-INSENSITIVE line search: print the lines of a file that contain
+    // <pattern> ignoring ASCII letter case. Distinct from grep (case-
+    // sensitive), grepv (inverse), grepc (count), grepn (line numbers).
+    let (pat, file) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim()),
+        None => (rest, ""),
+    };
+    if pat.is_empty() || file.is_empty() {
+        crate::kprintln!("usage: grepi <pattern> <file>");
+    } else {
+        // Case-folding substring test (folds ASCII letters only, so it
+        // matches ignoring case without disturbing digits/punctuation).
+        fn fold(b: u8) -> u8 {
+            if b.is_ascii_uppercase() {
+                b | 0x20
+            } else {
+                b
+            }
+        }
+        fn ci_contains(hay: &str, needle: &str) -> bool {
+            let h = hay.as_bytes();
+            let n = needle.as_bytes();
+            if n.is_empty() {
+                return true;
+            }
+            if n.len() > h.len() {
+                return false;
+            }
+            'outer: for start in 0..=(h.len() - n.len()) {
+                for k in 0..n.len() {
+                    if fold(h[start + k]) != fold(n[k]) {
+                        continue 'outer;
+                    }
+                }
+                return true;
+            }
+            false
+        }
+        match vfs::read_str(file) {
+            None => crate::kprintln!("grepi: no such file: {}", file),
+            Some(s) => {
+                let mut hits = 0;
+                for line in s.lines() {
+                    if ci_contains(line, pat) {
+                        crate::kprintln!("{}", line);
+                        hits += 1;
+                    }
+                }
+                if hits == 0 {
+                    crate::kprintln!("(no matches)");
+                }
+            }
+        }
+    }
+}
+
+/// `grepw` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_grepw(line: &str, cmd: &str, rest: &str) {
+    // WHOLE-WORD line search: print the lines of a file where <word> appears
+    // as a complete word (bounded by a non-alphanumeric char or the line
+    // start/end on BOTH sides), not merely as a substring. Distinct from
+    // grep (any substring), grepi (case-insensitive), grepv (inverse),
+    // grepc (count), grepn (line numbers).
+    let (pat, file) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim()),
+        None => (rest, ""),
+    };
+    if pat.is_empty() || file.is_empty() {
+        crate::kprintln!("usage: grepw <word> <file>");
+    } else {
+        // True iff `needle` occurs in `hay` bounded by word edges.
+        fn word_contains(hay: &str, needle: &str) -> bool {
+            let h = hay.as_bytes();
+            let n = needle.as_bytes();
+            if n.is_empty() || n.len() > h.len() {
+                return false;
+            }
+            for start in 0..=(h.len() - n.len()) {
+                if &h[start..start + n.len()] != n {
+                    continue;
+                }
+                let left_ok = start == 0 || !h[start - 1].is_ascii_alphanumeric();
+                let end = start + n.len();
+                let right_ok = end == h.len() || !h[end].is_ascii_alphanumeric();
+                if left_ok && right_ok {
+                    return true;
+                }
+            }
+            false
+        }
+        match vfs::read_str(file) {
+            None => crate::kprintln!("grepw: no such file: {}", file),
+            Some(s) => {
+                let mut hits = 0;
+                for line in s.lines() {
+                    if word_contains(line, pat) {
+                        crate::kprintln!("{}", line);
+                        hits += 1;
+                    }
+                }
+                if hits == 0 {
+                    crate::kprintln!("(no matches)");
+                }
+            }
+        }
+    }
+}
+
+/// `grepv` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_grepv(line: &str, cmd: &str, rest: &str) {
+    // Print the lines of a file that do NOT contain a substring (inverse of grep).
+    let (pat, file) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim()),
+        None => (rest, ""),
+    };
+    if pat.is_empty() || file.is_empty() {
+        crate::kprintln!("usage: grepv <pattern> <file>");
+    } else {
+        match vfs::read_str(file) {
+            None => crate::kprintln!("grepv: no such file: {}", file),
+            Some(s) => {
+                let mut hits = 0;
+                for line in s.lines() {
+                    if !line.contains(pat) {
+                        crate::kprintln!("{}", line);
+                        hits += 1;
+                    }
+                }
+                if hits == 0 {
+                    crate::kprintln!("(no matches)");
+                }
+            }
+        }
+    }
+}
+
+/// `grepc` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_grepc(line: &str, cmd: &str, rest: &str) {
+    // Count the lines of a file that contain a substring (like grep -c).
+    // Completes the grep family: grep prints, grepn numbers, grepv inverts,
+    // grepc counts. Same parsing + substring test as grep; only the action
+    // differs (a counter instead of printing each line).
+    let (pat, file) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim()),
+        None => (rest, ""),
+    };
+    if pat.is_empty() || file.is_empty() {
+        crate::kprintln!("usage: grepc <pattern> <file>");
+    } else {
+        match vfs::read_str(file) {
+            None => crate::kprintln!("grepc: no such file: {}", file),
+            Some(s) => {
+                let mut count = 0usize;
+                for line in s.lines() {
+                    if line.contains(pat) {
+                        count += 1;
+                    }
+                }
+                crate::kprintln!("grepc: {} matching lines", count);
+            }
+        }
+    }
+}
+
+/// `nthsentence` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_nthsentence(line: &str, cmd: &str, rest: &str) {
+    // Print the Nth (1-based) sentence of INLINE text -- the sentence-level analogue
+    // of wordat (Nth word) and charat (Nth char), and the "pick" companion to
+    // countsentences (which only counts, doesn't extract). Same segmentation rule as
+    // countsentences: a sentence is a maximal run of characters containing at least one
+    // non-space char, terminated by one or more of . ! ? (a run of terminators ends one
+    // sentence); trailing unterminated text still counts as a final sentence. The
+    // terminator itself is not included in the printed sentence, and surrounding
+    // whitespace is trimmed. "nthsentence 2 Hi there. How are you? Good!" -> "How are
+    // you", "nthsentence 1 Wait... really?!" -> "Wait", "nthsentence 1 No punctuation"
+    // -> "No punctuation" (trailing sentence, no terminator). Distinct from
+    // countsentences/countsentencesf (COUNT only) and wordat/charat (word/char
+    // granularity, not sentence).
+    let (nstr, text) = match rest.find(' ') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest.trim(), ""),
+    };
+    match nstr.trim().parse::<usize>().ok() {
+        Some(n) if n >= 1 => {
+            let bytes = text.as_bytes();
+            let mut seg_start = 0usize;
+            let mut has_content = false;
+            let mut count = 0usize;
+            let mut found: Option<&str> = None;
+            for (i, &b) in bytes.iter().enumerate() {
+                if matches!(b, b'.' | b'!' | b'?') {
+                    if has_content {
+                        count += 1;
+                        if count == n {
+                            found = Some(text[seg_start..i].trim());
+                        }
+                        has_content = false;
+                    }
+                    seg_start = i + 1;
+                } else if !b.is_ascii_whitespace() {
+                    has_content = true;
+                }
+            }
+            if has_content {
+                count += 1;
+                if count == n {
+                    found = Some(text[seg_start..].trim());
+                }
+            }
+            match found {
+                Some(s) => crate::kprintln!("nthsentence: {}", s),
+                None => crate::kprintln!(
+                    "nthsentence: text has fewer than {} sentence(s)",
+                    n
+                ),
+            }
+        }
+        _ => crate::kprintln!("usage: nthsentence <n> <text>"),
+    }
+}
+
+/// `trim` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_trim(line: &str, cmd: &str, rest: &str) {
+    // Remove all LEADING and TRAILING characters that appear in the <chars> set from
+    // <text>, like Python str.strip(chars). "trim x xxhelloxx" -> "hello", "trim 0
+    // 004200" -> "42", "trim ab abcba" -> "c" (both a and b stripped from each end).
+    // Interior characters are untouched. Distinct from strippunct/despace (which remove
+    // fixed char CLASSES anywhere) and stripprefix/stripsuffix (a whole substring, once).
+    let (chars, text) = match rest.find(' ') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    if chars.is_empty() || text.is_empty() {
+        crate::kprintln!("usage: trim <chars> <text>");
+    } else {
+        let set = chars.as_bytes();
+        let b = text.as_bytes();
+        let mut start = 0usize;
+        let mut end = b.len();
+        while start < end && set.contains(&b[start]) {
+            start += 1;
+        }
+        while end > start && set.contains(&b[end - 1]) {
+            end -= 1;
+        }
+        crate::kprintln!(
+            "trim: {}",
+            core::str::from_utf8(&b[start..end]).unwrap_or("?")
+        );
+    }
+}
+
+/// `product` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_product(line: &str, cmd: &str, rest: &str) {
+    // Product of a list of integers in u128, with an explicit overflow guard.
+    let mut p: u128 = 1;
+    let mut n = 0u64;
+    let mut bad = false;
+    let mut overflow = false;
+    for tok in rest.split_whitespace() {
+        match tok.parse::<u64>() {
+            Ok(v) => {
+                n += 1;
+                match p.checked_mul(v as u128) {
+                    Some(x) => p = x,
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+            }
+            Err(_) => {
+                bad = true;
+                break;
+            }
+        }
+    }
+    if bad || n == 0 {
+        crate::kprintln!("usage: product <n1> <n2> ...");
+    } else if overflow {
+        crate::kprintln!("product: overflows u128 (after {} of the values)", n);
+    } else {
+        crate::kprintln!("product: {} (of {} values)", p, n);
+    }
+}
+
+/// `linelen` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_linelen(line: &str, cmd: &str, rest: &str) {
+    // Report the byte length of the Nth (1-based) line of a VFS file
+    // (newline excluded). Distinct from line (prints the CONTENT of a
+    // line), avglen (AVERAGE line length), and wc (whole-file totals).
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<usize>().ok());
+    let name = it.next();
+    match (n, name) {
+        (Some(n), Some(name)) if n >= 1 => match vfs::read_str(name) {
+            None => crate::kprintln!("linelen: no such file: {}", name),
+            Some(s) => match s.lines().nth(n - 1) {
+                Some(l) => crate::kprintln!("linelen: line {} is {} bytes", n, l.len()),
+                None => crate::kprintln!("linelen: file has fewer than {} lines", n),
+            },
+        },
+        _ => crate::kprintln!("usage: linelen <n> <file>"),
+    }
+}
+
+/// `istwinprime` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_istwinprime(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is a TWIN PRIME: n is prime AND at least one of n-2
+    // or n+2 is also prime (3<->5, 5<->7, 11<->13, 17<->19, 29<->31). The
+    // isolated prime 23 (21 = 3*7 and 25 = 5^2 both composite) is NOT a twin.
+    // Primality by trial division with the overflow-safe d <= n/d bound; n is
+    // capped at 1e7 so n+2 cannot overflow. Distinct from isprime (primality
+    // only), emirp (reverse is a distinct prime), and ispalprime.
+    fn is_prime(x: u64) -> bool {
+        if x < 2 {
+            return false;
+        }
+        if x < 4 {
+            return true;
+        }
+        if x % 2 == 0 {
+            return false;
+        }
+        let mut d = 3u64;
+        while d <= x / d {
+            if x % d == 0 {
+                return false;
+            }
+            d += 2;
+        }
+        true
+    }
+    match rest.trim().parse::<u64>() {
+        Ok(n) if n <= 10_000_000 => {
+            if !is_prime(n) {
+                crate::kprintln!("istwinprime: {} is NOT a twin prime (not prime)", n);
+            } else {
+                let lo = n >= 2 && is_prime(n - 2);
+                let hi = is_prime(n + 2);
+                if lo && hi {
+                    crate::kprintln!(
+                        "istwinprime: {} IS a twin prime (pairs with {} and {})",
+                        n, n - 2, n + 2
+                    );
+                } else if lo {
+                    crate::kprintln!(
+                        "istwinprime: {} IS a twin prime (pairs with {})",
+                        n, n - 2
+                    );
+                } else if hi {
+                    crate::kprintln!(
+                        "istwinprime: {} IS a twin prime (pairs with {})",
+                        n, n + 2
+                    );
+                } else {
+                    crate::kprintln!(
+                        "istwinprime: {} is NOT a twin prime (isolated prime)",
+                        n
+                    );
+                }
+            }
+        }
+        Ok(_) => crate::kprintln!("istwinprime: n too large (max 10000000)"),
+        Err(_) => crate::kprintln!("usage: istwinprime <n>"),
+    }
+}
+
+/// `iscousinprime` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_iscousinprime(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is a COUSIN PRIME: n is prime AND at least one of n-4
+    // or n+4 is also prime (3<->7, 7<->11, 13<->17, 19<->23, 37<->41). The gap-4
+    // analogue of istwinprime (gap 2); primality by trial division with the
+    // overflow-safe d <= n/d bound, n capped at 1e7 so n+4 cannot overflow.
+    // Distinct from istwinprime, emirp, iscircularprime, and issafeprime.
+    fn is_prime(x: u64) -> bool {
+        if x < 2 {
+            return false;
+        }
+        if x < 4 {
+            return true;
+        }
+        if x % 2 == 0 {
+            return false;
+        }
+        let mut d = 3u64;
+        while d <= x / d {
+            if x % d == 0 {
+                return false;
+            }
+            d += 2;
+        }
+        true
+    }
+    match rest.trim().parse::<u64>() {
+        Ok(n) if n <= 10_000_000 => {
+            if !is_prime(n) {
+                crate::kprintln!("iscousinprime: {} is NOT a cousin prime (not prime)", n);
+            } else {
+                let lo = n >= 4 && is_prime(n - 4);
+                let hi = is_prime(n + 4);
+                if lo && hi {
+                    crate::kprintln!(
+                        "iscousinprime: {} IS a cousin prime (pairs with {} and {})",
+                        n, n - 4, n + 4
+                    );
+                } else if lo {
+                    crate::kprintln!(
+                        "iscousinprime: {} IS a cousin prime (pairs with {})",
+                        n, n - 4
+                    );
+                } else if hi {
+                    crate::kprintln!(
+                        "iscousinprime: {} IS a cousin prime (pairs with {})",
+                        n, n + 4
+                    );
+                } else {
+                    crate::kprintln!(
+                        "iscousinprime: {} is NOT a cousin prime (isolated prime)",
+                        n
+                    );
+                }
+            }
+        }
+        Ok(_) => crate::kprintln!("iscousinprime: n too large (max 10000000)"),
+        Err(_) => crate::kprintln!("usage: iscousinprime <n>"),
+    }
+}
+
+/// `issexyprime` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_issexyprime(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is a SEXY PRIME: n is prime AND at least one of n-6 or
+    // n+6 is also prime (5<->11, 7<->13, 11<->17, 13<->19, 17<->23). "Sexy" is
+    // from the Latin sex = six. The gap-6 analogue of istwinprime (gap 2) and
+    // iscousinprime (gap 4); primality by trial division with the overflow-safe
+    // d <= n/d bound, n capped at 1e7 so n+6 cannot overflow.
+    fn is_prime(x: u64) -> bool {
+        if x < 2 {
+            return false;
+        }
+        if x < 4 {
+            return true;
+        }
+        if x % 2 == 0 {
+            return false;
+        }
+        let mut d = 3u64;
+        while d <= x / d {
+            if x % d == 0 {
+                return false;
+            }
+            d += 2;
+        }
+        true
+    }
+    match rest.trim().parse::<u64>() {
+        Ok(n) if n <= 10_000_000 => {
+            if !is_prime(n) {
+                crate::kprintln!("issexyprime: {} is NOT a sexy prime (not prime)", n);
+            } else {
+                let lo = n >= 6 && is_prime(n - 6);
+                let hi = is_prime(n + 6);
+                if lo && hi {
+                    crate::kprintln!(
+                        "issexyprime: {} IS a sexy prime (pairs with {} and {})",
+                        n, n - 6, n + 6
+                    );
+                } else if lo {
+                    crate::kprintln!(
+                        "issexyprime: {} IS a sexy prime (pairs with {})",
+                        n, n - 6
+                    );
+                } else if hi {
+                    crate::kprintln!(
+                        "issexyprime: {} IS a sexy prime (pairs with {})",
+                        n, n + 6
+                    );
+                } else {
+                    crate::kprintln!(
+                        "issexyprime: {} is NOT a sexy prime (isolated prime)",
+                        n
+                    );
+                }
+            }
+        }
+        Ok(_) => crate::kprintln!("issexyprime: n too large (max 10000000)"),
+        Err(_) => crate::kprintln!("usage: issexyprime <n>"),
+    }
+}
+
+/// `gpio` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_gpio(line: &str, cmd: &str, rest: &str) {
+    let arg = rest.trim();
+    if let Some(spec) = arg.strip_prefix("set ") {
+        // gpio set <pin> <0|1>: drive an output pin and read it back.
+        let mut it = spec.split_whitespace();
+        let pin = it.next().and_then(|s| s.parse::<u8>().ok());
+        let val = it.next().and_then(|s| s.parse::<u8>().ok());
+        match (pin, val) {
+            (Some(p), Some(v)) if p < 8 && v < 2 => {
+                crate::gpio::set_output(p);
+                crate::gpio::write_pin(p, v == 1);
+                crate::kprintln!(
+                    "gpio: pin{} set to {}, readback {:#04x} (dir {:#04x})",
+                    p, v, crate::gpio::read_pins(), crate::gpio::direction()
+                );
+            }
+            _ => crate::kprintln!("usage: gpio set <pin 0-7> <0|1>"),
+        }
+    } else {
+        // Probe: identify the PL061 by its PrimeCell ID + read pin state.
+        let part = crate::gpio::part_number();
+        if crate::gpio::probe() {
+            crate::kprintln!(
+                "gpio: PL061 @ {:#010x}, part {:#05x}, pins {:#04x}",
+                crate::board::GPIO_BASE,
+                part,
+                crate::gpio::read_pins()
+            );
+        } else {
+            crate::kprintln!("gpio: PL061 not detected (part {:#05x})", part);
+        }
+    }
+}
+
+/// `wordstartcount` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wordstartcount(line: &str, cmd: &str, rest: &str) {
+    // Count how many whitespace-delimited words in a VFS file BEGIN with
+    // a given character (the first char of <ch>, case-sensitive). Distinct
+    // from charcount (counts a char anywhere), grepc (counts matching
+    // LINES), wordfreq (the most frequent word), and countword (a whole
+    // word in inline text).
+    let (needle, file) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim()),
+        None => (rest, ""),
+    };
+    if needle.is_empty() || file.is_empty() {
+        crate::kprintln!("usage: wordstartcount <ch> <file>");
+    } else {
+        let target = needle.as_bytes()[0];
+        match vfs::read_str(file) {
+            None => crate::kprintln!("wordstartcount: no such file: {}", file),
+            Some(s) => {
+                let n = s
+                    .split_whitespace()
+                    .filter(|w| w.as_bytes().first() == Some(&target))
+                    .count();
+                crate::kprintln!("wordstartcount: {} words start with {}", n, target as char);
+            }
+        }
+    }
+}
+
+/// `wordendcount` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wordendcount(line: &str, cmd: &str, rest: &str) {
+    // Count how many whitespace-delimited words in a VFS file END with a
+    // given character (the first char of <ch>, case-sensitive) -- the
+    // mirror of wordstartcount. Distinct from charcount (a char
+    // anywhere), grepc (matching LINES), wordfreq, and countword.
+    let (needle, file) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim()),
+        None => (rest, ""),
+    };
+    if needle.is_empty() || file.is_empty() {
+        crate::kprintln!("usage: wordendcount <ch> <file>");
+    } else {
+        let target = needle.as_bytes()[0];
+        match vfs::read_str(file) {
+            None => crate::kprintln!("wordendcount: no such file: {}", file),
+            Some(s) => {
+                let n = s
+                    .split_whitespace()
+                    .filter(|w| w.as_bytes().last() == Some(&target))
+                    .count();
+                crate::kprintln!("wordendcount: {} words end with {}", n, target as char);
+            }
+        }
+    }
+}
+
+/// `isdudeney` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_isdudeney(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is a DUDENEY number: a perfect cube whose digit SUM
+    // equals its cube ROOT. e.g. 512 = 8^3 and 5+1+2 = 8; 4913 = 17^3 and
+    // 4+9+1+3 = 17; also 1, 5832, 17576, 19683. Reuses icbrt's u128-cube
+    // binary search to find the integer cube root and confirm a perfect cube,
+    // then compares the digit sum. Distinct from icbrt (just the root),
+    // digitsum (just the sum), and the digit-power classifiers armstrong/
+    // isfactorion.
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            // Integer cube root via binary search (u128 cube, no overflow).
+            let target = n as u128;
+            let mut lo: u64 = 0;
+            let mut hi: u64 = 2_642_246;
+            while lo < hi {
+                let mid = (lo + hi + 1) / 2;
+                if (mid as u128).pow(3) <= target {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            let perfect = (lo as u128).pow(3) == target;
+            // Decimal digit sum (0 has digit sum 0).
+            let mut ds = 0u64;
+            let mut x = n;
+            while x > 0 {
+                ds += x % 10;
+                x /= 10;
+            }
+            if perfect && ds == lo {
+                crate::kprintln!(
+                    "isdudeney: {} IS a Dudeney number ({}^3 and digit sum {})",
+                    n, lo, ds
+                );
+            } else if perfect {
+                crate::kprintln!(
+                    "isdudeney: {} is NOT a Dudeney number ({}^3 but digit sum {} != {})",
+                    n, lo, ds, lo
+                );
+            } else {
+                crate::kprintln!(
+                    "isdudeney: {} is NOT a Dudeney number (not a perfect cube)",
+                    n
+                );
+            }
+        }
+        _ => crate::kprintln!("usage: isdudeney <n>"),
+    }
+}
+
+/// `tetranacci` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_tetranacci(line: &str, cmd: &str, rest: &str) {
+    // nth tetranacci (T0=T1=T2=0, T3=1; a FOUR-term recurrence T(n)=T(n-1)+
+    // T(n-2)+T(n-3)+T(n-4), OEIS A000078): 0,0,0,1,1,2,4,8,15,29,56,108,... It
+    // extends the fib(2-term)/tribonacci(3-term) family with a 4-wide rolling
+    // window. u128 with an honest overflow guard (grows ~1.9276^n, so it outpaces
+    // tribonacci and overflows earlier for a given width -- u128 pushes it far out).
+    match rest.trim().parse::<u64>() {
+        Ok(n) if n <= 2 => crate::kprintln!("tetranacci: T({}) = 0", n),
+        Ok(3) => crate::kprintln!("tetranacci: T(3) = 1"),
+        Ok(n) => {
+            let mut a: u128 = 0; // T(k-4)
+            let mut b: u128 = 0; // T(k-3)
+            let mut c: u128 = 0; // T(k-2)
+            let mut d: u128 = 1; // T(k-1), starting at k = 3
+            let mut overflow = false;
+            for _ in 4..=n {
+                match a
+                    .checked_add(b)
+                    .and_then(|x| x.checked_add(c))
+                    .and_then(|x| x.checked_add(d))
+                {
+                    Some(s) => {
+                        a = b;
+                        b = c;
+                        c = d;
+                        d = s;
+                    }
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+            }
+            if overflow {
+                crate::kprintln!("tetranacci: T({}) overflows u128", n);
+            } else {
+                crate::kprintln!("tetranacci: T({}) = {}", n, d);
+            }
+        }
+        Err(_) => crate::kprintln!("usage: tetranacci <n>"),
+    }
+}
+
+/// `ismunchausen` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_ismunchausen(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is a MUNCHAUSEN number: n equals the sum of each of
+    // its decimal digits raised to ITSELF (d^d), with the convention 0^0 = 0.
+    // The only base-10 Munchausen numbers are 0, 1, and 3435 (=3^3+4^4+3^3+5^5
+    // = 27+256+27+3125) and 438579088. Uses a fixed 0..=9 table of d^d and a
+    // digit walk. Distinct from armstrong (digit^digit-COUNT), isdisarium
+    // (digit^POSITION), and isfactorion (digit FACTORIALS).
+    const DD: [u128; 10] =
+        [0, 1, 4, 27, 256, 3125, 46656, 823543, 16777216, 387420489];
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            // Sum d^d over the digits; saturating so no input can panic.
+            let mut sum: u128 = 0;
+            let mut x = n;
+            // n == 0 has the single digit 0 whose 0^0 = 0, so the sum is 0
+            // (the loop never runs), which correctly equals n.
+            while x > 0 {
+                let d = (x % 10) as usize;
+                sum = sum.saturating_add(DD[d]);
+                x /= 10;
+            }
+            if sum == n as u128 {
+                crate::kprintln!(
+                    "ismunchausen: {} IS a Munchausen number (sum of digit^digit = {})",
+                    n, sum
+                );
+            } else {
+                crate::kprintln!(
+                    "ismunchausen: {} is NOT a Munchausen number (sum of digit^digit = {})",
+                    n, sum
+                );
+            }
+        }
+        Err(_) => crate::kprintln!("usage: ismunchausen <n>"),
+    }
+}
+
+/// `istrimorphic` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_istrimorphic(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is a TRIMORPHIC number: n^3 ENDS IN n, i.e.
+    // n^3 mod 10^k == n where k is the digit count of n (1,4,5,6,9,24,25,
+    // 49,51,75,76,99,125,... yes). The CUBE analog of automorphic
+    // (n^2 ends in n). Cubing is done in u128 to avoid overflow.
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let mut k: u32 = 0;
+            let mut c = n;
+            while c > 0 {
+                k += 1;
+                c /= 10;
+            }
+            if k == 0 {
+                k = 1;
+            }
+            // Cube in u128 with an explicit overflow guard so a very large
+            // n cannot trigger a kernel panic (cf. the 2.265 gcd-lcm fix).
+            let cube = (n as u128)
+                .checked_mul(n as u128)
+                .and_then(|sq| sq.checked_mul(n as u128));
+            match cube {
+                None => crate::kprintln!("istrimorphic: {} too large to cube in u128", n),
+                Some(cube) => {
+                    let m = 10u128.pow(k);
+                    if cube % m == n as u128 {
+                        crate::kprintln!(
+                            "istrimorphic: {} IS trimorphic ({}^3 = {} ends in {})",
+                            n, n, cube, n
+                        );
+                    } else {
+                        crate::kprintln!(
+                            "istrimorphic: {} is NOT trimorphic ({}^3 = {})",
+                            n, n, cube
+                        );
+                    }
+                }
+            }
+        }
+        Err(_) => crate::kprintln!("usage: istrimorphic <n>"),
+    }
+}
+
+/// `topchar` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_topchar(line: &str, cmd: &str, rest: &str) {
+    // The MOST FREQUENT non-whitespace character in the inline text, with its count;
+    // ties resolve to the FIRST such character by occurrence. "topchar aabbbc" -> "b
+    // (3)", "topchar hello" -> "l (2)", "topchar mississippi" -> "i (4)" (i and s both
+    // 4, i occurs first), "topchar abc" -> "a (1)" (all tie -> first). Whitespace is
+    // ignored so a space never wins. The inline CHARACTER analogue of topword; distinct
+    // from letterfreq (a FILE, letters only, case-folded) and histogram (a FILE, bytes).
+    let bytes = rest.as_bytes();
+    let mut best = 0u8;
+    let mut best_count = 0usize;
+    for (i, &c) in bytes.iter().enumerate() {
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        // Only evaluate a char at its FIRST occurrence (so ties keep the earliest).
+        if bytes[..i].iter().any(|&u| u == c) {
+            continue;
+        }
+        let count = bytes.iter().filter(|&&u| u == c).count();
+        if count > best_count {
+            best_count = count;
+            best = c;
+        }
+    }
+    if best_count == 0 {
+        crate::kprintln!("usage: topchar <text>");
+    } else {
+        crate::kprintln!("topchar: {} ({})", best as char, best_count);
+    }
+}
+
+/// `rarechar` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rarechar(line: &str, cmd: &str, rest: &str) {
+    // The LEAST FREQUENT non-whitespace character in the inline text, with its count;
+    // ties resolve to the FIRST such character by occurrence. "rarechar aabbbc" -> "c
+    // (1)", "rarechar mississippi" -> "m (1)", "rarechar aabb" -> "a (2)" (a & b tie,
+    // a first), "rarechar abc" -> "a (1)". Whitespace is ignored. The complement of
+    // topchar (most frequent); the inline CHARACTER analogue of rareword.
+    let bytes = rest.as_bytes();
+    let mut best = 0u8;
+    let mut best_count = usize::MAX;
+    for (i, &c) in bytes.iter().enumerate() {
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        if bytes[..i].iter().any(|&u| u == c) {
+            continue;
+        }
+        let count = bytes.iter().filter(|&&u| u == c).count();
+        if count < best_count {
+            best_count = count;
+            best = c;
+        }
+    }
+    if best_count == usize::MAX {
+        crate::kprintln!("usage: rarechar <text>");
+    } else {
+        crate::kprintln!("rarechar: {} ({})", best as char, best_count);
+    }
+}
+
+/// `mean` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_mean(line: &str, cmd: &str, rest: &str) {
+    // Arithmetic (integer, truncated) mean of a list of integers.
+    let mut sum: u128 = 0;
+    let mut count: u64 = 0;
+    let mut bad = false;
+    for t in rest.split_whitespace() {
+        match t.parse::<u64>() {
+            Ok(v) => {
+                sum += v as u128;
+                count += 1;
+            }
+            Err(_) => {
+                bad = true;
+                break;
+            }
+        }
+    }
+    if bad {
+        crate::kprintln!("mean: invalid number");
+    } else if count == 0 {
+        crate::kprintln!("usage: mean <n1> <n2> ...");
+    } else {
+        let m = sum / (count as u128);
+        crate::kprintln!("mean: sum {}, count {}, mean {}", sum, count, m);
+    }
+}
+
+/// `countsubstr` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_countsubstr(line: &str, cmd: &str, rest: &str) {
+    // Count NON-OVERLAPPING occurrences of <sub> as a raw byte substring in the
+    // INLINE text, spanning word boundaries (unlike countword, which matches whole
+    // words). "ss" in "mississippi" -> 2; "aa" in "aaaa" -> 2 (non-overlapping, so
+    // after a hit the scan advances by the needle length). The multi-char companion
+    // of countchar; distinct from replace/tr (which transform) and grepc (LINES).
+    let (needle, text) = match rest.find(' ') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    if needle.is_empty() || text.is_empty() {
+        crate::kprintln!("usage: countsubstr <sub> <text>");
+    } else {
+        let nb = needle.as_bytes();
+        let hb = text.as_bytes();
+        let mut count = 0usize;
+        let mut i = 0usize;
+        while i + nb.len() <= hb.len() {
+            if &hb[i..i + nb.len()] == nb {
+                count += 1;
+                i += nb.len(); // non-overlapping: skip past the match
+            } else {
+                i += 1;
+            }
+        }
+        crate::kprintln!("countsubstr: \"{}\" occurs {} times", needle, count);
+    }
+}
+
+/// `alternatingfactorial` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_alternatingfactorial(line: &str, cmd: &str, rest: &str) {
+    // nth alternating factorial af(n) = n! - (n-1)! + (n-2)! - ... +- 1!,
+    // computed via the recurrence af(0)=0, af(k)=k!-af(k-1) in u128:
+    // 0,1,1,5,19,101,619,4421,... (OEIS A005165). The running k! is guarded
+    // with checked_mul; because af(k-1) < (k-1)! <= k!, the subtraction never
+    // underflows. Distinct from factorial (n!), superfact (product of
+    // factorials), doublefact (n!!), primorial, and hyperfactorial (k^k). af(34)
+    // is the last value that fits u128; af(35) overflows.
+    match rest.trim().parse::<u64>() {
+        Ok(0) => crate::kprintln!("alternatingfactorial: af(0) = 0"),
+        Ok(n) => {
+            let mut fact: u128 = 1;
+            let mut af: u128 = 0;
+            let mut overflow = false;
+            for k in 1..=n as u128 {
+                match fact.checked_mul(k) {
+                    Some(v) => {
+                        fact = v; // fact is now k!
+                        af = fact - af;
+                    }
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+            }
+            if overflow {
+                crate::kprintln!("alternatingfactorial: af({}) overflows u128", n);
+            } else {
+                crate::kprintln!("alternatingfactorial: af({}) = {}", n, af);
+            }
+        }
+        Err(_) => crate::kprintln!("usage: alternatingfactorial <n>"),
+    }
+}
+
+/// `mmfr` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_mmfr(line: &str, cmd: &str, rest: &str) {
+    // Decode ID_AA64MMFR0_EL1 (Memory Model Feature Register 0): the CPU's
+    // physical-address range, ASID size, and translation-granule support.
+    let mmfr: u64;
+    // SAFETY: ID_AA64MMFR0_EL1 is a standard AArch64 ID register readable at EL1.
+    unsafe { #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr); #[cfg(not(target_arch = "aarch64"))] { mmfr = crate::shell_pc::sysreg("id_aa64mmfr0_el1"); }
+    }
+    let parange = (mmfr & 0xf) as u32;
+    let asid_field = ((mmfr >> 4) & 0xf) as u32;
+    let tgran16 = ((mmfr >> 20) & 0xf) as u32;
+    let tgran64 = ((mmfr >> 24) & 0xf) as u32;
+    let tgran4 = ((mmfr >> 28) & 0xf) as u32;
+    let pa_bits = match parange {
+        0 => 32, 1 => 36, 2 => 40, 3 => 42, 4 => 44, 5 => 48, 6 => 52,
+        _ => 0, // unknown code
+    };
+    let asid_bits = match asid_field {
+        0 => 8,
+        2 => 16,
+        _ => 0,
+    };
+    let yn = |b: bool| if b { "yes" } else { "no" };
+    // TGran4/TGran64: 0 = supported, 0xf = not. TGran16: 0 = not, else supported.
+    crate::kprintln!("mmfr: ID_AA64MMFR0_EL1 = 0x{:016x}", mmfr);
+    if pa_bits != 0 {
+        crate::kprintln!("mmfr: PA range = {} bits (code {})", pa_bits, parange);
+    } else {
+        crate::kprintln!("mmfr: PA range = unknown (code {})", parange);
+    }
+    if asid_bits != 0 {
+        crate::kprintln!("mmfr: ASID = {} bits", asid_bits);
+    } else {
+        crate::kprintln!("mmfr: ASID = unknown (code {})", asid_field);
+    }
+    crate::kprintln!(
+        "mmfr: granules: 4K={} 16K={} 64K={}",
+        yn(tgran4 == 0),
+        yn(tgran16 != 0),
+        yn(tgran64 == 0)
+    );
+}
+
+/// `titlecount` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_titlecount(line: &str, cmd: &str, rest: &str) {
+    // Count the words in TITLE CASE -- those whose first character is an uppercase ASCII
+    // letter and which contain NO other uppercase letter ("The"/"Quick"/"Fox" qualify;
+    // "brown" (lowercase start), "HELLO" (all caps), and "iPhone"/"McDonald" (interior
+    // caps) do NOT). "The Quick brown Fox" -> 3 of 4. Whitespace-delimited. Distinct from
+    // casecount (a per-LETTER upper/lower tally of a FILE), capitalize (a TRANSFORM), and
+    // title (which REWRITES text to title case) -- this COUNTS already-title-case words.
+    if rest.trim().is_empty() {
+        crate::kprintln!("usage: titlecount <text>");
+    } else {
+        let mut total = 0u32;
+        let mut title = 0u32;
+        for w in rest.split_whitespace() {
+            total += 1;
+            let b = w.as_bytes();
+            if b[0].is_ascii_uppercase() {
+                let mut ok = true;
+                for &c in &b[1..] {
+                    if c.is_ascii_uppercase() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    title += 1;
+                }
+            }
+        }
+        crate::kprintln!("titlecount: {} of {} words are title case", title, total);
+    }
+}
+
+/// `iroot` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_iroot(line: &str, cmd: &str, rest: &str) {
+    // Integer k-th root: floor(n^(1/k)), the largest r with r^k <= n. Generalizes
+    // isqrt (k=2) and icbrt (k=3) to any k >= 1. "iroot 4 16" -> 2, "iroot 5 32" -> 2,
+    // "iroot 2 10" -> 3 (floor), "iroot 10 1024" -> 2, "iroot 10 1023" -> 1. k = 0 is
+    // undefined. Binary search with a checked r^k so a large mid can't overflow u64.
+    let mut it = rest.split_whitespace();
+    let k = it.next().and_then(|s| s.parse::<u32>().ok());
+    let n = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (k, n) {
+        (Some(k), Some(n)) if k >= 1 => {
+            // r^k, or None if it overflows u64 (hence certainly > any u64 n)
+            fn ipow(base: u64, exp: u32) -> Option<u64> {
+                let mut r: u64 = 1;
+                for _ in 0..exp {
+                    r = r.checked_mul(base)?;
+                }
+                Some(r)
+            }
+            let mut lo: u64 = 0;
+            let mut hi: u64 = n;
+            while lo < hi {
+                let mid = lo + (hi - lo + 1) / 2; // upper mid to converge on the floor
+                match ipow(mid, k) {
+                    Some(p) if p <= n => lo = mid,
+                    _ => hi = mid - 1,
+                }
+            }
+            let exact = ipow(lo, k) == Some(n);
+            crate::kprintln!(
+                "iroot: floor({}^(1/{})) = {} ({})",
+                n, k, lo,
+                if exact { "perfect power" } else { "floor" }
+            );
+        }
+        _ => crate::kprintln!("usage: iroot <k> <n> (k >= 1)"),
+    }
+}
+
+/// `motzkin` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_motzkin(line: &str, cmd: &str, rest: &str) {
+    // nth Motzkin number M(n) via the exact two-term integer recurrence in
+    // u128: M(0)=M(1)=1, (n+2)*M(n) = (2n+1)*M(n-1) + 3*(n-1)*M(n-2). Counts
+    // the ways to draw non-crossing chords between n points on a circle (and
+    // the Motzkin lattice paths). Distinct from catalan (Dyck paths) and the
+    // fib/lucas/pell linear recurrences. Guards u128 overflow.
+    match rest.trim().parse::<u64>() {
+        Ok(0) => crate::kprintln!("motzkin: M(0) = 1"),
+        Ok(1) => crate::kprintln!("motzkin: M(1) = 1"),
+        Ok(n) => {
+            let mut a: u128 = 1; // M(k-2)
+            let mut b: u128 = 1; // M(k-1)
+            let mut cur: u128 = 1;
+            let mut steps = 0u64;
+            let mut overflow = false;
+            let mut k: u128 = 2;
+            while k <= n as u128 {
+                let num = b
+                    .checked_mul(2 * k + 1)
+                    .and_then(|t1| a.checked_mul(3 * (k - 1)).and_then(|t2| t1.checked_add(t2)));
+                match num {
+                    Some(s) => {
+                        cur = s / (k + 2);
+                        a = b;
+                        b = cur;
+                        steps += 1;
+                    }
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            if overflow {
+                crate::kprintln!("motzkin: M({}) overflows u128 after {} steps", n, steps);
+            } else {
+                crate::kprintln!("motzkin: M({}) = {}", n, cur);
+            }
+        }
+        _ => crate::kprintln!("usage: motzkin <n>"),
+    }
+}
+
+/// `uartinfo` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_uartinfo(line: &str, cmd: &str, rest: &str) {
+    // Read the PL011 UART's PrimeCell identification registers over MMIO.
+    let base = crate::board::UART_BASE;
+    // SAFETY: read-only MMIO of the PL011 ID registers (present on both boards).
+    let rd = |off: usize| unsafe { core::ptr::read_volatile((base + off) as *const u32) & 0xff };
+    let (p0, p1, p2, p3) = (rd(0xFE0), rd(0xFE4), rd(0xFE8), rd(0xFEC));
+    let _ = p3; // configuration byte, not decoded
+    let (c0, c1, c2, c3) = (rd(0xFF0), rd(0xFF4), rd(0xFF8), rd(0xFFC));
+    let part = (p0 & 0xff) | ((p1 & 0x0f) << 8);
+    let designer = ((p1 >> 4) & 0x0f) | ((p2 & 0x0f) << 4);
+    let revision = (p2 >> 4) & 0x0f;
+    let cellid = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
+    crate::kprintln!("uartinfo: PL011 @ 0x{:x}", base);
+    crate::kprintln!(
+        "uartinfo: part 0x{:03x} ({})",
+        part,
+        if part == 0x011 { "PL011" } else { "?" }
+    );
+    crate::kprintln!(
+        "uartinfo: designer 0x{:02x} ({})",
+        designer,
+        if designer == 0x41 { "ARM" } else { "?" }
+    );
+    crate::kprintln!("uartinfo: revision {}  PrimeCell ID 0x{:08x}", revision, cellid);
+}
+
+/// `firstrepeat` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_firstrepeat(line: &str, cmd: &str, rest: &str) {
+    // Report the FIRST repeating character of the inline text -- the first byte
+    // whose value has already been seen earlier (case-sensitive). "swiss" -> s
+    // (the 4th char), "abca" -> a; "abcdef" has none. The complement of
+    // firstunique; distinct from uniqchars (which lists the distinct bytes) and
+    // squeeze/collapse (adjacent-run collapse). A single pass with a `seen` table.
+    if rest.is_empty() {
+        crate::kprintln!("usage: firstrepeat <text>");
+    } else {
+        let src = rest.as_bytes();
+        let mut seen = [false; 256];
+        let mut found = false;
+        for &b in src {
+            if seen[b as usize] {
+                let ch = [b];
+                crate::kprintln!(
+                    "firstrepeat: {}",
+                    core::str::from_utf8(&ch).unwrap_or("?")
+                );
+                found = true;
+                break;
+            }
+            seen[b as usize] = true;
+        }
+        if !found {
+            crate::kprintln!("firstrepeat: (no repeating character)");
+        }
+    }
+}
+
+/// `centeredcube` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_centeredcube(line: &str, cmd: &str, rest: &str) {
+    // The nth CENTERED CUBE number: n^3 + (n-1)^3 -- a central point with successive
+    // cubic shells (OEIS A005898): 1, 9, 35, 91, 189, 331, ... Notably C(10) = 1729, the
+    // Hardy-Ramanujan taxicab number. Distinct from cube (n^3), the centered-POLYGONAL
+    // family (2D), and the pyramidal numbers. Computed in u128 (checked) to avoid overflow.
+    match rest.trim().parse::<u64>() {
+        Ok(n) if n >= 1 => {
+            let a = n as u128;
+            let n3 = a.checked_mul(a).and_then(|s| s.checked_mul(a));
+            let m = a - 1;
+            let m3 = m.checked_mul(m).and_then(|s| s.checked_mul(m));
+            match n3.and_then(|x| m3.and_then(|y| x.checked_add(y))) {
+                Some(v) => crate::kprintln!("centeredcube: C({}) = {}", n, v),
+                None => crate::kprintln!("centeredcube: C({}) overflowed u128", n),
+            }
+        }
+        _ => crate::kprintln!("usage: centeredcube <n> (n >= 1)"),
+    }
+}
+
+/// `hmac` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_hmac(line: &str, cmd: &str, rest: &str) {
+    // HMAC-SHA256 (keyed) of a file: hmac <key> <file>.
+    let (key, file) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim()),
+        None => (rest, ""),
+    };
+    if key.is_empty() || file.is_empty() {
+        crate::kprintln!("usage: hmac <key> <file>");
+    } else {
+        match vfs::read_raw(file) {
+            None => crate::kprintln!("hmac: no such file: {}", file),
+            Some(data) => {
+                let mac = hmac_sha256(key.as_bytes(), data);
+                let mut hex = [0u8; 64];
+                crate::sha256::to_hex(&mac, &mut hex);
+                crate::kprintln!(
+                    "hmac-sha256 {}: {}",
+                    file,
+                    core::str::from_utf8(&hex).unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `wordcountf` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wordcountf(line: &str, cmd: &str, rest: &str) {
+    // Count how many WHOLE whitespace-delimited words in a VFS FILE exactly
+    // equal <word> (case-sensitive, punctuation kept as part of the token).
+    // The file analogue of countword (which counts in INLINE text), mirroring
+    // how charcount is the file analogue of countchar. Distinct from wordfreq
+    // (the MOST frequent word), uniqwords (DISTINCT word count), and grepc
+    // (matching LINES).
+    let (needle, name) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim()),
+        None => (rest.trim(), ""),
+    };
+    if needle.is_empty() || name.is_empty() {
+        crate::kprintln!("usage: wordcountf <word> <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("wordcountf: no such file: {}", name),
+            Some(s) => {
+                let n = s.split_whitespace().filter(|w| *w == needle).count();
+                crate::kprintln!(
+                    "wordcountf: {} occurs {} times in {}",
+                    needle,
+                    n,
+                    name
+                );
+            }
+        }
+    }
+}
+
+/// `line` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_line(line: &str, cmd: &str, rest: &str) {
+    // Print the Nth (1-based) line of a VFS file. Distinct from head/tail
+    // (byte ranges), cut (a field of each line), and nl (numbers all lines).
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<usize>().ok());
+    let name = it.next();
+    match (n, name) {
+        (Some(n), Some(name)) if n >= 1 => match vfs::read_str(name) {
+            None => crate::kprintln!("line: no such file: {}", name),
+            Some(s) => match s.lines().nth(n - 1) {
+                Some(l) => crate::kprintln!("{}", l),
+                None => crate::kprintln!("line: file has fewer than {} lines", n),
+            },
+        },
+        _ => crate::kprintln!("usage: line <n> <file>"),
+    }
+}
+
+/// `charat` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_charat(line: &str, cmd: &str, rest: &str) {
+    // Print the Nth (1-based) BYTE of a VFS file's whole content,
+    // reporting the character. Counts every byte (newlines included),
+    // unlike line (Nth line), wordn (Nth word), cut (a field), and
+    // linelen (a line's byte length). Out-of-range n is reported.
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<usize>().ok());
+    let name = it.next();
+    match (n, name) {
+        (Some(n), Some(name)) if n >= 1 => match vfs::read_str(name) {
+            None => crate::kprintln!("charat: no such file: {}", name),
+            Some(s) => match s.as_bytes().get(n - 1) {
+                Some(&b) => crate::kprintln!("charat: char {} is {}", n, b as char),
+                None => crate::kprintln!("charat: file has fewer than {} chars", n),
+            },
+        },
+        _ => crate::kprintln!("usage: charat <n> <file>"),
+    }
+}
+
+/// `ispolydivisible` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_ispolydivisible(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is POLYDIVISIBLE: for every prefix length k
+    // (1..=digit count), the number formed by n's first k decimal digits is
+    // divisible by k. 1200 -> 1|1, 12|2, 120|3, 1200|4 all divide, so IS; 15
+    // is NOT because 15 is not divisible by 2. Distinct from harshad (whole n
+    // divisible by its digit SUM) and isdigitsorted (monotone digits).
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            // decimal digits, most-significant first
+            let mut digs = [0u8; 20];
+            let mut tmp = [0u8; 20];
+            let mut c = 0usize;
+            let mut x = n;
+            if x == 0 {
+                tmp[0] = 0;
+                c = 1;
+            } else {
+                while x > 0 {
+                    tmp[c] = (x % 10) as u8;
+                    x /= 10;
+                    c += 1;
+                }
+            }
+            for i in 0..c {
+                digs[i] = tmp[c - 1 - i];
+            }
+            let d = c;
+            let mut poly = true;
+            let mut prefix = 0u64;
+            let mut failed_k = 0usize;
+            for i in 0..d {
+                prefix = prefix * 10 + digs[i] as u64;
+                if prefix % (i as u64 + 1) != 0 {
+                    poly = false;
+                    failed_k = i + 1;
+                    break;
+                }
+            }
+            if poly {
+                crate::kprintln!("ispolydivisible: {} IS polydivisible", n);
+            } else {
+                crate::kprintln!(
+                    "ispolydivisible: {} is NOT polydivisible (first {} digits not divisible by {})",
+                    n, failed_k, failed_k
+                );
+            }
+        }
+        Err(_) => crate::kprintln!("usage: ispolydivisible <n>"),
+    }
+}
+
+/// `rtcinfo` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_rtcinfo(line: &str, cmd: &str, rest: &str) {
+    // Read the PL031 RTC's PrimeCell identity + live data register over MMIO.
+    #[cfg(not(feature = "board-raspi"))]
+    {
+        let base = crate::board::RTC_BASE;
+        // SAFETY: read-only MMIO of the PL031 (present on virt).
+        let rd = |off: usize| unsafe {
+            core::ptr::read_volatile((base + off) as *const u32) & 0xff
+        };
+        let (p0, p1, p2, _p3) = (rd(0xFE0), rd(0xFE4), rd(0xFE8), rd(0xFEC));
+        let (c0, c1, c2, c3) = (rd(0xFF0), rd(0xFF4), rd(0xFF8), rd(0xFFC));
+        let part = (p0 & 0xff) | ((p1 & 0x0f) << 8);
+        let designer = ((p1 >> 4) & 0x0f) | ((p2 & 0x0f) << 4);
+        let cellid = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
+        let rtcdr = unsafe { core::ptr::read_volatile(base as *const u32) };
+        crate::kprintln!("rtcinfo: PL031 @ 0x{:x}", base);
+        crate::kprintln!(
+            "rtcinfo: part 0x{:03x} ({})",
+            part,
+            if part == 0x031 { "PL031" } else { "?" }
+        );
+        crate::kprintln!(
+            "rtcinfo: designer 0x{:02x} ({})",
+            designer,
+            if designer == 0x41 { "ARM" } else { "?" }
+        );
+        crate::kprintln!("rtcinfo: PrimeCell ID 0x{:08x}", cellid);
+        crate::kprintln!("rtcinfo: RTCDR (data) = {}", rtcdr);
+    }
+    #[cfg(feature = "board-raspi")]
+    {
+        crate::kprintln!("rtcinfo: PL031 RTC not present on this board");
+    }
+}
+
+/// `uuid` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_uuid(line: &str, cmd: &str, rest: &str) {
+    // Random RFC 4122 version-4 UUID from the hardware-seeded CSPRNG.
+    let mut b = [0u8; 16];
+    for i in 0..4 {
+        b[i * 4..i * 4 + 4].copy_from_slice(&crate::rng::next_u32().to_le_bytes());
+    }
+    b[6] = (b[6] & 0x0F) | 0x40; // version 4
+    b[8] = (b[8] & 0x3F) | 0x80; // variant 10xx
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = [0u8; 36];
+    let mut j = 0;
+    for (i, &byte) in b.iter().enumerate() {
+        if i == 4 || i == 6 || i == 8 || i == 10 {
+            s[j] = b'-';
+            j += 1;
+        }
+        s[j] = HEX[(byte >> 4) as usize];
+        s[j + 1] = HEX[(byte & 0x0F) as usize];
+        j += 2;
+    }
+    crate::kprintln!("uuid: {}", core::str::from_utf8(&s).unwrap_or("?"));
+}
+
+/// `ipow` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_ipow(line: &str, cmd: &str, rest: &str) {
+    // Integer power base^exp in u128 -- NOT modular (distinct from pow, which is modular
+    // a^b mod m). "ipow 2 10" -> 1024, "ipow 3 5" -> 243, "ipow 10 20" -> 10^20; b^0 = 1
+    // for any b. Accumulates with checked_mul so an overflow (e.g. "ipow 2 200") is
+    // reported honestly rather than wrapped.
+    let mut it = rest.split_whitespace();
+    let b = it.next().and_then(|s| s.parse::<u64>().ok());
+    let e = it.next().and_then(|s| s.parse::<u32>().ok());
+    match (b, e) {
+        (Some(b), Some(e)) => {
+            let mut r: u128 = 1;
+            let mut overflow = false;
+            for _ in 0..e {
+                match r.checked_mul(b as u128) {
+                    Some(v) => r = v,
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+            }
+            if overflow {
+                crate::kprintln!("ipow: {}^{} overflows u128", b, e);
+            } else {
+                crate::kprintln!("ipow: {}^{} = {}", b, e, r);
+            }
+        }
+        _ => crate::kprintln!("usage: ipow <base> <exp>"),
+    }
+}
+
+/// `mmfr1` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_mmfr1(line: &str, cmd: &str, rest: &str) {
+    // Decode ID_AA64MMFR1_EL1 (Memory Model Feature Register 1): a second set
+    // of memory-model features. Complements `mmfr` (ID_AA64MMFR0_EL1).
+    let mmfr1: u64;
+    // SAFETY: ID_AA64MMFR1_EL1 is a standard AArch64 ID register readable at EL1.
+    unsafe { #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("mrs {}, id_aa64mmfr1_el1", out(reg) mmfr1); #[cfg(not(target_arch = "aarch64"))] { mmfr1 = crate::shell_pc::sysreg("id_aa64mmfr1_el1"); }
+    }
+    let hafdbs = (mmfr1 & 0xf) as u32; // HW access/dirty-flag management
+    let vmidbits = ((mmfr1 >> 4) & 0xf) as u32;
+    let vh = ((mmfr1 >> 8) & 0xf) as u32; // virtualization host extensions
+    let hpds = ((mmfr1 >> 12) & 0xf) as u32; // hierarchical permission disables
+    let lo = ((mmfr1 >> 16) & 0xf) as u32; // LORegions
+    let pan = ((mmfr1 >> 20) & 0xf) as u32; // privileged access never
+    let specsei = ((mmfr1 >> 24) & 0xf) as u32;
+    let xnx = ((mmfr1 >> 28) & 0xf) as u32; // execute-never distinction EL0/EL1
+    crate::kprintln!("mmfr1: ID_AA64MMFR1_EL1 = 0x{:016x}", mmfr1);
+    crate::kprintln!(
+        "mmfr1: HAFDBS={} VMIDBits={} VH={} PAN={}",
+        hafdbs, vmidbits, vh, pan
+    );
+    crate::kprintln!(
+        "mmfr1: HPDS={} LO={} SpecSEI={} XNX={}",
+        hpds, lo, specsei, xnx
+    );
+    crate::kprintln!(
+        "mmfr1: VMID = {}",
+        if vmidbits == 2 { "16-bit" } else { "8-bit" }
+    );
+}
+
+/// `firstsentencef` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_firstsentencef(line: &str, cmd: &str, rest: &str) {
+    // Print the FIRST sentence of a VFS FILE -- the file analogue of firstsentence
+    // (inline), just as countsentencesf is to countsentences. Same segmentation rule:
+    // a sentence is a maximal run of characters containing at least one non-space
+    // char, terminated by one or more of . ! ? (a run of terminators ends one
+    // sentence, stripped from the output); trailing unterminated text still counts as
+    // a final sentence; embedded newlines are just whitespace, so a sentence can span
+    // lines (about.txt's first sentence ends "...OS service", crossing its line
+    // break). "firstsentencef motd" -> "Welcome to AfriSovera OS -- a sovereign,
+    // capability-secured OS" (its only sentence, terminator stripped). Distinct from
+    // firstsentence (INLINE text)/countsentencesf (COUNT only, no extraction)/
+    // headlines (LINE, not sentence, granularity).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: firstsentencef <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("firstsentencef: no such file: {}", name),
+            Some(s) => {
+                let bytes = s.as_bytes();
+                let mut seg_start = 0usize;
+                let mut has_content = false;
+                let mut first: Option<&str> = None;
+                for (i, &b) in bytes.iter().enumerate() {
+                    if matches!(b, b'.' | b'!' | b'?') {
+                        if has_content {
+                            first = Some(s[seg_start..i].trim());
+                            break;
+                        }
+                        seg_start = i + 1;
+                    } else if !b.is_ascii_whitespace() {
+                        has_content = true;
+                    }
+                }
+                if first.is_none() && has_content {
+                    first = Some(s[seg_start..].trim());
+                }
+                match first {
+                    Some(sent) => crate::kprintln!("firstsentencef: {} = {}", name, sent),
+                    None => crate::kprintln!("firstsentencef: {} has no sentences", name),
+                }
+            }
+        }
+    }
+}
+
+/// `lastsentencef` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_lastsentencef(line: &str, cmd: &str, rest: &str) {
+    // Print the LAST sentence of a VFS FILE -- the file analogue of lastsentence
+    // (inline), just as firstsentencef is to firstsentence. Same segmentation rule:
+    // a sentence is a maximal run of characters containing at least one non-space
+    // char, terminated by one or more of . ! ? (a run of terminators ends one
+    // sentence, stripped from the output); trailing unterminated text still counts as
+    // a final sentence; embedded newlines are just whitespace, so a sentence can span
+    // lines. "lastsentencef about.txt" -> "You own the device and the software on it"
+    // (its second/last sentence, terminator stripped). Distinct from lastsentence
+    // (INLINE text)/firstsentencef (FIRST sentence of a file)/taillines (LINE, not
+    // sentence, granularity).
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: lastsentencef <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("lastsentencef: no such file: {}", name),
+            Some(s) => {
+                let bytes = s.as_bytes();
+                let mut seg_start = 0usize;
+                let mut has_content = false;
+                let mut last: Option<&str> = None;
+                for (i, &b) in bytes.iter().enumerate() {
+                    if matches!(b, b'.' | b'!' | b'?') {
+                        if has_content {
+                            last = Some(s[seg_start..i].trim());
+                            has_content = false;
+                        }
+                        seg_start = i + 1;
+                    } else if !b.is_ascii_whitespace() {
+                        has_content = true;
+                    }
+                }
+                if has_content {
+                    last = Some(s[seg_start..].trim());
+                }
+                match last {
+                    Some(sent) => crate::kprintln!("lastsentencef: {} = {}", name, sent),
+                    None => crate::kprintln!("lastsentencef: {} has no sentences", name),
+                }
+            }
+        }
+    }
+}
+
+/// `wordn` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wordn(line: &str, cmd: &str, rest: &str) {
+    // Print the Nth (1-based) whitespace-separated word of a VFS file,
+    // counting across ALL lines. Distinct from cut (a field of each line)
+    // and line (a whole line).
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<usize>().ok());
+    let name = it.next();
+    match (n, name) {
+        (Some(n), Some(name)) if n >= 1 => match vfs::read_str(name) {
+            None => crate::kprintln!("wordn: no such file: {}", name),
+            Some(s) => match s.split_whitespace().nth(n - 1) {
+                Some(w) => crate::kprintln!("wordn: {}", w),
+                None => crate::kprintln!("wordn: file has fewer than {} words", n),
+            },
+        },
+        _ => crate::kprintln!("usage: wordn <n> <file>"),
+    }
+}
+
+/// `harshad` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_harshad(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is a HARSHAD (Niven) number: a positive integer
+    // divisible by its own digit sum. e.g. 18 (digit sum 9, 18/9=2) IS;
+    // 11 (digit sum 2, remainder 1) is NOT. Distinct from digitsum (just
+    // the sum + digital root), armstrong (digit^k sum), happy (sum of digit
+    // squares -> 1), perfect (divisor sum), and divisors (lists divisors).
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let mut ds = 0u64;
+            let mut x = n;
+            while x > 0 {
+                ds += x % 10;
+                x /= 10;
+            }
+            if ds == 0 {
+                // Only n == 0 reaches here; its digit sum is 0.
+                crate::kprintln!("harshad: 0 has digit sum 0 (undefined)");
+            } else if n % ds == 0 {
+                crate::kprintln!(
+                    "harshad: {} IS a Harshad number (digit sum {} divides {}: {}/{} = {})",
+                    n, ds, n, n, ds, n / ds
+                );
+            } else {
+                crate::kprintln!(
+                    "harshad: {} is NOT a Harshad number (digit sum {}, remainder {})",
+                    n, ds, n % ds
+                );
+            }
+        }
+        Err(_) => crate::kprintln!("usage: harshad <n>"),
+    }
+}
+
+/// `taillines` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_taillines(line: &str, cmd: &str, rest: &str) {
+    // Print the last N LINES of a VFS file (the whole file if it has fewer).
+    // The line-oriented mirror of headlines and the tail analogue of head/tail
+    // (which cut by BYTE); distinct from `line` (one line by index). Scans the
+    // raw bytes backward, keeping everything after the Nth newline from the end.
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<usize>().ok());
+    let file = it.next();
+    match (n, file) {
+        (Some(n), Some(file)) => match vfs::read_raw(file) {
+            None => crate::kprintln!("taillines: {} not found", file),
+            Some(data) => {
+                // start just after the Nth newline counted from the end
+                let mut start = if n == 0 { data.len() } else { 0 };
+                let mut seen = 0usize;
+                let mut i = data.len();
+                while i > 0 {
+                    i -= 1;
+                    if data[i] == b'\n' {
+                        seen += 1;
+                        if seen == n {
+                            start = i + 1;
+                            break;
+                        }
+                    }
+                }
+                crate::kprintln!(
+                    "taillines: {}",
+                    core::str::from_utf8(&data[start..]).unwrap_or("?")
+                );
+            }
+        },
+        _ => crate::kprintln!("usage: taillines <n> <file>"),
+    }
+}
+
+/// `between` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_between(line: &str, cmd: &str, rest: &str) {
+    // Extract the text BETWEEN the first <open> delimiter and the next <close> after it.
+    // "between ( ) foo(bar)baz" -> "bar", "between [ ] a[xy]b" -> "xy". If either
+    // delimiter is missing (or <close> does not follow <open>) the result is empty.
+    // Extends before/after (a single separator) to a paired-delimiter extractor;
+    // distinct from substr (a numeric slice) and cut (a whitespace field of a line).
+    let mut parts = rest.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(open), Some(close), Some(text)) if !open.is_empty() && !close.is_empty() => {
+            let out = match text.find(open) {
+                Some(i) => {
+                    let after = &text[i + open.len()..];
+                    match after.find(close) {
+                        Some(j) => &after[..j],
+                        None => "",
+                    }
+                }
+                None => "",
+            };
+            crate::kprintln!("between: {}", out);
+        }
+        _ => crate::kprintln!("usage: between <open> <close> <text>"),
+    }
+}
+
+/// `verify-sig` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_verify_sig(line: &str, cmd: &str, rest: &str) {
+    // AfriStore authorship: Ed25519-verify the publisher's signature over
+    // the app's SHA-256 digest. `verify-sig <app> tamper` re-checks against
+    // a modified copy's digest to show the signature no longer matches.
+    let mut parts = rest.split_whitespace();
+    let name = parts.next().unwrap_or("");
+    let tamper = parts.next() == Some("tamper");
+    match vfs::read_raw(name) {
+        Some(data) => match crate::integrity::signature_for(name) {
+            Some(sig) => {
+                let digest = if tamper {
+                    crate::integrity::hash_tampered(data)
+                } else {
+                    crate::sha256::digest(data)
+                };
+                crate::kprintln!("verify-sig {}{}", name, if tamper { " (tampered copy)" } else { "" });
+                if crate::ed25519::verify(&crate::integrity::PUBLISHER_PUBKEY, &digest, sig) {
+                    crate::kprintln!("  => signature valid (publisher trusted, Ed25519)");
+                } else {
+                    crate::kprintln!("  => INVALID signature (app tampered or wrong publisher)");
+                }
+            }
+            None => crate::kprintln!("verify-sig: {} is unsigned (no publisher signature on file)", name),
+        },
+        None => crate::kprintln!("verify-sig: no such file: {}", name),
+    }
+}
+
+/// `cpuinfo` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_cpuinfo(line: &str, cmd: &str, rest: &str) {
+    // Identify the running core by decoding its AArch64 ID system registers.
+    let midr: u64;
+    let mpidr: u64;
+    let cur_el: u64;
+    unsafe { #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("mrs {}, midr_el1", out(reg) midr); #[cfg(not(target_arch = "aarch64"))] { midr = crate::shell_pc::sysreg("midr_el1"); } #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr); #[cfg(not(target_arch = "aarch64"))] { mpidr = crate::shell_pc::sysreg("mpidr_el1"); } #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("mrs {}, CurrentEL", out(reg) cur_el); #[cfg(not(target_arch = "aarch64"))] { cur_el = crate::shell_pc::sysreg("CurrentEL"); }
+    }
+    let implementer = ((midr >> 24) & 0xFF) as u32;
+    let variant = ((midr >> 20) & 0xF) as u32;
+    let partnum = ((midr >> 4) & 0xFFF) as u32;
+    let revision = (midr & 0xF) as u32;
+    let aff0 = (mpidr & 0xFF) as u32;
+    let el = ((cur_el >> 2) & 0x3) as u32;
+    let imp_name = if implementer == 0x41 { "ARM" } else { "?" };
+    let part_name = match partnum {
+        0xd08 => "Cortex-A72",
+        0xd03 => "Cortex-A53",
+        _ => "?",
+    };
+    crate::kprintln!("cpuinfo: implementer 0x{:x} ({})", implementer, imp_name);
+    crate::kprintln!("cpuinfo: part 0x{:x} ({})", partnum, part_name);
+    crate::kprintln!("cpuinfo: variant 0x{:x} revision 0x{:x}", variant, revision);
+    crate::kprintln!("cpuinfo: core (Aff0) {}  EL {}", aff0, el);
+}
+
+/// `nextmultiple` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_nextmultiple(line: &str, cmd: &str, rest: &str) {
+    // The smallest multiple of m that is >= n (ceiling to a multiple of m),
+    // computed as ceil(n/m)*m in u128 to avoid overflow. "nextmultiple 17 5 -> 20",
+    // "nextmultiple 20 5 -> 20" (n already a multiple), "nextmultiple 1 10 -> 10",
+    // "nextmultiple 100 7 -> 105", "nextmultiple 0 5 -> 0". m = 0 is reported, not a
+    // crash. A rounding-up arithmetic primitive distinct from divmod and gcd/lcm.
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<u64>().ok());
+    let m = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (n, m) {
+        (Some(_), Some(0)) => crate::kprintln!("nextmultiple: m must be nonzero"),
+        (Some(n), Some(m)) => {
+            let nn = n as u128;
+            let mm = m as u128;
+            let up = ((nn + mm - 1) / mm) * mm;
+            crate::kprintln!("nextmultiple: {} -> {} (multiple of {})", n, up, m);
+        }
+        _ => crate::kprintln!("usage: nextmultiple <n> <m>"),
+    }
+}
+
+/// `iscoprime` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_iscoprime(line: &str, cmd: &str, rest: &str) {
+    // Classify whether two integers are COPRIME (relatively prime) -- i.e. gcd(a, b) = 1.
+    // "iscoprime 8 15" -> coprime (gcd 1), "iscoprime 12 18" -> NOT coprime (gcd 6). A
+    // boolean predicate over the gcd; distinct from gcd (which prints the gcd + lcm values).
+    let mut it = rest.split_whitespace();
+    let a = it.next().and_then(|s| s.parse::<u64>().ok());
+    let b = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let (mut x, mut y) = (a, b);
+            while y != 0 {
+                let t = y;
+                y = x % y;
+                x = t;
+            }
+            let g = x;
+            if g == 1 {
+                crate::kprintln!("iscoprime: {} and {} are coprime (gcd 1)", a, b);
+            } else {
+                crate::kprintln!(
+                    "iscoprime: {} and {} are NOT coprime (gcd {})",
+                    a, b, g
+                );
+            }
+        }
+        _ => crate::kprintln!("usage: iscoprime <a> <b>"),
+    }
+}
+
+/// `isharmonic` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_isharmonic(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n (>= 1) is a HARMONIC DIVISOR (Ore) number: the HARMONIC
+    // mean of its divisors, H = n*tau(n)/sigma(n), is an integer (OEIS A001599).
+    // 1, 6, 28, 140, 270, 496, 672, ... IS; 2, 10, 100 are NOT. Every perfect
+    // number is harmonic. Distinct from perfect (sigma == 2n) and isarithmetic
+    // (the ARITHMETIC mean sigma/tau). Trial division to d <= n/d, n capped at 1e8
+    // so sigma and n*tau fit u64 (tau <= ~768 for n <= 1e8, so 1e8*tau < u64 max).
+    match rest.trim().parse::<u64>() {
+        Ok(0) => crate::kprintln!("isharmonic: 0 is NOT harmonic (needs n >= 1)"),
+        Ok(n) if n <= 100_000_000 => {
+            let mut tau = 0u64;
+            let mut sigma = 0u64;
+            let mut d = 1u64;
+            while d <= n / d {
+                if n % d == 0 {
+                    tau += 1;
+                    sigma += d;
+                    let e = n / d;
+                    if e != d {
+                        tau += 1;
+                        sigma += e;
+                    }
+                }
+                d += 1;
+            }
+            if (n * tau) % sigma == 0 {
+                crate::kprintln!(
+                    "isharmonic: {} IS harmonic (divisor harmonic mean {})",
+                    n,
+                    (n * tau) / sigma
+                );
+            } else {
+                crate::kprintln!(
+                    "isharmonic: {} is NOT harmonic (n*tau {} not divisible by sigma {})",
+                    n,
+                    n * tau,
+                    sigma
+                );
+            }
+        }
+        Ok(_) => crate::kprintln!("isharmonic: n too large (max 100000000)"),
+        Err(_) => crate::kprintln!("usage: isharmonic <n>"),
+    }
+}
+
+/// `kaprekar` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_kaprekar(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n (n>=1) is a KAPREKAR number: split the decimal
+    // digits of n^2 so the RIGHT part has as many digits as n itself, and
+    // the two parts sum to n (45^2=2025 -> 20+25=45; 9^2=81 -> 8+1=9;
+    // 99^2=9801 -> 98+01=99; 297,703,999,2223 yes; 1 yes: 1^2=1 -> 0+1).
+    // The low part must be positive. n^2 is computed in u128 to avoid
+    // overflow. Distinct from issquare, armstrong, and automorphic.
+    match rest.trim().parse::<u64>() {
+        Ok(n) if n >= 1 => {
+            // Number of decimal digits of n.
+            let mut d = 0u32;
+            let mut t = n;
+            while t > 0 {
+                d += 1;
+                t /= 10;
+            }
+            let sq = (n as u128) * (n as u128);
+            let pw = 10u128.pow(d);
+            let low = sq % pw;
+            let high = sq / pw;
+            if low > 0 && high + low == n as u128 {
+                crate::kprintln!(
+                    "kaprekar: {} IS a Kaprekar number ({}^2 = {} -> {} + {})",
+                    n, n, sq, high, low
+                );
+            } else {
+                crate::kprintln!("kaprekar: {} is NOT a Kaprekar number", n);
+            }
+        }
+        _ => crate::kprintln!("usage: kaprekar <n>"),
+    }
+}
+
+/// `commonsuffix` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_commonsuffix(line: &str, cmd: &str, rest: &str) {
+    // The longest common SUFFIX of two whitespace-separated strings -- the mirror of
+    // commonprefix. "commonsuffix testing running" -> "ing", "commonsuffix yellow fellow"
+    // -> "ellow", "commonsuffix abc xyz" -> "" (empty). Byte-wise comparison from the END.
+    // Distinct from stripsuffix (removes a KNOWN suffix if present) and after (splits on a
+    // separator) -- this DISCOVERS the shared trailing run of two strings.
+    let mut it = rest.split_whitespace();
+    match (it.next(), it.next()) {
+        (Some(a), Some(b)) => {
+            let ab = a.as_bytes();
+            let bb = b.as_bytes();
+            let mut i = 0usize;
+            while i < ab.len()
+                && i < bb.len()
+                && ab[ab.len() - 1 - i] == bb[bb.len() - 1 - i]
+            {
+                i += 1;
+            }
+            crate::kprintln!(
+                "commonsuffix: {}",
+                core::str::from_utf8(&ab[ab.len() - i..]).unwrap_or("?")
+            );
+        }
+        _ => crate::kprintln!("usage: commonsuffix <a> <b>"),
+    }
+}
+
+/// `middlechar` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_middlechar(line: &str, cmd: &str, rest: &str) {
+    // Emit the MIDDLE character(s) of the inline text, delimited by [ ]:
+    // an odd length gives the single middle char ("hello" -> "l"), an even
+    // length gives the two middle chars ("test" -> "es"). Distinct from
+    // charat (a char at an explicit INDEX of a VFS FILE), firstn/lastn
+    // (prefix/suffix), and chars (a character-class breakdown) -- this
+    // auto-computes the center of a string.
+    if rest.is_empty() {
+        crate::kprintln!("usage: middlechar <text>");
+    } else {
+        let b = rest.as_bytes();
+        let n = b.len();
+        let mid = if n % 2 == 1 {
+            &b[(n - 1) / 2..(n - 1) / 2 + 1] // one middle char
+        } else {
+            &b[n / 2 - 1..n / 2 + 1] // two middle chars
+        };
+        crate::kprintln!(
+            "middlechar: [{}]",
+            core::str::from_utf8(mid).unwrap_or("?")
+        );
+    }
+}
+
+/// `soundex` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_soundex(line: &str, cmd: &str, rest: &str) {
+    // Soundex phonetic encoding: first letter (uppercased) + 3 digits.
+    // Standard h/w-aware algorithm. ASCII-only, no heap.
+    fn digit(c: u8) -> u8 {
+        match c {
+            b'b' | b'f' | b'p' | b'v' => 1,
+            b'c' | b'g' | b'j' | b'k' | b'q' | b's' | b'x' | b'z' => 2,
+            b'd' | b't' => 3,
+            b'l' => 4,
+            b'm' | b'n' => 5,
+            b'r' => 6,
+            _ => 0, // a/e/i/o/u/h/w/y and anything else
+        }
+    }
+    match rest.split_whitespace().next() {
+        None => crate::kprintln!("usage: soundex <word>"),
+        Some(word) => {
+            let bytes = word.as_bytes();
+            // First alphabetic byte becomes the leading letter.
+            match bytes.iter().position(|&c| (c | 0x20).is_ascii_lowercase()) {
+                None => crate::kprintln!("usage: soundex <word>"),
+                Some(start) => {
+                    let first_lower = bytes[start] | 0x20;
+                    let mut out = [0u8; 4];
+                    out[0] = first_lower & !0x20; // uppercase
+                    let mut len = 1usize;
+                    let mut prev = digit(first_lower);
+                    for &c in &bytes[start + 1..] {
+                        let cl = c | 0x20;
+                        if !(b'a'..=b'z').contains(&cl) {
+                            continue; // skip non-letters, leave prev unchanged
+                        }
+                        let code = digit(cl);
+                        if code != 0 && code != prev && len < 4 {
+                            out[len] = b'0' + code;
+                            len += 1;
+                        }
+                        if cl != b'h' && cl != b'w' {
+                            prev = code; // h/w do not update prev; vowels reset it to 0
+                        }
+                    }
+                    while len < 4 {
+                        out[len] = b'0';
+                        len += 1;
+                    }
+                    crate::kprintln!(
+                        "soundex: {}",
+                        core::str::from_utf8(&out[..4]).unwrap_or("?")
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `isbinpalindrome` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_isbinpalindrome(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n's BINARY representation (no leading zeros) is a
+    // palindrome: 5=101, 7=111, 9=1001, 585=1001001001 IS; 6=110, 10=1010 NOT.
+    // Reverses the low `bit_len` bits of n and compares. Distinct from revnum
+    // (DECIMAL palindrome), bitrev (reverses ALL 32 bits including leading
+    // zeros), and isrepdigit. 0 -> "0" is trivially a palindrome.
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let bits = if n == 0 { 1 } else { 64 - n.leading_zeros() };
+            // Reverse the low `bits` bits of n.
+            let mut rev = 0u64;
+            let mut i = 0u32;
+            while i < bits {
+                if (n >> i) & 1 == 1 {
+                    rev |= 1u64 << (bits - 1 - i);
+                }
+                i += 1;
+            }
+            // Format the binary digits (MSB first) for the message.
+            let mut bin = [0u8; 64];
+            let mut bl = 0usize;
+            let mut j = bits;
+            while j > 0 {
+                j -= 1;
+                bin[bl] = b'0' + ((n >> j) & 1) as u8;
+                bl += 1;
+            }
+            let bstr = core::str::from_utf8(&bin[..bl]).unwrap_or("?");
+            if rev == n {
+                crate::kprintln!(
+                    "isbinpalindrome: {} ({}) IS a binary palindrome",
+                    n, bstr
+                );
+            } else {
+                crate::kprintln!(
+                    "isbinpalindrome: {} ({}) is NOT a binary palindrome",
+                    n, bstr
+                );
+            }
+        }
+        Err(_) => crate::kprintln!("usage: isbinpalindrome <n>"),
+    }
+}
+
+/// `ilog` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_ilog(line: &str, cmd: &str, rest: &str) {
+    // Integer logarithm floor(log_b(n)): the largest k with b^k <= n. Generalizes ilog2
+    // (base 2) to any base b >= 2 -- the log-side companion of iroot's root generalization.
+    // "ilog 10 999" -> 2, "ilog 10 1000" -> 3, "ilog 2 1024" -> 10, "ilog 3 27" -> 3,
+    // "ilog 7 6" -> 0. Requires b >= 2 and n >= 1. Uses p <= n/b to step without overflow.
+    let mut it = rest.split_whitespace();
+    let b = it.next().and_then(|s| s.parse::<u64>().ok());
+    let n = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (b, n) {
+        (Some(b), Some(n)) if b >= 2 && n >= 1 => {
+            let mut k = 0u32;
+            let mut p = 1u64;
+            while p <= n / b {
+                p *= b;
+                k += 1;
+            }
+            let exact = p == n; // b^k == n exactly
+            crate::kprintln!(
+                "ilog: floor(log{}({})) = {}{}",
+                b, n, k,
+                if exact { " (exact power)" } else { "" }
+            );
+        }
+        _ => crate::kprintln!("usage: ilog <b> <n> (b >= 2, n >= 1)"),
+    }
+}
+
+/// `isundulating` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_isundulating(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is an UNDULATING number: at least 3 decimal digits
+    // that strictly alternate between two DIFFERENT values a,b,a,b,...
+    // (121, 1212, 70707, 2323 IS; 123, 1234 NOT because no alternation;
+    // 111 NOT because a==b; anything under 3 digits NOT). Extract the digits
+    // MSB-first, then require d[0]!=d[1] and d[i]==d[i-2] for all i>=2 -- a
+    // pure digit walk, no overflow. Distinct from isrepdigit (all EQUAL),
+    // isdigitsorted (non-decreasing), and maxdigit (extreme values).
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            // Digit count, then fill digits[] most-significant-first.
+            let mut d = 0usize;
+            let mut c = n;
+            while c > 0 {
+                d += 1;
+                c /= 10;
+            }
+            let mut digits = [0u8; 20];
+            let mut c = n;
+            for i in (0..d).rev() {
+                digits[i] = (c % 10) as u8;
+                c /= 10;
+            }
+            let undulating = if d < 3 {
+                false
+            } else if digits[0] == digits[1] {
+                false // a == b: not a genuine undulation
+            } else {
+                let mut ok = true;
+                for i in 2..d {
+                    if digits[i] != digits[i - 2] {
+                        ok = false;
+                        break;
+                    }
+                }
+                ok
+            };
+            if undulating {
+                crate::kprintln!(
+                    "isundulating: {} IS undulating (digits alternate {}{}{}...)",
+                    n, digits[0], digits[1], digits[0]
+                );
+            } else {
+                crate::kprintln!("isundulating: {} is NOT undulating", n);
+            }
+        }
+        Err(_) => crate::kprintln!("usage: isundulating <n>"),
+    }
+}
+
+/// `armstrong` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_armstrong(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is an ARMSTRONG (narcissistic) number: the sum of
+    // each decimal digit raised to the power of the DIGIT COUNT equals n.
+    // e.g. 153 = 1^3+5^3+3^3, 9474 = 9^4+4^4+7^4+4^4. Distinct from digitsum
+    // (plain sum, no power), digitprod (product), and perfect (divisor sum).
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            // Digit count (0 has one digit).
+            let mut d: u32 = 0;
+            let mut c = n;
+            while c > 0 {
+                d += 1;
+                c /= 10;
+            }
+            if d == 0 {
+                d = 1;
+            }
+            // Accumulate in u128: a 20-digit power-sum can exceed u64, but
+            // stays far below u128 max (<= ~20 * 9^20), so no guard needed.
+            let mut sum: u128 = 0;
+            let mut x = n;
+            if x == 0 {
+                sum = 0; // the single digit 0 raised to any power is 0
+            } else {
+                while x > 0 {
+                    let digit = (x % 10) as u128;
+                    let mut term: u128 = 1;
+                    for _ in 0..d {
+                        term *= digit;
+                    }
+                    sum += term;
+                    x /= 10;
+                }
+            }
+            if sum == n as u128 {
+                crate::kprintln!(
+                    "armstrong: {} IS an Armstrong number (sum of digits^{} = {})",
+                    n, d, sum
+                );
+            } else {
+                crate::kprintln!(
+                    "armstrong: {} is NOT an Armstrong number (sum of digits^{} = {})",
+                    n, d, sum
+                );
+            }
+        }
+        Err(_) => crate::kprintln!("usage: armstrong <n>"),
+    }
+}
+
+/// `iszuckerman` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_iszuckerman(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is a ZUCKERMAN number: a positive integer divisible
+    // by the PRODUCT of its own digits. e.g. 24 (digit product 2*4=8, 24/8=3)
+    // IS; 13 (product 3, remainder 1) is NOT; any number containing a 0 digit
+    // has product 0 and is excluded. Distinct from harshad (divisible by the
+    // digit SUM) and digitprod (which only PRINTS the product + persistence,
+    // not the divisibility test).
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            // Digit product in u128 (saturating so a big n cannot panic).
+            let mut dp: u128 = 1;
+            let mut x = n;
+            if x == 0 {
+                dp = 0; // the single digit 0 gives product 0
+            } else {
+                while x > 0 {
+                    dp = dp.saturating_mul((x % 10) as u128);
+                    x /= 10;
+                }
+            }
+            if dp == 0 {
+                crate::kprintln!(
+                    "iszuckerman: {} is NOT a Zuckerman number (digit product 0 -- has a 0 digit)",
+                    n
+                );
+            } else if (n as u128) % dp == 0 {
+                crate::kprintln!(
+                    "iszuckerman: {} IS a Zuckerman number (digit product {} divides {})",
+                    n, dp, n
+                );
+            } else {
+                crate::kprintln!(
+                    "iszuckerman: {} is NOT a Zuckerman number (digit product {}, remainder {})",
+                    n, dp, (n as u128) % dp
+                );
+            }
+        }
+        Err(_) => crate::kprintln!("usage: iszuckerman <n>"),
+    }
+}
+
+/// `nexttriangular` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_nexttriangular(line: &str, cmd: &str, rest: &str) {
+    // The SMALLEST triangular number T(k)=k(k+1)/2 that is >= n, reporting the
+    // index k -- the triangular sibling of nextsquare/nextcube. nexttriangular(7)
+    // = T(4) = 10, nexttriangular(10) = T(4) = 10 (already triangular),
+    // nexttriangular(11) = T(5) = 15, nexttriangular(1) = T(1) = 1,
+    // nexttriangular(0) = T(0) = 0. Found via the floor triangular index
+    // k = (sqrt(8n+1)-1)/2, rounding up when T(k) < n. Distinct from triangular
+    // (a MEMBERSHIP test) and sumto (the nth triangular by index).
+    fn isqrt(v: u128) -> u128 {
+        if v < 2 {
+            return v;
+        }
+        let mut x = v;
+        let mut y = (x + 1) / 2;
+        while y < x {
+            x = y;
+            y = (x + v / x) / 2;
+        }
+        x
+    }
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let nn = n as u128;
+            // floor index k0 with T(k0) <= n, then round up if T(k0) < n
+            let s = isqrt(8 * nn + 1);
+            let mut k = (s - 1) / 2;
+            if k * (k + 1) / 2 < nn {
+                k += 1;
+            }
+            let t = k * (k + 1) / 2; // >= n, smallest triangular >= n
+            crate::kprintln!(
+                "nexttriangular: smallest triangular >= {} is T({}) = {}",
+                n, k as u64, t as u64
+            );
+        }
+        Err(_) => crate::kprintln!("usage: nexttriangular <n>"),
+    }
+}
+
+/// `shortestword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_shortestword(line: &str, cmd: &str, rest: &str) {
+    // Report the shortest whitespace-delimited word (by byte length) in the
+    // inline text, plus its length. Ties resolve to the FIRST such word.
+    // The min-analog of `longestword`. NOTE: unlike longestword's `best=""`
+    // seed (empty is never longer), shortest needs an Option -- an empty
+    // string would falsely win as the shortest.
+    let mut best: Option<&str> = None;
+    for w in rest.split_whitespace() {
+        match best {
+            None => best = Some(w),
+            Some(b) if w.len() < b.len() => best = Some(w),
+            _ => {}
+        }
+    }
+    match best {
+        None => crate::kprintln!("usage: shortestword <text>"),
+        Some(w) => crate::kprintln!("shortestword: {} ({} bytes)", w, w.len()),
+    }
+}
+
+/// `minmax` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_minmax(line: &str, cmd: &str, rest: &str) {
+    // Minimum and maximum of a list of integers (single pass).
+    let mut min = u64::MAX;
+    let mut max = 0u64;
+    let mut count: u64 = 0;
+    let mut bad = false;
+    for t in rest.split_whitespace() {
+        match t.parse::<u64>() {
+            Ok(v) => {
+                if v < min {
+                    min = v;
+                }
+                if v > max {
+                    max = v;
+                }
+                count += 1;
+            }
+            Err(_) => {
+                bad = true;
+                break;
+            }
+        }
+    }
+    if bad {
+        crate::kprintln!("minmax: invalid number");
+    } else if count == 0 {
+        crate::kprintln!("usage: minmax <n1> <n2> ...");
+    } else {
+        crate::kprintln!("minmax: min {}, max {} ({} values)", min, max, count);
+    }
+}
+
+/// `roundto` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_roundto(line: &str, cmd: &str, rest: &str) {
+    // Round n to the NEAREST multiple of m (round half up), computed as
+    // ((n + m/2) / m) * m in u128. "roundto 17 5 -> 15", "roundto 18 5 -> 20", "roundto
+    // 12 5 -> 10", "roundto 13 5 -> 15", "roundto 25 10 -> 30" (exact half rounds up).
+    // m = 0 is reported, not a crash. The nearest-multiple companion of nextmultiple
+    // (which always rounds UP); distinct from divmod and gcd/lcm.
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<u64>().ok());
+    let m = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (n, m) {
+        (Some(_), Some(0)) => crate::kprintln!("roundto: m must be nonzero"),
+        (Some(n), Some(m)) => {
+            let nn = n as u128;
+            let mm = m as u128;
+            let nearest = ((nn + mm / 2) / mm) * mm;
+            crate::kprintln!("roundto: {} -> {} (nearest multiple of {})", n, nearest, m);
+        }
+        _ => crate::kprintln!("usage: roundto <n> <m>"),
+    }
+}
+
+/// `gcd3` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_gcd3(line: &str, cmd: &str, rest: &str) {
+    // GCD of THREE integers via gcd(gcd(a, b), c) -- the three-argument extension of gcd.
+    // "gcd3 12 18 24 -> 6", "gcd3 100 40 60 -> 20", "gcd3 8 12 20 -> 4", "gcd3 7 5 3 -> 1"
+    // (coprime). Distinct from gcd (two integers, also prints lcm).
+    fn gcd2(mut x: u64, mut y: u64) -> u64 {
+        while y != 0 {
+            let t = y;
+            y = x % y;
+            x = t;
+        }
+        x
+    }
+    let mut it = rest.split_whitespace();
+    let a = it.next().and_then(|s| s.parse::<u64>().ok());
+    let b = it.next().and_then(|s| s.parse::<u64>().ok());
+    let c = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (a, b, c) {
+        (Some(a), Some(b), Some(c)) => {
+            let g = gcd2(gcd2(a, b), c);
+            crate::kprintln!("gcd3({}, {}, {}) = {}", a, b, c, g);
+        }
+        _ => crate::kprintln!("usage: gcd3 <a> <b> <c>"),
+    }
+}
+
+/// `isarithmetic` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_isarithmetic(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n (>= 1) is an ARITHMETIC number: the average of its
+    // positive divisors is an integer, i.e. sigma(n) (divisor SUM) is divisible
+    // by tau(n) (divisor COUNT). 1, 3, 5, 6, 7 IS (means 1, 2, 3, 3, 4); 2 is
+    // NOT (divisors 1,2 sum 3, 3/2 = 1.5). The first non-arithmetic number is
+    // 2. Trial division to i <= n/i (n capped at 1e8 so sigma fits u64 and the
+    // scan stays fast). Distinct from perfect (sigma == 2n) and ispractical.
+    match rest.trim().parse::<u64>() {
+        Ok(0) => crate::kprintln!("isarithmetic: 0 is NOT arithmetic (needs n >= 1)"),
+        Ok(n) if n <= 100_000_000 => {
+            let mut tau = 0u64;
+            let mut sigma = 0u64;
+            let mut d = 1u64;
+            while d <= n / d {
+                if n % d == 0 {
+                    tau += 1;
+                    sigma += d;
+                    let e = n / d;
+                    if e != d {
+                        tau += 1;
+                        sigma += e;
+                    }
+                }
+                d += 1;
+            }
+            if sigma % tau == 0 {
+                crate::kprintln!(
+                    "isarithmetic: {} IS arithmetic (divisor mean {})",
+                    n,
+                    sigma / tau
+                );
+            } else {
+                crate::kprintln!(
+                    "isarithmetic: {} is NOT arithmetic (divisor sum {} not divisible by count {})",
+                    n, sigma, tau
+                );
+            }
+        }
+        Ok(_) => crate::kprintln!("isarithmetic: n too large (max 100000000)"),
+        Err(_) => crate::kprintln!("usage: isarithmetic <n>"),
+    }
+}
+
+/// `bitops` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_bitops(line: &str, cmd: &str, rest: &str) {
+    // The three binary bitwise operations of two integers in one shot: AND, OR, XOR.
+    // "bitops 12 10 -> and 8 or 14 xor 6" (1100 & 1010 = 1000, | = 1110, ^ = 0110),
+    // "bitops 255 15 -> and 15 or 255 xor 240". A fundamental bit primitive distinct from
+    // popcount (set bits of ONE number) and hammingdist (popcount of the XOR only).
+    let mut it = rest.split_whitespace();
+    let a = it.next().and_then(|s| s.parse::<u64>().ok());
+    let b = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            crate::kprintln!(
+                "bitops: {} and {} -> and {} or {} xor {}",
+                a,
+                b,
+                a & b,
+                a | b,
+                a ^ b
+            );
+        }
+        _ => crate::kprintln!("usage: bitops <a> <b>"),
+    }
+}
+
+/// `luhn` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_luhn(line: &str, cmd: &str, rest: &str) {
+    // Luhn mod-10 check-digit validity of a digit string.
+    let s = rest.trim();
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        crate::kprintln!("usage: luhn <digits>");
+    } else {
+        let mut sum = 0u32;
+        for (i, &b) in s.as_bytes().iter().rev().enumerate() {
+            let mut v = (b - b'0') as u32;
+            if i % 2 == 1 {
+                v *= 2;
+                if v > 9 {
+                    v -= 9;
+                }
+            }
+            sum += v;
+        }
+        let valid = sum % 10 == 0;
+        crate::kprintln!(
+            "luhn: {} is {} (checksum sum {}, mod 10 = {})",
+            s,
+            if valid { "VALID" } else { "INVALID" },
+            sum,
+            sum % 10
+        );
+    }
+}
+
+/// `giccinfo` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_giccinfo(line: &str, cmd: &str, rest: &str) {
+    // Read the GICv2 CPU interface identity + control regs (complements gicinfo).
+    #[cfg(not(feature = "board-raspi"))]
+    {
+        let base = crate::gic::cpu_base();
+        // SAFETY: read-only MMIO of the GICv2 CPU interface (present on virt).
+        let iidr = unsafe { core::ptr::read_volatile((base + 0x0fc) as *const u32) };
+        let ctlr = unsafe { core::ptr::read_volatile((base + 0x000) as *const u32) };
+        let pmr = unsafe { core::ptr::read_volatile((base + 0x004) as *const u32) };
+        let implementer = iidr & 0xfff;
+        let revision = (iidr >> 12) & 0xf;
+        let arch = (iidr >> 16) & 0xf;
+        let product = (iidr >> 20) & 0xfff;
+        let enabled = ctlr & 1 != 0;
+        crate::kprintln!("giccinfo: GICC_IIDR = 0x{:08x}", iidr);
+        crate::kprintln!(
+            "giccinfo: implementer = 0x{:03x}  arch = GICv{}  rev = {}  product = 0x{:x}",
+            implementer, arch, revision, product
+        );
+        crate::kprintln!(
+            "giccinfo: CTLR enable = {}  PMR = 0x{:02x}",
+            if enabled { "on" } else { "off" },
+            pmr & 0xff
+        );
+    }
+    #[cfg(feature = "board-raspi")]
+    {
+        crate::kprintln!("giccinfo: no GIC CPU interface on this board");
+    }
+}
+
+/// `wordfromend` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wordfromend(line: &str, cmd: &str, rest: &str) {
+    // Print the Nth (1-based) word counting from the END of the inline text. "wordfromend
+    // 1 a b c d" -> "d", "wordfromend 2 a b c d" -> "c", "wordfromend 4 a b c d" -> "a",
+    // "wordfromend 5 a b c" -> "(none)". The end-anchored mirror of wordat (Nth word from
+    // the START); distinct from lastword (the LAST word) and lastwords (the last n words).
+    let (nstr, text) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim_start()),
+        None => (rest.trim(), ""),
+    };
+    match nstr.parse::<usize>() {
+        Ok(n) if n >= 1 && !text.is_empty() => {
+            let total = text.split_whitespace().count();
+            if n <= total {
+                // Nth from end = (total - n)th from start (0-based).
+                let w = text.split_whitespace().nth(total - n).unwrap_or("");
+                crate::kprintln!("wordfromend: {}", w);
+            } else {
+                crate::kprintln!("wordfromend: (none)");
+            }
+        }
+        _ => crate::kprintln!("usage: wordfromend <n> <text>"),
+    }
+}
+
+/// `uart8250` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_uart8250(line: &str, cmd: &str, rest: &str) {
+    // Exercise the DesignWare 8250/16550 console driver (uart_ns16550.rs).
+    // No board we can run has that part, so the driver is checked against a
+    // RAM-backed fake register block: offsets, THRE/DR polarity, the bounded
+    // TX spin. It verifies the port's register discipline, not silicon.
+    crate::kprintln!(
+        "uart8250: console driver on this build = {} ({} @ {:#010x})",
+        crate::uart::driver_name(),
+        crate::board::ACTIVE.uart_kind,
+        crate::board::UART_BASE
+    );
+    crate::kprintln!(
+        "uart8250: self-test target = fake register block in RAM (reg-shift {}, tx spin limit {})",
+        crate::uart_ns16550::REG_SHIFT,
+        crate::uart_ns16550::TX_SPIN_LIMIT
+    );
+    let (pass, total) = crate::uart_ns16550::selftest();
+    if pass == total {
+        crate::kprintln!("uart8250: {}/{} checks passed", pass, total);
+    } else {
+        crate::kprintln!("uart8250: {}/{} checks passed — FAILURES above", pass, total);
+    }
+}
+
+/// `narayana` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_narayana(line: &str, cmd: &str, rest: &str) {
+    // nth Narayana's cows number: N(0)=N(1)=N(2)=1, N(n)=N(n-1)+N(n-3) in u128
+    // -> 1,1,1,2,3,4,6,9,13,19,28,41,... It counts a cow herd where each cow
+    // bears one calf per year from its fourth year on, and grows at the
+    // supergolden ratio ~1.4656. Distinct from fib (N(n-1)+N(n-2)), padovan/
+    // perrin (the GAP recurrence N(n-2)+N(n-3)), and tribonacci. Guards u128
+    // overflow (N(233) fits, N(234) overflows).
+    match rest.trim().parse::<u64>() {
+        Ok(n) if n <= 2 => crate::kprintln!("narayana: N({}) = 1", n),
+        Ok(n) => {
+            let mut a: u128 = 1; // N(k-3)
+            let mut b: u128 = 1; // N(k-2)
+            let mut c: u128 = 1; // N(k-1), starting at k = 3 with N(0),N(1),N(2)
+            let mut overflow = false;
+            for _ in 3..=n {
+                // N(k) = N(k-1) + N(k-3) = c + a
+                match c.checked_add(a) {
+                    Some(s) => {
+                        a = b;
+                        b = c;
+                        c = s;
+                    }
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+            }
+            if overflow {
+                crate::kprintln!("narayana: N({}) overflows u128", n);
+            } else {
+                crate::kprintln!("narayana: N({}) = {}", n, c);
+            }
+        }
+        Err(_) => crate::kprintln!("usage: narayana <n>"),
+    }
+}
+
+/// `automorphic` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_automorphic(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is an AUTOMORPHIC number: n^2 ENDS IN n, i.e.
+    // n^2 mod 10^k == n where k is the digit count of n. e.g. 5^2=25,
+    // 25^2=625, 76^2=5776. Distinct from armstrong (digit-power-sum),
+    // isqrt/icbrt (roots), sumsq (sum of squares), and pow (exponent).
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            // Digit count (0 counts as one digit).
+            let mut k: u32 = 0;
+            let mut c = n;
+            while c > 0 {
+                k += 1;
+                c /= 10;
+            }
+            if k == 0 {
+                k = 1;
+            }
+            // Square in u128 so large n cannot overflow; compare the low k
+            // decimal digits against n.
+            let sq = (n as u128) * (n as u128);
+            let m = 10u128.pow(k);
+            if sq % m == n as u128 {
+                crate::kprintln!(
+                    "automorphic: {} IS automorphic ({}^2 = {} ends in {})",
+                    n, n, sq, n
+                );
+            } else {
+                crate::kprintln!(
+                    "automorphic: {} is NOT automorphic ({}^2 = {})",
+                    n, n, sq
+                );
+            }
+        }
+        Err(_) => crate::kprintln!("usage: automorphic <n>"),
+    }
+}
+
+/// `centeredtriangular` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_centeredtriangular(line: &str, cmd: &str, rest: &str) {
+    // Compute the nth CENTERED TRIANGULAR number CT(n) = 3n(n-1)/2 + 1 -- a dot
+    // at the centre surrounded by triangular rings. CT(1..6) = 1, 4, 10, 19, 31,
+    // 46 (OEIS A005448). Completes the centered-polygonal family with centeredhex
+    // (3n(n-1)+1), starnumber (6n(n-1)+1), and centeredsquare (2n(n-1)+1). Since
+    // n(n-1) is even, the /2 is exact. Evaluated as (n*n - n)/2 * 3 + 1 in u128
+    // (n*n - n never underflows since n*n >= n, checked_mul guards overflow).
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let a = n as u128;
+            match a.checked_mul(a) {
+                Some(sq) => {
+                    // sq - a = a(a-1) is even and never underflows (sq >= a)
+                    let half = (sq - a) / 2;
+                    match half.checked_mul(3).and_then(|t| t.checked_add(1)) {
+                        Some(v) => {
+                            crate::kprintln!("centeredtriangular: CT({}) = {}", n, v)
+                        }
+                        None => crate::kprintln!(
+                            "centeredtriangular: CT({}) overflowed u128",
+                            n
+                        ),
+                    }
+                }
+                None => {
+                    crate::kprintln!("centeredtriangular: CT({}) overflowed u128", n)
+                }
+            }
+        }
+        Err(_) => crate::kprintln!("usage: centeredtriangular <n>"),
+    }
+}
+
+/// `centeredpentagonal` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_centeredpentagonal(line: &str, cmd: &str, rest: &str) {
+    // Compute the nth CENTERED PENTAGONAL number CP(n) = 5n(n-1)/2 + 1 -- a dot at
+    // the centre surrounded by pentagonal rings. CP(1..6) = 1, 6, 16, 31, 51, 76
+    // (OEIS A005891). Completes the centered-polygonal family alongside
+    // centeredtriangular (3n(n-1)/2+1), centeredsquare (2n(n-1)+1), centeredhex
+    // (3n(n-1)+1), and starnumber (6n(n-1)+1). Since n(n-1) is even the /2 is exact.
+    // Evaluated as (n*n - n)/2 * 5 + 1 in u128 (n*n - n never underflows; checked_mul).
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let a = n as u128;
+            match a.checked_mul(a) {
+                Some(sq) => {
+                    // sq - a = a(a-1) is even and never underflows (sq >= a)
+                    let half = (sq - a) / 2;
+                    match half.checked_mul(5).and_then(|t| t.checked_add(1)) {
+                        Some(v) => {
+                            crate::kprintln!("centeredpentagonal: CP({}) = {}", n, v)
+                        }
+                        None => crate::kprintln!(
+                            "centeredpentagonal: CP({}) overflowed u128",
+                            n
+                        ),
+                    }
+                }
+                None => {
+                    crate::kprintln!("centeredpentagonal: CP({}) overflowed u128", n)
+                }
+            }
+        }
+        Err(_) => crate::kprintln!("usage: centeredpentagonal <n>"),
+    }
+}
+
+/// `centeredheptagonal` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_centeredheptagonal(line: &str, cmd: &str, rest: &str) {
+    // Compute the nth CENTERED HEPTAGONAL number CH(n) = 7n(n-1)/2 + 1 -- a dot at
+    // the centre surrounded by heptagonal (7-sided) rings. CH(1..6) = 1, 8, 22, 43,
+    // 71, 106 (OEIS A069099). Extends the centered-polygonal family (general form
+    // k*n(n-1)/2+1): centeredtriangular k=3, centeredsquare k=4 (2n(n-1)+1),
+    // centeredpentagonal k=5, centeredhex k=6 (3n(n-1)+1), now heptagonal k=7. Since
+    // n(n-1) is even the /2 is exact; (n*n - n)/2 * 7 + 1 in u128 (checked_mul).
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let a = n as u128;
+            match a.checked_mul(a) {
+                Some(sq) => {
+                    // sq - a = a(a-1) is even and never underflows (sq >= a)
+                    let half = (sq - a) / 2;
+                    match half.checked_mul(7).and_then(|t| t.checked_add(1)) {
+                        Some(v) => {
+                            crate::kprintln!("centeredheptagonal: CH({}) = {}", n, v)
+                        }
+                        None => crate::kprintln!(
+                            "centeredheptagonal: CH({}) overflowed u128",
+                            n
+                        ),
+                    }
+                }
+                None => {
+                    crate::kprintln!("centeredheptagonal: CH({}) overflowed u128", n)
+                }
+            }
+        }
+        Err(_) => crate::kprintln!("usage: centeredheptagonal <n>"),
+    }
+}
+
+/// `tail` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_tail(line: &str, cmd: &str, rest: &str) {
+    // Print the last N bytes of a VFS file (whole file if N exceeds size).
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<usize>().ok());
+    let file = it.next();
+    match (n, file) {
+        (Some(n), Some(file)) => match vfs::read_raw(file) {
+            None => crate::kprintln!("tail: {} not found", file),
+            Some(data) => {
+                let start = data.len().saturating_sub(n);
+                crate::kprintln!(
+                    "tail: {}",
+                    core::str::from_utf8(&data[start..]).unwrap_or("?")
+                );
+            }
+        },
+        _ => crate::kprintln!("usage: tail <n> <file>"),
+    }
+}
+
+/// `clamp` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_clamp(line: &str, cmd: &str, rest: &str) {
+    // Constrain n to the inclusive range [lo, hi] = max(lo, min(n, hi)). "clamp 5 1 10 ->
+    // 5" (in range), "clamp 15 1 10 -> 10" (above -> hi), "clamp 0 1 10 -> 1" (below ->
+    // lo), "clamp 7 7 7 -> 7". A basic range-limiting primitive distinct from minmax (min
+    // and max OF a list) and median.
+    let mut it = rest.split_whitespace();
+    let n = it.next().and_then(|s| s.parse::<u64>().ok());
+    let lo = it.next().and_then(|s| s.parse::<u64>().ok());
+    let hi = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (n, lo, hi) {
+        (Some(n), Some(lo), Some(hi)) => {
+            let clamped = if n < lo {
+                lo
+            } else if n > hi {
+                hi
+            } else {
+                n
+            };
+            crate::kprintln!("clamp: {} in [{}, {}] = {}", n, lo, hi, clamped);
+        }
+        _ => crate::kprintln!("usage: clamp <n> <lo> <hi>"),
+    }
+}
+
+/// `charcount` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_charcount(line: &str, cmd: &str, rest: &str) {
+    // Count how many times a single character occurs in a VFS file
+    // (the FIRST character of <ch>, across the whole file content).
+    // Distinct from grepc (counts matching LINES) and histogram (freq of
+    // ALL bytes) -- this counts ONE specific char.
+    let (needle, file) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim()),
+        None => (rest, ""),
+    };
+    if needle.is_empty() || file.is_empty() {
+        crate::kprintln!("usage: charcount <ch> <file>");
+    } else {
+        let target = needle.as_bytes()[0];
+        match vfs::read_str(file) {
+            None => crate::kprintln!("charcount: no such file: {}", file),
+            Some(s) => {
+                let n = s.as_bytes().iter().filter(|&&b| b == target).count();
+                crate::kprintln!("charcount: {} occurs {} times", target as char, n);
+            }
+        }
+    }
+}
+
+/// `countword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_countword(line: &str, cmd: &str, rest: &str) {
+    // Count how many WHOLE whitespace-delimited words in the INLINE text
+    // exactly equal <word> (case-sensitive, punctuation kept). The word-
+    // level companion of countchar; distinct from wordfreq (the most
+    // frequent word in a VFS FILE), grepc (matching LINES), and wc.
+    let (needle, text) = match rest.find(' ') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    if needle.is_empty() || text.is_empty() {
+        crate::kprintln!("usage: countword <word> <text>");
+    } else {
+        let n = text.split_whitespace().filter(|w| *w == needle).count();
+        crate::kprintln!("countword: {} occurs {} times", needle, n);
+    }
+}
+
+/// `ask` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_ask(line: &str, cmd: &str, rest: &str) {
+    // Query the on-device Asili assistant directly (private, no cloud).
+    if rest.is_empty() {
+        crate::kprintln!("usage: ask <question>   (e.g. 'ask 20% of 150' or 'ask who are you')");
+    } else {
+        let mut out = [0u8; 256];
+        let n = crate::nia::respond(rest.as_bytes(), &mut out);
+        crate::kprintln!("[asili] {}", core::str::from_utf8(&out[..n]).unwrap_or("?"));
+    }
+}
+
+/// `cacheinfo` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_cacheinfo(line: &str, cmd: &str, rest: &str) {
+    // Decode CTR_EL0 (the Cache Type Register): cache line geometry.
+    let ctr: u64;
+    // SAFETY: CTR_EL0 is a standard AArch64 register readable at EL1.
+    unsafe { #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr); #[cfg(not(target_arch = "aarch64"))] { ctr = crate::shell_pc::sysreg("ctr_el0"); }
+    }
+    let raw = (ctr & 0xffff_ffff) as u32;
+    let imin = (raw & 0xf) as u32; // IminLine: log2(icache line / words)
+    let dmin = ((raw >> 16) & 0xf) as u32; // DminLine: log2(dcache line / words)
+    let erg = ((raw >> 20) & 0xf) as u32; // exclusives reservation granule
+    let cwg = ((raw >> 24) & 0xf) as u32; // cache writeback granule
+    let icache_bytes = 4u32 << imin;
+    let dcache_bytes = 4u32 << dmin;
+    let erg_bytes = 4u32 << erg;
+    crate::kprintln!("cacheinfo: CTR_EL0 = 0x{:08x}", raw);
+    crate::kprintln!(
+        "cacheinfo: icache min line = {} bytes (IminLine={})",
+        icache_bytes, imin
+    );
+    crate::kprintln!(
+        "cacheinfo: dcache min line = {} bytes (DminLine={})",
+        dcache_bytes, dmin
+    );
+    if cwg == 0 {
+        crate::kprintln!("cacheinfo: CWG = unknown  ERG = {} bytes", erg_bytes);
+    } else {
+        let cwg_bytes = 4u32 << cwg;
+        crate::kprintln!("cacheinfo: CWG = {} bytes  ERG = {} bytes", cwg_bytes, erg_bytes);
+    }
+}
+
+/// `dfr` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_dfr(line: &str, cmd: &str, rest: &str) {
+    // Decode ID_AA64DFR0_EL1 (Debug Feature Register 0): debug architecture
+    // version, hardware breakpoint/watchpoint counts, and PMU version.
+    let dfr: u64;
+    // SAFETY: ID_AA64DFR0_EL1 is a standard AArch64 ID register readable at EL1.
+    unsafe { #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("mrs {}, id_aa64dfr0_el1", out(reg) dfr); #[cfg(not(target_arch = "aarch64"))] { dfr = crate::shell_pc::sysreg("id_aa64dfr0_el1"); }
+    }
+    let debug_ver = dfr & 0xf;
+    let pmu_ver = (dfr >> 8) & 0xf;
+    let brps = (dfr >> 12) & 0xf;
+    let wrps = (dfr >> 20) & 0xf;
+    let debug_name = match debug_ver {
+        6 => "ARMv8",
+        7 => "ARMv8-VHE",
+        8 => "ARMv8.2",
+        9 => "ARMv8.4",
+        _ => "?",
+    };
+    let pmu_name = match pmu_ver {
+        0 => "none",
+        1 => "PMUv3",
+        4 => "PMUv3(v8.1)",
+        0xf => "impl-defined",
+        _ => "?",
+    };
+    crate::kprintln!("dfr: ID_AA64DFR0_EL1 = 0x{:016x}", dfr);
+    crate::kprintln!("dfr: debug = {} (DebugVer={})", debug_name, debug_ver);
+    crate::kprintln!(
+        "dfr: breakpoints = {}  watchpoints = {}",
+        brps + 1,
+        wrps + 1
+    );
+    crate::kprintln!("dfr: PMU = {}", pmu_name);
+}
+
+/// `firstn` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_firstn(line: &str, cmd: &str, rest: &str) {
+    // Emit the first <n> bytes of a run of text, delimited by [ ] so the
+    // truncation is visible. If the text is shorter than n the whole text is
+    // emitted (n is clamped to the length). Reuses the wrap/center `<n>
+    // <text>` parse. Distinct from chars (a character-CLASS breakdown), cut
+    // (extracts a delimited FIELD), wordn (extracts a WORD), and head (first
+    // n LINES of a VFS file) -- this is a raw char-prefix of inline text.
+    let r = rest.trim_start();
+    let parsed = r.find(' ').and_then(|sp| {
+        r[..sp].parse::<usize>().ok().filter(|&k| k > 0).map(|k| (k, &r[sp + 1..]))
+    });
+    match parsed {
+        None => crate::kprintln!("usage: firstn <n> <text>"),
+        Some((n, text)) => {
+            let bytes = text.as_bytes();
+            let take = if n < bytes.len() { n } else { bytes.len() };
+            crate::kprintln!(
+                "firstn: [{}]",
+                core::str::from_utf8(&bytes[..take]).unwrap_or("?")
+            );
+        }
+    }
+}
+
+/// `isdisarium` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_isdisarium(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is a DISARIUM number: the sum of each decimal
+    // digit raised to the power of its 1-based POSITION FROM THE LEFT
+    // equals n. e.g. 89 = 8^1 + 9^2, 135 = 1^1 + 3^2 + 5^3, 175 = 1^1 +
+    // 7^2 + 5^3, 518 = 5^1 + 1^2 + 8^3. Distinct from armstrong, which
+    // raises every digit to the SAME power (the digit count).
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            // Digit count (0 has one digit); positions run 1..=d from the
+            // left, so a right-to-left digit walk uses pos = d, d-1, ..., 1.
+            let mut d: u32 = 0;
+            let mut c = n;
+            while c > 0 {
+                d += 1;
+                c /= 10;
+            }
+            if d == 0 {
+                d = 1;
+            }
+            // Accumulate in u128 with saturating ops so no input can panic
+            // (a 20-digit tail like 9^20 stays well within u128, but if a
+            // term ever saturated the sum != n comparison simply fails).
+            let mut sum: u128 = 0;
+            let mut x = n;
+            let mut pos = d; // rightmost digit has the largest position
+            if x == 0 {
+                sum = 0; // the single digit 0 to power 1 is 0
+            } else {
+                while x > 0 {
+                    let digit = (x % 10) as u128;
+                    let mut term: u128 = 1;
+                    for _ in 0..pos {
+                        term = term.saturating_mul(digit);
+                    }
+                    sum = sum.saturating_add(term);
+                    x /= 10;
+                    pos -= 1;
+                }
+            }
+            if sum == n as u128 {
+                crate::kprintln!(
+                    "isdisarium: {} IS a Disarium number (sum of digit^position = {})",
+                    n, sum
+                );
+            } else {
+                crate::kprintln!(
+                    "isdisarium: {} is NOT a Disarium number (sum of digit^position = {})",
+                    n, sum
+                );
+            }
+        }
+        Err(_) => crate::kprintln!("usage: isdisarium <n>"),
+    }
+}
+
+/// `isprimepower` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_isprimepower(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n (>= 2) is a PRIME POWER: n = p^k for a single prime p
+    // and k >= 1 (so primes themselves qualify): 7=7^1, 8=2^3, 9=3^2, 25=5^2 IS;
+    // 12=2^2*3 and 36=2^2*3^2 (two distinct primes) NOT. Factor by trial
+    // division and count DISTINCT primes -- n is a prime power iff there is
+    // exactly one. Distinct from isperfectpower (a^b for ANY a>=2: 36 IS a
+    // perfect power but NOT a prime power) and semiprime.
+    match rest.trim().parse::<u64>() {
+        Ok(n) if n >= 2 => {
+            let mut m = n;
+            let mut distinct = 0u32;
+            let mut base = 0u64;
+            let mut exp = 0u32;
+            let mut d = 2u64;
+            while d <= m / d {
+                if m % d == 0 {
+                    distinct += 1;
+                    base = d;
+                    exp = 0;
+                    while m % d == 0 {
+                        m /= d;
+                        exp += 1;
+                    }
+                }
+                d += 1;
+            }
+            if m > 1 {
+                // A leftover factor is a prime to the first power (any square
+                // factor would have a base <= sqrt and been caught above).
+                distinct += 1;
+                base = m;
+                exp = 1;
+            }
+            if distinct == 1 {
+                crate::kprintln!(
+                    "isprimepower: {} IS a prime power ({}^{})",
+                    n, base, exp
+                );
+            } else {
+                crate::kprintln!("isprimepower: {} is NOT a prime power", n);
+            }
+        }
+        Ok(n) => crate::kprintln!(
+            "isprimepower: {} is NOT a prime power (needs n >= 2)",
+            n
+        ),
+        Err(_) => crate::kprintln!("usage: isprimepower <n>"),
+    }
+}
+
+/// `longestword` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_longestword(line: &str, cmd: &str, rest: &str) {
+    // Report the longest whitespace-delimited word (by byte length) in the
+    // inline text, plus its length. Ties resolve to the FIRST such word.
+    // Distinct from `rwords` (reverses word ORDER), `chars`/`vowels`
+    // (counts), and `wordn`/`avglen` (which read VFS files) -- this scans
+    // the inline argument.
+    let mut best: &str = "";
+    for w in rest.split_whitespace() {
+        if w.len() > best.len() {
+            best = w;
+        }
+    }
+    if best.is_empty() {
+        crate::kprintln!("usage: longestword <text>");
+    } else {
+        crate::kprintln!("longestword: {} ({} bytes)", best, best.len());
+    }
+}
+
+/// `sumrange` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_sumrange(line: &str, cmd: &str, rest: &str) {
+    // Sum of ALL integers from a to b inclusive, Gauss closed-form (a+b)(b-a+1)/2 in
+    // u128. The general-interval companion of sumto (which is fixed at 1..n): "sumrange
+    // 1 10 -> 55", "sumrange 10 20 -> 165", "sumrange 5 5 -> 5", "sumrange 1 100 -> 5050".
+    // An empty range (a > b) sums to 0.
+    let mut it = rest.split_whitespace();
+    let a = it.next().and_then(|s| s.parse::<u64>().ok());
+    let b = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let sum: u128 = if a > b {
+                0
+            } else {
+                (a as u128 + b as u128) * (b as u128 - a as u128 + 1) / 2
+            };
+            crate::kprintln!("sumrange: {}+...+{} = {}", a, b, sum);
+        }
+        _ => crate::kprintln!("usage: sumrange <a> <b>"),
+    }
+}
+
+/// `jacobi` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_jacobi(line: &str, cmd: &str, rest: &str) {
+    // The Jacobi symbol (a/n) for ODD n >= 1 -- the generalization of the Legendre
+    // symbol to composite odd moduli, computed via quadratic reciprocity. The result
+    // is -1, 0, or 1 (it is 0 exactly when gcd(a, n) > 1). "jacobi 2 7" -> 1, "jacobi
+    // 2 3" -> -1, "jacobi 6 9" -> 0. n must be odd (the symbol is undefined for even
+    // n). A crypto / number-theory primitive; companion of modinv.
+    let mut it = rest.split_whitespace();
+    let a0 = it.next().and_then(|s| s.parse::<u64>().ok());
+    let n0 = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (a0, n0) {
+        (Some(a0), Some(n)) if n % 2 == 1 => {
+            let mut a = a0 % n;
+            let mut m = n; // working modulus
+            let mut result: i32 = 1;
+            while a != 0 {
+                while a % 2 == 0 {
+                    a /= 2;
+                    let r = m % 8;
+                    if r == 3 || r == 5 {
+                        result = -result;
+                    }
+                }
+                core::mem::swap(&mut a, &mut m);
+                if a % 4 == 3 && m % 4 == 3 {
+                    result = -result;
+                }
+                a %= m;
+            }
+            let sym = if m == 1 { result } else { 0 };
+            crate::kprintln!("jacobi: ({}/{}) = {}", a0, n, sym);
+        }
+        _ => crate::kprintln!("usage: jacobi <a> <n> (n odd, >= 1)"),
+    }
+}
+
+/// `mmuinfo` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_mmuinfo(line: &str, cmd: &str, rest: &str) {
+    // Decode SCTLR_EL1 (the EL1 System Control Register): live MMU + cache state.
+    let sctlr: u64;
+    // SAFETY: SCTLR_EL1 is readable at EL1.
+    unsafe { #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr); #[cfg(not(target_arch = "aarch64"))] { sctlr = crate::shell_pc::sysreg("sctlr_el1"); }
+    }
+    let on = |b: bool| if b { "on" } else { "off" };
+    let m = sctlr & (1 << 0) != 0; // MMU enable
+    let a = sctlr & (1 << 1) != 0; // alignment check
+    let c = sctlr & (1 << 2) != 0; // data/unified cache enable
+    let sa = sctlr & (1 << 3) != 0; // SP alignment check
+    let i = sctlr & (1 << 12) != 0; // instruction cache enable
+    crate::kprintln!("mmuinfo: SCTLR_EL1 = 0x{:016x}", sctlr);
+    crate::kprintln!("mmuinfo: MMU {}  dcache {}  icache {}", on(m), on(c), on(i));
+    crate::kprintln!("mmuinfo: SP-align-check {}  align-check {}", on(sa), on(a));
+}
+
+/// `iscarmichael` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_iscarmichael(line: &str, cmd: &str, rest: &str) {
+    // Classify a CARMICHAEL number via Korselt's criterion: n is Carmichael iff
+    // n is composite, SQUAREFREE, and (p-1) divides (n-1) for EVERY prime p | n.
+    // 561=3*11*17, 1105, 1729, 2465 are the first four; 15=3*5 fails because
+    // (5-1)=4 does not divide 14; 9=3^2 fails squarefree; primes fail composite.
+    // Distinct from isprime (Carmichael numbers are Fermat pseudoprimes to every
+    // coprime base, yet all composite). Factors n by trial division.
+    match rest.trim().parse::<u64>() {
+        Ok(n) if n >= 2 => {
+            let mut x = n;
+            let mut squarefree = true;
+            let mut nprimes = 0u32;
+            let mut korselt = true;
+            let mut d = 2u64;
+            while d <= x / d {
+                if x % d == 0 {
+                    let mut e = 0u32;
+                    while x % d == 0 {
+                        x /= d;
+                        e += 1;
+                    }
+                    nprimes += 1;
+                    if e >= 2 {
+                        squarefree = false;
+                    }
+                    if (n - 1) % (d - 1) != 0 {
+                        korselt = false;
+                    }
+                }
+                d += 1;
+            }
+            if x > 1 {
+                // A prime factor greater than sqrt(n) remains, exponent 1.
+                nprimes += 1;
+                if (n - 1) % (x - 1) != 0 {
+                    korselt = false;
+                }
+            }
+            // n (>= 2) is prime iff it has a single prime factor of exponent 1.
+            let is_prime = nprimes == 1 && squarefree;
+            let composite = !is_prime;
+            if composite && squarefree && korselt {
+                crate::kprintln!(
+                    "iscarmichael: {} IS a Carmichael number (squarefree composite; (p-1)|(n-1) for all p|n)",
+                    n
+                );
+            } else {
+                let reason = if is_prime {
+                    "prime, not composite"
+                } else if !squarefree {
+                    "not squarefree"
+                } else {
+                    "(p-1) does not divide (n-1) for some prime factor p"
+                };
+                crate::kprintln!("iscarmichael: {} is NOT a Carmichael number ({})", n, reason);
+            }
+        }
+        _ => crate::kprintln!("usage: iscarmichael <n>"),
+    }
+}
+
+/// `hyperfactorial` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_hyperfactorial(line: &str, cmd: &str, rest: &str) {
+    // The hyperfactorial H(n) = product of k^k for k = 1..n, in u128:
+    // 1, 1, 4, 108, 27648, 86400000, ... Distinct from factorial (a single n!),
+    // superfact (product of factorials), doublefact (n!!), and primorial
+    // (product of primes): hyperfactorial multiplies the powers k^k. It grows
+    // even faster than superfact, so H(9) fits u128 but H(10) overflows. Each
+    // k^k and the running product are guarded with checked_mul.
+    match rest.trim().parse::<u64>() {
+        Ok(0) => crate::kprintln!("hyperfactorial: H(0) = 1"),
+        Ok(n) => {
+            let mut h: u128 = 1;
+            let mut overflow = false;
+            let mut k: u128 = 1;
+            while k <= n as u128 {
+                // k^k via repeated checked multiplication (avoids a u32 cast)
+                let mut kk: u128 = 1;
+                let mut e: u128 = 0;
+                while e < k {
+                    match kk.checked_mul(k) {
+                        Some(v) => kk = v,
+                        None => {
+                            overflow = true;
+                            break;
+                        }
+                    }
+                    e += 1;
+                }
+                if overflow {
+                    break;
+                }
+                match h.checked_mul(kk) {
+                    Some(v) => h = v,
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            if overflow {
+                crate::kprintln!("hyperfactorial: H({}) overflows u128", n);
+            } else {
+                crate::kprintln!("hyperfactorial: H({}) = {}", n, h);
+            }
+        }
+        Err(_) => crate::kprintln!("usage: hyperfactorial <n>"),
+    }
+}
+
+/// `luhngen` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_luhngen(line: &str, cmd: &str, rest: &str) {
+    // Compute the Luhn mod-10 CHECK DIGIT for a payload of digits -- the digit that, when
+    // appended, makes the full number pass the Luhn check (as used by card / IMEI / ID
+    // numbers). Whereas `luhn` VALIDATES a complete string, luhngen GENERATES the missing
+    // check digit. "luhngen 7992739871" -> 3 (79927398713 is Luhn-valid). Every SECOND
+    // digit from the payload's right is doubled (subtract 9 when > 9); check = (10 - sum%10)%10.
+    let s = rest.trim();
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        crate::kprintln!("usage: luhngen <digits>");
+    } else {
+        let mut sum = 0u32;
+        for (i, &b) in s.as_bytes().iter().rev().enumerate() {
+            let mut v = (b - b'0') as u32;
+            if i % 2 == 0 {
+                // payload's rightmost sits at an odd position in the full number -> doubled
+                v *= 2;
+                if v > 9 {
+                    v -= 9;
+                }
+            }
+            sum += v;
+        }
+        let check = (10 - sum % 10) % 10;
+        crate::kprintln!("luhngen: check digit for {} is {} ({}{})", s, check, s, check);
+    }
+}
+
+/// `nextsquare` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_nextsquare(line: &str, cmd: &str, rest: &str) {
+    // The SMALLEST perfect square that is >= n (round n up to a perfect
+    // square), reporting the root. Distinct from nextpow2 (power of TWO
+    // >= n), issquare (a MEMBERSHIP test), isqrt (the FLOOR root), and
+    // nextprime (smallest prime > n): nextsquare rounds UP to a square.
+    fn isqrt(v: u128) -> u128 {
+        if v < 2 {
+            return v;
+        }
+        let mut x = v;
+        let mut y = (x + 1) / 2;
+        while y < x {
+            x = y;
+            y = (x + v / x) / 2;
+        }
+        x
+    }
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let nn = n as u128;
+            let r = isqrt(nn);
+            let k = if r * r == nn { r } else { r + 1 };
+            let sq = k * k; // >= n, the smallest perfect square >= n
+            if sq > u64::MAX as u128 {
+                crate::kprintln!("nextsquare: no perfect square >= {} fits in u64", n);
+            } else {
+                crate::kprintln!(
+                    "nextsquare: smallest perfect square >= {} is {}^2 = {}",
+                    n, k as u64, sq as u64
+                );
+            }
+        }
+        Err(_) => crate::kprintln!("usage: nextsquare <n>"),
+    }
+}
+
+/// `scrabblef` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_scrabblef(line: &str, cmd: &str, rest: &str) {
+    // Sum the English Scrabble tile values of all letters in a VFS FILE -- the file
+    // analogue of scrabble (which scores INLINE text). Non-letters are ignored. Distinct
+    // from charcount (counts ONE char), wordcountf (counts a WORD), casecount (upper/
+    // lower letter counts), and histogram (byte frequency).
+    const VAL: [u32; 26] = [
+        1, 3, 3, 2, 1, 4, 2, 4, 1, 8, 5, 1, 3, 1, 1, 3, 10, 1, 1, 1, 1, 4, 4, 8, 4, 10,
+    ];
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: scrabblef <file>");
+    } else {
+        match vfs::read_str(name) {
+            None => crate::kprintln!("scrabblef: no such file: {}", name),
+            Some(s) => {
+                let mut sum = 0u32;
+                for &b in s.as_bytes() {
+                    let c = b | 0x20;
+                    if (b'a'..=b'z').contains(&c) {
+                        sum += VAL[(c - b'a') as usize];
+                    }
+                }
+                crate::kprintln!("scrabblef: {} scores {}", name, sum);
+            }
+        }
+    }
+}
+
+/// `divmod` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_divmod(line: &str, cmd: &str, rest: &str) {
+    // Integer division of two u64s reporting BOTH quotient and remainder:
+    // a = q*b + r with 0 <= r < b (Euclidean/truncated division, same as Python
+    // divmod for non-negatives). "divmod 17 5 -> q=3 r=2", "divmod 20 4 -> q=5 r=0",
+    // "divmod 7 10 -> q=0 r=7". Division by zero is reported, not a crash. A basic
+    // arithmetic primitive distinct from gcd (gcd+lcm) and mod-only utilities.
+    let mut it = rest.split_whitespace();
+    let a = it.next().and_then(|s| s.parse::<u64>().ok());
+    let b = it.next().and_then(|s| s.parse::<u64>().ok());
+    match (a, b) {
+        (Some(_), Some(0)) => crate::kprintln!("divmod: division by zero"),
+        (Some(a), Some(b)) => {
+            crate::kprintln!("divmod: {} / {} -> q={} r={}", a, b, a / b, a % b);
+        }
+        _ => crate::kprintln!("usage: divmod <a> <b>"),
+    }
+}
+
+/// `clidr` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_clidr(line: &str, cmd: &str, rest: &str) {
+    // Decode CLIDR_EL1 (Cache Level ID): the cache-hierarchy topology.
+    // Distinct from cacheinfo (CTR_EL0 line sizes) -- this is which levels
+    // exist and whether each is I-only / D-only / separate / unified.
+    let clidr: u64;
+    // SAFETY: CLIDR_EL1 is a standard AArch64 ID register readable at EL1.
+    unsafe { #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("mrs {}, clidr_el1", out(reg) clidr); #[cfg(not(target_arch = "aarch64"))] { clidr = crate::shell_pc::sysreg("clidr_el1"); }
+    }
+    let raw = (clidr & 0xffff_ffff) as u32;
+    fn ctype_name(c: u32) -> &'static str {
+        match c {
+            0b001 => "I",
+            0b010 => "D",
+            0b011 => "I+D",
+            0b100 => "unified",
+            _ => "?",
+        }
+    }
+    let louis = (raw >> 21) & 0x7;
+    let loc = (raw >> 24) & 0x7;
+    let louu = (raw >> 27) & 0x7;
+    crate::kprintln!("clidr: CLIDR_EL1 = 0x{:08x}", raw);
+    // Print each populated level (Ctype != 0), stopping at the first empty one.
+    for level in 1..=7u32 {
+        let ctype = (raw >> (3 * (level - 1))) & 0x7;
+        if ctype == 0 {
+            break;
+        }
+        crate::kprintln!("clidr: L{} = {}", level, ctype_name(ctype));
+    }
+    crate::kprintln!("clidr: LoC = {}  LoUU = {}  LoUIS = {}", loc, louu, louis);
+}
+
+/// `roman` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_roman(line: &str, cmd: &str, rest: &str) {
+    // Convert a decimal integer 1..3999 to Roman numerals (subtractive form).
+    match rest.trim().parse::<u32>() {
+        Ok(n) if n >= 1 && n <= 3999 => {
+            const TABLE: [(u32, &str); 13] = [
+                (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"),
+                (100, "C"), (90, "XC"), (50, "L"), (40, "XL"),
+                (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+            ];
+            let mut buf = [0u8; 16];
+            let mut len = 0usize;
+            let mut rem = n;
+            for &(v, sym) in TABLE.iter() {
+                while rem >= v {
+                    for &c in sym.as_bytes() {
+                        if len < buf.len() {
+                            buf[len] = c;
+                            len += 1;
+                        }
+                    }
+                    rem -= v;
+                }
+            }
+            crate::kprintln!("roman: {} = {}", n, core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+        }
+        _ => crate::kprintln!("usage: roman <1..3999>"),
+    }
+}
+
+/// `wordat` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wordat(line: &str, cmd: &str, rest: &str) {
+    // Print the Nth (1-based) whitespace-separated word of the INLINE text. The
+    // inline-text analogue of wordn (which reads the Nth word of a VFS file), just
+    // as charat reads one char of inline text. Distinct from firstword/lastword/
+    // middleword (fixed positions) and truncatewords/firstn (word/char prefixes).
+    let (nstr, text) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim_start()),
+        None => (rest.trim(), ""),
+    };
+    match nstr.parse::<usize>() {
+        Ok(n) if n >= 1 && !text.is_empty() => match text.split_whitespace().nth(n - 1) {
+            Some(w) => crate::kprintln!("wordat: {}", w),
+            None => crate::kprintln!("wordat: text has fewer than {} words", n),
+        },
+        _ => crate::kprintln!("usage: wordat <n> <text>"),
+    }
+}
+
+/// `padovan` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_padovan(line: &str, cmd: &str, rest: &str) {
+    // nth Padovan number: P(0)=P(1)=P(2)=1, P(n)=P(n-2)+P(n-3) ->
+    // 1,1,1,2,2,3,4,5,7,9,12,16,21,28,... Distinct from tribonacci (three
+    // CONSECUTIVE terms) and fib (n-1,n-2): Padovan is a GAP recurrence
+    // that SKIPS the immediate predecessor, growing at the plastic ratio
+    // ~1.3247 (very slowly, overflowing u64 very late). Honest overflow guard.
+    match rest.trim().parse::<u64>() {
+        Ok(n) if n <= 2 => crate::kprintln!("padovan: P({}) = 1", n),
+        Ok(n) => {
+            let mut a: u64 = 1; // P(k-3)
+            let mut b: u64 = 1; // P(k-2)
+            let mut c: u64 = 1; // P(k-1), starting at k = 3 with P(0),P(1),P(2)
+            let mut overflow = false;
+            for _ in 3..=n {
+                // P(k) = P(k-2) + P(k-3) = b + a
+                match a.checked_add(b) {
+                    Some(s) => {
+                        a = b;
+                        b = c;
+                        c = s;
+                    }
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+            }
+            if overflow {
+                crate::kprintln!("padovan: P({}) overflows u64", n);
+            } else {
+                crate::kprintln!("padovan: P({}) = {}", n, c);
+            }
+        }
+        Err(_) => crate::kprintln!("usage: padovan <n>"),
+    }
+}
+
+/// `derangement` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_derangement(line: &str, cmd: &str, rest: &str) {
+    // nth derangement number (subfactorial !n: permutations of n items with
+    // NO fixed point). D(0)=1, D(n)=n*D(n-1)+(-1)^n -> 1,0,1,2,9,44,265,...
+    // Distinct from factorial (n! itself) and the linear recurrences: the
+    // alternating +/-1 term is the wrinkle, and !n = round(n!/e) grows just
+    // under n!. Honest u64 overflow guard.
+    match rest.trim().parse::<u64>() {
+        Ok(0) => crate::kprintln!("derangement: D(0) = 1"),
+        Ok(n) => {
+            let mut d: u64 = 1; // D(0)
+            let mut overflow = false;
+            for k in 1..=n {
+                match d.checked_mul(k) {
+                    Some(m) => {
+                        if k % 2 == 0 {
+                            match m.checked_add(1) {
+                                Some(v) => d = v,
+                                None => {
+                                    overflow = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            // m = k*D(k-1) >= 1 for k >= 1 (k=1 gives m=1,
+                            // D(1)=0), so `m - 1` never underflows.
+                            d = m - 1;
+                        }
+                    }
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+            }
+            if overflow {
+                crate::kprintln!("derangement: D({}) overflows u64", n);
+            } else {
+                crate::kprintln!("derangement: D({}) = {}", n, d);
+            }
+        }
+        Err(_) => crate::kprintln!("usage: derangement <n>"),
+    }
+}
+
+/// `triangular` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_triangular(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is a TRIANGULAR number (n = k*(k+1)/2 for some
+    // k>=0), reporting the index k when it is. A number is triangular iff
+    // 8*n+1 is a perfect square; then k = (sqrt(8n+1)-1)/2. Distinct from
+    // sumto (which COMPUTES the nth triangular) and the digit-based
+    // classifiers -- triangular tests figurate-number membership.
+    fn isqrt(v: u128) -> u128 {
+        if v < 2 {
+            return v;
+        }
+        let mut x = v;
+        let mut y = (x + 1) / 2;
+        while y < x {
+            x = y;
+            y = (x + v / x) / 2;
+        }
+        x
+    }
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let m = 8u128 * (n as u128) + 1;
+            let s = isqrt(m);
+            if s * s == m {
+                let k = ((s - 1) / 2) as u64;
+                crate::kprintln!(
+                    "triangular: {} IS triangular (T({}) = {}*({}+1)/2)",
+                    n, k, k, k
+                );
+            } else {
+                crate::kprintln!("triangular: {} is NOT triangular", n);
+            }
+        }
+        Err(_) => crate::kprintln!("usage: triangular <n>"),
+    }
+}
+
+/// `pronic` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_pronic(line: &str, cmd: &str, rest: &str) {
+    // Classify whether n is a PRONIC (oblong / heteromecic) number:
+    // n = k*(k+1) for some k>=0, reporting the index k. A number is pronic
+    // iff 4*n+1 is a perfect square (since n=k(k+1) => 4n+1=(2k+1)^2); then
+    // k = (sqrt(4n+1)-1)/2. Distinct from triangular (n=k(k+1)/2 -- pronic
+    // are exactly 2x triangular), isfib, sumto, and the digit classifiers.
+    fn isqrt(v: u128) -> u128 {
+        if v < 2 {
+            return v;
+        }
+        let mut x = v;
+        let mut y = (x + 1) / 2;
+        while y < x {
+            x = y;
+            y = (x + v / x) / 2;
+        }
+        x
+    }
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let m = 4u128 * (n as u128) + 1;
+            let s = isqrt(m);
+            if s * s == m {
+                let k = ((s - 1) / 2) as u64;
+                crate::kprintln!("pronic: {} IS pronic ({}*({}+1) = {})", n, k, k, n);
+            } else {
+                crate::kprintln!("pronic: {} is NOT pronic", n);
+            }
+        }
+        Err(_) => crate::kprintln!("usage: pronic <n>"),
+    }
+}
+
+/// `centeredhex` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_centeredhex(line: &str, cmd: &str, rest: &str) {
+    // Compute the nth CENTERED HEXAGONAL number CH(n) = 3n(n-1)+1 -- a dot at
+    // the centre surrounded by hexagonal rings (the honeycomb / hex-grid count).
+    // CH(1..7) = 1, 7, 19, 37, 61, 91, 127. Deliberately distinct from the
+    // figurate MEMBERSHIP test `hexagonal` (which classifies n = k(2k-1)): this
+    // COMPUTES the nth CENTERED hexagonal term. Evaluated as 3*n*n - 3*n + 1 in
+    // u128 (underflow-safe for n=0, checked_mul guards overflow).
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let a = n as u128;
+            match a.checked_mul(a).and_then(|sq| sq.checked_mul(3)) {
+                // 3*a*a >= 3*a for a >= 1, and both are 0 for a = 0, so the
+                // subtraction never underflows.
+                Some(t) => crate::kprintln!("centeredhex: CH({}) = {}", n, t - 3 * a + 1),
+                None => crate::kprintln!("centeredhex: CH({}) overflowed u128", n),
+            }
+        }
+        Err(_) => crate::kprintln!("usage: centeredhex <n>"),
+    }
+}
+
+/// `centeredsquare` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_centeredsquare(line: &str, cmd: &str, rest: &str) {
+    // Compute the nth CENTERED SQUARE number CS(n) = 2n(n-1)+1 -- a dot at the
+    // centre surrounded by square rings. CS(1..6) = 1, 5, 13, 25, 41, 61 (OEIS
+    // A001844). Part of the centered-polygonal family alongside centeredhex
+    // (3n(n-1)+1) and starnumber (6n(n-1)+1); distinct from square (n^2) and
+    // pronic (n(n+1)). Evaluated as 2*n*n - 2*n + 1 in u128 (underflow-safe for
+    // n=0 since 2*a*a >= 2*a for a >= 1, checked_mul guards overflow).
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let a = n as u128;
+            match a.checked_mul(a).and_then(|sq| sq.checked_mul(2)) {
+                Some(t) => {
+                    crate::kprintln!("centeredsquare: CS({}) = {}", n, t - 2 * a + 1)
+                }
+                None => crate::kprintln!("centeredsquare: CS({}) overflowed u128", n),
+            }
+        }
+        Err(_) => crate::kprintln!("usage: centeredsquare <n>"),
+    }
+}
+
+/// `starnumber` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_starnumber(line: &str, cmd: &str, rest: &str) {
+    // Compute the nth (centered) STAR NUMBER S(n) = 6n(n-1)+1 -- a centred
+    // hexagram (Star of David) figurate number. S(1..6) = 1, 13, 37, 73, 121,
+    // 181. Parallels centeredhex (3n(n-1)+1) with coefficient 6; a COMPUTE,
+    // distinct from the figurate MEMBERSHIP tests. Evaluated as 6*n*n - 6*n + 1
+    // in u128 (underflow-safe for n=0, checked_mul guards overflow).
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let a = n as u128;
+            match a.checked_mul(a).and_then(|sq| sq.checked_mul(6)) {
+                // 6*a*a >= 6*a for a >= 1, and both are 0 for a = 0, so the
+                // subtraction never underflows.
+                Some(t) => crate::kprintln!("starnumber: S({}) = {}", n, t - 6 * a + 1),
+                None => crate::kprintln!("starnumber: S({}) overflowed u128", n),
+            }
+        }
+        Err(_) => crate::kprintln!("usage: starnumber <n>"),
+    }
+}
+
+/// `df` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_df(line: &str, cmd: &str, rest: &str) {
+    // One-line filesystem-usage summary of the in-RAM VFS.
+    let mut used_files = 0usize;
+    let mut bytes_used = 0usize;
+    for i in 0..vfs::MAX_FILES {
+        if vfs::is_used(i) {
+            used_files += 1;
+            bytes_used += vfs::size_of(i);
+        }
+    }
+    let capacity = vfs::MAX_FILES * vfs::MAX_BIG_FILE_BYTES;
+    crate::kprintln!(
+        "df: {}/{} files, {} bytes used of {} ({} free), disk {}",
+        used_files,
+        vfs::MAX_FILES,
+        bytes_used,
+        capacity,
+        capacity - bytes_used,
+        if crate::virtio::blk_present() { "attached" } else { "none" }
+    );
+}
+
+/// `wc` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_wc(line: &str, cmd: &str, rest: &str) {
+    // Count lines (newlines), whitespace-delimited words, and bytes.
+    let name = rest.trim();
+    if name.is_empty() {
+        crate::kprintln!("usage: wc <file>");
+    } else if let Some(data) = vfs::read_raw(name) {
+        let bytes = data.len();
+        let mut lines = 0usize;
+        let mut words = 0usize;
+        let mut in_word = false;
+        for &b in data {
+            if b == b'\n' {
+                lines += 1;
+            }
+            let ws = b == b' ' || b == b'\n' || b == b'\t' || b == b'\r';
+            if ws {
+                in_word = false;
+            } else if !in_word {
+                words += 1;
+                in_word = true;
+            }
+        }
+        crate::kprintln!("wc {}: {} lines, {} words, {} bytes", name, lines, words, bytes);
+    } else {
+        crate::kprintln!("wc: no such file: {}", name);
+    }
+}
+
+/// `countchar` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_countchar(line: &str, cmd: &str, rest: &str) {
+    // Count how many times a single character occurs in INLINE text
+    // (the FIRST character of <ch>, across the rest of the argument).
+    // The inline-text analog of charcount (which reads a VFS file);
+    // distinct from chars (per-char list) and squeeze (collapse runs).
+    let (needle, text) = match rest.find(' ') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    if needle.is_empty() || text.is_empty() {
+        crate::kprintln!("usage: countchar <ch> <text>");
+    } else {
+        let target = needle.as_bytes()[0];
+        let n = text.as_bytes().iter().filter(|&&b| b == target).count();
+        crate::kprintln!("countchar: {} occurs {} times", target as char, n);
+    }
+}
+
+/// `magicconstant` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_magicconstant(line: &str, cmd: &str, rest: &str) {
+    // The magic constant of an order-n magic square: M(n) = n*(n^2+1)/2 --
+    // the common sum of every row, column, and main diagonal of an n x n
+    // square filled with 1..n^2 (M(3)=15, M(4)=34, M(5)=65, M(6)=111, ...).
+    // n*(n^2+1) is always even so the /2 is exact. u128 with checked_mul so
+    // a large n reports overflow honestly instead of panicking.
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let n = n as u128;
+            match n
+                .checked_mul(n)
+                .and_then(|sq| sq.checked_add(1))
+                .and_then(|s| n.checked_mul(s))
+                .map(|p| p / 2)
+            {
+                Some(m) => crate::kprintln!("magicconstant({}) = {}", n, m),
+                None => crate::kprintln!("magicconstant({}) overflows u128", n),
+            }
+        }
+        Err(_) => crate::kprintln!("usage: magicconstant <n>"),
+    }
+}
+
+/// `superfact` (moved out of `exec` unchanged: the exec split)
+#[inline(never)]
+#[allow(unused_variables)]
+fn cmd_superfact(line: &str, cmd: &str, rest: &str) {
+    // The superfactorial: the product of the first n factorials
+    // 1!*2!*3!*...*n! -> 1,1,2,12,288,34560,24883200,... Distinct from
+    // factorial (a single n!), doublefact (n!!), and primorial (product of
+    // primes): superfact multiplies together whole factorials. It grows
+    // extremely fast, so it overflows u64 early (sf(8) fits, sf(9) overflows).
+    match rest.trim().parse::<u64>() {
+        Ok(n) => {
+            let mut fact: u64 = 1; // running k!
+            let mut result: u64 = 1; // running product of factorials
+            let mut overflow = false;
+            for k in 1..=n {
+                match fact.checked_mul(k) {
+                    Some(v) => fact = v, // fact is now k!
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+                match result.checked_mul(fact) {
+                    Some(v) => result = v,
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+            }
+            if overflow {
+                crate::kprintln!("superfact: sf({}) overflows u64", n);
+            } else {
+                crate::kprintln!("superfact: sf({}) = {}", n, result);
+            }
+        }
+        Err(_) => crate::kprintln!("usage: superfact <n>"),
     }
 }

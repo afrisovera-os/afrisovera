@@ -5,7 +5,7 @@
 # disk, QEMU q35 + EDK II (OVMF), graded from the serial log. This suite grades
 # kernel/src/pc/user.rs: three tiny programs entered with iretq at privilege level 3.
 #   1. program 1 talks to the kernel only through system calls (int 0x80): it prints 42, asks
-#      which privilege level the CPU saw it at and prints that -- the kernel must report 3 --
+#      which privilege level the CPU saw it at and prints that (the kernel must report 3)
 #      and exits with code 7: "[user] print 42", "[user] print 3", "made 4 system calls and
 #      exited with code 7 (ok)";
 #   2. program 2 reads a kernel address: the read must page-fault AT THAT ADDRESS with an
@@ -32,14 +32,14 @@ grade() {
         return 1
     fi
     L="$(tr -d '\r' < "$F" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$L" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$L"; }
 
     has '^\[user\] print 42$' ||
         _f "program 1's first system call (print 42) never reached the kernel"
     has '^\[user\] print 3$' ||
         _f "the kernel did not see program 1 running at privilege level 3"
     if has '^\[user\] print [0-2]$'; then
-        _f "program 1 ran at privilege level $(printf '%s\n' "$L" | grep -aoE '^\[user\] print [0-2]$' | head -1 | awk '{print $3}') -- not in ring 3"
+        _f "program 1 ran at privilege level $(printf '%s\n' "$L" | grep -aoE '^\[user\] print [0-2]$' | head -1 | awk '{print $3}'); not in ring 3"
     fi
     has '^\[pc\] ring 3: program 1 made 4 system calls and exited with code 7 \(ok\)$' ||
         _f "program 1 did not make its 4 system calls and exit with code 7"
@@ -70,7 +70,7 @@ grade() {
 }
 
 # --------------------------------------------------------------- the selftest --
-GREEN="[pc] Mansa x86-64 (PC) -- started by UEFI firmware
+GREEN="[pc] Mansa x86-64 (PC), started by UEFI firmware
 [pc] own page tables: CR3 0xcded000 (firmware's was 0xf801000), 4 GiB mapped 1:1 with 2 MiB pages in 6 table frames
 [user] print 42
 [user] print 3
@@ -106,7 +106,7 @@ selftest() {
     arm fault-elsewhere red < <(printf '%s\n' "$GREEN" | sed 's/) at 0xccd69d8,/) at 0xccea930,/')
     arm fault-not-user red < <(printf '%s\n' "$GREEN" | sed 's/(error 0x5)/(error 0x1)/')
     arm cli-not-stopped red < <(printf '%s\n' "$GREEN" | grep -v 'program 3')
-    arm kernel-exception red < <(printf '%s\n' "$GREEN" | sed 's/^\[pc\] MANSA-PC BOOT OK$/[pc] EXCEPTION vector 13 (general protection) error 0x0 at RIP 0x10000000000 (CR2 0x0) -- halted/')
+    arm kernel-exception red < <(printf '%s\n' "$GREEN" | sed 's/^\[pc\] MANSA-PC BOOT OK$/[pc] EXCEPTION vector 13 (general protection) error 0x0 at RIP 0x10000000000 (CR2 0x0); halted/')
     arm verdict-in-prose red < <(printf '%s\n' "$GREEN" | sed 's/^\[user\] print 42$/  [user] print 42/')
     arm empty-log red < /dev/null
     rm -rf "$D"
@@ -117,10 +117,10 @@ selftest() {
 # ------------------------------------------------------------------- driver --
 echo "== PC ring 3 (suite 693, PC track step 1) =="
 if ! selftest; then
-    echo "PC RING3 TEST FAILED (grader selftest) -- no QEMU run spent"
+    echo "PC RING3 TEST FAILED (grader selftest): no QEMU run spent"
     exit 1
 fi
-[ "${1:-}" = "--selftest" ] && { echo "PC RING3 SELFTEST ONLY -- no measurement taken"; exit 0; }
+[ "${1:-}" = "--selftest" ] && { echo "PC RING3 SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || { echo "PC RING3 TEST FAILED (harness: qemu-system-x86_64 not on PATH)"; exit 1; }
 QDIR="$(dirname "$(command -v qemu-system-x86_64)")"
@@ -153,7 +153,7 @@ timeout 240 qemu-system-x86_64 -M q35 -m 256M \
     -serial "file:$(winpath "$SER")" -display none -no-reboot -net none \
     -fw_cfg name=opt/afrisovera/poweroff,string=1
 QRC=$?
-echo "  qemu exit $QRC ($([ "$QRC" -eq 124 ] && echo 'timed out -- the kernel never powered off' || echo 'the kernel powered off'))"
+echo "  qemu exit $QRC ($([ "$QRC" -eq 124 ] && echo 'timed out; the kernel never powered off' || echo 'the kernel powered off'))"
 tr -d '\r' < "$SER" 2>/dev/null | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | grep -aE '^\[(pc|user)\]|^kernel heap: [0-9]|^ *\[FAIL\]' | sed 's/^/  | /'
 
 echo "  --- grading ---"

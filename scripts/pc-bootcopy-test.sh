@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track step 5 (7 Nov 2026): `bootcopy` -- AfriSovera's boot file copied into the EFI system partition a
+# PC track step 5 (7 Nov 2026): `bootcopy`: AfriSovera's boot file copied into the EFI system partition a
 # Windows disk already has (\EFI\afrisovera\afrisovera.efi), on the owner's code, and `bootcopy remove`, the
 # way back. No firmware boot entry is added (that comes next, on the owner's word).
 #
@@ -80,7 +80,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     cl() { tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g'; }
     A="$(cl "$1")"; B="$(cl "$2")"; C="$(cl "$3")"; D="$(cl "$4")"
     blk() { printf '%s\n' "$1" | awk -v c="afrisovera> $2" '$0==c{on=1;next} /^afrisovera>/{on=0} on'; }
-    in_blk() { printf '%s\n' "$1" | grep -aqxE "$2"; }
+    in_blk() { grep -aqxE "$2" <<< "$1"; }
     local kb
     kb="$(printf '%s\n' "$A" | sed -nE "s/^bootcopy: AfriSovera's boot file \(([0-9]+) KiB\) -> $NAME partition $PNO \(start $STARTL\)$FILE_RE$/\1/p" | head -1)"
     [ -n "$kb" ] || _f "boot 1: bootcopy did not name the boot file's size and $NAME partition $PNO (start $STARTL)"
@@ -88,9 +88,9 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
         _f "boot 1: bootcopy did not say the room it takes and that nothing else changes"
     in_blk "$(blk "$A" bootcopy)" 'bootcopy: nothing written yet. To do it, type exactly: bootcopy yes [0-9a-f]{4}' ||
         _f "boot 1: bootcopy did not give the code"
-    in_blk "$(blk "$A" 'bootcopy yes zzzz')" 'bootcopy: that code does not fit this EFI partition as it is now -- nothing written' ||
+    in_blk "$(blk "$A" 'bootcopy yes zzzz')" 'bootcopy: that code does not fit this EFI partition as it is now; nothing written' ||
         _f "boot 1: a wrong code was not refused"
-    in_blk "$(blk "$A" 'bootcopy remove')" "bootcopy remove: no EFI system partition holds \\\\EFI\\\\afrisovera that may be changed \(bootplan says why\) -- nothing written" ||
+    in_blk "$(blk "$A" 'bootcopy remove')" "bootcopy remove: no EFI system partition holds \\\\EFI\\\\afrisovera that may be changed \(bootplan says why\); nothing written" ||
         _f "boot 1: bootcopy remove did not find nothing to take out"
     printf '%s\n' "$A" | grep -aqx 'harness: disk images unchanged' || _f "boot 1: a disk image changed (or the check is missing)"
     local B1 BP B2
@@ -98,13 +98,13 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     BP="$(blk "$B" bootplan)"; B2="$(blk "$B" bootcopy)"
     in_blk "$B1" "bootcopy: copied to $NAME partition $PNO$FILE_RE, read back the same \($kb KiB, both FAT copies equal, [0-9]+ KiB free now\)" ||
         _f "boot 2: the copy was not read back the same ($kb KiB)"
-    in_blk "$B1" 'bootcopy: no boot entry was added -- the PC starts exactly as before; bootcopy remove takes the file out again' ||
+    in_blk "$B1" 'bootcopy: no boot entry was added, so the PC starts exactly as before; bootcopy remove takes the file out again' ||
         _f "boot 2: bootcopy did not say no boot entry was added"
     in_blk "$BP" '  \\EFI holds: Microsoft, BOOT, afrisovera' || _f "boot 2: bootplan does not list afrisovera in \\EFI after Microsoft and BOOT"
-    in_blk "$BP" "  \\\\EFI\\\\afrisovera is already there \($kb KiB\) -- nothing to copy" || _f "boot 2: bootplan did not find the copied file"
-    in_blk "$BP" "  boot entry: AfriSovera's file is there but no entry points at it yet -- adding one will ask for the owner's word" ||
+    in_blk "$BP" "  \\\\EFI\\\\afrisovera is already there \($kb KiB\); nothing to copy" || _f "boot 2: bootplan did not find the copied file"
+    in_blk "$BP" "  boot entry: AfriSovera's file is there but no entry points at it yet; adding one will ask for the owner's word" ||
         _f "boot 2: bootplan did not say the file has no boot entry yet"
-    in_blk "$B2" "bootcopy: $NAME partition $PNO already holds \\\\EFI\\\\afrisovera -- nothing to copy \(bootcopy remove takes it out\)" ||
+    in_blk "$B2" "bootcopy: $NAME partition $PNO already holds \\\\EFI\\\\afrisovera; nothing to copy \(bootcopy remove takes it out\)" ||
         _f "boot 2: a second bootcopy did not refuse"
     printf '%s\n' "$B" | grep -aqx 'harness: bootcopy image check PASSED' || _f "boot 2: the image check did not pass"
     printf '%s\n' "$B" | grep -aqxE "check: the EFI system partition is GPT entry $PNO \(start $STARTL\)" ||
@@ -120,7 +120,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
         _f "boot 3: bootcopy remove did not say what goes"
     in_blk "$(blk "$C" 'bootcopy remove')" 'bootcopy remove: nothing written yet. To do it, type exactly: bootcopy remove yes [0-9a-f]{4}' ||
         _f "boot 3: bootcopy remove did not give the code"
-    in_blk "$(blk "$C" 'bootcopy remove yes zzzz')" 'bootcopy remove: that code does not fit this EFI partition as it is now -- nothing written' ||
+    in_blk "$(blk "$C" 'bootcopy remove yes zzzz')" 'bootcopy remove: that code does not fit this EFI partition as it is now; nothing written' ||
         _f "boot 3: a wrong code was not refused"
     printf '%s\n' "$C" | grep -aqx 'harness: disk images unchanged' || _f "boot 3: a disk image changed (or the check is missing)"
     local D1
@@ -143,26 +143,26 @@ bootcopy: nothing written yet. To do it, type exactly: bootcopy yes 3fa2
 afrisovera> bootcopy yes zzzz
 bootcopy: AfriSovera's boot file (2360 KiB) -> sata port 2 partition 1 (start 2048)\\EFI\\afrisovera\\afrisovera.efi
   it takes 2361 KiB of the 100776 KiB free; nothing already in the partition is moved or changed; no boot entry is added yet
-bootcopy: that code does not fit this EFI partition as it is now -- nothing written
+bootcopy: that code does not fit this EFI partition as it is now; nothing written
 afrisovera> bootcopy remove
-bootcopy remove: no EFI system partition holds \\EFI\\afrisovera that may be changed (bootplan says why) -- nothing written
+bootcopy remove: no EFI system partition holds \\EFI\\afrisovera that may be changed (bootplan says why); nothing written
 afrisovera>
 harness: disk images unchanged"
 L2="afrisovera> bootcopy yes 3fa2
 bootcopy: AfriSovera's boot file (2360 KiB) -> sata port 2 partition 1 (start 2048)\\EFI\\afrisovera\\afrisovera.efi
   it takes 2361 KiB of the 100776 KiB free; nothing already in the partition is moved or changed; no boot entry is added yet
 bootcopy: copied to sata port 2 partition 1\\EFI\\afrisovera\\afrisovera.efi, read back the same (2360 KiB, both FAT copies equal, 98415 KiB free now)
-bootcopy: no boot entry was added -- the PC starts exactly as before; bootcopy remove takes the file out again
+bootcopy: no boot entry was added, so the PC starts exactly as before; bootcopy remove takes the file out again
 afrisovera> bootplan
 bootplan: AfriSovera's boot file is 2360 KiB (kept at power-on)
 bootplan: sata port 2: EFI system partition (GPT entry 1, LBA 2048-206847, 100 MiB)
   FAT32, 512-byte clusters, 98415 KiB free
   \\EFI holds: Microsoft, BOOT, afrisovera
-  \\EFI\\afrisovera is already there (2360 KiB) -- nothing to copy
-  boot entry: AfriSovera's file is there but no entry points at it yet -- adding one will ask for the owner's word
-bootplan: a plan only -- nothing was written; adding it will ask for the owner's word, with the way back
+  \\EFI\\afrisovera is already there (2360 KiB); nothing to copy
+  boot entry: AfriSovera's file is there but no entry points at it yet; adding one will ask for the owner's word
+bootplan: a plan only, so nothing was written; adding it will ask for the owner's word, with the way back
 afrisovera> bootcopy
-bootcopy: sata port 2 partition 1 already holds \\EFI\\afrisovera -- nothing to copy (bootcopy remove takes it out)
+bootcopy: sata port 2 partition 1 already holds \\EFI\\afrisovera; nothing to copy (bootcopy remove takes it out)
 afrisovera>
 check: the EFI system partition is GPT entry 1 (start 2048)
 check: both FAT copies equal
@@ -172,7 +172,7 @@ bootcopy remove: sata port 2 partition 1 (start 2048): \\EFI\\afrisovera (2360 K
 bootcopy remove: nothing written yet. To do it, type exactly: bootcopy remove yes 09bc
 afrisovera> bootcopy remove yes zzzz
 bootcopy remove: sata port 2 partition 1 (start 2048): \\EFI\\afrisovera (2360 KiB) would be taken out; nothing else in the partition changes
-bootcopy remove: that code does not fit this EFI partition as it is now -- nothing written
+bootcopy remove: that code does not fit this EFI partition as it is now; nothing written
 afrisovera>
 harness: disk images unchanged"
 L4="afrisovera> bootcopy remove yes 09bc
@@ -282,8 +282,8 @@ selftest() {
 }
 
 echo "== PC boot file copied into the Windows EFI partition and back out (PC track step 5) =="
-if ! selftest; then echo "PC BOOTCOPY${UP} TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC BOOTCOPY${UP} SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC BOOTCOPY${UP} TEST FAILED (grader selftest); no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC BOOTCOPY${UP} SELFTEST ONLY; no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

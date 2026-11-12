@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track (7 Nov 2026): `fwinfo` -- the firmware that started AfriSovera, READ ONLY.
+# PC track (7 Nov 2026): `fwinfo`: the firmware that started AfriSovera, READ ONLY.
 #
 # For the owner's real-PC try of the USB kit and before bootcopy/bootentry/bootnext: the firmware's vendor and
 # revision, its UEFI version, whether its variable services answer, Secure Boot (SecureBoot) and Setup Mode
@@ -11,7 +11,7 @@
 #   Boot 1: the plain edk2 firmware (no Secure Boot built in): Secure Boot off or not reported, never on; the
 #           owner's line matches it; vendor and revision agree with the kernel's own boot line.
 #   Boot 2: edk2's Secure-Boot-capable firmware (SMM on) with an empty key store: Secure Boot reported OFF and
-#           Setup Mode YES (no platform key) -- what a real PC with Secure Boot switched off and no keys says.
+#           Setup Mode YES (no platform key): what a real PC with Secure Boot switched off and no keys says.
 #   scripts/pc-fwinfo-test.sh              # grader selftest, then the two QEMU boots
 #   scripts/pc-fwinfo-test.sh --selftest   # grader selftest only
 set -uo pipefail
@@ -22,7 +22,7 @@ START='the firmware can start AfriSovera from its own boot entry \(bootplan, boo
 
 common() { # common <cleaned serial text> <boot name>; prints FAIL lines
     local S="$1" b="$2" v1 v2
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[pc\] Secure Boot: (off|on|not reported by this firmware), kept for fwinfo$' ||
         echo "  FAIL: $b: at power-on the kernel did not keep the Secure Boot state"
     has '^fwinfo: the firmware that started AfriSovera, as read at power-on \(nothing is changed\)$' ||
@@ -47,23 +47,23 @@ grade() { # grade <boot 1 log> <boot 2 log>
     [ -n "$out" ] && { printf '%s\n' "$out"; fail=1; }
     in1() { printf '%s\n' "$S1" | grep -aqE "$1"; }
     in2() { printf '%s\n' "$S2" | grep -aqE "$1"; }
-    # boot 1: the plain firmware -- off or not reported, the owner's line agreeing, both lines agreeing
+    # boot 1: the plain firmware: off or not reported, the owner's line agreeing, both lines agreeing
     if in1 '^  Secure Boot: off$'; then
         in1 '^\[pc\] Secure Boot: off, kept for fwinfo$' || { echo "  FAIL: boot 1: fwinfo and the boot line disagree"; fail=1; }
-        in1 "^  for the owner: Secure Boot is off( \\(keys are enrolled, so it can be switched back on later\\))? -- $START\$" ||
+        in1 "^  for the owner: Secure Boot is off( \\(keys are enrolled, so it can be switched back on later\\))?; $START\$" ||
             { echo "  FAIL: boot 1: Secure Boot off but the owner's line does not say AfriSovera can start"; fail=1; }
     elif in1 '^  Secure Boot: not reported by this firmware$'; then
         in1 '^\[pc\] Secure Boot: not reported by this firmware, kept for fwinfo$' || { echo "  FAIL: boot 1: fwinfo and the boot line disagree"; fail=1; }
-        in1 "^  for the owner: this firmware has no Secure Boot to switch off -- $START\$" ||
+        in1 "^  for the owner: this firmware has no Secure Boot to switch off; $START\$" ||
             { echo "  FAIL: boot 1: Secure Boot not reported but the owner's line does not say so"; fail=1; }
     else
         echo "  FAIL: boot 1: the plain firmware (no Secure Boot built in) was not read as off or not reported"; fail=1
     fi
-    # boot 2: Secure-Boot-capable firmware, no keys -- off, setup mode
+    # boot 2: Secure-Boot-capable firmware, no keys: off, setup mode
     in2 '^\[pc\] Secure Boot: off, kept for fwinfo$' || { echo "  FAIL: boot 2: the boot line does not say Secure Boot off"; fail=1; }
     in2 '^  Secure Boot: off$' || { echo "  FAIL: boot 2: fwinfo does not say Secure Boot off"; fail=1; }
     in2 '^  Setup Mode: yes \(no platform key enrolled\)$' || { echo "  FAIL: boot 2: fwinfo does not say Setup Mode (no platform key)"; fail=1; }
-    in2 "^  for the owner: Secure Boot is off -- $START\$" || { echo "  FAIL: boot 2: the owner's line is not 'Secure Boot is off'"; fail=1; }
+    in2 "^  for the owner: Secure Boot is off; $START\$" || { echo "  FAIL: boot 2: the owner's line is not 'Secure Boot is off'"; fail=1; }
     return "$fail"
 }
 
@@ -77,7 +77,7 @@ fwinfo: the firmware that started AfriSovera, as read at power-on (nothing is ch
   variable services: working
   Secure Boot: not reported by this firmware
   Setup Mode: not reported by this firmware
-  for the owner: this firmware has no Secure Boot to switch off -- the firmware can start AfriSovera from its own boot entry (bootplan, bootcopy, bootentry, bootnext)"
+  for the owner: this firmware has no Secure Boot to switch off; the firmware can start AfriSovera from its own boot entry (bootplan, bootcopy, bootentry, bootnext)"
 B2="[pc] firmware: EDK II (revision 0x10000)
 [pc] Secure Boot: off, kept for fwinfo
 [pc] MANSA-PC BOOT OK
@@ -88,8 +88,8 @@ fwinfo: the firmware that started AfriSovera, as read at power-on (nothing is ch
   variable services: working
   Secure Boot: off
   Setup Mode: yes (no platform key enrolled)
-  for the owner: Secure Boot is off -- the firmware can start AfriSovera from its own boot entry (bootplan, bootcopy, bootentry, bootnext)"
-B1OFF="$(printf '%s\n' "$B2" | sed 's/^  Setup Mode: .*/  Setup Mode: no (a platform key is enrolled)/; s/Secure Boot is off --/Secure Boot is off (keys are enrolled, so it can be switched back on later) --/')"
+  for the owner: Secure Boot is off; the firmware can start AfriSovera from its own boot entry (bootplan, bootcopy, bootentry, bootnext)"
+B1OFF="$(printf '%s\n' "$B2" | sed 's/^  Setup Mode: .*/  Setup Mode: no (a platform key is enrolled)/; s/Secure Boot is off;/Secure Boot is off (keys are enrolled, so it can be switched back on later);/')"
 
 selftest() {
     local D pass=0 bad=0
@@ -114,11 +114,11 @@ selftest() {
     arm vars-down red "$B1" "$(printf '%s\n' "$B2" | sed 's/^  variable services: working/  variable services: not answering/')"
     arm boot1-on red "$(printf '%s\n' "$B2" | sed 's/Secure Boot: off/Secure Boot: on/')" "$B2"
     arm boot1-lines-disagree red "$(printf '%s\n' "$B1" | sed 's/^\[pc\] Secure Boot: not reported by this firmware/[pc] Secure Boot: off/')" "$B2"
-    arm boot1-wrong-verdict red "$(printf '%s\n' "$B1" | sed 's/^  for the owner: .*/  for the owner: Secure Boot is off -- x/')" "$B2"
+    arm boot1-wrong-verdict red "$(printf '%s\n' "$B1" | sed 's/^  for the owner: .*/  for the owner: Secure Boot is off; x/')" "$B2"
     arm boot2-not-reported red "$B1" "$B1"
     arm boot2-on red "$B1" "$(printf '%s\n' "$B2" | sed 's/Secure Boot: off/Secure Boot: on/')"
     arm boot2-user-mode red "$B1" "$B1OFF"
-    arm boot2-unclear red "$B1" "$(printf '%s\n' "$B2"; echo '  for the owner: the firmware gave an unclear Secure Boot answer -- look in its set-up screen before bootentry')"
+    arm boot2-unclear red "$B1" "$(printf '%s\n' "$B2"; echo '  for the owner: the firmware gave an unclear Secure Boot answer; look in its set-up screen before bootentry')"
     arm panic red "$B1" "$(printf '%s\nKERNEL PANIC\n' "$B2")"
     arm empty red "" ""
     rm -rf "$D"
@@ -127,8 +127,8 @@ selftest() {
 }
 
 echo "== PC firmware facts: vendor, UEFI version, Secure Boot (fwinfo, read only) =="
-if ! selftest; then echo "PC FWINFO TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC FWINFO SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC FWINFO TEST FAILED (grader selftest); no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC FWINFO SELFTEST ONLY; no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

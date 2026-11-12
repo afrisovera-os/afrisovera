@@ -33,8 +33,8 @@ def grade(serial, recv, report, card, port, closed):
         bad.append("bare `report` did not explain itself")
     # QEMU's user network answers a closed host port with RST on some hosts and with silence
     # on others (Windows); either way the guest must give up in plain words
-    if not has(r"^report: NOT SENT -- 10\.0\.2\.2 (is there but nothing listens on port %d -- start tools/report-receiver\.py first"
-               r"|never answered -- its firewall may block Python \(allow it on private networks\))$" % closed):
+    if not has(r"^report: NOT SENT: 10\.0\.2\.2 (is there but nothing listens on port %d; start tools/report-receiver\.py first"
+               r"|never answered; its firewall may block Python \(allow it on private networks\))$" % closed):
         bad.append("a report to a closed port was not refused in plain words")
     if not has(r"^\[report\] from 10\.0\.2\.15, receiver 10\.0\.2\.2 is at ([0-9a-f]{2}:){5}[0-9a-f]{2}$"):
         bad.append("the receiver's MAC was not found by ARP (on-link route)")
@@ -114,7 +114,7 @@ def fixture(card):
     report = body + b"\n== end of report (%d bytes before this line) ==\n" % n
     serial = ("afrisovera> report\nreport: send this PC's details to your main PC over the home network.\n"
               "afrisovera> report 10.0.2.2:9\n"
-              "report: NOT SENT -- 10.0.2.2 is there but nothing listens on port 9 -- start tools/report-receiver.py first\n"
+              "report: NOT SENT: 10.0.2.2 is there but nothing listens on port 9; start tools/report-receiver.py first\n"
               "afrisovera> report 10.0.2.2:5000\n"
               "[report] from 10.0.2.15, receiver 10.0.2.2 is at 52:55:0a:00:02:02\n"
               "[report] connected to 10.0.2.2:5000, sending %d bytes\n"
@@ -147,8 +147,8 @@ def selftest():
     arm("wrong-card", "red", s, r, rep, "rtl")
     arm("no-usage", "red", s.replace("report: send this PC", "x"), r, rep)
     arm("not-refused", "red", s.replace("NOT SENT", "SENT"), r, rep)
-    arm("closed-silent", "green", s.replace("is there but nothing listens on port 9 -- start tools/report-receiver.py first",
-        "never answered -- its firewall may block Python (allow it on private networks)"), r, rep)
+    arm("closed-silent", "green", s.replace("is there but nothing listens on port 9; start tools/report-receiver.py first",
+        "never answered; its firewall may block Python (allow it on private networks)"), r, rep)
     arm("no-arp", "red", s.replace("receiver 10.0.2.2 is at", "router 10.0.2.2 is at"), r, rep)
     arm("not-sent", "red", s.replace("[report] SENT", "[report] sent"), r, rep)
     arm("panic", "red", s + "[pc] PANIC: oops\n", r, rep)

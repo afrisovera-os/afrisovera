@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track step 5 (7 Nov 2026): `bootnext` -- the proof that the firmware really STARTS AfriSovera from its own
+# PC track step 5 (7 Nov 2026): `bootnext`: the proof that the firmware really STARTS AfriSovera from its own
 # boot entry, and that the PC goes back to its usual first choice by itself afterwards.
 #
 # bootcopy puts AfriSovera's boot file into the EFI system partition Windows uses; bootentry adds Boot#### at the
@@ -51,6 +51,30 @@
 # back BootOrder must read exactly as at boot 1. Ubuntu's stand-in grubx64.efi first gets a PE32+ EFI-application
 # header in this test's disk copy: without one, edk2's QEMU boot order cannot open the entry's file and deletes the
 # entry before boot 1 (seen on os2 run 43074837186), which a real PC's firmware would not do.
+# BOOTNEXT_KIND=windows and windows4k (scripts/pc-bootnext-windows-test.sh and pc-bootnext-windows4k-test.sh, 11 Nov
+# 2026): the ubuntu and ubuntu4k kinds on a disk set up as a real Windows and Ubuntu PC: before boot 1 the harness
+# writes Boot0005 "Windows Boot Manager" .../\EFI\Microsoft\Boot\bootmgfw.efi (as Windows' setup leaves it), then
+# Boot0006 "ubuntu" first in BootOrder (as Ubuntu's installer, run after Windows, leaves it), so BootOrder starts
+# 0006 0005. Both entries must be there at boot 1, keep their numbers, never be started and read the same at boots
+# 5, 6 and 8; AfriSovera's entry takes a third number; BootOrder after the way back reads as at boot 1. The stand-in
+# bootmgfw.efi gets a PE32+ header too, for the same edk2 reason as Ubuntu's.
+# On the ubuntu, ubuntu4k, windows and windows4k kinds boot 1 also runs bootplan (11 Nov 2026): it must name Ubuntu's
+# entry (and Windows Boot Manager's) with its partition, its file and its place in BootOrder, say each stays as it is,
+# never name AfriSovera's own, and say the PC keeps starting "ubuntu" first. Boot 8, after the way back, runs bootplan
+# again (11 Nov 2026): its target partition, boot entry, first-choice and "stays as it is" lines must read exactly as at
+# boot 1, so the way back leaves the plan as it was before AfriSovera came (same entries, same places in BootOrder).
+# At boots 1 and 8 the entry bootplan says the PC keeps starting first (12 Nov 2026) must be the first place of that
+# boot's BootOrder in bootentries, unless bootplan names the places before it "passed over before it in BootOrder",
+# each with a reason (no such entry, off, hidden, a firmware app) that bootentries bears out.
+# Boot 3 also runs bootentries after bootnext (12 Nov 2026), on every kind: the entry bootnext says the power-on after
+# the one-time start goes back to ("first in it") is held to the same rule against that BootOrder, and bootnext names
+# the places passed over before it with the same words as bootplan.
+# BOOTNEXT_KIND=winhidden (scripts/pc-bootnext-winhidden-test.sh, 12 Nov 2026): the windows kind with Windows Boot
+# Manager's entry written HIDDEN (attributes 9, active and hidden, as a firmware setup screen leaves an entry the user
+# hid from its boot menu): bootentries must show it "[hidden]", bootplan must say ", hidden" and that it stays as it
+# is, and it must read exactly so at boots 5, 6 and 8 (never unhidden, turned off or started). An entry written OFF
+# (attributes 8) cannot be tested here: QEMU's firmware rebuilds BootOrder from QEMU's own boot list at every power-on,
+# keeps only active entries, and deleted the off entry before boot 2 (os2 run 43123637642); a real PC keeps it.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T="${TMPDIR:-/tmp}"
@@ -59,27 +83,37 @@ KIND="${BOOTNEXT_KIND:-sata}"
 # byte where the GPT entry array starts (block 2), the first serial port and the name in the PASSED/FAILED line
 NAME="sata port 2"; STARTL=2048; ESPK=gpt-esp-fsinfo; GOFF=1024; PORT=5430; UP=""
 PNO=1; RSTART=0 # the EFI partition's GPT entry number; the recovery partition's first block (recovery-first kinds)
-FOURK=0; { [ "$KIND" = nvme4k ] || [ "$KIND" = recfirst4k ] || [ "$KIND" = dual4k ] || [ "$KIND" = ubuntu4k ]; } && FOURK=1 # the Windows-like disk on 4 KiB-block NVMe
-SHARED=0; { [ "$KIND" = dual ] || [ "$KIND" = dual4k ] || [ "$KIND" = ubuntu ] || [ "$KIND" = ubuntu4k ]; } && SHARED=1 # Windows and Ubuntu in one EFI partition
-UBU=0; { [ "$KIND" = ubuntu ] || [ "$KIND" = ubuntu4k ]; } && UBU=1 # Ubuntu's own firmware entry is there before boot 1
+WIN=0; { [ "$KIND" = windows ] || [ "$KIND" = windows4k ] || [ "$KIND" = winhidden ]; } && WIN=1 # Windows Boot Manager's own entry too, before Ubuntu's
+FOURK=0; { [ "$KIND" = nvme4k ] || [ "$KIND" = recfirst4k ] || [ "$KIND" = dual4k ] || [ "$KIND" = ubuntu4k ] || [ "$KIND" = windows4k ]; } && FOURK=1 # the Windows-like disk on 4 KiB-block NVMe
+SHARED=0; { [ "$KIND" = dual ] || [ "$KIND" = dual4k ] || [ "$KIND" = ubuntu ] || [ "$KIND" = ubuntu4k ] || [ "$WIN" = 1 ]; } && SHARED=1 # Windows and Ubuntu in one EFI partition
+UBU=0; { [ "$KIND" = ubuntu ] || [ "$KIND" = ubuntu4k ] || [ "$WIN" = 1 ]; } && UBU=1 # Ubuntu's own firmware entry is there before boot 1
 if [ "$FOURK" = 1 ]; then
     NAME=nvme; STARTL=256; ESPK=gpt-esp-fsinfo-4k; GOFF=8192; PORT=6650; UP=" NVME 4K"
     # recovery first: GPT entry 2 (its entry is 128 bytes after entry 1's) at block 5376, the recovery partition at 256
     [ "$KIND" = recfirst4k ] && { STARTL=5376; ESPK=gpt-esp-recfirst-4k; GOFF=8320; PORT=7050; UP=" RECOVERY FIRST NVME 4K"; PNO=2; RSTART=256; }
     [ "$KIND" = dual4k ] && { ESPK=gpt-esp-dual-4k; PORT=7140; UP=" NVME 4K, SHARING ONE EFI PARTITION WITH UBUNTU"; }
     [ "$KIND" = ubuntu4k ] && { ESPK=gpt-esp-dual-4k; PORT=7200; UP=" NVME 4K, BESIDE UBUNTU'S OWN BOOT ENTRY"; }
+    [ "$KIND" = windows4k ] && { ESPK=gpt-esp-dual-4k; PORT=7260; UP=" NVME 4K, BESIDE WINDOWS' AND UBUNTU'S OWN BOOT ENTRIES"; }
 elif [ "$KIND" = recfirst ]; then
     STARTL=43008; ESPK=gpt-esp-recfirst; GOFF=1152; PORT=7080; UP=" RECOVERY FIRST"; PNO=2; RSTART=2048
 elif [ "$KIND" = dual ]; then
     ESPK=gpt-esp-dual; PORT=7110; UP=" SATA, SHARING ONE EFI PARTITION WITH UBUNTU"
 elif [ "$KIND" = ubuntu ]; then
     ESPK=gpt-esp-dual; PORT=7170; UP=" SATA, BESIDE UBUNTU'S OWN BOOT ENTRY"
+elif [ "$KIND" = windows ]; then
+    ESPK=gpt-esp-dual; PORT=7230; UP=" SATA, BESIDE WINDOWS' AND UBUNTU'S OWN BOOT ENTRIES"
+elif [ "$KIND" = winhidden ]; then
+    ESPK=gpt-esp-dual; PORT=7290; UP=" SATA, BESIDE UBUNTU'S ENTRY AND WINDOWS' HIDDEN ENTRY"
 fi
+# Windows Boot Manager's entry: its attributes, how bootentries shows them, bootplan's words and the harness's note
+WATTR=1; WST="active  "; WTAIL=""; WTAIL_RE=""; WPLAN=""; WHARN=""
+[ "$KIND" = winhidden ] && { WATTR=9; WTAIL="  [hidden]"; WTAIL_RE='  \[hidden\]'; WPLAN=", hidden"; WHARN=" (attributes 9: active, hidden)"; }
 KEPT="harness: Microsoft, BOOT and ubuntu files byte-identical (clusters 4-27 and their FAT entries)"
 INSIDE="harness: the Windows-like disk changed only inside its EFI partition"
 
 FILE_RE='\\EFI\\afrisovera\\afrisovera\.efi'
 UFILE='\EFI\ubuntu\grubx64.efi'; UFILE_RE='\\EFI\\ubuntu\\grubx64\.efi' # Ubuntu's file, as its own entry names it
+WFILE='\EFI\Microsoft\Boot\bootmgfw.efi'; WFILE_RE='\\EFI\\Microsoft\\Boot\\bootmgfw\.efi' # Windows Boot Manager's
 grade() { # grade <boot1 log> ... <boot6 log> [<boot7 log> <boot8 log>] (boots 7 and 8 on the shared kinds only)
     local fail=0 A B C D E F G7="" H8=""
     _f() { echo "  FAIL: $*"; fail=1; }
@@ -92,9 +126,9 @@ grade() { # grade <boot1 log> ... <boot6 log> [<boot7 log> <boot8 log>] (boots 7
     fi
     blk() { printf '%s\n' "$1" | awk -v c="afrisovera> $2" '$0==c{on=1;next} /^afrisovera>/{on=0} on'; }
     pblk() { printf '%s\n' "$1" | awk -v c="^afrisovera> $2" '$0~c{on=1;next} /^afrisovera>/{on=0} on'; }
-    in_blk() { printf '%s\n' "$1" | grep -aqxE "$2"; }
+    in_blk() { grep -aqxE "$2" <<< "$1"; }
     local NUM N4 G FIRST=""
-    in_blk "$(blk "$A" bootnext)" 'bootnext: AfriSovera has no boot entry \(bootentry adds it first\) -- nothing written' ||
+    in_blk "$(blk "$A" bootnext)" 'bootnext: AfriSovera has no boot entry \(bootentry adds it first\); nothing written' ||
         _f "boot 1: bootnext was not refused without AfriSovera's entry"
     printf '%s\n' "$(pblk "$B" 'bootcopy yes ')" | grep -aqE "^bootcopy: copied to $NAME partition $PNO$FILE_RE, read back the same" ||
         _f "boot 2: bootcopy did not copy the boot file to partition $PNO"
@@ -109,7 +143,40 @@ grade() { # grade <boot1 log> ... <boot6 log> [<boot7 log> <boot8 log>] (boots 7
     in_blk "$C2" '  the firmware deletes BootNext as it starts it; the power-on after that follows BootOrder again( \(first in it: ".+"\))?' ||
         _f "boot 3: bootnext did not say the PC goes back to BootOrder afterwards"
     in_blk "$C2" 'bootnext: nothing written yet. To do it, type exactly: bootnext yes [0-9a-f]{4}' || _f "boot 3: bootnext did not give the code"
-    in_blk "$(blk "$C" 'bootnext yes zzzz')" "bootnext: that code does not fit the firmware's boot entries as they are now -- nothing written" ||
+    # the entry bootplan says the PC keeps starting first (12 Nov 2026), and the one bootnext says the PC goes back to
+    # ("first in it"), is the first place of that boot's BootOrder, unless the places before it are named as passed
+    # over, each for a reason bootentries bears out
+    fp() { # fp <bootentries block> <bootplan or bootnext block> <which boot> [bootnext]
+        local be="$1" bp="$2" w="$3" c="${4:-bootplan}" ks po i=0 n r el
+        if [ "$c" = bootnext ]; then
+            ks="$(printf '%s\n' "$bp" | sed -nE 's/^  the firmware deletes BootNext as it starts it; the power-on after that follows BootOrder again \(first in it: "(.*)"\)$/\1/p' | head -1)"
+        else
+            ks="$(printf '%s\n' "$bp" | sed -nE 's/^  the PC keeps starting "(.*)" first; AfriSovera is picked from the firmware.s boot menu$/\1/p' | head -1)"
+        fi
+        [ -n "$ks" ] || return 0
+        po="$(printf '%s\n' "$bp" | sed -nE 's/^  passed over before it in BootOrder: (.*)$/\1/p' | head -1)"
+        set -- $(printf '%s\n' "$be" | grep -a '^  BootOrder:' | head -1 | sed 's/^  BootOrder://')
+        while read -r n r; do
+            [ -n "$n" ] || continue
+            i=$((i+1)); [ "$n" = "Boot${!i:-none}" ] || _f "$w: $c says $n is passed over as place $i of BootOrder, which is Boot${!i:-none}"
+            el="$(printf '%s\n' "$be" | grep -aE "^  $n  " | head -1)"
+            case "$r" in
+                "no such entry") [ -z "$el" ] || _f "$w: $c says $n has no entry, but bootentries lists it";;
+                off) printf '%s\n' "$el" | grep -aqE "^  $n  off  " || _f "$w: $c says $n is off, but bootentries does not";;
+                hidden) printf '%s\n' "$el" | grep -aqE "^  $n  active  .*  \[hidden\]" || _f "$w: $c says $n is hidden, but bootentries does not";;
+                "a firmware app") { printf '%s\n' "$el" | grep -aqE "^  $n  active  " && ! printf '%s\n' "$el" | grep -aq '  \[hidden\]'; } ||
+                    _f "$w: $c says $n is a firmware app, but bootentries shows it off, hidden or not at all";;
+                damaged) ;;
+                *) _f "$w: $c passes over $n for a reason it never gives ($r)";;
+            esac
+        done < <(printf '%s\n' "$po" | grep -aoE 'Boot[0-9A-F]{4} \([a-z ]+\)' | sed -E 's/^(Boot[0-9A-F]{4}) \((.*)\)$/\1 \2/')
+        i=$((i+1)); n="${!i:-}"
+        el="$(printf '%s\n' "$be" | grep -aE "^  Boot${n:-none}  " | head -1)"
+        { printf '%s\n' "$el" | grep -aqF "  active  \"$ks\"  " && ! printf '%s\n' "$el" | grep -aq '  \[hidden\]'; } ||
+            _f "$w: $c says the PC keeps starting \"$ks\" first, but place $i of BootOrder (Boot${n:-none}) is not that entry, or is passed over without a word"
+    }
+    fp "$(blk "$C" bootentries)" "$C2" "boot 3" bootnext
+    in_blk "$(blk "$C" 'bootnext yes zzzz')" "bootnext: that code does not fit the firmware's boot entries as they are now; nothing written" ||
         _f "boot 3: a wrong code was not refused"
     # boot 4: written, read back; this boot still came from the stick
     local DE; DE="$(blk "$D" bootentries)"
@@ -121,7 +188,7 @@ grade() { # grade <boot1 log> ... <boot6 log> [<boot7 log> <boot8 log>] (boots 7
     FIRST="$(printf '%s\n' "$DE" | sed -nE 's/^  Boot[0-9A-F]{4}  active  "(.+)"  .*  <- started this time$/\1/p' | head -1)"
     [ -n "$FIRST" ] || _f "boot 4: bootentries does not show which entry started this boot"
     [ "$FIRST" != "AfriSovera" ] || _f "boot 4: this boot was already started from AfriSovera's entry"
-    in_blk "$(blk "$D" bootnext)" "bootnext: BootNext already starts $NUM \"AfriSovera\" at the next power-on -- nothing to do" ||
+    in_blk "$(blk "$D" bootnext)" "bootnext: BootNext already starts $NUM \"AfriSovera\" at the next power-on; nothing to do" ||
         _f "boot 4: a second bootnext did not see BootNext already set"
     # boot 5: the firmware started AfriSovera's own entry
     local EE; EE="$(blk "$E" bootentries)"
@@ -143,7 +210,7 @@ grade() { # grade <boot1 log> ... <boot6 log> [<boot7 log> <boot8 log>] (boots 7
         in_blk "$F2" "bootentry remove: $NUM \"AfriSovera\" would be deleted" || _f "boot 6: bootentry remove did not say what goes"
         in_blk "$F2" 'bootentry remove: nothing written yet. To do it, type exactly: bootentry remove yes [0-9a-f]{4}' ||
             _f "boot 6: bootentry remove did not give the code"
-        in_blk "$(pblk "$G7" 'bootentry remove yes ')" "bootentry remove: $NUM deleted and out of BootOrder, read back -- the firmware's boot entries are as before bootentry" ||
+        in_blk "$(pblk "$G7" 'bootentry remove yes ')" "bootentry remove: $NUM deleted and out of BootOrder, read back; the firmware's boot entries are as before bootentry" ||
             _f "boot 7: bootentry remove did not delete $NUM and read back"
         local G2; G2="$(blk "$G7" 'bootcopy remove')"
         in_blk "$G2" "bootcopy remove: $NAME partition $PNO \(start $STARTL\): \\\\EFI\\\\afrisovera \([0-9]+ KiB\) would be taken out; nothing else in the partition changes" ||
@@ -176,7 +243,62 @@ grade() { # grade <boot1 log> ... <boot6 log> [<boot7 log> <boot8 log>] (boots 7
             printf '%s\n' "$HE" | grep -aqxF "$UL" || _f "boot 8: Ubuntu's entry is not as it was at boot 1"
         fi
         { [ -n "$BO1" ] && printf '%s\n' "$HE" | grep -aqxF "$BO1"; } || _f "boot 8: BootOrder is not as it was at boot 1"
+        # bootplan names the other systems' entries and says they stay, each at its place in boot 1's BootOrder (QEMU's
+        # firmware puts its own disks before them at power-on, so Ubuntu need not be first there)
+        local AP UPL; AP="$(blk "$A" bootplan)"
+        pl() { printf '%s\n' "$BO1" | sed 's/^  BootOrder://' | tr ' ' '\n' | grep -v '^$' | grep -nx "${1#Boot}" | cut -d: -f1 | head -1; }
+        UPL="$(pl "${UNUM:-Boot????}")"
+        in_blk "$AP" "  stays as it is: ${UNUM:-Boot????} \"ubuntu\", partition $PNO, $UFILE_RE \(place ${UPL:-?} in BootOrder\)" ||
+            _f "boot 1: bootplan does not say Ubuntu's entry ${UNUM:-?} (partition $PNO, $UFILE, place ${UPL:-?} in BootOrder) stays as it is"
+        if printf '%s\n' "$AP" | grep -aE '^  stays as it is: ' | grep -aqiE '"AfriSovera"|\\afrisovera\\'; then
+            _f "boot 1: bootplan names AfriSovera's own entry as one that stays"; fi
+        in_blk "$AP" '  the PC keeps starting ".+" first; AfriSovera is picked from the firmware.s boot menu' ||
+            _f "boot 1: bootplan does not say which entry the PC keeps starting first"
+        fp "$A1" "$AP" "boot 1"
+        # boot 8, after the way back: bootplan says what it said at boot 1 (target, entry, first choice, the others)
+        local PL='^(bootplan: the boot file would go to |  boot entry: |  the PC keeps starting |  passed over before it in BootOrder: |  stays as it is: )' P1 P8
+        P1="$(printf '%s\n' "$AP" | grep -aE "$PL")"; P8="$(blk "$H8" bootplan | grep -aE "$PL")"
+        { printf '%s\n' "$P1" | grep -aq '^  stays as it is: ' && [ "$P1" = "$P8" ]; } ||
+            _f "boot 8: bootplan after the way back does not say what it said at boot 1 (the same entries at the same places)"
+        fp "$HE" "$(blk "$H8" bootplan)" "boot 8"
+        if [ "$WIN" = 1 ]; then # Windows Boot Manager's own entry too: there first, never started, left exactly as it was
+            local WL WNUM=""
+            printf '%s\n' "$A" | grep -aqE '^harness: Boot[0-9A-F]{4} "Windows Boot Manager" .* written to the variable store' ||
+                _f "harness: Windows Boot Manager's entry was not written to the variable store before boot 1"
+            WL="$(printf '%s\n' "$A1" | grep -aE "^  Boot[0-9A-F]{4}  $WST\"Windows Boot Manager\"  HD\($PNO,GPT,$G,start $STARTL\)/$WFILE_RE$WTAIL_RE\$" | head -1)"
+            [ -n "$WL" ] || _f "boot 1: bootentries does not show Windows Boot Manager's entry ${WST%% *} HD($PNO,GPT,$G,start $STARTL)/$WFILE$WTAIL"
+            WNUM="$(printf '%s\n' "$WL" | sed -nE 's/^  (Boot[0-9A-F]{4}) .*/\1/p')"
+            { [ -n "$WNUM" ] && printf '%s\n' "$BO1" | grep -aqE " ${WNUM#Boot}( |\$)"; } || _f "boot 1: BootOrder does not hold Windows Boot Manager's entry"
+            [ "$NUM" != "$WNUM" ] || _f "boot 3: bootentry took Windows Boot Manager's number $WNUM"
+            [ -z "$WNUM" ] || [ "$WNUM" != "$UNUM" ] || _f "boot 1: Windows Boot Manager and Ubuntu show the same number $WNUM"
+            local WP; WP="$(pl "${WNUM:-Boot????}")"
+            in_blk "$AP" "  stays as it is: ${WNUM:-Boot????} \"Windows Boot Manager\", partition $PNO, $WFILE_RE$WPLAN \(place ${WP:-?} in BootOrder\)" ||
+                _f "boot 1: bootplan does not say Windows Boot Manager's entry ${WNUM:-?} (partition $PNO, $WFILE$WPLAN, place ${WP:-?} in BootOrder) stays as it is"
+            [ -z "$UPL" ] || [ -z "$WP" ] || [ "$UPL" -lt "$WP" ] || _f "boot 1: Ubuntu's entry is not before Windows Boot Manager's in BootOrder"
+            if [ -n "$WL" ]; then
+                printf '%s\n' "$EE" | grep -aqxF "$WL" || _f "boot 5: Windows Boot Manager's entry changed, is gone or was started"
+                printf '%s\n' "$FE" | grep -aqxF "$WL" || _f "boot 6: Windows Boot Manager's entry changed, is gone or was started"
+                printf '%s\n' "$HE" | grep -aqxF "$WL" || _f "boot 8: Windows Boot Manager's entry is not as it was at boot 1"
+            fi
+        fi
     fi
+    # a BootOrder place bootentries calls empty (12 Nov 2026) must be in that BootOrder with no Boot#### line of its
+    # own; QEMU's firmware rebuilds BootOrder from the entries it has, so a real run here shows none
+    dang() { # dang <log text> <which boot>
+        local b dl n; b="$(blk "$1" bootentries)"
+        dl="$(printf '%s\n' "$b" | sed -nE 's/^  in BootOrder but no such entry \(the firmware passes over it, nothing is changed\): (.*)$/\1/p')"
+        for n in $(printf '%s\n' "$dl" | grep -aoE 'Boot[0-9A-F]{4}'); do
+            printf '%s\n' "$b" | grep -a '^  BootOrder:' | grep -aqE " ${n#Boot}( |\$)" || _f "$2: bootentries calls $n an empty place, but BootOrder does not name it"
+            if printf '%s\n' "$b" | grep -aqE "^  $n  "; then _f "$2: bootentries calls $n an empty place, but lists its entry"; fi
+        done
+        # BootNext (12 Nov 2026): "no such entry" only for a number with no Boot#### line, the usual words only
+        # for one with a line (QEMU's firmware deletes BootNext at power-on, so a real run shows only boot 4's)
+        n="$(printf '%s\n' "$b" | sed -nE 's/^  BootNext: ([0-9A-F]{4}) \(no such entry: the firmware deletes it at the next power-on and follows BootOrder\)$/\1/p' | head -1)"
+        if [ -n "$n" ] && printf '%s\n' "$b" | grep -aqE "^  Boot$n  "; then _f "$2: bootentries says BootNext $n has no entry, but lists Boot$n"; fi
+        n="$(printf '%s\n' "$b" | sed -nE 's/^  BootNext: ([0-9A-F]{4}) \(started ONCE at the next power-on, then the firmware deletes it\)$/\1/p' | head -1)"
+        if [ -n "$n" ] && ! printf '%s\n' "$b" | grep -aqE "^  Boot$n  |^  \([0-9]+ more entries not shown\)$"; then _f "$2: bootentries says BootNext starts $n, but lists no Boot$n"; fi
+    }
+    dang "$A" "boot 1"; dang "$D" "boot 4"; dang "$E" "boot 5"; dang "$F" "boot 6"; dang "$H8" "boot 8"
     if printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$A" "$B" "$C" "$D" "$E" "$F" "$G7" "$H8" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)|FAILED|refused to write|could not be written|did not read back|did not delete'; then
         _f "the kernel panicked, a disk command or a firmware write failed, or something FAILED"
     fi
@@ -187,7 +309,7 @@ ESPG="00000000-0000-0000-0000-0000000af000"
 [ "$PNO" = 2 ] && ESPG="00000000-0000-0000-0000-0000000af001" # GPT entry 2's unique GUID on the recovery-first kinds
 STICK="UEFI QEMU HARDDISK QM00001 "
 L1="afrisovera> bootnext
-bootnext: AfriSovera has no boot entry (bootentry adds it first) -- nothing written
+bootnext: AfriSovera has no boot entry (bootentry adds it first); nothing written
 afrisovera> bootcopy
 bootcopy: nothing written yet. To do it, type exactly: bootcopy yes 3fa2
 afrisovera>"
@@ -204,7 +326,13 @@ bootnext: the next power-on starts Boot0005 \"AfriSovera\" ONCE (BootNext now: n
 bootnext: nothing written yet. To do it, type exactly: bootnext yes 9a41
 afrisovera> bootnext yes zzzz
 bootnext: the next power-on starts Boot0005 \"AfriSovera\" ONCE (BootNext now: none -> 0005)
-bootnext: that code does not fit the firmware's boot entries as they are now -- nothing written
+bootnext: that code does not fit the firmware's boot entries as they are now; nothing written
+afrisovera> bootentries
+bootentries: the firmware's boot entries, as read again after bootentry changed them (nothing is changed here)
+  BootOrder: 0001 0002 0003 0004 0000 0005
+  Boot0001  active  \"$STICK\"  PciRoot/Pci(1f.2)/Sata(0)  <- started this time
+  Boot0005  active  \"AfriSovera\"  HD(1,GPT,$ESPG,start 2048)/\\EFI\\afrisovera\\afrisovera.efi
+  AfriSovera's own entry: Boot0005
 afrisovera>"
 L4="afrisovera> bootnext yes 9a41
 bootnext: BootNext = Boot0005 written and read back; the next power-on starts AfriSovera from its own entry, once
@@ -216,7 +344,7 @@ bootentries: the firmware's boot entries, as read again after bootentry changed 
   Boot0005  active  \"AfriSovera\"  HD(1,GPT,$ESPG,start 2048)/\\EFI\\afrisovera\\afrisovera.efi
   AfriSovera's own entry: Boot0005
 afrisovera> bootnext
-bootnext: BootNext already starts Boot0005 \"AfriSovera\" at the next power-on -- nothing to do
+bootnext: BootNext already starts Boot0005 \"AfriSovera\" at the next power-on; nothing to do
 afrisovera>"
 L5="afrisovera> bootentries
 bootentries: the firmware's boot entries, as read at power-on (nothing is changed)
@@ -256,7 +384,7 @@ $INSIDE
 $KEPT"
 L7="afrisovera> bootentry remove yes 0e3d
 bootentry remove: Boot0005 \"AfriSovera\" would be deleted
-bootentry remove: Boot0005 deleted and out of BootOrder, read back -- the firmware's boot entries are as before bootentry
+bootentry remove: Boot0005 deleted and out of BootOrder, read back; the firmware's boot entries are as before bootentry
 afrisovera> bootcopy remove
 bootcopy remove: sata port 2 partition 1 (start 2048): \\EFI\\afrisovera (2360 KiB) would be taken out; nothing else in the partition changes
 bootcopy remove: nothing written yet. To do it, type exactly: bootcopy remove yes 09bc
@@ -278,31 +406,59 @@ if [ "$FOURK" = 1 ]; then
     L8="$(printf '%s\n' "$L8" | sed 's/sata port 2 partition 1 (start 2048)/nvme partition 1 (start 256)/; s/sata port 2 partition 1,/nvme partition 1,/; s/GPT entry 1 (start 2048)/GPT entry 1 (start 256)/')"
 fi
 fi
-if [ "$UBU" = 1 ]; then # Ubuntu's entry is Boot0005 and first in BootOrder, so AfriSovera's is Boot0006
-UL="  Boot0005  active  \"ubuntu\"  HD($PNO,GPT,$ESPG,start $STARTL)/$UFILE"
-UBU_SED='s/Boot0005/Boot0006/g; s/-> 0005)/-> 0006)/; s/^  BootNext: 0005/  BootNext: 0006/
-s/^  BootOrder: 0001 0002 0003 0004 0000 0005$/  BootOrder: 0005 0001 0002 0003 0004 0000 0006/
-s/^  BootOrder: 0001 0002 0003 0004 0000$/  BootOrder: 0005 0001 0002 0003 0004 0000/
-s/BootOrder now: 0001 0002 0003 0004 0000 0005  -> after: 0001 0002 0003 0004 0000$/BootOrder now: 0005 0001 0002 0003 0004 0000 0006  -> after: 0005 0001 0002 0003 0004 0000/
-s/^  5 entries; the next free number is Boot0006/  6 entries; the next free number is Boot0006/'
-ubu() { printf '%s\n' "$1" | sed "$UBU_SED" | UL="$UL" awk '{print} /^  Boot0001  active  /{print ENVIRON["UL"]}'; }
+if [ "$UBU" = 1 ]; then # Ubuntu's entry is Boot0005 and first in BootOrder, so AfriSovera's is Boot0006; with Windows
+# Boot Manager's entry first at Boot0005, Ubuntu's is Boot0006 (BootOrder 0006 0005 ...) and AfriSovera's Boot0007
+UN=0005; AN=0006; PRE="0005"; NE=6; WL=""
+[ "$WIN" = 1 ] && { UN=0006; AN=0007; PRE="0006 0005"; NE=7
+    WL="  Boot0005  $WST\"Windows Boot Manager\"  HD($PNO,GPT,$ESPG,start $STARTL)/$WFILE$WTAIL"; }
+UL="  Boot$UN  active  \"ubuntu\"  HD($PNO,GPT,$ESPG,start $STARTL)/$UFILE"
+UBU_SED="s/Boot0005/Boot$AN/g; s/-> 0005)/-> $AN)/; s/^  BootNext: 0005/  BootNext: $AN/
+s/^  BootOrder: 0001 0002 0003 0004 0000 0005\$/  BootOrder: $PRE 0001 0002 0003 0004 0000 $AN/
+s/^  BootOrder: 0001 0002 0003 0004 0000\$/  BootOrder: $PRE 0001 0002 0003 0004 0000/
+s/BootOrder now: 0001 0002 0003 0004 0000 0005  -> after: 0001 0002 0003 0004 0000\$/BootOrder now: $PRE 0001 0002 0003 0004 0000 $AN  -> after: $PRE 0001 0002 0003 0004 0000/
+s/^  5 entries; the next free number is Boot$AN/  $NE entries; the next free number is Boot$AN/
+s/(first in it: \"$STICK\")\$/(first in it: \"ubuntu\")/"
+ubu() { printf '%s\n' "$1" | sed "$UBU_SED" | UL="$UL" WL="$WL" awk '{print} /^  Boot0001  active  /{if (ENVIRON["WL"] != "") print ENVIRON["WL"]; print ENVIRON["UL"]}'; }
 L1="${L1%afrisovera>}afrisovera> bootentries
 bootentries: the firmware's boot entries, as read at power-on (nothing is changed)
   BootOrder: 0001 0002 0003 0004 0000
   Boot0001  active  \"$STICK\"  PciRoot/Pci(1f.2)/Sata(0)  <- started this time
   5 entries; the next free number is Boot0005
   AfriSovera's own entry: none yet (adding one will ask for the owner's word)
-afrisovera>
-harness: Boot0005 \"ubuntu\" HD($PNO,GPT,$ESPG,start $STARTL)/$UFILE written to the variable store, first in BootOrder (0005)"
-L1="$(ubu "$L1" | sed 's/^harness: Boot0006/harness: Boot0005/')"
+afrisovera>"
+L1="$(ubu "$L1")"
+PLAN="bootplan: AfriSovera's boot file is 2360 KiB (kept at power-on)
+bootplan: the boot file would go to sata port 2 partition $PNO (start $STARTL), the one Windows starts from; no other EFI partition is changed
+  boot entry: Boot$AN \"AfriSovera\" -> sata port 2 partition $PNO (start $STARTL)\\EFI\\afrisovera\\afrisovera.efi would be added at the END of BootOrder
+  the PC keeps starting \"ubuntu\" first; AfriSovera is picked from the firmware's boot menu
+  stays as it is: Boot$UN \"ubuntu\", partition $PNO, $UFILE (place 1 in BootOrder)"
+[ "$WIN" = 1 ] && PLAN="$PLAN
+  stays as it is: Boot0005 \"Windows Boot Manager\", partition $PNO, $WFILE$WPLAN (place 2 in BootOrder)"
+PLAN="$PLAN
+bootplan: a plan only, so nothing was written; adding it will ask for the owner's word, with the way back"
+L1="${L1%afrisovera>}afrisovera> bootplan
+$PLAN
+afrisovera>"
+[ "$WIN" = 1 ] && L1="$L1
+harness: Boot0005 \"Windows Boot Manager\" HD($PNO,GPT,$ESPG,start $STARTL)/$WFILE$WHARN written to the variable store, first in BootOrder (0005)"
+L1="$L1
+harness: Boot$UN \"ubuntu\" HD($PNO,GPT,$ESPG,start $STARTL)/$UFILE written to the variable store, first in BootOrder ($PRE)"
 L3="$(ubu "$L3")"; L4="$(ubu "$L4")"; L5="$(ubu "$L5")"; L6="$(ubu "$L6")"; L7="$(ubu "$L7")"; L8="$(ubu "$L8")"
+# boot 8 runs bootplan again after bootentries, before the harness's removal check (the same plan as boot 1)
+L8NP="$L8"; P8H="${L8%%$'\n'check:*}"
+L8="${P8H%afrisovera>}afrisovera> bootplan
+$PLAN
+afrisovera>
+check:${L8#*$'\n'check:}"
 fi
 selftest() {
-    local D pass=0 bad=0 N=21
+    local D pass=0 bad=0 N=31
     [ "$FOURK" = 1 ] && N=$((N+2))
     [ "$PNO" = 2 ] && N=$((N+3))
     [ "$SHARED" = 1 ] && N=$((N+15))
-    [ "$UBU" = 1 ] && N=$((N+8))
+    [ "$UBU" = 1 ] && N=$((N+19))
+    [ "$WIN" = 1 ] && N=$((N+10))
+    [ "$WATTR" = 9 ] && N=$((N+5))
     D="$(mktemp -d "$T/pc-bootnext-selftest.XXXXXX")" || return 1
     arm() { # arm <name> <expect> <b1> .. <b6> [<b7> <b8>] (boots 7 and 8 default to the model samples)
         local got
@@ -328,14 +484,42 @@ selftest() {
     arm not-written red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | grep -v 'written and read back')" "$L5" "$L6"
     arm next-not-shown red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | grep -v '^  BootNext:')" "$L5" "$L6"
     arm set-twice red "$L1" "$L2" "$L3" "$(printf '%s\n' "$L4" | grep -v 'already starts')" "$L5" "$L6"
+    # boot 3's "first in it" (12 Nov 2026): an empty place 0009 put first in that boot's BootOrder is right when bootnext
+    # passes over it as "no such entry"; wrong when not said, when the entry named is not BootOrder's first active one,
+    # or when there is no bootentries to bear it out
+    nz() { printf '%s\n' "$1" | sed -E 's/^  BootOrder: /  BootOrder: 0009 /' |
+        if [ -n "$2" ]; then PO="$2" awk '{print} /^  the firmware deletes BootNext as it starts it; .*\(first in it: /{print ENVIRON["PO"]}'; else cat; fi; }
+    NPO='  passed over before it in BootOrder: Boot0009 (no such entry)'
+    arm next-first-passed-right green "$L1" "$L2" "$(nz "$L3" "$NPO")" "$L4" "$L5" "$L6"
+    arm next-first-passed-unsaid red "$L1" "$L2" "$(nz "$L3" "")" "$L4" "$L5" "$L6"
+    arm next-first-not-first red "$L1" "$L2" "$(printf '%s\n' "$L3" | sed -E 's/\(first in it: ".*"\)$/(first in it: "AfriSovera")/')" "$L4" "$L5" "$L6"
+    arm next-first-no-entries red "$L1" "$L2" "$(printf '%s\n' "$L3" | awk '/^afrisovera> bootentries$/{exit} {print}')" "$L4" "$L5" "$L6"
     arm firmware-ignored-it red "$L1" "$L2" "$L3" "$L4" "$(printf '%s\n' "$L5" | sed 's/  <- started this time//; s/Sata(0)$/Sata(0)  <- started this time/')" "$L6"
     arm started-other-file red "$L1" "$L2" "$L3" "$L4" "$(printf '%s\n' "$L5" | sed 's/afrisovera\\afrisovera.efi  <- started/BOOT\\BOOTX64.EFI  <- started/')" "$L6"
     arm next-kept red "$L1" "$L2" "$L3" "$L4" "$(printf '%s\n' "$L5" | sed 's/^  BootOrder: .*/&\n  BootNext: 0005 (started ONCE at the next power-on, then the firmware deletes it)/')" "$L6"
     arm stuck-on-ours red "$L1" "$L2" "$L3" "$L4" "$L5" "$L5"
     arm entry-lost red "$L1" "$L2" "$L3" "$L4" "$L5" "$(printf '%s\n' "$L6" | grep -v "own entry")"
-    arm firmware-refused red "$L1" "$L2" "$L3" "$(printf '%s\nbootnext: BootNext could not be written (status 0x8000000000000008) -- bootentries shows what is there' "$L4")" "$L5" "$L6"
+    arm firmware-refused red "$L1" "$L2" "$L3" "$(printf '%s\nbootnext: BootNext could not be written (status 0x8000000000000008); bootentries shows what is there' "$L4")" "$L5" "$L6"
     arm panic red "$(printf '%s\nKERNEL PANIC at bootent.rs' "$L1")" "$L2" "$L3" "$L4" "$L5" "$L6"
     arm empty red "" "" "" "" "" ""
+    # an empty BootOrder place: right when BootOrder names it with no entry line, wrong when listed or not in BootOrder
+    EMPTYP='  in BootOrder but no such entry (the firmware passes over it, nothing is changed):'
+    arm empty-place-right green "$L1" "$L2" "$L3" "$L4" "$(printf '%s\n' "$L5" | sed "s/^  BootOrder: .*/&\n$EMPTYP Boot0002/")" "$L6"
+    arm empty-place-listed red "$L1" "$L2" "$L3" "$L4" "$(printf '%s\n' "$L5" | sed "s/^  BootOrder: .*/&\n$EMPTYP Boot0002 Boot0001/")" "$L6"
+    arm empty-place-not-in-order red "$L1" "$L2" "$L3" "$L4" "$(printf '%s\n' "$L5" | sed "s/^  BootOrder: .*/&\n$EMPTYP Boot0009/")" "$L6"
+    # a BootNext with no entry behind it at boot 1: right for a number not listed, wrong for a listed one, and the
+    # usual words wrong for a number not listed
+    nx1() { if printf '%s\n' "$L1" | grep -aq '^  BootOrder:'; then printf '%s\n' "$L1" | sed "s/^  BootOrder: .*/&\n$1/"
+        else printf '%s\n' "${L1%afrisovera>}afrisovera> bootentries
+bootentries: the firmware's boot entries, as read at power-on (nothing is changed)
+  BootOrder: 0001 0002 0003 0004 0000
+$1
+  Boot0001  active  \"$STICK\"  PciRoot/Pci(1f.2)/Sata(0)  <- started this time
+afrisovera>"; fi; }
+    NXE='(no such entry: the firmware deletes it at the next power-on and follows BootOrder)'
+    arm next-empty-right green "$(nx1 "  BootNext: 0009 $NXE")" "$L2" "$L3" "$L4" "$L5" "$L6"
+    arm next-empty-listed red "$(nx1 "  BootNext: 0001 $NXE")" "$L2" "$L3" "$L4" "$L5" "$L6"
+    arm next-usual-unlisted red "$(nx1 "  BootNext: 0009 (started ONCE at the next power-on, then the firmware deletes it)")" "$L2" "$L3" "$L4" "$L5" "$L6"
     if [ "$FOURK" = 1 ]; then # the partition counted in 512-byte sectors on a 4 KiB-block disk, or the wrong disk
         arm hd-in-512 red "$L1" "$L2" "$L3" "$L4" "$(printf '%s\n' "$L5" | sed "s/,start $STARTL)/,start $((STARTL*8)))/")" "$L6"
         arm copied-to-sata red "$L1" "$(printf '%s\n' "$L2" | sed "s/nvme partition $PNO/sata port 2 partition $PNO/")" "$L3" "$L4" "$L5" "$L6"
@@ -367,11 +551,50 @@ selftest() {
         arm ubuntu-not-written red "$(printf '%s\n' "$L1" | grep -v '^harness')" "$L2" "$L3" "$L4" "$L5" "$L6"
         arm ubuntu-not-seen red "$(printf '%s\n' "$L1" | grep -v '"ubuntu"  HD')" "$L2" "$L3" "$L4" "$L5" "$L6"
         arm ubuntu-wrong-partition red "$(printf '%s\n' "$L1" | sed "s/,start $STARTL)\/\\\\EFI\\\\ubuntu/,start 34)\/\\\\EFI\\\\ubuntu/")" "$L2" "$L3" "$L4" "$L5" "$L6"
-        arm took-ubuntu-number red "$L1" "$L2" "$(printf '%s\n' "$L3" | sed 's/^bootentry: Boot0006/bootentry: Boot0005/')" "$L4" "$L5" "$L6"
+        arm took-ubuntu-number red "$L1" "$L2" "$(printf '%s\n' "$L3" | sed "s/^bootentry: Boot$AN/bootentry: Boot$UN/")" "$L4" "$L5" "$L6"
         arm ubuntu-started red "$L1" "$L2" "$L3" "$L4" "$(printf '%s\n' "$L5" | sed 's/  <- started this time//; s/grubx64.efi$/grubx64.efi  <- started this time/')" "$L6"
         arm ubuntu-gone red "$L1" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$(printf '%s\n' "$L8" | grep -v '"ubuntu"')"
         arm ubuntu-changed-entry red "$L1" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$(printf '%s\n' "$L8" | sed 's/grubx64.efi$/shimx64.efi/')"
-        arm order-not-back red "$L1" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$(printf '%s\n' "$L8" | sed 's/^  BootOrder: 0005 \(.*\)$/  BootOrder: \1 0005/')"
+        arm plan-no-ubuntu red "$(printf '%s\n' "$L1" | grep -v '^  stays as it is: Boot[0-9A-F]* "ubuntu"')" "$L2" "$L3" "$L4" "$L5" "$L6"
+        arm plan-ubuntu-place red "$(printf '%s\n' "$L1" | sed 's/(place 1 in BootOrder)/(place 3 in BootOrder)/')" "$L2" "$L3" "$L4" "$L5" "$L6"
+        arm plan-names-ours red "$(printf '%s\n' "$L1" | sed "s/^bootplan: a plan only/  stays as it is: Boot$AN \"AfriSovera\", partition $PNO, OURS (place 9 in BootOrder)\n&/")" "$L2" "$L3" "$L4" "$L5" "$L6"
+        arm plan-no-first red "$(printf '%s\n' "$L1" | grep -v '^  the PC keeps starting ')" "$L2" "$L3" "$L4" "$L5" "$L6"
+        arm order-not-back red "$L1" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$(printf '%s\n' "$L8" | sed 's/^  BootOrder: \([0-9A-F]*\) \(.*\)$/  BootOrder: \2 \1/')"
+        # boot 8's bootplan: missing, Ubuntu at another place, or AfriSovera's entry still seen
+        arm plan8-missing red "$L1" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$L8NP"
+        arm plan8-ubuntu-moved red "$L1" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$(printf '%s\n' "$L8" | sed 's/(place 1 in BootOrder)/(place 4 in BootOrder)/')"
+        arm plan8-ours-still red "$L1" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$(printf '%s\n' "$L8" | sed "s/^  boot entry: .*/  boot entry: AfriSovera already has one (Boot$AN); nothing to add/")"
+        # the first choice (12 Nov 2026): an empty place 0009 put first in BootOrder at boots 1 and 8 is right when
+        # bootplan passes over it as "no such entry"; wrong when not said, said for the wrong reason, or the first
+        # choice named is not BootOrder's first entry
+        pz() { # pz <log> <passed-over line or empty>
+            printf '%s\n' "$1" | sed -E "s/^  BootOrder: ($PRE 0001 )/  BootOrder: 0009 \1/; s/\(place 2 in BootOrder\)/(place 3 in BootOrder)/; s/\(place 1 in BootOrder\)/(place 2 in BootOrder)/" |
+                if [ -n "$2" ]; then PO="$2" awk '{print} /^  the PC keeps starting /{print ENVIRON["PO"]}'; else cat; fi; }
+        POL='  passed over before it in BootOrder: Boot0009 (no such entry)'
+        arm first-passed-right green "$(pz "$L1" "$POL")" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$(pz "$L8" "$POL")"
+        arm first-passed-unsaid red "$(pz "$L1" "")" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$(pz "$L8" "")"
+        arm first-passed-hidden red "$(pz "$L1" "${POL/no such entry/hidden}")" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$(pz "$L8" "${POL/no such entry/hidden}")"
+        SKS='s/keeps starting "ubuntu" first/keeps starting "UEFI QEMU HARDDISK QM00001 " first/'
+        arm first-not-first red "$(printf '%s\n' "$L1" | sed "$SKS")" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$(printf '%s\n' "$L8" | sed "$SKS")"
+    fi
+    if [ "$WIN" = 1 ]; then # Windows Boot Manager's entry: not written, not seen, its number taken, started, changed or gone
+        arm windows-not-written red "$(printf '%s\n' "$L1" | grep -v '^harness: Boot0005 "Windows Boot Manager"')" "$L2" "$L3" "$L4" "$L5" "$L6"
+        arm windows-not-seen red "$(printf '%s\n' "$L1" | grep -v '"Windows Boot Manager"  HD')" "$L2" "$L3" "$L4" "$L5" "$L6"
+        arm took-windows-number red "$L1" "$L2" "$(printf '%s\n' "$L3" | sed "s/^bootentry: Boot$AN/bootentry: Boot0005/")" "$L4" "$L5" "$L6"
+        arm windows-started red "$L1" "$L2" "$L3" "$L4" "$(printf '%s\n' "$L5" | sed -E 's/  <- started this time//; s/^(  Boot0005  .*"Windows Boot Manager".*)$/\1  <- started this time/')" "$L6"
+        arm windows-gone red "$L1" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$(printf '%s\n' "$L8" | grep -v '"Windows Boot Manager"')"
+        arm windows-changed-entry red "$L1" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$(printf '%s\n' "$L8" | if [ "$WATTR" = 9 ]; then sed 's/bootmgfw.efi  \[hidden\]$/bootmgfw.efi/'; else sed 's/bootmgfw.efi$/bootmgfw.efi  [hidden]/'; fi)"
+        arm plan-no-windows red "$(printf '%s\n' "$L1" | grep -v '^  stays as it is: Boot0005 "Windows Boot Manager"')" "$L2" "$L3" "$L4" "$L5" "$L6"
+        arm plan-windows-other-file red "$(printf '%s\n' "$L1" | sed '/^  stays as it is: Boot0005 /s/bootmgfw\.efi/bootmgr.efi/')" "$L2" "$L3" "$L4" "$L5" "$L6"
+        arm plan8-no-windows red "$L1" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$(printf '%s\n' "$L8" | grep -v '^  stays as it is: Boot0005 "Windows Boot Manager"')"
+        arm windows-boot6-changed red "$L1" "$L2" "$L3" "$L4" "$L5" "$(printf '%s\n' "$L6" | sed 's/^  Boot0005  active  "Windows/  Boot0005  off     "Windows/')"
+        if [ "$WATTR" = 9 ]; then # hidden: shown off or not hidden, or bootplan leaves out ", hidden" or adds ", off"
+            arm windows-shown-off red "$(printf '%s\n' "$L1" | sed 's/^  Boot0005  active  "Windows/  Boot0005  off     "Windows/')" "$L2" "$L3" "$L4" "$L5" "$L6"
+            arm windows-not-hidden red "$(printf '%s\n' "$L1" | sed 's/bootmgfw.efi  \[hidden\]$/bootmgfw.efi/')" "$L2" "$L3" "$L4" "$L5" "$L6"
+            arm plan-windows-not-hidden red "$(printf '%s\n' "$L1" | sed 's/bootmgfw.efi, hidden (place/bootmgfw.efi (place/')" "$L2" "$L3" "$L4" "$L5" "$L6"
+            arm plan8-windows-off red "$L1" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$(printf '%s\n' "$L8" | sed 's/bootmgfw.efi, hidden (place/bootmgfw.efi, off, hidden (place/')"
+            arm boot8-windows-off red "$L1" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$(printf '%s\n' "$L8" | sed 's/^  Boot0005  active  "Windows/  Boot0005  off     "Windows/')"
+        fi
     fi
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
@@ -380,10 +603,12 @@ selftest() {
 
 DESC=""; [ "$FOURK" = 1 ] && DESC=", Windows disk on 4 KiB-block NVMe"; [ "$PNO" = 2 ] && DESC="$DESC, recovery partition first"
 [ "$SHARED" = 1 ] && DESC="$DESC, one EFI partition shared with Ubuntu"
-[ "$UBU" = 1 ] && DESC="$DESC, Ubuntu's own boot entry there first"
+[ "$UBU" = 1 ] && [ "$WIN" = 0 ] && DESC="$DESC, Ubuntu's own boot entry there first"
+[ "$WIN" = 1 ] && DESC="$DESC, Windows Boot Manager's and Ubuntu's own boot entries there first"
+[ "$WATTR" = 9 ] && DESC="$DESC, Windows' entry hidden"
 echo "== PC firmware starts AfriSovera once from its own boot entry (BootNext)$DESC (PC track step 5) =="
-if ! selftest; then echo "PC BOOTNEXT${UP} TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC BOOTNEXT${UP} SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC BOOTNEXT${UP} TEST FAILED (grader selftest); no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC BOOTNEXT${UP} SELFTEST ONLY; no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }
@@ -421,22 +646,33 @@ if [ "$UBU" = 1 ]; then # Ubuntu's own entry, as its installer leaves it, before
     # edk2's QEMU boot order keeps an HD() entry only if it can open the file and finds an EFI application's PE
     # header there (QemuBootOrderLib, BmIsLoadOptionPeHeaderValid); a real grubx64.efi has one, so the stand-in
     # gets one too (in this test's own disk, before the fresh copy below is taken; its length stays the same)
+    # (the windows kinds give Windows Boot Manager's stand-in bootmgfw.efi the same header)
+    PE_FILES="grubx64.efi"; [ "$WIN" = 1 ] && PE_FILES="bootmgfw.efi grubx64.efi"
+    # shellcheck disable=SC2086
     "$PY" -c '
 import struct, sys
 p = sys.argv[1]
 x = bytearray(open(p, "rb").read())
-o = x.find(b"MZ stand-in for grubx64.efi")
-if o < 0:
-    sys.exit("harness: the stand-in for Ubuntu grubx64.efi was not found in the image")
-h = bytearray(512)
-h[0:2] = b"MZ"; struct.pack_into("<I", h, 0x3C, 0x40)
-h[0x40:0x44] = b"PE\0\0"; struct.pack_into("<HHIIIHH", h, 0x44, 0x8664, 0, 0, 0, 0, 240, 0x22)
-struct.pack_into("<H", h, 0x58, 0x20B); struct.pack_into("<H", h, 0x58 + 68, 10) # PE32+, EFI application
-h[0x180:0x180 + 40] = b"stand-in for grubx64.efi, a header only".ljust(40, b"\0")
-x[o:o + 512] = h
+for f in sys.argv[2:]:
+    o = x.find(b"MZ stand-in for " + f.encode())
+    if o < 0:
+        sys.exit("harness: the stand-in for %s was not found in the image" % f)
+    h = bytearray(512)
+    h[0:2] = b"MZ"; struct.pack_into("<I", h, 0x3C, 0x40)
+    h[0x40:0x44] = b"PE\0\0"; struct.pack_into("<HHIIIHH", h, 0x44, 0x8664, 0, 0, 0, 0, 240, 0x22)
+    struct.pack_into("<H", h, 0x58, 0x20B); struct.pack_into("<H", h, 0x58 + 68, 10) # PE32+, EFI application
+    h[0x180:0x180 + 40] = ("stand-in for %s, a header only" % f).encode().ljust(40, b"\0")
+    x[o:o + 512] = h
 open(p, "wb").write(x)
-' "$W/gpt-esp-fsinfo.img" || { echo "PC BOOTNEXT${UP} TEST FAILED (harness: could not give Ubuntu's stand-in file its PE header)"; exit 1; }
-    "$PY" scripts/lib/efivars.py add-boot "$W/vars.fd" 0005 ubuntu "$W/gpt-esp-fsinfo.img" "$GOFF" "$UFILE" > "$W/ubuntu.txt" 2>&1 ||
+' "$W/gpt-esp-fsinfo.img" $PE_FILES || { echo "PC BOOTNEXT${UP} TEST FAILED (harness: could not give the stand-in boot files their PE header)"; exit 1; }
+    : > "$W/ubuntu.txt"
+    UNUMH=0005
+    if [ "$WIN" = 1 ]; then # Windows' setup first, then Ubuntu's installer puts its own entry before it
+        UNUMH=0006
+        "$PY" scripts/lib/efivars.py add-boot "$W/vars.fd" 0005 "Windows Boot Manager" "$W/gpt-esp-fsinfo.img" "$GOFF" "$WFILE" "$WATTR" >> "$W/ubuntu.txt" 2>&1 ||
+            { cat "$W/ubuntu.txt"; echo "PC BOOTNEXT${UP} TEST FAILED (harness: could not write Windows Boot Manager's entry to the variable store)"; exit 1; }
+    fi
+    "$PY" scripts/lib/efivars.py add-boot "$W/vars.fd" "$UNUMH" ubuntu "$W/gpt-esp-fsinfo.img" "$GOFF" "$UFILE" >> "$W/ubuntu.txt" 2>&1 ||
         { cat "$W/ubuntu.txt"; echo "PC BOOTNEXT${UP} TEST FAILED (harness: could not write Ubuntu's entry to the variable store)"; exit 1; }
 fi
 cp "$W/gpt-esp-fsinfo.img" "$W/win.fresh" # the Windows-like disk as it was, for the shared kinds' comparison
@@ -466,8 +702,8 @@ boot() { # boot <serial port> <log> <commands (| between)>
 code() { tr -d '\r' < "$1" | sed -nE "s/^$2: nothing written yet\. To do it, type exactly: $2 yes ([0-9a-f]{4})$/\1/p" | head -1; }
 
 if [ "$UBU" = 1 ]; then
-    echo "  --- boot 1: bootnext (no entry yet), bootcopy (its code), bootentries (Ubuntu's entry) ---"
-    boot "$PORT" "$W/boot1.log" 'bootnext|bootcopy|bootentries'
+    echo "  --- boot 1: bootnext (no entry yet), bootcopy (its code), bootentries (Ubuntu's entry), bootplan ---"
+    boot "$PORT" "$W/boot1.log" 'bootnext|bootcopy|bootentries|bootplan'
     printf '\n' >> "$W/boot1.log"; cat "$W/ubuntu.txt" >> "$W/boot1.log"
 else
     echo "  --- boot 1: bootnext (no entry yet), bootcopy (its code) ---"
@@ -477,12 +713,12 @@ C1="$(code "$W/boot1.log" bootcopy)"
 echo "  --- boot 2: bootcopy yes ${C1:-(no code)}, bootentry (its code) ---"
 boot $((PORT+4)) "$W/boot2.log" "bootcopy yes ${C1:-none}|bootentry"
 C2="$(code "$W/boot2.log" bootentry)"
-echo "  --- boot 3: bootentry yes ${C2:-(no code)}, bootnext (its code), a wrong code ---"
-boot $((PORT+8)) "$W/boot3.log" "bootentry yes ${C2:-none}|bootnext|bootnext yes zzzz"
+echo "  --- boot 3: bootentry yes ${C2:-(no code)}, bootnext (its code), a wrong code, bootentries ---"
+boot $((PORT+8)) "$W/boot3.log" "bootentry yes ${C2:-none}|bootnext|bootnext yes zzzz|bootentries"
 C3="$(code "$W/boot3.log" bootnext)"
 echo "  --- boot 4: bootnext yes ${C3:-(no code)}, bootentries, bootnext again ---"
 boot $((PORT+12)) "$W/boot4.log" "bootnext yes ${C3:-none}|bootentries|bootnext"
-echo "  --- boot 5: power-on -- bootentries (which entry did the firmware start?) ---"
+echo "  --- boot 5: power-on, bootentries (which entry did the firmware start?) ---"
 boot $((PORT+16)) "$W/boot5.log" 'bootentries'
 printf '\n' >> "$W/boot5.log"   # the log ends at the shell's prompt, with no newline
 "$PY" -c '
@@ -491,10 +727,10 @@ d = open(sys.argv[1], "rb").read()
 print("harness: EFI partition GUID %s" % uuid.UUID(bytes_le=d[int(sys.argv[2]) + 16:int(sys.argv[2]) + 32]))
 ' "$W/gpt-esp-fsinfo.img" "$GOFF" >> "$W/boot5.log" 2>&1
 if [ "$SHARED" = 1 ]; then
-    echo "  --- boot 6: power-on again -- bootentries, bootentry remove (its code) ---"
+    echo "  --- boot 6: power-on again, bootentries, bootentry remove (its code) ---"
     boot $((PORT+20)) "$W/boot6.log" 'bootentries|bootentry remove'
 else
-    echo "  --- boot 6: power-on again -- bootentries ---"
+    echo "  --- boot 6: power-on again, bootentries ---"
     boot $((PORT+20)) "$W/boot6.log" 'bootentries'
 fi
 if [ "$SHARED" = 1 ]; then # the harness's byte comparison with the fresh copy, added to boot 6's log
@@ -544,8 +780,13 @@ C6="$(code "$W/boot6.log" 'bootentry remove')"
 echo "  --- boot 7: bootentry remove yes ${C6:-(no code)}, bootcopy remove (its code) ---"
 boot $((PORT+24)) "$W/boot7.log" "bootentry remove yes ${C6:-none}|bootcopy remove"
 C7="$(code "$W/boot7.log" 'bootcopy remove')"
-echo "  --- boot 8: bootcopy remove yes ${C7:-(no code)}, bootentries ---"
-boot $((PORT+28)) "$W/boot8.log" "bootcopy remove yes ${C7:-none}|bootentries"
+if [ "$UBU" = 1 ]; then # bootplan again: the same plan as at boot 1, now the way back is done
+    echo "  --- boot 8: bootcopy remove yes ${C7:-(no code)}, bootentries, bootplan ---"
+    boot $((PORT+28)) "$W/boot8.log" "bootcopy remove yes ${C7:-none}|bootentries|bootplan"
+else
+    echo "  --- boot 8: bootcopy remove yes ${C7:-(no code)}, bootentries ---"
+    boot $((PORT+28)) "$W/boot8.log" "bootcopy remove yes ${C7:-none}|bootentries"
+fi
 printf '\n' >> "$W/boot8.log"   # the log ends at the shell's prompt, with no newline
 "$PY" scripts/lib/check-bootcopy.py removed "$W/win.fresh" "$W/mid.img" "$W/gpt-esp-fsinfo.img" >> "$W/boot8.log" 2>&1
 fi

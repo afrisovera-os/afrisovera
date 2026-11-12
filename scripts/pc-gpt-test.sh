@@ -43,9 +43,9 @@ grade() { # grade <boot1 log> <boot2 log>
     hasB '  part 1: EFI system, LBA 2048-34815 \(16 MiB\), "DFI system partition"' || _f "boot 2: the damaged entry was not read as it is on disk"
     hasB '  gpt: 4 partition\(s\), usable LBA 34-131038, primary header OK, backup header MISSING/DAMAGED, entries CRC BAD' ||
         _f "boot 2: the damaged GPT (backup header wiped, an entry changed) was not caught"
-    hasB '  WARNING: this GPT is damaged -- not safe to change' || _f "boot 2: no warning for the damaged GPT"
+    hasB '  WARNING: this GPT is damaged; not safe to change' || _f "boot 2: no warning for the damaged GPT"
     for L in "$A" "$B"; do
-        printf '%s\n' "$L" | grep -aqx 'lsparts: read only -- nothing was written' || _f "lsparts did not finish in a boot"
+        printf '%s\n' "$L" | grep -aqx 'lsparts: read only; nothing was written' || _f "lsparts did not finish in a boot"
         printf '%s\n' "$L" | grep -aqx 'harness: disk images unchanged' || _f "a disk image changed during a boot (or the check is missing)"
     done
     if printf '%s\n%s\n' "$A" "$B" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)'; then
@@ -73,7 +73,7 @@ lsparts: sata port 2, 32 MiB, 512-byte sectors
   mbr 1: type 0x0c (FAT32), start 2048, 32768 sectors (16 MiB)
   mbr 2: type 0x83 (Linux), start 34816, 30720 sectors (15 MiB)
   mbr: 2 partition(s)
-lsparts: read only -- nothing was written
+lsparts: read only; nothing was written
 harness: disk images unchanged'
 B2='afrisovera> lsparts
 lsparts: nvme namespace 1, 64 MiB, 512-byte blocks
@@ -83,8 +83,8 @@ lsparts: nvme namespace 1, 64 MiB, 512-byte blocks
   part 4: Windows recovery, LBA 118784-129023 (5 MiB), "Recovery"
   gpt: 4 partition(s), usable LBA 34-131038, primary header OK, backup header MISSING/DAMAGED, entries CRC BAD
   free: 10 MiB in all, largest LBA 100352-118783 (9 MiB)
-  WARNING: this GPT is damaged -- not safe to change
-lsparts: read only -- nothing was written
+  WARNING: this GPT is damaged; not safe to change
+lsparts: read only; nothing was written
 harness: disk images unchanged'
 
 selftest() {
@@ -106,7 +106,7 @@ selftest() {
     arm crc-not-checked red "$B1" "$(printf '%s\n' "$B2" | sed 's/entries CRC BAD/entries CRC OK/')"
     arm backup-not-checked red "$B1" "$(printf '%s\n' "$B2" | sed 's/backup header MISSING\/DAMAGED/backup header OK/')"
     arm no-warning red "$B1" "$(printf '%s\n' "$B2" | grep -v WARNING)"
-    arm warning-on-good red "$(printf '%s\n  WARNING: partitions overlap -- this table is not safe to change' "$B1")" "$B2"
+    arm warning-on-good red "$(printf '%s\n  WARNING: partitions overlap; this table is not safe to change' "$B1")" "$B2"
     arm free-wrong red "$(printf '%s\n' "$B1" | sed 's/largest LBA 100352-118783 (9 MiB)/largest LBA 129024-131038 (0 MiB)/')" "$B2"
     arm mbr-missing red "$(printf '%s\n' "$B1" | grep -v '^  mbr 2:')" "$B2"
     arm image-changed red "$(printf '%s\n' "$B1" | grep -v '^harness:')" "$B2"
@@ -118,8 +118,8 @@ selftest() {
 }
 
 echo "== PC partition tables, read only (PC track step 5 groundwork) =="
-if ! selftest; then echo "PC GPT TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC GPT SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC GPT TEST FAILED (grader selftest); no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC GPT SELFTEST ONLY; no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

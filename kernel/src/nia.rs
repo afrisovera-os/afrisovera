@@ -17,7 +17,7 @@ use core::ptr::addr_of_mut;
 
 const MAX_TYPES: usize = 16;
 const MAX_FUNCS: usize = 16;
-const MAX_IMPORTS: usize = 8;
+const MAX_IMPORTS: usize = 16; // imported functions per module (8 until claude/nia-imports)
 const STACK_CAP: usize = 256;
 const LOCALS_CAP: usize = 32;
 const MAX_GLOBALS: usize = 16;
@@ -41,6 +41,9 @@ const CAP_AI: u32 = 1 << 6; // host on-device AI (Asili AI)
 const CAP_VOICE: u32 = 1 << 7; // host voice / text-to-speech (Asili Voice)
 const CAP_NET: u32 = 1 << 8; // host networking (virtio-net: ping / DNS)
 const CAP_RANDOM: u32 = 1 << 9; // host random number generator
+/// What an app outside the integrity manifest gets (appget's sideloaded apps, architect's change B,
+/// claude/appget): no file, net, AI or voice. Manifest apps keep CAP_ALL.
+pub const CAP_SIDELOAD: u32 = CAP_PRINT | CAP_PUTC | CAP_DRAW | CAP_TIME | CAP_INPUT | CAP_RANDOM;
 const CAP_ALL: u32 = CAP_PRINT
     | CAP_PUTC
     | CAP_DRAW
@@ -68,6 +71,8 @@ const HOST_SPEAK: u8 = 11;
 const HOST_NET: u8 = 12;
 const HOST_RANDOM: u8 = 13;
 const HOST_PRINTQ: u8 = 14; // host "print64"(i64) -> prints a 64-bit integer
+const HOST_POLLKEY: u8 = 15; // host "pollkey"() -> the next key or -1, never waits (claude/nia-poll)
+const HOST_SLEEP: u8 = 16; // host "sleep_ms"(ms) -> the ms slept, at most SLEEP_MAX_MS per call
 const HOST_UNKNOWN: u8 = 255;
 
 /// Owner id shown on windows a WASM app creates via the compositor.
@@ -281,10 +286,219 @@ static WASM_NOTIFY2: &[u8] = &[
     0x45, 0x41, 0x44, 0x59, 0x2E,
 ];
 
-// --- Linear memory + host output buffer -------------------------------------
+// --- Linear memory ----------------------------------------------------------
 static mut WASM_MEM: [u8; MEM_SIZE] = [0; MEM_SIZE];
-static mut PUTC_BUF: [u8; 256] = [0; 256];
-static mut PUTC_LEN: usize = 0;
+
+// --- putc: text shown as it is written (claude/nia-putc, OS_REQUESTS item 6) --------------------------
+// Each byte goes through a small UTF-8 assembler and is printed at once, on lines that start with
+// "    [wasm app] ". A complete valid character prints as it is, unless it is unsafe for a terminal: C0 and C1
+// controls other than \n and \t, DEL, and the bidi controls U+202A..U+202E and U+2066..U+2069 print `?`. An
+// invalid or cut sequence prints U+FFFD. Nothing is buffered or sliced, so no byte an app writes can panic the
+// kernel (the old end-of-run print sliced a "?" fallback to the buffer length). `putc_break` closes an open line
+// before any other kernel print during a run, and `finish_putc` runs where every run ends.
+static mut PUTC_OPEN: bool = false; // a "[wasm app] " line has been started and not ended
+static mut PUTC_PEND: [u8; 4] = [0; 4]; // the bytes of a UTF-8 character still being assembled
+static mut PUTC_PLEN: usize = 0;
+static mut PUTC_NEED: usize = 0;
+
+fn putc_safe(c: char) -> bool {
+    match c {
+        '\n' | '\t' => true,
+        ' '..='~' => true,
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => false, // bidi controls ("trojan source")
+        _ => c >= '\u{A0}', // C0, DEL and C1 (U+0080..U+009F) are below
+    }
+}
+
+fn putc_emit(c: char) {
+    let c = if putc_safe(c) { c } else { '?' };
+    // SAFETY: single-threaded interpreter; plain flag.
+    unsafe {
+        if !PUTC_OPEN {
+            crate::kprint!("    [wasm app] ");
+            PUTC_OPEN = true;
+        }
+        if c == '\n' {
+            crate::kprint!("\n");
+            PUTC_OPEN = false;
+        } else {
+            crate::kprint!("{}", c);
+        }
+    }
+}
+
+/// Host `putc(byte)`: assemble UTF-8 and print each character as soon as it is complete.
+fn putc_byte(b: u8) {
+    // SAFETY: single-threaded interpreter; PUTC_PLEN stays below 4.
+    unsafe {
+        if PUTC_PLEN > 0 {
+            if b & 0xC0 == 0x80 {
+                (*addr_of_mut!(PUTC_PEND))[PUTC_PLEN] = b;
+                PUTC_PLEN += 1;
+                if PUTC_PLEN == PUTC_NEED {
+                    let n = PUTC_PLEN;
+                    PUTC_PLEN = 0;
+                    // from_utf8 also refuses overlong forms and surrogates: those print U+FFFD.
+                    match core::str::from_utf8(&(&*core::ptr::addr_of!(PUTC_PEND))[..n]).ok().and_then(|t| t.chars().next()) {
+                        Some(c) => putc_emit(c),
+                        None => putc_emit('\u{FFFD}'),
+                    }
+                }
+                return;
+            }
+            PUTC_PLEN = 0; // a character cut by a new lead byte or ASCII: U+FFFD, then handle this byte
+            putc_emit('\u{FFFD}');
+        }
+        match b {
+            0x00..=0x7F => putc_emit(b as char),
+            0xC2..=0xDF | 0xE0..=0xEF | 0xF0..=0xF4 => {
+                PUTC_NEED = if b < 0xE0 { 2 } else if b < 0xF0 { 3 } else { 4 };
+                (*addr_of_mut!(PUTC_PEND))[0] = b;
+                PUTC_PLEN = 1;
+            }
+            _ => putc_emit('\u{FFFD}'), // a continuation byte alone, or a byte that never starts UTF-8
+        }
+    }
+}
+
+/// Close an open putc line (and flush a cut character as U+FFFD) before any other kernel print during a run.
+fn putc_break() {
+    // SAFETY: single-threaded interpreter; plain flags.
+    unsafe {
+        if PUTC_PLEN > 0 {
+            PUTC_PLEN = 0;
+            putc_emit('\u{FFFD}');
+        }
+        if PUTC_OPEN {
+            crate::kprint!("\n");
+            PUTC_OPEN = false;
+        }
+    }
+}
+
+/// Where every run ends (clean return, TRAP, Ctrl+C): the same as a break.
+fn finish_putc() {
+    putc_break();
+}
+
+fn putc_reset() {
+    // SAFETY: single-threaded interpreter; plain stores.
+    unsafe {
+        PUTC_OPEN = false;
+        PUTC_PLEN = 0;
+    }
+}
+
+// N1 stop key (claude/nia-n1). An app that loops forever is stopped by Ctrl+C
+// (byte 0x03). Every POLL_EVERY branches back to a loop label, `branch` reads
+// one byte from the console (`uart::getc`): 0x03 stops the app with a TRAP, any
+// other byte goes into this queue (dropped when it is full), and `getkey`
+// drains the queue before it reads the console, so no key is lost. Ctrl+C read
+// by `getkey` stops the app too, so apps never see byte 3. The queue is cleared
+// when an app starts, so keys left over when an app ends are dropped and never
+// reach the next app. Only the serial console feeds `uart::getc` today.
+const STOP_KEY: u8 = 0x03;
+const POLL_EVERY: u32 = 4096;
+const KEYQ_CAP: usize = 16;
+const STOPPED: &str = "stopped by Ctrl+C";
+static mut KEYQ: [u8; KEYQ_CAP] = [0; KEYQ_CAP];
+static mut KEYQ_HEAD: usize = 0;
+static mut KEYQ_LEN: usize = 0;
+static mut LOOP_BRANCHES: u32 = 0;
+static mut KEYS_QUEUED: u32 = 0; // keys the loop poll queued since the app started (wasmfuzz reads it)
+
+fn keyq_reset() {
+    // SAFETY: single-threaded interpreter; plain stores to statics.
+    unsafe {
+        KEYQ_HEAD = 0;
+        KEYQ_LEN = 0;
+        LOOP_BRANCHES = 0;
+        KEYS_QUEUED = 0;
+    }
+}
+
+fn keyq_pop() -> Option<u8> {
+    // SAFETY: single-threaded interpreter; indexes stay below KEYQ_CAP.
+    unsafe {
+        if KEYQ_LEN == 0 {
+            return None;
+        }
+        let b = (*addr_of_mut!(KEYQ))[KEYQ_HEAD];
+        KEYQ_HEAD = (KEYQ_HEAD + 1) % KEYQ_CAP;
+        KEYQ_LEN -= 1;
+        Some(b)
+    }
+}
+
+/// Called on every branch back to a loop label: one console read per POLL_EVERY.
+fn loop_poll() -> Result<(), &'static str> {
+    // SAFETY: single-threaded interpreter; a plain counter.
+    unsafe {
+        LOOP_BRANCHES = LOOP_BRANCHES.wrapping_add(1);
+        if LOOP_BRANCHES % POLL_EVERY != 0 {
+            return Ok(());
+        }
+    }
+    console_key()
+}
+
+/// The one non-blocking console read the interpreter does outside `getkey` (the loop poll, `pollkey` and
+/// `sleep_ms` all come here): Ctrl+C stops the app (checked before the queue limit, so a full queue never hides
+/// it), any other key joins the queue (dropped when it is full).
+fn console_key() -> Result<(), &'static str> {
+    // SAFETY: single-threaded interpreter; indexes stay below KEYQ_CAP.
+    unsafe {
+        if let Some(c) = crate::uart::getc() {
+            if c == STOP_KEY {
+                return Err(STOPPED);
+            }
+            if KEYQ_LEN < KEYQ_CAP {
+                (*addr_of_mut!(KEYQ))[(KEYQ_HEAD + KEYQ_LEN) % KEYQ_CAP] = c;
+                KEYQ_LEN += 1;
+                KEYS_QUEUED += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Host `pollkey()`: the next key, or -1 when there is none; never waits. The console is read first through
+/// `console_key` (so a Ctrl+C TRAPs and is never returned or queued), then the oldest queued key is returned.
+fn host_pollkey() -> Result<i32, &'static str> {
+    console_key()?;
+    Ok(match keyq_pop() {
+        Some(c) => c as i32,
+        None => -1,
+    })
+}
+
+/// The longest one `sleep_ms` call waits; an app that wants longer calls it again.
+const SLEEP_MAX_MS: u64 = 10_000;
+
+/// Host `sleep_ms(ms)`: wait `ms` milliseconds (unsigned, at most SLEEP_MAX_MS) on the always-running counter
+/// (CNTPCT on ARM, the TSC on the PC), reading the console about every millisecond through `console_key`, so
+/// keys are kept for pollkey/getkey and Ctrl+C stops the app at once. A spin, not wfi: it works whether
+/// interrupts are masked or not (a wfi version on the 10 ms tick is a later item). Returns the milliseconds
+/// slept, measured on the same counter.
+fn host_sleep_ms(ms: i32) -> Result<i32, &'static str> {
+    let ms = (ms as u32 as u64).min(SLEEP_MAX_MS);
+    let hz = crate::timer::hz().max(1);
+    let target = ms * hz / 1000; // the deadline, once, in counter units (at most 1e4 * ~5e9, fits in u64)
+    let step = (hz / 1000).max(1); // about 1 ms between console reads
+    let t0 = crate::timer::cycles();
+    let mut last = t0;
+    let mut elapsed = 0u64;
+    while elapsed < target {
+        let now = crate::timer::cycles();
+        elapsed = now.wrapping_sub(t0);
+        if now.wrapping_sub(last) >= step {
+            last = now;
+            console_key()?;
+        }
+        core::hint::spin_loop();
+    }
+    Ok((elapsed * 1000 / hz).min(i32::MAX as u64) as i32)
+}
 
 // --- Module globals (2.92) --------------------------------------------------
 // Each WASM global's value is held as a raw 64-bit cell (works for i32/i64/f32/
@@ -344,30 +558,64 @@ fn mem_write64(addr: usize, v: i64) {
     }
 }
 
-/// Read a NUL-free name string out of the app's linear memory into a small buffer.
-fn read_name<'a>(ptr: usize, len: usize, buf: &'a mut [u8; 32]) -> &'a str {
-    let n = len.min(32);
-    for i in 0..n {
-        buf[i] = mem_read8(ptr + i);
+/// The trap for an access outside the app's 64 KiB of linear memory.
+const OOB: &str = "out of bounds memory access";
+
+/// The effective address of a `width`-byte access, as WebAssembly says: the i32 base is UNSIGNED (`as u32`, so
+/// -1 is 4294967295, never usize::MAX), the offset is added with a check, and the whole access must end at or
+/// before the end of memory; otherwise the app traps. After this, `addr + i` inside mem_read*/mem_write* can
+/// never overflow (claude/nia-addr).
+fn ea(base: i32, off: usize, width: usize) -> Result<usize, &'static str> {
+    let a = (base as u32 as usize).checked_add(off).ok_or(OOB)?;
+    match a.checked_add(width) {
+        Some(end) if end <= MEM_SIZE => Ok(a),
+        _ => Err(OOB),
     }
-    core::str::from_utf8(&buf[..n]).unwrap_or("")
+}
+
+/// A host function's pointer and the number of bytes it will touch: the same rule as `ea`.
+fn mem_range(ptr: i32, len: usize) -> Result<usize, &'static str> {
+    ea(ptr, 0, len)
+}
+
+/// An i32 argument as an unsigned number (WebAssembly's i32 has no sign of its own), so -1 is 4294967295 and
+/// never usize::MAX: values stay below 2^32, so adding two of them (tonga's `rx + rw`, `x + col`) cannot
+/// overflow a 64-bit usize. Used for every draw argument (claude/nia-addr, architect's addition A).
+fn u(v: i32) -> usize {
+    v as u32 as usize
+}
+
+/// A length argument (i32, unsigned as WebAssembly says) capped at what the host function uses.
+fn ulen(v: i32, cap: usize) -> usize {
+    (v as u32 as usize).min(cap)
+}
+
+/// Read a NUL-free name string out of the app's linear memory into a small buffer.
+fn read_name<'a>(ptr: i32, len: i32, buf: &'a mut [u8; 32]) -> Result<&'a str, &'static str> {
+    let n = ulen(len, 32);
+    let p = mem_range(ptr, n)?;
+    for i in 0..n {
+        buf[i] = mem_read8(p + i);
+    }
+    Ok(core::str::from_utf8(&buf[..n]).unwrap_or(""))
 }
 
 /// Host `file_write(name_ptr, name_len, data_ptr, data_len)` → bytes written / -1.
-fn host_file_write(nptr: usize, nlen: usize, dptr: usize, dlen: usize) -> i32 {
+fn host_file_write(nptr: i32, nlen: i32, dptr: i32, dlen: i32) -> Result<i32, &'static str> {
     let mut nb = [0u8; 32];
-    let name = read_name(nptr, nlen, &mut nb);
+    let name = read_name(nptr, nlen, &mut nb)?;
     let mut db = [0u8; 512];
-    let dn = dlen.min(512);
+    let dn = ulen(dlen, 512);
+    let d = mem_range(dptr, dn)?;
     for i in 0..dn {
-        db[i] = mem_read8(dptr + i);
+        db[i] = mem_read8(d + i);
     }
     if crate::vfs::write(name, &db[..dn]) {
         crate::kprintln!("    [wasm app] file_write('{}', {} bytes) -> ok", name, dn);
-        dn as i32
+        Ok(dn as i32)
     } else {
         crate::kprintln!("    [wasm app] file_write('{}') -> failed", name);
-        -1
+        Ok(-1)
     }
 }
 
@@ -1203,6 +1451,21 @@ fn try_convert(p: &[u8], out: &mut [u8]) -> Option<usize> {
 /// *architecture* is what's real — AI as a sandboxed OS service reached only via a
 /// granted capability, prompt + reply never leaving the device. It handles a wide
 /// set of questions so it feels useful; it is not a neural net yet.
+/// Wall-clock seconds since 1970 from the board's clock, for `time` and the clock answer (claude/nia-time,
+/// OS_REQUESTS item 7). nia.rs is shared by both kernels, so it reads the *resolved* RTC the way `vfs.rs` does:
+/// on ARM virt the PL031 data register (device-tree corrected); on the PC a word `board::resolved()` has just
+/// refreshed from the CMOS clock. A board with no clock we read (Pi, Pine64: rtc 0) gives 0; address 0 is
+/// never read.
+fn wall_secs() -> u32 {
+    let base = crate::board::resolved().rtc;
+    if base == 0 {
+        return 0;
+    }
+    // SAFETY: a non-zero resolved RTC base is the active board's readable clock word (MMIO on ARM, the CMOS
+    // shadow on the PC).
+    unsafe { core::ptr::read_volatile(base as *const u32) }
+}
+
 fn asili_respond(prompt: &[u8], out: &mut [u8]) -> usize {
     let mut low = [0u8; 128];
     let n = prompt.len().min(128);
@@ -1277,7 +1540,7 @@ fn asili_respond(prompt: &[u8], out: &mut [u8]) -> usize {
 
     // 2) The on-device clock (real hardware read).
     if contains(p, b"time") || contains(p, b"clock") || contains(p, b"date") {
-        let t = unsafe { core::ptr::read_volatile(0x0901_0000 as *const u32) as i64 };
+        let t = wall_secs() as i64;
         let pre = b"THE ON-DEVICE CLOCK READS ";
         let mut k = pre.len();
         out[..k].copy_from_slice(pre);
@@ -1364,11 +1627,12 @@ pub fn respond(prompt: &[u8], out: &mut [u8]) -> usize {
 }
 
 /// Host `ai(prompt_ptr, prompt_len, out_ptr, out_cap)` → reply length.
-fn host_ai(pptr: usize, plen: usize, optr: usize, ocap: usize) -> i32 {
+fn host_ai(pptr: i32, plen: i32, optr: i32, ocap: i32) -> Result<i32, &'static str> {
     let mut pb = [0u8; 128];
-    let pn = plen.min(128);
+    let pn = ulen(plen, 128);
+    let p = mem_range(pptr, pn)?;
     for i in 0..pn {
-        pb[i] = mem_read8(pptr + i);
+        pb[i] = mem_read8(p + i);
     }
     crate::kprintln!(
         "    [wasm app] ai(\"{}\")  [on-device, private]",
@@ -1376,31 +1640,70 @@ fn host_ai(pptr: usize, plen: usize, optr: usize, ocap: usize) -> i32 {
     );
     let mut ob = [0u8; 256];
     let on = asili_respond(&pb[..pn], &mut ob);
-    let n = on.min(ocap);
+    let n = on.min(ulen(ocap, 256));
+    let o = mem_range(optr, n)?;
     for i in 0..n {
-        mem_write8(optr + i, ob[i]);
+        mem_write8(o + i, ob[i]);
     }
-    n as i32
+    Ok(n as i32)
 }
 
 /// Host `file_read(name_ptr, name_len, buf_ptr, buf_cap)` → bytes read / -1.
-fn host_file_read(nptr: usize, nlen: usize, bptr: usize, cap: usize) -> i32 {
+fn host_file_read(nptr: i32, nlen: i32, bptr: i32, cap: i32) -> Result<i32, &'static str> {
     let mut nb = [0u8; 32];
-    let name = read_name(nptr, nlen, &mut nb);
+    let name = read_name(nptr, nlen, &mut nb)?;
     match crate::vfs::read_raw(name) {
         Some(bytes) => {
-            let n = bytes.len().min(cap);
+            let n = bytes.len().min(cap as u32 as usize);
+            let b = mem_range(bptr, n)?;
             for i in 0..n {
-                mem_write8(bptr + i, bytes[i]);
+                mem_write8(b + i, bytes[i]);
             }
             crate::kprintln!("    [wasm app] file_read('{}') -> {} bytes", name, n);
-            n as i32
+            Ok(n as i32)
         }
         None => {
             crate::kprintln!("    [wasm app] file_read('{}') -> not found", name);
-            -1
+            Ok(-1)
         }
     }
+}
+
+/// One WebAssembly name (a uleb length, then that many bytes) at `*c`, which must end at or before `end`
+/// (the section's end). The adds are checked, so a 10-byte LEB length near usize::MAX is refused, never an
+/// overflow (claude/nia-afri, architect's A1). Advances `*c` past the name.
+fn name_in<'m>(m: &'m [u8], c: &mut usize, end: usize) -> Option<&'m [u8]> {
+    if *c >= end {
+        return None;
+    }
+    let (n, a) = uleb(m, *c);
+    let start = c.checked_add(a)?;
+    let stop = start.checked_add(n)?;
+    if stop > end {
+        return None;
+    }
+    *c = stop;
+    Some(&m[start..stop])
+}
+
+/// The load-time line for an import from a module other than `afri` or `env`. The name is the app's own text,
+/// so it is printed as escaped bytes: printable ASCII as it is, anything else (ESC, bidi, any byte from 0x80) as
+/// \xNN, and at most 32 bytes of it (architect's A3).
+fn refuse_module(module: &[u8]) {
+    crate::kprint!("[nia] import from module '");
+    for &b in module.iter().take(32) {
+        if (b' '..=b'~').contains(&b) && b != b'\\' && b != b'\'' {
+            crate::kprint!("{}", b as char);
+        } else {
+            crate::kprint!("\\x{:02x}", b);
+        }
+    }
+    if module.len() > 32 {
+        crate::kprint!("' and {} more bytes", module.len() - 32);
+    } else {
+        crate::kprint!("'");
+    }
+    crate::kprintln!(" (Nia offers only 'afri')");
 }
 
 // --- LEB128 (bounds-safe: never index past the module; malformed input just
@@ -1991,6 +2294,35 @@ static WASM_I64MEM: &[u8] = &[
         0x0B,                               // end
 ];
 
+// oob.wasm (claude/nia-addr): run() { print(1); speak(ptr = -1, len = 10); print(99) }. The one host-pointer
+// case only a full-capability app reaches (unverified apps are denied voice first). Before nia-addr,
+// `a[0] as usize + i` overflowed (-1 is usize::MAX) and panicked the debug kernel; now the pointer is unsigned
+// (4294967295), the range is checked, and the app TRAPs with "out of bounds memory access". print(99) never runs.
+#[rustfmt::skip]
+static WASM_OOB: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+    // type: [0]=(i32)->()  [1]=(i32,i32)->()  [2]=()->()
+    0x01, 0x0D, 0x03, 0x60, 0x01, 0x7F, 0x00, 0x60, 0x02, 0x7F, 0x7F, 0x00, 0x60, 0x00, 0x00,
+    // import: env.print : type 0, env.speak : type 1
+    0x02, 0x19, 0x02, 0x03, 0x65, 0x6E, 0x76, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x00, 0x00,
+    0x03, 0x65, 0x6E, 0x76, 0x05, 0x73, 0x70, 0x65, 0x61, 0x6B, 0x00, 0x01,
+    // function: one func of type 2; memory: (memory 1); export: "run" = func 2
+    0x03, 0x02, 0x01, 0x02, 0x05, 0x03, 0x01, 0x00, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x02,
+    // code
+    0x0A, 0x13, 0x01, 0x11, 0x00,
+        0x41, 0x01, 0x10, 0x00,             // print(1)
+        0x41, 0x7F, 0x41, 0x0A, 0x10, 0x01, // speak(-1, 10)
+        0x41, 0xE3, 0x00, 0x10, 0x00,       // print(99), never reached
+        0x0B,                               // end
+];
+
+/// Run a full-capability module that calls `speak` with a pointer of -1: it must TRAP (out of bounds memory
+/// access), not panic the kernel.
+pub fn oob_demo() {
+    crate::kprintln!("[nia] oob.wasm - speak() with a pointer of -1 (must TRAP, not panic)...");
+    run_app("oob.wasm", WASM_OOB, CAP_ALL);
+}
+
 /// Run a WASM module that stores a >32-bit i64 to linear memory and loads it back
 /// -- proving i64 values round-trip through the sandbox's 64KiB memory. Prints
 /// 4294967338 via print64.
@@ -2055,12 +2387,32 @@ pub fn fuzz() {
         0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00,
         0x0A, 0x05, 0x01, 0x03, 0x00, 0x41, 0x01,
     ];
-    let cases: [(&str, &[u8]); 5] = [
+    // A 10-byte LEB (2^64 - 1) where the parser reads a length; each overflowed an unchecked add and
+    // panicked the kernel until steps A and A2 (scripts/lib/afri-wasm.py af1 to af3,
+    // scripts/lib/parse-wasm.py ov1 to ov4 make the same bytes).
+    let ov_af1: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00];
+    let ov_af2: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60, 0x00, 0x00, 0x60, 0x01, 0x7F, 0x00, 0x02, 0x13, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let ov_af3: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60, 0x00, 0x00, 0x60, 0x01, 0x7F, 0x00, 0x02, 0x18, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let ov_ov1: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x14, 0x01, 0x60, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let ov_ov2: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x15, 0x01, 0x60, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let ov_ov3: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0x07, 0x13, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let ov_ov4: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00, 0x0A, 0x13, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    // run's body is one byte, 0x7F: 127 local groups and no bytes for them (ov5)
+    let ov_ov5: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00, 0x0A, 0x03, 0x01, 0x01, 0x7F];
+    let cases: [(&str, &[u8]); 13] = [
         ("empty", empty),
         ("magic-only (no run)", magic_only),
         ("truncated section", trunc_section),
         ("oversized export name", bad_name),
         ("code missing end", no_end),
+        ("overflow: section size", ov_af1),
+        ("overflow: import module-name length", ov_af2),
+        ("overflow: import field-name length", ov_af3),
+        ("overflow: type parameter count", ov_ov1),
+        ("overflow: type result count", ov_ov2),
+        ("overflow: export name length", ov_ov3),
+        ("overflow: code body size", ov_ov4),
+        ("local groups past the body's end", ov_ov5),
     ];
     crate::kprintln!("[fuzz] feeding {} malformed modules to the WASM parser...", cases.len());
     for (name, bytes) in cases.iter() {
@@ -2226,6 +2578,76 @@ fn guard_cases() {
     // Unbounded recursion must TRAP, and the next app must run normally.
     run_app("guard: endless recursion", &WASM_BAD_RECURSE, CAP_ALL);
     run_app("guard: 16 deep again, after the TRAP", &WASM_DEPTH16, CAP_ALL);
+    stop_key_cases();
+}
+
+// --- N1 / N2 test modules (claude/nia-n1; made by a script, checked with the
+// nia-apps emulator). ---
+static WASM_KEY_LOOP: [u8; 38] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02,
+    0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00, 0x0A, 0x09, 0x01, 0x07, 0x00,
+    0x03, 0x40, 0x0C, 0x00, 0x0B, 0x0B,
+];
+static WASM_KEY_IGNORE: [u8; 62] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60, 0x00, 0x00, 0x60, 0x00,
+    0x01, 0x7F, 0x02, 0x0F, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0x06, 0x67, 0x65, 0x74, 0x6B, 0x65,
+    0x79, 0x00, 0x01, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x01,
+    0x0A, 0x0C, 0x01, 0x0A, 0x00, 0x03, 0x40, 0x10, 0x00, 0x1A, 0x0C, 0x00, 0x0B, 0x0B,
+];
+static WASM_KEY_KEEP: [u8; 95] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0C, 0x03, 0x60, 0x00, 0x00, 0x60, 0x00,
+    0x01, 0x7F, 0x60, 0x01, 0x7F, 0x00, 0x02, 0x1C, 0x02, 0x04, 0x61, 0x66, 0x72, 0x69, 0x06, 0x67,
+    0x65, 0x74, 0x6B, 0x65, 0x79, 0x00, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05, 0x70, 0x72, 0x69,
+    0x6E, 0x74, 0x00, 0x02, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00,
+    0x02, 0x0A, 0x1C, 0x01, 0x1A, 0x01, 0x01, 0x7F, 0x41, 0x80, 0xE0, 0x00, 0x21, 0x00, 0x03, 0x40,
+    0x20, 0x00, 0x41, 0x01, 0x6B, 0x22, 0x00, 0x0D, 0x00, 0x0B, 0x10, 0x00, 0x10, 0x01, 0x0B,
+];
+static WASM_RET_BR: [u8; 69] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0C, 0x03, 0x60, 0x01, 0x7F, 0x00, 0x60,
+    0x00, 0x00, 0x60, 0x00, 0x01, 0x7F, 0x02, 0x0E, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05, 0x70,
+    0x72, 0x69, 0x6E, 0x74, 0x00, 0x00, 0x03, 0x03, 0x02, 0x02, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72,
+    0x75, 0x6E, 0x00, 0x02, 0x0A, 0x0F, 0x02, 0x06, 0x00, 0x41, 0x07, 0x0C, 0x00, 0x0B, 0x06, 0x00,
+    0x10, 0x01, 0x10, 0x00, 0x0B,
+];
+static WASM_RET_BRTABLE: [u8; 76] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0C, 0x03, 0x60, 0x01, 0x7F, 0x00, 0x60,
+    0x00, 0x00, 0x60, 0x00, 0x01, 0x7F, 0x02, 0x0E, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05, 0x70,
+    0x72, 0x69, 0x6E, 0x74, 0x00, 0x00, 0x03, 0x03, 0x02, 0x02, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72,
+    0x75, 0x6E, 0x00, 0x02, 0x0A, 0x16, 0x02, 0x0D, 0x00, 0x02, 0x7F, 0x41, 0x07, 0x41, 0x05, 0x0E,
+    0x01, 0x00, 0x01, 0x0B, 0x0B, 0x06, 0x00, 0x10, 0x01, 0x10, 0x00, 0x0B,
+];
+
+/// One key case: print the marker the suite's driver waits for (it sends the
+/// listed bytes after `driver_wait_ms`), give the bytes `settle_ms` to land in
+/// the console's receive ring, then run the app.
+fn key_case(label: &str, bytes: &[u8], keys: &str, driver_wait_ms: u64, settle_ms: u64) {
+    crate::kprintln!("[fuzz] keys (wait {} ms): {}", driver_wait_ms, keys);
+    if settle_ms > 0 {
+        crate::timer::busywait_ms(settle_ms);
+    }
+    run_app(label, bytes, CAP_ALL);
+}
+
+/// The N1 stop-key and N2 return-by-branch cases (part of `wasmfuzz`).
+fn stop_key_cases() {
+    crate::kprintln!("[fuzz] nia N2: a branch to the function's own label returns");
+    run_app("n2: br 0 out of a () -> i32 function", &WASM_RET_BR, CAP_ALL);
+    run_app("n2: br_table default = the function's label", &WASM_RET_BRTABLE, CAP_ALL);
+
+    crate::kprintln!("[fuzz] nia N1: Ctrl+C stops an app that never ends");
+    // Ctrl+C arrives while the loop runs (the driver waits 1 s first).
+    key_case("n1: endless loop, Ctrl+C", &WASM_KEY_LOOP, "03", 1000, 0);
+    // An app that reads and ignores every key: stopped by Ctrl+C through getkey.
+    key_case("n1: app ignores every key, Ctrl+C", &WASM_KEY_IGNORE, "61 03", 0, 1500);
+    // Keys before Ctrl+C go to the queue; the stop still happens.
+    key_case("n1: keys then Ctrl+C, bare loop", &WASM_KEY_LOOP, "78 79 03", 0, 1500);
+    // A key read by the loop poll reaches getkey afterwards (no key lost); the
+    // 'x' 'y' left in the queue by the case above must not reach this app.
+    key_case("n1: key during a loop reaches getkey", &WASM_KEY_KEEP, "6B", 0, 1500);
+    // SAFETY: single-threaded; read the counter the loop poll keeps.
+    let q = unsafe { KEYS_QUEUED };
+    crate::kprintln!("[fuzz] keys the loop poll queued for getkey: {}", q);
+    run_app("n1: a good app after the stops", &WASM_DEPTH16, CAP_ALL);
 }
 
 /// Roll a WASM dice app `n` times — each run draws from the capability-gated RNG
@@ -2237,9 +2659,49 @@ pub fn dice_demo(n: usize) {
     }
 }
 
+/// The bundled apps: one table for seeding the VFS, recording the integrity manifest (from these
+/// compiled-in bytes) and restoring them after a disk load, so the lists cannot drift apart. appget refuses
+/// these names.
+pub const BUNDLED: [(&str, fn() -> &'static [u8]); 12] = [
+    ("hello.wasm", hello_wasm),
+    ("sum.wasm", sum_wasm),
+    ("draw.wasm", draw_wasm),
+    ("fileapp.wasm", file_wasm),
+    ("clock.wasm", clock_wasm),
+    ("type.wasm", type_wasm),
+    ("ai.wasm", ai_wasm),
+    ("chat.wasm", chat_wasm),
+    ("notify.wasm", notify_wasm),
+    ("notify2.wasm", notify2_wasm),
+    ("net.wasm", net_wasm),
+    ("rand.wasm", rand_wasm),
+];
+
+/// After `vfs::load_from_disk`: a bundled name whose disk copy differs from the built-in bytes gets the
+/// built-in copy back (an old disk after a kernel upgrade, or a tampered one), with one line; a missing one is
+/// seeded again.
+pub fn restore_bundled() {
+    for (name, bytes) in BUNDLED {
+        let want = bytes();
+        match crate::vfs::read_full(name) {
+            Some(have) if have == want => {}
+            Some(_) => {
+                crate::vfs::write(name, want);
+                crate::kprintln!("[vfs] {}: the disk copy differed from the bundled app; bundled copy restored", name);
+            }
+            None => {
+                if !crate::vfs::write(name, want) {
+                    crate::kprintln!("[vfs] {}: no free file slot to restore the bundled app", name);
+                }
+            }
+        }
+    }
+}
+
 /// Load a `.wasm` app from the filesystem and run it (granted all host caps).
 pub fn run_file(name: &str) {
-    match crate::vfs::read_raw(name) {
+    // The whole file (up to 16 KiB, claude/vfs-big), not the 512-byte view.
+    match crate::vfs::read_full(name) {
         Some(bytes) if bytes.len() >= 8 => {
             // Integrity gate: verify the app's bytes against the manifest BEFORE
             // running it. Tamper/corruption defense at load, layered under the
@@ -2262,40 +2724,98 @@ pub fn run_file(name: &str) {
                     );
                 }
             }
+            // Manifest apps keep every capability; anything else (a sideloaded app) runs without
+            // file, net, AI and voice (claude/appget, change B).
+            let caps = match crate::integrity::check(name, bytes) {
+                crate::integrity::Verdict::Ok => CAP_ALL,
+                _ => {
+                    crate::kprintln!(
+                        "[nia] '{}' runs without file, net, AI and voice (not in the manifest)",
+                        name
+                    );
+                    CAP_SIDELOAD
+                }
+            };
             crate::kprintln!("[nia] loaded '{}' from the filesystem ({} bytes)", name, bytes.len());
             crate::tonga::wm_reset(); // fresh window server for a graphical app
-            run_app(name, bytes, CAP_ALL);
+            run_app(name, bytes, caps);
         }
         Some(_) => crate::kprintln!("[nia] '{}' is too small to be a WASM module", name),
         None => crate::kprintln!("[nia] no such file: {}  (try 'ls')", name),
     }
 }
 
+/// The capability one host function needs, and its name (the same table `host_call` enforces).
+fn host_cap(host: u8) -> (u32, &'static str) {
+    match host {
+        HOST_PRINT => (CAP_PRINT, "print"),
+        HOST_PRINTQ => (CAP_PRINT, "print64"),
+        HOST_PUTC => (CAP_PUTC, "putc"),
+        HOST_WIN_CREATE | HOST_WIN_FILL | HOST_WIN_PRESENT | HOST_WIN_TEXT => (CAP_DRAW, "draw"),
+        HOST_FILE_WRITE | HOST_FILE_READ => (CAP_FILE, "file"),
+        HOST_TIME | HOST_SLEEP => (CAP_TIME, "time"),
+        HOST_GETKEY | HOST_POLLKEY => (CAP_INPUT, "input"),
+        HOST_AI => (CAP_AI, "AI"),
+        HOST_SPEAK => (CAP_VOICE, "voice"),
+        HOST_NET => (CAP_NET, "net"),
+        HOST_RANDOM => (CAP_RANDOM, "random"),
+        _ => (0, "unknown"),
+    }
+}
+
+/// Print `label` and the capability names in `mask` on one line (`none` when the mask is empty).
+pub fn print_caps(label: &str, mask: u32, none: &str) {
+    if mask == 0 {
+        crate::kprintln!("{}{}", label, none.trim_start());
+        return;
+    }
+    let names = [
+        (CAP_PRINT, "print"), (CAP_PUTC, "putc"), (CAP_DRAW, "draw"), (CAP_FILE, "file"), (CAP_TIME, "time"),
+        (CAP_INPUT, "input"), (CAP_AI, "AI"), (CAP_VOICE, "voice"), (CAP_NET, "net"), (CAP_RANDOM, "random"),
+    ];
+    let mut line = [0u8; 96];
+    let mut n = 0;
+    for (bit, nm) in names {
+        if mask & bit != 0 && n + nm.len() + 2 <= line.len() {
+            if n > 0 {
+                line[n..n + 2].copy_from_slice(b", ");
+                n += 2;
+            }
+            line[n..n + nm.len()].copy_from_slice(nm.as_bytes());
+            n += nm.len();
+        }
+    }
+    crate::kprintln!("{}{}", label, core::str::from_utf8(&line[..n]).unwrap_or("?"));
+}
+
+/// Parse a module exactly as `run_file` would and NEVER run it (appget). All capabilities are allowed for the
+/// parse only, so imports are listed, not refused. Returns the capabilities its imports need.
+pub fn check_module(bytes: &[u8]) -> Result<u32, &'static str> {
+    if bytes.len() < 8 {
+        return Err("too small to be a WASM module");
+    }
+    let m = parse(bytes, CAP_ALL)?;
+    let mut need = 0u32;
+    for i in 0..m.import_count.min(MAX_IMPORTS) {
+        need |= host_cap(m.import_host[i]).0;
+    }
+    Ok(need)
+}
+
 fn run_app(label: &str, bytes: &[u8], caps: u32) {
     crate::kprintln!();
     crate::kprintln!("[nia] === {} ===", label);
     crate::kprintln!("[nia] loading module ({} bytes), granted caps = {:#04x}", bytes.len(), caps);
-    // SAFETY: single-threaded; reset per-run output buffer.
-    unsafe {
-        PUTC_LEN = 0;
-    }
+    putc_reset();
+    keyq_reset(); // N1: one app's keys never reach the next
     match parse(bytes, caps) {
         Ok(m) => {
             crate::kprintln!("[nia] executing 'run' in the sandbox...");
             let mut st = Stack::new();
-            match m.invoke(m.run_index, &mut st) {
-                Ok(()) => {
-                    // SAFETY: read the accumulated putc output.
-                    unsafe {
-                        if PUTC_LEN > 0 {
-                            let s = core::str::from_utf8(&*core::ptr::addr_of!(PUTC_BUF))
-                                .unwrap_or("?");
-                            let s = &s[..PUTC_LEN];
-                            crate::kprintln!("    [wasm app] output: {}", s);
-                        }
-                    }
-                    crate::kprintln!("[nia] 'run' returned cleanly");
-                }
+            let r = m.invoke(m.run_index, &mut st);
+            finish_putc(); // the app's last putc line ends before the run's own line, whichever way it ended
+            match r {
+                Ok(()) => crate::kprintln!("[nia] 'run' returned cleanly"),
                 Err(e) => crate::kprintln!("[nia] TRAP: {}", e),
             }
         }
@@ -2340,12 +2860,14 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
         c += 1;
         let (size, a) = uleb(m, c);
         c += a;
-        let end = c + size;
         // Reject a section that claims to extend past the module (truncated /
-        // hostile input): every section must fit within the module bytes.
-        if end > m.len() {
-            return Err("truncated section");
-        }
+        // hostile input): every section must fit within the module bytes. The add is
+        // checked: a 10-byte LEB size near usize::MAX overflowed `c + size` and
+        // panicked the kernel (claude/nia-afri, architect's A1).
+        let end = match c.checked_add(size) {
+            Some(e) if e <= m.len() => e,
+            _ => return Err("truncated section"),
+        };
         match id {
             1 => {
                 let (cnt, a) = uleb(m, c);
@@ -2354,11 +2876,14 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
                     return Err("too many types (Nia holds 16)");
                 }
                 for i in 0..cnt {
+                    // 0x60, then the parameter and result type vectors (one byte each), read with
+                    // name_in so the counts are checked adds within the section (step A2).
+                    if c >= end {
+                        return Err("truncated type");
+                    }
                     c += 1;
-                    let (np, a) = uleb(m, c);
-                    c += a + np;
-                    let (nr, a) = uleb(m, c);
-                    c += a + nr;
+                    let np = name_in(m, &mut c, end).ok_or("truncated type")?.len();
+                    let nr = name_in(m, &mut c, end).ok_or("truncated type")?.len();
                     md.types[i] = (np, nr);
                 }
                 md.ntypes = cnt;
@@ -2367,22 +2892,24 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
                 let (cnt, a) = uleb(m, c);
                 c += a;
                 for _ in 0..cnt {
-                    let (ml, a) = uleb(m, c);
-                    c += a + ml;
-                    let (nl, a) = uleb(m, c);
-                    c += a;
-                    if c + nl >= m.len() {
+                    let module = name_in(m, &mut c, end).ok_or("truncated import name")?;
+                    let name = name_in(m, &mut c, end).ok_or("truncated import name")?;
+                    // Imports come from module `afri` (`env` too, for v0 apps: the 23
+                    // built-in apps use it). Exact bytes, no case folding or prefix.
+                    if module != b"afri" && module != b"env" {
+                        refuse_module(module);
+                        return Err("import from a module Nia does not offer");
+                    }
+                    if c >= end {
                         return Err("truncated import name");
                     }
-                    let name = &m[c..c + nl];
-                    c += nl;
                     let kind = m[c];
                     c += 1;
                     let (desc, a) = uleb(m, c);
                     c += a;
                     if kind == 0 {
                         if md.import_count >= MAX_IMPORTS {
-                            return Err("too many imported functions (Nia holds 8)");
+                            return Err("too many imported functions (Nia holds 16)");
                         }
                         if desc >= md.ntypes {
                             return Err("import has a bad type index");
@@ -2404,6 +2931,8 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
                                 b"net" => HOST_NET,
                                 b"random" => HOST_RANDOM,
                                 b"print64" => HOST_PRINTQ,
+                                b"pollkey" => HOST_POLLKEY,
+                                b"sleep_ms" => HOST_SLEEP,
                                 _ => HOST_UNKNOWN,
                             };
                             md.import_type[md.import_count] = desc; // type index
@@ -2432,13 +2961,10 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
                 let (cnt, a) = uleb(m, c);
                 c += a;
                 for _ in 0..cnt {
-                    let (nl, a) = uleb(m, c);
-                    c += a;
-                    if c + nl >= m.len() {
+                    let name = name_in(m, &mut c, end).ok_or("truncated export name")?;
+                    if c >= end {
                         return Err("truncated export name");
                     }
-                    let name = &m[c..c + nl];
-                    c += nl;
                     let kind = m[c];
                     c += 1;
                     let (idx, a) = uleb(m, c);
@@ -2455,11 +2981,10 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
                     return Err("too many functions (Nia holds 16)");
                 }
                 for i in 0..cnt {
-                    let (bsz, a) = uleb(m, c);
-                    c += a;
-                    md.code_off[i] = c;
-                    md.code_len[i] = bsz;
-                    c += bsz;
+                    // a body's size, then its bytes: within the section, a checked add (step A2)
+                    let body = name_in(m, &mut c, end).ok_or("truncated code body")?;
+                    md.code_off[i] = c - body.len();
+                    md.code_len[i] = body.len();
                 }
                 ncode = cnt;
             }
@@ -2532,15 +3057,18 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
                         // offset expr: i32.const N, end
                         if c < m.len() && m[c] == 0x41 {
                             let (v, a) = sleb(m, c + 1);
-                            off = v as usize;
+                            off = v as u32 as usize; // unsigned, as WebAssembly says
                             c += 1 + a;
                         }
                         c += 1; // 0x0B end
                     }
                     let (len, a) = uleb(m, c);
                     c += a;
-                    if c + len > m.len() {
+                    if c.checked_add(len).map_or(true, |e| e > m.len()) {
                         return Err("truncated data segment");
+                    }
+                    if off.checked_add(len).map_or(true, |end| end > MEM_SIZE) {
+                        return Err("data segment past the end of memory");
                     }
                     for i in 0..len {
                         mem_write8(off + i, m[c + i]);
@@ -2564,6 +3092,12 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
 impl<'a> Module<'a> {
     fn host_call(&self, fidx: usize, caller: &mut Stack) -> Result<(), &'static str> {
         let host = if fidx < MAX_IMPORTS { self.import_host[fidx] } else { HOST_UNKNOWN };
+        // A host function that may print closes an open putc line first. The quiet ones (time, getkey, random,
+        // pollkey, sleep_ms) print nothing, so a prompt written with putc stays on its line while the app waits for
+        // a key. A refusal below prints a DENIED line, so it closes the line itself.
+        if !matches!(host, HOST_PUTC | HOST_TIME | HOST_GETKEY | HOST_RANDOM | HOST_POLLKEY | HOST_SLEEP) {
+            putc_break();
+        }
 
         // print64(i64) takes a single 64-bit argument, so it must pop the full
         // i64 value (the generic arg loop below pops i32 cells). Handle it here.
@@ -2606,9 +3140,12 @@ impl<'a> Module<'a> {
             HOST_SPEAK => (CAP_VOICE, "speak"),
             HOST_NET => (CAP_NET, "net"),
             HOST_RANDOM => (CAP_RANDOM, "random"),
+            HOST_POLLKEY => (CAP_INPUT, "pollkey"),
+            HOST_SLEEP => (CAP_TIME, "sleep_ms"),
             _ => (0xFFFF_FFFF, "unknown"),
         };
         if host == HOST_UNKNOWN || (self.caps & req) == 0 {
+            putc_break();
             crate::kprintln!("    [nia] DENIED: app called host '{}' without the capability", name);
             return Err("capability denied");
         }
@@ -2616,61 +3153,56 @@ impl<'a> Module<'a> {
         let mut result: Option<i32> = None;
         match host {
             HOST_PRINT => crate::kprintln!("    [wasm app] print({}) = {:#x}", a[0], a[0] as u32),
-            HOST_PUTC => {
-                // SAFETY: append to the per-run output buffer.
-                unsafe {
-                    if PUTC_LEN < 256 {
-                        (*addr_of_mut!(PUTC_BUF))[PUTC_LEN] = a[0] as u8;
-                        PUTC_LEN += 1;
-                    }
-                }
-            }
+            HOST_PUTC => putc_byte(a[0] as u8),
             HOST_WIN_CREATE => {
                 crate::framebuffer::set_console(false); // switch the screen to graphics
-                result = Some(crate::tonga::win_create(NIA_OWNER, a[0] as usize, a[1] as usize) as i32);
+                result = Some(crate::tonga::win_create(NIA_OWNER, u(a[0]), u(a[1])) as i32);
             }
-            HOST_WIN_FILL => crate::tonga::win_fill(
-                a[0] as usize, a[1] as usize, a[2] as usize, a[3] as usize, a[4] as usize, a[5] as u32,
-            ),
+            HOST_WIN_FILL => crate::tonga::win_fill(u(a[0]), u(a[1]), u(a[2]), u(a[3]), u(a[4]), a[5] as u32),
             HOST_WIN_PRESENT => crate::tonga::win_present(),
             HOST_FILE_WRITE => {
-                result = Some(host_file_write(a[0] as usize, a[1] as usize, a[2] as usize, a[3] as usize));
+                result = Some(host_file_write(a[0], a[1], a[2], a[3])?);
             }
             HOST_FILE_READ => {
-                result = Some(host_file_read(a[0] as usize, a[1] as usize, a[2] as usize, a[3] as usize));
+                result = Some(host_file_read(a[0], a[1], a[2], a[3])?);
             }
-            HOST_TIME => {
-                // PL031 RTC data register (seconds since epoch) at PA 0x0901_0000.
-                let t = unsafe { core::ptr::read_volatile(0x0901_0000 as *const u32) as i32 };
-                result = Some(t);
-            }
+            HOST_TIME => result = Some(wall_secs() as i32), // epoch seconds; wraps in 2038 as an i32
             HOST_GETKEY => {
-                // Block for the next console key (routed to the app).
-                let k = loop {
-                    if let Some(c) = crate::uart::getc() {
-                        break c as i32;
-                    }
-                    core::hint::spin_loop();
+                // The next key: first any the loop poll queued, else block on the
+                // console. Ctrl+C stops the app (N1), so an app that ignores
+                // every key can still be left.
+                let k = match keyq_pop() {
+                    Some(c) => c,
+                    None => loop {
+                        if let Some(c) = crate::uart::getc() {
+                            break c;
+                        }
+                        core::hint::spin_loop();
+                    },
                 };
-                result = Some(k);
+                if k == STOP_KEY {
+                    return Err(STOPPED);
+                }
+                result = Some(k as i32);
             }
             HOST_WIN_TEXT => {
-                crate::tonga::win_text(a[0] as usize, a[1] as usize, a[2] as usize, a[3] as u8, a[4] as u32);
+                crate::tonga::win_text(u(a[0]), u(a[1]), u(a[2]), a[3] as u8, a[4] as u32);
             }
             HOST_AI => {
                 // ai(prompt_ptr, prompt_len, out_ptr, out_cap) -> out_len.
                 // On-device, capability-gated, private. Reads the prompt from the
                 // app's memory and writes the reply back into it.
-                result = Some(host_ai(a[0] as usize, a[1] as usize, a[2] as usize, a[3] as usize));
+                result = Some(host_ai(a[0], a[1], a[2], a[3])?);
             }
             HOST_SPEAK => {
                 // speak(text_ptr, text_len): Asili Voice. Real audio needs an
                 // audio driver + an on-device TTS model (Piper-class, docs/14);
                 // v0 emits the text as a placeholder for the spoken output.
                 let mut tb = [0u8; 160];
-                let tn = (a[1] as usize).min(160);
+                let tn = ulen(a[1], 160);
+                let t = mem_range(a[0], tn)?;
                 for i in 0..tn {
-                    tb[i] = mem_read8(a[0] as usize + i);
+                    tb[i] = mem_read8(t + i);
                 }
                 crate::kprintln!(
                     "    [asili voice] (would speak aloud): \"{}\"",
@@ -2702,6 +3234,12 @@ impl<'a> Module<'a> {
                     crate::virtio::net_dns()
                 };
                 result = Some(if ok { 1 } else { 0 });
+            }
+            HOST_POLLKEY => {
+                result = Some(host_pollkey()?);
+            }
+            HOST_SLEEP => {
+                result = Some(host_sleep_ms(a[0])?);
             }
             HOST_RANDOM => {
                 // random() -> i32. Reached only with CAP_RANDOM. A fresh draw from
@@ -2762,6 +3300,11 @@ impl<'a> Module<'a> {
         let mut c = a;
         let mut nlocals = nparams;
         for _ in 0..ngroups {
+            // A body claiming more local groups than it has bytes used to run `c` past its end, and
+            // `&body[c..]` below panicked (claude/nia-parse, step A2).
+            if c >= body.len() {
+                return Err("truncated code body");
+            }
             let (n, a) = uleb(body, c);
             c += a + 1;
             for _ in 0..n {
@@ -2771,6 +3314,9 @@ impl<'a> Module<'a> {
                 locals[nlocals] = 0;
                 nlocals += 1;
             }
+        }
+        if c > body.len() {
+            return Err("truncated code body");
         }
         let code = &body[c..];
         let mut st = Stack::new();
@@ -2842,12 +3388,16 @@ impl<'a> Module<'a> {
                 }
                 0x0C => {
                     let (l, _) = uleb(code, pc + 1);
-                    branch(l, &mut ctrl, &mut cp, st, &mut pc)?;
+                    if branch(l, &mut ctrl, &mut cp, st, &mut pc)? {
+                        return Ok(()); // N2: br to the function's own label = return
+                    }
                 }
                 0x0D => {
                     let (l, a) = uleb(code, pc + 1);
                     if st.pop() != 0 {
-                        branch(l, &mut ctrl, &mut cp, st, &mut pc)?;
+                        if branch(l, &mut ctrl, &mut cp, st, &mut pc)? {
+                            return Ok(());
+                        }
                     } else {
                         pc = pc + 1 + a;
                     }
@@ -2872,7 +3422,9 @@ impl<'a> Module<'a> {
                     if !found {
                         chosen = deflt;
                     }
-                    branch(chosen, &mut ctrl, &mut cp, st, &mut pc)?;
+                    if branch(chosen, &mut ctrl, &mut cp, st, &mut pc)? {
+                        return Ok(());
+                    }
                 }
                 0x0F => return Ok(()),
                 0x10 => {
@@ -2926,30 +3478,51 @@ impl<'a> Module<'a> {
                     }
                     global_set(i, st.pop_i64());
                 }
-                0x28 | 0x2C | 0x2D => {
-                    // i32.load / i32.load8_s / i32.load8_u
+                0x28 | 0x2C | 0x2D | 0x2E | 0x2F => {
+                    // i32.load / i32.load8_s / i32.load8_u / i32.load16_s / i32.load16_u
                     let (_al, a) = uleb(code, pc + 1);
                     let (off, b) = uleb(code, pc + 1 + a);
                     pc += 1 + a + b;
-                    let addr = st.pop() as usize + off;
+                    let w = match op {
+                        0x28 => 4,
+                        0x2C | 0x2D => 1,
+                        0x2E | 0x2F => 2,
+                        _ => return Err("unsupported opcode"), // not reached: the arm lists every opcode
+                    };
+                    let addr = ea(st.pop(), off, w)?; // unsigned base, checked, inside 64 KiB or TRAP
                     let v = match op {
                         0x28 => mem_read32(addr),
                         0x2C => (mem_read8(addr) as i8) as i32,
-                        _ => mem_read8(addr) as i32,
+                        0x2D => mem_read8(addr) as i32,
+                        0x2E => (mem_read16(addr) as i16) as i32,
+                        0x2F => mem_read16(addr) as i32,
+                        _ => return Err("unsupported opcode"), // not reached: the arm lists every opcode
                     };
                     st.push(v);
                 }
-                0x36 | 0x3A => {
-                    // i32.store / i32.store8
+                0x36 | 0x3A | 0x3B => {
+                    // i32.store / i32.store8 / i32.store16 (the low 16 bits)
                     let (_al, a) = uleb(code, pc + 1);
                     let (off, b) = uleb(code, pc + 1 + a);
                     pc += 1 + a + b;
                     let v = st.pop();
-                    let addr = st.pop() as usize + off;
-                    if op == 0x36 {
-                        mem_write32(addr, v);
-                    } else {
-                        mem_write8(addr, v as u8);
+                    let w = match op {
+                        0x36 => 4,
+                        0x3A => 1,
+                        0x3B => 2,
+                        _ => return Err("unsupported opcode"), // not reached: the arm lists every opcode
+                    };
+                    let addr = ea(st.pop(), off, w)?; // unsigned base, checked, inside 64 KiB or TRAP
+                    match op {
+                        0x36 => mem_write32(addr, v),
+                        0x3A => mem_write8(addr, v as u8),
+                        0x3B => {
+                            // i32.store16, written as i64.store16 is (ea has checked both bytes).
+                            let b2 = (v as u16).to_le_bytes();
+                            mem_write8(addr, b2[0]);
+                            mem_write8(addr + 1, b2[1]);
+                        }
+                        _ => return Err("unsupported opcode"), // not reached: the arm lists every opcode
                     }
                 }
                 0x29 | 0x30 | 0x31 | 0x32 | 0x33 | 0x34 | 0x35 => {
@@ -2958,7 +3531,14 @@ impl<'a> Module<'a> {
                     let (_al, a) = uleb(code, pc + 1);
                     let (off, b) = uleb(code, pc + 1 + a);
                     pc += 1 + a + b;
-                    let addr = st.pop() as usize + off;
+                    let w = match op {
+                        0x29 => 8,
+                        0x30 | 0x31 => 1,
+                        0x32 | 0x33 => 2,
+                        0x34 | 0x35 => 4,
+                        _ => return Err("unsupported opcode"), // not reached: the arm lists every opcode
+                    };
+                    let addr = ea(st.pop(), off, w)?; // unsigned base, checked, inside 64 KiB or TRAP
                     let v: i64 = match op {
                         0x29 => mem_read64(addr),                    // i64.load
                         0x30 => (mem_read8(addr) as i8) as i64,      // i64.load8_s
@@ -2976,7 +3556,14 @@ impl<'a> Module<'a> {
                     let (off, b) = uleb(code, pc + 1 + a);
                     pc += 1 + a + b;
                     let v = st.pop_i64();
-                    let addr = st.pop() as usize + off;
+                    let w = match op {
+                        0x37 => 8,
+                        0x3C => 1,
+                        0x3D => 2,
+                        0x3E => 4,
+                        _ => return Err("unsupported opcode"), // not reached: the arm lists every opcode
+                    };
+                    let addr = ea(st.pop(), off, w)?; // unsigned base, checked, inside 64 KiB or TRAP
                     match op {
                         0x37 => mem_write64(addr, v),                // i64.store
                         0x3C => mem_write8(addr, v as u8),           // i64.store8
@@ -3254,6 +3841,25 @@ impl<'a> Module<'a> {
                     st.push(v as i32);
                     pc += 1;
                 }
+                0xA7 => {
+                    // i32.wrap_i64: keep the low 32 bits.
+                    let v = st.pop_i64();
+                    st.push(v as i32);
+                    pc += 1;
+                }
+                0xAC => {
+                    // i64.extend_i32_s: sign-extend.
+                    let v = st.pop();
+                    st.push_i64(v as i64);
+                    pc += 1;
+                }
+                0xAD => {
+                    // i64.extend_i32_u: zero-extend. The cell holds the i32 sign-extended, so go
+                    // through u32 or a negative i32 would stay negative.
+                    let v = st.pop();
+                    st.push_i64((v as u32) as i64);
+                    pc += 1;
+                }
                 0xB7 => {
                     // f64.convert_i32_s: i32 -> f64.
                     let v = st.pop();
@@ -3283,13 +3889,21 @@ fn branch(
     cp: &mut usize,
     st: &mut Stack,
     pc: &mut usize,
-) -> Result<(), &'static str> {
-    // Nia guard: label l must name an open block. (A br to the function's own
-    // outer label is legal WASM, but Nia keeps no Ctrl for it; refuse it.)
-    if l >= *cp {
+) -> Result<bool, &'static str> {
+    // Ok(true) means "return from the function" (N2): label l == cp is the
+    // function's own label, which WASM defines as a return carrying the
+    // function's results; `invoke` takes them from the top of the stack with
+    // its underflow check. A label past that is not open: TRAP (Nia guard).
+    if l == *cp {
+        return Ok(true);
+    }
+    if l > *cp {
         return Err("branch out of the function");
     }
     let target = *cp - 1 - l;
+    if ctrl[target].is_loop {
+        loop_poll()?; // N1: an endless loop can be stopped with Ctrl+C
+    }
     let arity = ctrl[target].arity;
     st.check()?;
     if st.sp < arity || arity > 4 {
@@ -3309,5 +3923,5 @@ fn branch(
         *cp = target;
     }
     *pc = ctrl[target].cont_pc;
-    Ok(())
+    Ok(false)
 }

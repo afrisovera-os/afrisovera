@@ -267,7 +267,7 @@ pub fn power_button_init() {
         }
         PB.state = "on";
         crate::kprintln!(
-            "[pc] power button: ready -- a press saves the files and switches off (PM1a {:#x}, ACPI mode {})",
+            "[pc] power button: ready; a press saves the files and switches off (PM1a {:#x}, ACPI mode {})",
             p.evt_a,
             if PB.acpi_mode_by_us { "switched on" } else { "already on" }
         );

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# PC BOOT check (suite 691, PC track step 1 — owner's decision 3 Nov 2026, docs/05).
+# PC BOOT check (suite 691, PC track step 1, owner's decision 3 Nov 2026, docs/05).
 #
 # Builds the x86-64 PC kernel (`mansa-pc`, a UEFI application), puts it where every
-# PC's firmware looks for a boot loader (EFI/BOOT/BOOTX64.EFI on a FAT partition — the
+# PC's firmware looks for a boot loader (EFI/BOOT/BOOTX64.EFI on a FAT partition: the
 # same layout a USB stick needs on real hardware), boots it in QEMU's q35 PC with the
 # EDK II (OVMF) UEFI firmware, and grades the serial log.
 #
 # WHAT IS GRADED (each line anchored at column 0, after stripping CR and the firmware's
-# terminal escape codes — the rxsplit lesson of 2 Nov 2026: GNU grep's `$` does not
+# terminal escape codes (the rxsplit lesson of 2 Nov 2026: GNU grep's `$` does not
 # match before a CR):
 #   1. the kernel was started by UEFI, and found the screen (GOP framebuffer);
 #   2. it read the memory map and EXITED boot services (the firmware is gone);
@@ -19,7 +19,7 @@
 #      every check held (P/P, P > 0) and no [FAIL] line anywhere;
 #   7. no EXCEPTION and no PANIC line; and the final MANSA-PC BOOT OK.
 # NOT graded: timings, addresses, memory sizes (they are the host's and the firmware's,
-# not the kernel's — a literal would recreate finding 3.365).
+# not the kernel's; a literal would recreate finding 3.365).
 #
 # The kernel powers itself off at the end ONLY because this rig passes
 # `-fw_cfg name=opt/afrisovera/poweroff` (see kernel/src/pc/qemu.rs); a real PC keeps its
@@ -46,16 +46,16 @@ grade() {
         return 1
     fi
     L="$(tr -d '\r' < "$F" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$L" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$L"; }  # a here-string: no printf for grep -q to cut off (SIGPIPE under pipefail)
 
-    has '^\[pc\] Mansa x86-64 \(PC\) -- started by UEFI firmware$' ||
-        _f "no start line -- the firmware never ran the kernel"
+    has '^\[pc\] Mansa x86-64 \(PC\), started by UEFI firmware$' ||
+        _f "no start line; the firmware never ran the kernel"
     has '^\[pc\] GOP framebuffer [0-9]+x[0-9]+ ' ||
-        _f "no GOP framebuffer line -- the screen was not found"
+        _f "no GOP framebuffer line; the screen was not found"
     has '^\[pc\] UEFI memory map: [1-9][0-9]* entries' ||
-        _f "no memory-map line -- the firmware's map was not read"
+        _f "no memory-map line; the firmware's map was not read"
     has '^\[pc\] boot services exited' ||
-        _f "boot services were never exited -- the kernel never took the machine over"
+        _f "boot services were never exited; the kernel never took the machine over"
     has '^\[pc\] frame pool: [1-9][0-9]* frames .* at 0x[0-9a-f]+, above the kernel heap arena' ||
         _f "the frame pool is missing or NOT above the heap's arena"
     has '^\[pc\] GDT loaded \(kernel code selector 0x8\)$' ||
@@ -65,7 +65,7 @@ grade() {
     local TK
     TK="$(printf '%s\n' "$L" | grep -aoE '^\[pc\] local APIC .* timer: [0-9]+ interrupts taken$' | tail -1 | awk '{print $(NF-2)}')"
     if [ -z "$TK" ]; then
-        _f "no local APIC timer line -- timer interrupts were never taken"
+        _f "no local APIC timer line; timer interrupts were never taken"
     elif [ "$TK" -lt 10 ]; then
         _f "only $TK timer interrupt(s) taken, not the 10 the kernel waits for"
     fi
@@ -93,11 +93,11 @@ grade() {
 }
 
 # --------------------------------------------------------------- the selftest --
-GREEN='[pc] Mansa x86-64 (PC) -- started by UEFI firmware
+GREEN='[pc] Mansa x86-64 (PC), started by UEFI firmware
 [pc] firmware: EDK II (revision 0x10000)
 [pc] GOP framebuffer 1280x800 (stride 1280) at 0x80000000, BGR
 [pc] UEFI memory map: 99 entries, 249 MiB usable after exit, largest free region 163 MiB at 0x1780000
-[pc] boot services exited -- the firmware is gone, the kernel owns the machine
+[pc] boot services exited; the firmware is gone, the kernel owns the machine
 [pc] frame pool: 4096 frames (16 MiB) at 0xcdf0000, above the kernel heap arena ending 0xcdef9e0
 [pc] GDT loaded (kernel code selector 0x8)
 [pc] IDT loaded; breakpoint exception taken and returned (1)
@@ -138,7 +138,7 @@ selftest() {
     arm crypto-failed red < <(printf '%s\n' "$GREEN" | sed 's/Ed25519 ok/Ed25519 FAILED/')
     arm heap-79-of-80 red < <(printf '%s\n' "$GREEN" | sed 's#80/80 bump#79/80 bump#')
     arm fail-line red < <(printf '%s\n' "$GREEN" | sed 's/^  \[ok\]   an aligned/  [FAIL] an aligned/')
-    arm exception red < <(printf '%s\n' "$GREEN" | sed 's/^\[pc\] MANSA-PC BOOT OK$/[pc] EXCEPTION vector 14 (page fault) error 0x2 at RIP 0x1 (CR2 0x0) -- halted/')
+    arm exception red < <(printf '%s\n' "$GREEN" | sed 's/^\[pc\] MANSA-PC BOOT OK$/[pc] EXCEPTION vector 14 (page fault) error 0x2 at RIP 0x1 (CR2 0x0); halted/')
     arm no-screen red < <(printf '%s\n' "$GREEN" | grep -v 'GOP framebuffer')
     # the verdict only in prose, not at column 0: must not green
     arm verdict-in-prose red < <(printf '%s\n' "$GREEN" | sed 's/^\[pc\] MANSA-PC BOOT OK$/  would print [pc] MANSA-PC BOOT OK here/')
@@ -151,10 +151,10 @@ selftest() {
 # ------------------------------------------------------------------- driver --
 echo "== PC boot (suite 691, PC track step 1) =="
 if ! selftest; then
-    echo "PC BOOT TEST FAILED (grader selftest) -- no QEMU run spent"
+    echo "PC BOOT TEST FAILED (grader selftest): no QEMU run spent"
     exit 1
 fi
-[ "${1:-}" = "--selftest" ] && { echo "PC BOOT SELFTEST ONLY -- no measurement taken"; exit 0; }
+[ "${1:-}" = "--selftest" ] && { echo "PC BOOT SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || { echo "PC BOOT TEST FAILED (harness: qemu-system-x86_64 not on PATH)"; exit 1; }
 QDIR="$(dirname "$(command -v qemu-system-x86_64)")"
@@ -187,7 +187,7 @@ timeout 240 qemu-system-x86_64 -M q35 -m 256M \
     -serial "file:$(winpath "$SER")" -display none -no-reboot -net none \
     -fw_cfg name=opt/afrisovera/poweroff,string=1
 QRC=$?
-echo "  qemu exit $QRC ($([ "$QRC" -eq 124 ] && echo 'timed out -- the kernel never powered off' || echo 'the kernel powered off'))"
+echo "  qemu exit $QRC ($([ "$QRC" -eq 124 ] && echo 'timed out; the kernel never powered off' || echo 'the kernel powered off'))"
 tr -d '\r' < "$SER" 2>/dev/null | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | grep -aE '^\[pc\]|^kernel heap: [0-9]|^ *\[FAIL\]' | sed 's/^/  | /'
 
 echo "  --- grading ---"

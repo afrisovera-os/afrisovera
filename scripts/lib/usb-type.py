@@ -74,6 +74,9 @@ def main():
                 return line
 
     for text in texts:
+        if text.startswith("@wait "):  # "@wait N": type nothing, read the console for N seconds
+            drain(float(text.split()[1]))
+            continue
         for ch in text + "\n":
             if ch in SHIFTED:
                 key("shift", SHIFTED[ch])

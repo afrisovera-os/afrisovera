@@ -116,6 +116,8 @@ static mut TRUN: u8 = 0;
 static mut TSTATS: (u64, u64) = (0, 0);
 /// A run read back after it is written.
 static mut TRB: [u8; RA_BYTES] = [0; RA_BYTES];
+/// Channel resets (SRST) because a drive stayed busy after an earlier command.
+static mut RESETS: u64 = 0;
 
 /// Wait up to `ms` milliseconds for `ok`.
 fn wait(ms: u64, mut ok: impl FnMut() -> bool) -> bool {
@@ -139,12 +141,37 @@ unsafe fn settle(ctl: u16) {
 }
 
 /// Select device `slave` on the channel (LBA mode, `hi` = bits 27:24 of an LBA28 address) and wait
-/// until it is ready for a command.
+/// until it is ready for a command. A drive still busy (BSY) or still asking for data (DRQ) after
+/// an earlier command failed (it hung, or a data phase stopped half way) would refuse every later
+/// command until power-off, so the channel gets a software reset (SRST) first, once.
 unsafe fn select(d: &Drive, hi: u8) -> bool {
+    let pick = || {
+        outb(d.ctl, CTL_NIEN);
+        outb(d.cmd + 6, 0xE0 | (d.slave as u8) << 4 | (hi & 0xF));
+        settle(d.ctl);
+        wait(2000, || inb(d.ctl) & (ST_BSY | ST_DRQ) == 0)
+    };
+    pick() || (recover(d) && pick())
+}
+
+/// A software reset of the drive's channel (ATA/ATAPI-8 ACS, device control register SRST; the
+/// same steps as at boot). It resets both drives of the channel and leaves the disks' contents
+/// alone. True when the drive is idle again.
+unsafe fn recover(d: &Drive) -> bool {
+    RESETS += 1;
+    crate::kprintln!("[ide] {}: busy (status {:#x}) after an earlier command: resetting the channel (SRST)", name(d), inb(d.ctl));
+    outb(d.ctl, CTL_SRST | CTL_NIEN);
+    crate::timer::busywait_ms(1);
     outb(d.ctl, CTL_NIEN);
-    outb(d.cmd + 6, 0xE0 | (d.slave as u8) << 4 | (hi & 0xF));
-    settle(d.ctl);
-    wait(2000, || inb(d.ctl) & (ST_BSY | ST_DRQ) == 0)
+    crate::timer::busywait_ms(3);
+    // a drive may take up to 31 s after a reset (ACS); ten is plenty for one that answers at all
+    let ok = wait(10_000, || inb(d.ctl) & ST_BSY == 0);
+    if ok {
+        crate::kprintln!("[ide] {}: ready again after the channel reset", name(d));
+    } else {
+        crate::kprintln!("[ide] {}: no answer after the channel reset (status {:#x})", name(d), inb(d.ctl));
+    }
+    ok
 }
 
 /// After a command: wait for BSY to clear, then true when the device asks for data (DRQ) and
@@ -882,6 +909,10 @@ pub fn list() {
             let word = |s: u8| match s { 1 => "on", 2 => "off", _ => "not checked yet" };
             crate::kprintln!("  reads: {} sector(s), {} from the read-ahead, {} multi-sector command(s), {} single ({})", r.0, r.1, r.2, r.3, word(mr));
             crate::kprintln!("  writes: {} sector(s), {} multi-sector command(s), {} single ({})", w.0, w.1, w.2, word(mw));
+        }
+        let resets = RESETS;
+        if resets > 0 {
+            crate::kprintln!("  channel resets after a drive stayed busy: {}", resets);
         }
         if TRUN != 0 {
             let t = TSTATS;

@@ -1,6 +1,6 @@
 //! The PC's screen after boot (5 Nov 2026), for PC step 4: what the shared framebuffer
-//! holds -- the shell's text console and the Tonga windows, 640x480, drawn by the same
-//! `framebuffer.rs` the ARM kernel shows through QEMU's ramfb -- is copied onto the UEFI
+//! holds (the shell's text console and the Tonga windows, 640x480, drawn by the same
+//! `framebuffer.rs` the ARM kernel shows through QEMU's ramfb) is copied onto the UEFI
 //! GOP framebuffer, centred and scaled by a whole number where the mode is big enough.
 //! A real laptop has no serial port; this is what makes the shell visible on one.
 //!
@@ -85,13 +85,13 @@ pub const FRAME: u32 = 0x0A_0E14;
 /// Take over the firmware's GOP framebuffer (its address, mode and pixel order).
 pub fn attach(base: u64, w: usize, h: usize, stride: usize, bgr: bool) {
     if base == 0 || w < W || h < H {
-        crate::kprintln!("[pc] screen: GOP mode {}x{} is smaller than the {}x{} console -- serial only", w, h, W, H);
+        crate::kprintln!("[pc] screen: GOP mode {}x{} is smaller than the {}x{} console, so serial only", w, h, W, H);
         return;
     }
     // a real machine may put the framebuffer above the 4 GiB the kernel maps 1:1; its pages
     // are mapped write-combining where the CPU has PAT (mmu::map_screen), else uncached
     if crate::mmu::map_screen(base, (stride * h * 4) as u64, true).is_none() {
-        crate::kprintln!("[pc] screen: could not map the GOP framebuffer at {:#x} -- serial only", base);
+        crate::kprintln!("[pc] screen: could not map the GOP framebuffer at {:#x}, so serial only", base);
         return;
     }
     // SAFETY: boot, single core, before the timer reads it.
@@ -325,7 +325,7 @@ fn present_now() {
         for y in 0..H {
             let row = src.add(y * W);
             // build the screen row once (scaled, pixel order converted) and copy it to each
-            // of its `s` screen lines as a block -- a real 1920x1080 screen at 2x would
+            // of its `s` screen lines as a block: a real 1920x1080 screen at 2x would
             // otherwise take a million single writes per redraw, inside the timer interrupt
             let line: *const u32 = if s == 1 && g.bgr {
                 row // same pixel layout (0x00RRGGBB little-endian = B,G,R,X)
@@ -521,7 +521,7 @@ unsafe fn cursor(g: Gop, (ox, oy, dw, dh): (usize, usize, usize, usize), px: usi
 /// `screeninfo`: the mode, the scale and how often the screen was redrawn.
 pub fn info() {
     if !ON.load(Ordering::Relaxed) {
-        crate::kprintln!("screen: no GOP framebuffer -- serial console only");
+        crate::kprintln!("screen: no GOP framebuffer, so serial console only");
         return;
     }
     // SAFETY: scalar reads.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC step 4 groundwork (5 Nov 2026): the PS/2 (i8042) keyboard -- how most laptops' built-in
+# PC step 4 groundwork (5 Nov 2026): the PS/2 (i8042) keyboard: how most laptops' built-in
 # keyboard reaches the CPU, and QEMU q35's default keyboard.
 #
 # Boots the PC kernel with no USB keyboard, so QEMU's QMP send-key goes to the PS/2 one.
@@ -26,7 +26,7 @@ grade() { # grade <serial capture>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial capture"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[ps2\] i8042 keyboard controller \(config 0x[0-9a-f]{2} -> 0x[0-9a-f]{2}\), scancode set 1, polled$' ||
         _f "the i8042 keyboard controller was not found"
     printf '%s\n' "$S" | grep -aqE "^afrisovera> echo $WORD$" || _f "the command typed on the PS/2 keyboard did not reach the shell"
@@ -113,8 +113,8 @@ selftest() {
 }
 
 echo "== PC PS/2 keyboard (PC step 4 groundwork) =="
-if ! selftest; then echo "PC PS2KBD TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC PS2KBD SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC PS2KBD TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC PS2KBD SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }

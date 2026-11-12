@@ -4,7 +4,7 @@
 //! A program is a few position-independent instructions copied into a fresh frame mapped
 //! for ring 3 at `mmu::USER_BASE`, with one stack page above it. `run` enters it with
 //! `iretq` (CS/SS = the ring-3 selectors) and returns when it ends: by the exit call, or by
-//! a fault, which the trap handler turns into a stop of THAT program — the kernel goes on.
+//! a fault, which the trap handler turns into a stop of THAT program; the kernel goes on.
 //! Kernel memory carries no user bit in the kernel's tables, so any touch of it from ring 3
 //! is a page fault; privileged instructions (cli, hlt, mov cr3) are a general-protection
 //! fault. This is the x86-64 twin of the ARM kernel's EL0 tasks, in its first, single-task
@@ -114,7 +114,7 @@ user_prog_hello_end:
 user_prog_snoop:        // rdi = an address inside the kernel
     mov rax, [rdi]      // must fault: kernel pages have no user bit
     mov rdi, rax
-    mov eax, 1          // would leak it -- never reached
+    mov eax, 1          // would leak it; never reached
     int 0x80
     mov eax, 0
     int 0x80

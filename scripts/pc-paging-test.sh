@@ -8,7 +8,7 @@
 #      the firmware's, at least 4 GiB is mapped 1:1 (RAM, framebuffer, APIC), in >= 1 frame;
 #   2. demand paging: N >= 1 pages nobody mapped were touched, each one page fault served by
 #      the kernel's #PF handler (faults == N), and all N read back through BOTH the virtual
-#      address and the frame's own 1:1 address -- "N of N ... (ok)";
+#      address and the frame's own 1:1 address: "N of N ... (ok)";
 #   3. ORDER: the page-table line comes BEFORE the local-APIC timer line, so the timer's
 #      MMIO and its interrupts ran under the kernel's tables, not the firmware's;
 #   4. nothing broke after the switch: the timer, the shared crypto and BOOT OK, with no
@@ -31,32 +31,32 @@ grade() {
         return 1
     fi
     L="$(tr -d '\r' < "$F" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$L" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$L"; }
 
     local PT CR FW GB TF
     PT="$(printf '%s\n' "$L" | grep -aE '^\[pc\] own page tables: CR3 0x[0-9a-f]+ \(firmware.s was 0x[0-9a-f]+\), [0-9]+ GiB mapped 1:1 with 2 MiB pages in [0-9]+ table frames$' | tail -1)"
     if [ -z "$PT" ]; then
-        _f "no own-page-tables line -- the kernel never switched to its own tables"
+        _f "no own-page-tables line; the kernel never switched to its own tables"
     else
         CR="$(printf '%s' "$PT" | sed -E 's/^.*CR3 (0x[0-9a-f]+) .*$/\1/')"
         FW="$(printf '%s' "$PT" | sed -E 's/^.*was (0x[0-9a-f]+)\).*$/\1/')"
         GB="$(printf '%s' "$PT" | sed -E 's/^.*\), ([0-9]+) GiB.*$/\1/')"
         TF="$(printf '%s' "$PT" | sed -E 's/^.* in ([0-9]+) table frames$/\1/')"
         [ "$CR" != "$FW" ] || _f "CR3 $CR is still the firmware's tables"
-        [ "$GB" -ge 4 ] || _f "only $GB GiB mapped -- the 4 GiB floor (framebuffer, APIC) is not covered"
+        [ "$GB" -ge 4 ] || _f "only $GB GiB mapped; the 4 GiB floor (framebuffer, APIC) is not covered"
         [ "$TF" -ge 1 ] || _f "the tables used $TF frames"
     fi
     local DP NF RB RN
     DP="$(printf '%s\n' "$L" | grep -aE '^\[pc\] demand paging: [0-9]+ page faults served at 0x[0-9a-f]+, [0-9]+ of [0-9]+ pages read back through both addresses \(ok\)$' | tail -1)"
     if [ -z "$DP" ]; then
-        _f "no demand-paging line ending (ok) -- a fault was not served or a page did not read back"
+        _f "no demand-paging line ending (ok); a fault was not served or a page did not read back"
     else
         NF="$(printf '%s' "$DP" | sed -E 's/^\[pc\] demand paging: ([0-9]+) page faults.*$/\1/')"
         RB="$(printf '%s' "$DP" | sed -E 's/^.*, ([0-9]+) of ([0-9]+) pages.*$/\1/')"
         RN="$(printf '%s' "$DP" | sed -E 's/^.*, ([0-9]+) of ([0-9]+) pages.*$/\2/')"
         [ "$RN" -ge 1 ] || _f "no pages were touched"
         [ "$RB" -eq "$RN" ] || _f "only $RB of $RN pages read back"
-        [ "$NF" -eq "$RN" ] || _f "$NF page faults for $RN pages -- each touch must fault exactly once"
+        [ "$NF" -eq "$RN" ] || _f "$NF page faults for $RN pages; each touch must fault exactly once"
     fi
     local LP LA
     LP="$(printf '%s\n' "$L" | grep -anE '^\[pc\] own page tables: CR3' | head -1 | cut -d: -f1)"
@@ -64,7 +64,7 @@ grade() {
     if [ -z "$LA" ]; then
         _f "no local APIC timer line after the switch"
     elif [ -n "$LP" ] && [ "$LA" -lt "$LP" ]; then
-        _f "the timer ran BEFORE the switch -- it proves nothing about the kernel's tables"
+        _f "the timer ran BEFORE the switch; it proves nothing about the kernel's tables"
     fi
     has '^\[pc\] shared code: SHA-256 ok, SHA-512 ok, Ed25519 ok' ||
         _f "a shared crypto self-test did not report ok after the switch"
@@ -80,8 +80,8 @@ grade() {
 }
 
 # --------------------------------------------------------------- the selftest --
-GREEN="[pc] Mansa x86-64 (PC) -- started by UEFI firmware
-[pc] boot services exited -- the firmware is gone, the kernel owns the machine
+GREEN="[pc] Mansa x86-64 (PC), started by UEFI firmware
+[pc] boot services exited; the firmware is gone, the kernel owns the machine
 [pc] IDT loaded; breakpoint exception taken and returned (1)
 [pc] own page tables: CR3 0xcdee000 (firmware's was 0xf801000), 4 GiB mapped 1:1 with 2 MiB pages in 6 table frames
 [pc] demand paging: 3 page faults served at 0x8000000000, 3 of 3 pages read back through both addresses (ok)
@@ -117,7 +117,7 @@ selftest() {
     arm faults-not-per-page red < <(printf '%s\n' "$GREEN" | sed 's/: 3 page faults/: 1 page faults/')
     arm zero-pages red < <(printf '%s\n' "$GREEN" | sed 's/: 3 page faults/: 0 page faults/; s/3 of 3 pages/0 of 0 pages/')
     arm timer-before-switch red < <(printf '%s\n' "$GREEN" | awk '/local APIC/ {next} /own page tables/ {print "[pc] local APIC (xAPIC at 0xfee00000) timer: 10 interrupts taken"} {print}')
-    arm page-fault-exception red < <(printf '%s\n' "$GREEN" | sed 's/^\[pc\] MANSA-PC BOOT OK$/[pc] EXCEPTION vector 14 (page fault) error 0x2 at RIP 0x1 (CR2 0x8000001000) -- halted/')
+    arm page-fault-exception red < <(printf '%s\n' "$GREEN" | sed 's/^\[pc\] MANSA-PC BOOT OK$/[pc] EXCEPTION vector 14 (page fault) error 0x2 at RIP 0x1 (CR2 0x8000001000); halted/')
     arm verdict-in-prose red < <(printf '%s\n' "$GREEN" | sed 's/^\[pc\] demand paging/  [pc] demand paging/')
     arm empty-log red < /dev/null
     rm -rf "$D"
@@ -128,10 +128,10 @@ selftest() {
 # ------------------------------------------------------------------- driver --
 echo "== PC paging (suite 692, PC track step 1) =="
 if ! selftest; then
-    echo "PC PAGING TEST FAILED (grader selftest) -- no QEMU run spent"
+    echo "PC PAGING TEST FAILED (grader selftest): no QEMU run spent"
     exit 1
 fi
-[ "${1:-}" = "--selftest" ] && { echo "PC PAGING SELFTEST ONLY -- no measurement taken"; exit 0; }
+[ "${1:-}" = "--selftest" ] && { echo "PC PAGING SELFTEST ONLY: no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || { echo "PC PAGING TEST FAILED (harness: qemu-system-x86_64 not on PATH)"; exit 1; }
 QDIR="$(dirname "$(command -v qemu-system-x86_64)")"
@@ -164,7 +164,7 @@ timeout 240 qemu-system-x86_64 -M q35 -m 256M \
     -serial "file:$(winpath "$SER")" -display none -no-reboot -net none \
     -fw_cfg name=opt/afrisovera/poweroff,string=1
 QRC=$?
-echo "  qemu exit $QRC ($([ "$QRC" -eq 124 ] && echo 'timed out -- the kernel never powered off' || echo 'the kernel powered off'))"
+echo "  qemu exit $QRC ($([ "$QRC" -eq 124 ] && echo 'timed out; the kernel never powered off' || echo 'the kernel powered off'))"
 tr -d '\r' < "$SER" 2>/dev/null | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | grep -aE '^\[pc\]|^kernel heap: [0-9]|^ *\[FAIL\]' | sed 's/^/  | /'
 
 echo "  --- grading ---"

@@ -11,9 +11,15 @@ use core::ptr::addr_of_mut;
 
 pub const MAX_FILES: usize = 24;
 const NAME_LEN: usize = 24;
-const DATA_LEN: usize = 512;
-/// Maximum bytes of content per file (the data cap). Exposed for `df`.
-pub const MAX_FILE_BYTES: usize = DATA_LEN;
+/// Bytes a slot holds in RAM (big files, claude/vfs-big): a Nia app up to 16 KiB.
+const DATA_LEN: usize = 16384;
+/// What every classic caller sees of a file: `read_raw`, `read_str` and `write`
+/// keep today's 512-byte view, so the shell commands, config and the editor are
+/// unchanged. Only `read_full` / `write_full` (used by `nia::run_file`) and the
+/// disk save and load see the whole file.
+pub const MAX_FILE_BYTES: usize = 512;
+/// The most a file can hold (whole-file API and disk).
+pub const MAX_BIG_FILE_BYTES: usize = DATA_LEN;
 
 #[derive(Clone, Copy)]
 struct File {
@@ -106,8 +112,19 @@ pub fn create(name: &str) -> Option<usize> {
     }
 }
 
-/// Write bytes to `name` (creating it if needed), truncating to the file cap.
+/// Write bytes to `name` (creating it if needed), truncating to MAX_FILE_BYTES
+/// (512), as every classic caller expects.
 pub fn write(name: &str, data: &[u8]) -> bool {
+    write_capped(name, data, MAX_FILE_BYTES)
+}
+
+/// Write up to MAX_BIG_FILE_BYTES (16 KiB). Only for whole-file users.
+#[allow(dead_code)]
+pub fn write_full(name: &str, data: &[u8]) -> bool {
+    write_capped(name, data, MAX_BIG_FILE_BYTES)
+}
+
+fn write_capped(name: &str, data: &[u8], cap: usize) -> bool {
     let i = match create(name) {
         Some(i) => i,
         None => return false,
@@ -115,7 +132,7 @@ pub fn write(name: &str, data: &[u8]) -> bool {
     // SAFETY: valid index from create().
     unsafe {
         let f = file(i);
-        let n = data.len().min(DATA_LEN);
+        let n = data.len().min(cap).min(DATA_LEN);
         (&mut (*f).data)[..n].copy_from_slice(&data[..n]);
         (*f).dlen = n;
         // Stamp the last-modified time from the RTC (parallel array).
@@ -145,26 +162,32 @@ pub fn mtime_of(name: &str) -> Option<u32> {
     Some(unsafe { addr_of_mut!(FILE_MTIME).cast::<u32>().add(i).read() })
 }
 
-/// Read a file's raw bytes (files live in static storage → 'static). Used to
-/// load binary content such as a `.wasm` module.
-pub fn read_raw(name: &str) -> Option<&'static [u8]> {
-    let i = find(name)?;
-    // SAFETY: valid index; slice points into the 'static FILES table.
+/// Up to `cap` bytes of slot `i` (never past the slot: dlen is clamped).
+fn slice_of(i: usize, cap: usize) -> &'static [u8] {
+    // SAFETY: valid index; the length is clamped to DATA_LEN, so the slice stays
+    // inside the 'static FILES table.
     unsafe {
         let f = file(i);
-        Some(core::slice::from_raw_parts((*f).data.as_ptr(), (*f).dlen))
+        let n = (*f).dlen.min(cap).min(DATA_LEN);
+        core::slice::from_raw_parts((*f).data.as_ptr(), n)
     }
 }
 
-/// Read a file's contents as a &str (files live in static storage → 'static).
+/// Read a file's raw bytes (files live in static storage → 'static): at most
+/// the first MAX_FILE_BYTES (512), the classic view.
+pub fn read_raw(name: &str) -> Option<&'static [u8]> {
+    Some(slice_of(find(name)?, MAX_FILE_BYTES))
+}
+
+/// The whole file, up to MAX_BIG_FILE_BYTES. Only for whole-file users
+/// (`nia::run_file`); every other caller keeps `read_raw`'s 512-byte view.
+pub fn read_full(name: &str) -> Option<&'static [u8]> {
+    Some(slice_of(find(name)?, MAX_BIG_FILE_BYTES))
+}
+
+/// Read a file's contents as a &str (at most the first 512 bytes).
 pub fn read_str(name: &str) -> Option<&'static str> {
-    let i = find(name)?;
-    // SAFETY: valid index; slice points into the 'static FILES table.
-    unsafe {
-        let f = file(i);
-        let s = core::slice::from_raw_parts((*f).data.as_ptr(), (*f).dlen);
-        core::str::from_utf8(s).ok()
-    }
+    core::str::from_utf8(slice_of(find(name)?, MAX_FILE_BYTES)).ok()
 }
 
 /// Delete a file. Returns false if it didn't exist.
@@ -186,11 +209,12 @@ pub fn is_used(i: usize) -> bool {
     unsafe { i < MAX_FILES && (*file(i)).used }
 }
 
+/// The true size of slot `i` (can be over 512 for a big file).
 pub fn size_of(i: usize) -> usize {
     // SAFETY: bounds-checked read.
     unsafe {
         if i < MAX_FILES {
-            (*file(i)).dlen
+            (*file(i)).dlen.min(DATA_LEN)
         } else {
             0
         }
@@ -218,7 +242,34 @@ pub fn seed() {
 // On-disk layout (512-byte sectors): sector 0 = superblock (magic + file count);
 // slot i uses two sectors: metadata (used flag + name + nlen + dlen) then data.
 // Minimal flat format, not a journaling FS.
+//
+// Big files (claude/vfs-big). The magic stays AFRIVFS1 (the PC drivers claim a
+// disk by it) and sectors 0-48 keep their layout. A file over 512 bytes keeps
+// dlen = 512 in its meta sector (an old kernel reads a safe 512-byte prefix) and
+// its true length at meta offset 37 (META_TRUE); superblock byte 12 = 2 says the
+// extension is in use. Slot i's bytes 512.. live in sectors 128 + 31*i to
+// 128 + 31*i + 30 (EXT_FIRST, EXT_PER): past the disk self-test at sector 100,
+// ending at 871, below the USB table backup at 2048. A disk or partition under
+// 872 sectors saves big files as their first 512 bytes, with a line. With no big
+// file the image is byte-identical to the old format (no flag, no length, no
+// extension). Downgrade: an old kernel shows the 512-byte prefix and its next
+// sync clears the flag, so big files are then cut to 512 bytes on disk.
 const DISK_MAGIC: &[u8; 8] = b"AFRIVFS1";
+const SB_FLAGS: usize = 12;
+const SB_BIG: u8 = 2;
+const META_TRUE: usize = 1 + NAME_LEN + 12;
+const EXT_FIRST: u64 = 128;
+const EXT_PER: u64 = 31;
+const EXT_END: u64 = EXT_FIRST + EXT_PER * MAX_FILES as u64; // 872: sectors needed for big files
+
+fn ext_sector(i: usize, k: usize) -> u64 {
+    EXT_FIRST + EXT_PER * i as u64 + k as u64
+}
+
+/// Sectors of extension a file of `len` bytes uses (0 for 512 bytes or less).
+fn ext_sectors(len: usize) -> usize {
+    len.saturating_sub(512).div_ceil(512)
+}
 
 /// Serialize the current VFS to the disk. Returns true if written.
 pub fn sync_to_disk() -> bool {
@@ -228,6 +279,35 @@ pub fn sync_to_disk() -> bool {
     }
     // SAFETY: single-threaded shell/boot context.
     unsafe {
+        // Big files first: their extension sectors go out BEFORE sectors 0-48, so
+        // the PC drivers' flush at the end of the VFS area still ends the save,
+        // and a cut mid-save leaves the old metadata.
+        let room = crate::virtio::blk_capacity() >= EXT_END;
+        let mut big = false;
+        for i in 0..MAX_FILES {
+            let fp = file(i);
+            let len = (*fp).dlen.min(DATA_LEN);
+            if !(*fp).used || len <= 512 {
+                continue;
+            }
+            if !room {
+                crate::kprintln!(
+                    "[vfs] disk too small for files over 512 bytes ({} sectors, {} needed): {} saved as 512 bytes",
+                    crate::virtio::blk_capacity(),
+                    EXT_END,
+                    name_of(i)
+                );
+                continue;
+            }
+            big = true;
+            for k in 0..ext_sectors(len) {
+                let mut sec = [0u8; 512];
+                let from = 512 + k * 512;
+                let to = (from + 512).min(len);
+                sec[..to - from].copy_from_slice(&(&(*fp).data)[from..to]);
+                crate::virtio::write_sector(ext_sector(i, k), &sec);
+            }
+        }
         let mut sb = [0u8; 512];
         sb[..8].copy_from_slice(DISK_MAGIC);
         let mut count = 0u32;
@@ -237,6 +317,9 @@ pub fn sync_to_disk() -> bool {
             }
         }
         sb[8..12].copy_from_slice(&count.to_le_bytes());
+        if big {
+            sb[SB_FLAGS] = SB_BIG;
+        }
         crate::virtio::write_sector(0, &sb);
 
         for i in 0..MAX_FILES {
@@ -246,8 +329,12 @@ pub fn sync_to_disk() -> bool {
                 meta[0] = 1;
                 meta[1..1 + NAME_LEN].copy_from_slice(&(*fp).name);
                 let o = 1 + NAME_LEN;
+                let len = (*fp).dlen.min(DATA_LEN);
                 meta[o..o + 4].copy_from_slice(&((*fp).nlen as u32).to_le_bytes());
-                meta[o + 4..o + 8].copy_from_slice(&((*fp).dlen as u32).to_le_bytes());
+                meta[o + 4..o + 8].copy_from_slice(&(len.min(512) as u32).to_le_bytes());
+                if big && len > 512 {
+                    meta[META_TRUE..META_TRUE + 4].copy_from_slice(&(len as u32).to_le_bytes());
+                }
                 // mtime lives in the free space of this slot's meta sector, past
                 // the existing fields, so no offsets shift and an old image (zero
                 // there) loads back as mtime 0 = "unknown".
@@ -256,7 +343,7 @@ pub fn sync_to_disk() -> bool {
             }
             crate::virtio::write_sector(1 + (i as u64) * 2, &meta);
             let mut data = [0u8; 512];
-            data.copy_from_slice(&(*fp).data);
+            data.copy_from_slice(&(&(*fp).data)[..512]);
             crate::virtio::write_sector(1 + (i as u64) * 2 + 1, &data);
         }
         crate::kprintln!("[vfs] synced {} files to disk", count);
@@ -276,6 +363,8 @@ pub fn load_from_disk() -> bool {
         if !crate::virtio::read_sector(0, &mut sb) || &sb[..8] != DISK_MAGIC {
             return false; // blank/foreign disk — keep the in-RAM VFS
         }
+        let flagged = sb[SB_FLAGS] == SB_BIG;
+        let room = crate::virtio::blk_capacity() >= EXT_END;
         let mut restored = 0u32;
         for i in 0..MAX_FILES {
             let mut meta = [0u8; 512];
@@ -285,14 +374,41 @@ pub fn load_from_disk() -> bool {
                 (*fp).used = true;
                 (*fp).name.copy_from_slice(&meta[1..1 + NAME_LEN]);
                 let o = 1 + NAME_LEN;
-                (*fp).nlen = u32::from_le_bytes([meta[o], meta[o + 1], meta[o + 2], meta[o + 3]]) as usize;
-                (*fp).dlen =
-                    u32::from_le_bytes([meta[o + 4], meta[o + 5], meta[o + 6], meta[o + 7]]) as usize;
+                // Clamp everything read from the disk: a damaged image must
+                // never give a slice past the slot.
+                (*fp).nlen = (u32::from_le_bytes([meta[o], meta[o + 1], meta[o + 2], meta[o + 3]]) as usize)
+                    .min(NAME_LEN);
+                (*fp).dlen = (u32::from_le_bytes([meta[o + 4], meta[o + 5], meta[o + 6], meta[o + 7]]) as usize)
+                    .min(512);
+                let t = &meta[META_TRUE..META_TRUE + 4];
+                let truelen = (u32::from_le_bytes([t[0], t[1], t[2], t[3]]) as usize).min(DATA_LEN);
                 let mt = u32::from_le_bytes([meta[o + 8], meta[o + 9], meta[o + 10], meta[o + 11]]);
                 addr_of_mut!(FILE_MTIME).cast::<u32>().add(i).write(mt);
                 let mut data = [0u8; 512];
                 crate::virtio::read_sector(1 + (i as u64) * 2 + 1, &mut data);
-                (*fp).data.copy_from_slice(&data);
+                (&mut (*fp).data)[..512].copy_from_slice(&data);
+                if flagged && truelen > 512 {
+                    // The extension: only with the flag, only within the disk.
+                    let mut whole = room;
+                    for k in 0..ext_sectors(truelen) {
+                        if !whole {
+                            break;
+                        }
+                        let mut sec = [0u8; 512];
+                        whole = crate::virtio::read_sector(ext_sector(i, k), &mut sec);
+                        let from = 512 + k * 512;
+                        let to = (from + 512).min(truelen);
+                        (&mut (*fp).data)[from..to].copy_from_slice(&sec[..to - from]);
+                    }
+                    if whole {
+                        (*fp).dlen = truelen;
+                    } else {
+                        crate::kprintln!(
+                            "[vfs] {}: the part past 512 bytes could not be read; keeping the first 512 bytes",
+                            name_of(i)
+                        );
+                    }
+                }
                 restored += 1;
             } else {
                 (*fp).used = false;

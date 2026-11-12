@@ -302,3 +302,169 @@ once, with the P2 proof; default on; `hold` may ship, on the conditions above. T
 
 Size: about 150 lines in `desk.rs` and `paint.rs`, a Settings row, one new suite. One branch, one Actions run at the
 end (minutes rule), the cloud runner for the rest.
+
+## 18. The faster console (11 Nov 2026) [law 0]
+
+The architect's gated item (2) from the F6 review (`ARCHITECT_REVIEWS.md`, "F6 handshake resend"). The kernel's text
+console in `framebuffer.rs` draws pixel by pixel in Rust loops, and at opt-level 0 one new line with a scroll takes
+over 100 ms. `uart::_print` holds interrupts masked for all of that, so the timer and the network go blind on both
+kernels. Target: one console line with a scroll in under 5 ms at opt-level 0, on both kernels.
+
+**What changes (only `framebuffer.rs`, plus one shell verb):**
+- `con_scroll` moves each pixel row with `core::ptr::copy` (memmove from compiler_builtins, which is optimised even
+  in a debug build), not a pixel loop.
+- `fill_rect` clips once, fills the first row, then copies that row down. The first row is filled by doubling copies
+  (1, 2, 4, ... pixels with `copy_nonoverlapping`), not with `slice::fill`. `fill` is generic, so it is compiled
+  in our crate at opt-level 0, about as slow as the loop it replaces. Results are the same pixels as before for
+  every input, including clipped and empty rectangles.
+- The console's glyph (`con_putc`) builds each 8-pixel row of a character with its background in a small array and
+  copies it in once, instead of one background fill plus up to 64 one-pixel fills.
+- Nothing else changes: `blit`, `draw_char` and `draw_string` keep their code (they call `fill_rect`, so they get
+  faster too), and `uart::_print`'s locking stays as it is.
+
+**How it is measured and proved:**
+- A new shell verb, `fbcon time`, runs on both kernels while the console is shown. It writes 8 full-width lines at
+  the bottom row, so each one ends in a scroll, and prints the fastest and slowest time in microseconds. It also
+  times the scroll on its own, and runs two self-checks:
+  - after every scroll, the moved rows hash the same as they did before, and the new bottom row is all background;
+  - the last line's pixels match the font's glyph bits, pixel by pixel.
+  It prints: `[fbcon] one line with a scroll: fastest A us, slowest B us over 8 lines; the scroll alone: C us`,
+  `[fbcon] scroll check: 8 of 8 scrolls moved every row up one text row` and
+  `[fbcon] glyph check: 76 chars, 0 pixels differ`.
+- The verb lands first in its own commit with the old drawing code, so "before" and "after" come from the same probe.
+- A new suite, `fbcon-time`, boots the ARM kernel and the PC kernel, runs `fbcon time` on each and grades:
+  - both self-checks;
+  - the fastest line under 5000 us on each kernel (QEMU's timing varies, so the fastest of 8 is graded, and the
+    slowest is printed but not graded);
+  - no panic.
+  Its grader selftest runs first.
+- The proof, as for P2: the cloud runner like-for-like md5 and `llvm-size` of branch and base (945f70a4), the console suites
+  (`pc-screen`, `desk`, `pc-desk`), `pi` and the board-* suites green, and a full ARM walk before the merge. The ARM
+  image moves once. Then one Actions run on the os2 pool.
+
+## 19. The row-at-a-time blit (12 Nov 2026) [law 0]
+
+After section 18, `framebuffer::blit` is the last pixel-by-pixel copy in `framebuffer.rs`. It calls `put` once
+per pixel, and `put` checks the bounds each time. It has two callers:
+- `pc/conback.rs` `restore()`, which puts the live console back after scrollback. It runs under the print lock, in
+  the same interrupts-off stretch as the console, and copies the whole console block (616 x 384 pixels).
+- `tonga.rs`, the compositor, which copies an app's surface into its window body.
+
+Target: the console-sized blit in under 5 ms at opt-level 0, on both kernels.
+
+**What changes (only `framebuffer.rs`, plus one shell verb):**
+- `blit` clips the block to the screen once, then copies each row with one `core::ptr::copy` (memmove from
+  compiler_builtins, optimised even in a debug build). Clipped, partial and empty blocks give the same pixels as
+  the pixel loop did: columns at or past `WIDTH` and rows at or past `HEIGHT` are left out, and source pixel
+  (i, j) still comes from `src[j * stride + i]`.
+- The architect's conditions (ARCHITECT_REVIEWS, 12 Nov):
+  - The clip adds with `saturating_add`, so a huge `w` or `h` cannot wrap. `fill_rect` gets the same.
+  - The `# Safety` contract reads: `src` is valid for `(h-1)*stride + w` pixels, and must not overlap the
+    destination rows. The memmove only protects within one row, since rows are copied top to bottom. Neither caller
+    passes the framebuffer as the source.
+  - Tonga's width floor, in its own commit: `win_create` keeps a window at least 2 pixels wide. Until now an app's
+    0- or 1-pixel window made the compositor's `w - 2` wrap and the kernel fault. persist-big boot 6 runs an app
+    from the disk that opens a 1-pixel window, and checks that it runs to its end and the shell still answers.
+- `put` (the per-pixel write with its bounds check) had `blit` as its only caller, so it is removed.
+- Nothing else changes: the two callers and their arguments stay as they are.
+
+**How it is measured and proved:**
+- A new shell verb, `fbcon blit`, runs on both kernels while the console is shown. It is added in its own commit,
+  on the old code, so "before" and "after" come from the same probe. It times 8 blits each of:
+  - the console block (the size `restore()` copies);
+  - the whole screen, 640 x 480.
+  The source is one row on the stack with stride 0, so the probe adds no static memory. It then runs two checks:
+  - **copy:** a 24 x 8 block from a 32-pixel-stride source on the stack, with every pixel different, must land
+    pixel for pixel;
+  - **clip:** a 64 x 64 block put 20 pixels from the right edge and 10 from the bottom must fill exactly the
+    20 x 10 corner that fits, and leave the pixel just outside it unchanged.
+  Afterwards it redraws the console (`console_reset`), so the screen is left as `clear` leaves it.
+  It prints:
+  - `[fbblit] console block 616x384: fastest A us; whole screen 640x480: fastest B us`
+  - `[fbblit] copy check: 192 of 192 pixels right; clip check: 200 of 200 inside, edge unchanged`
+- The `fbcon-time` suite types `fbcon blit` after `fbcon time` in the same two boots (ARM ramfb, then the PC
+  kernel), so there are no new boots or ports. On each kernel it grades:
+  - the fastest console-block blit under 5000 us;
+  - both checks.
+  The grader selftest gains cases for the new lines.
+- Proof as for section 18:
+  - the cloud runner like-for-like md5 and `llvm-size` for the base and the branch, in the same job;
+  - the before and after numbers;
+  - the console, desk, pi and board-* suites, and a full ARM walk;
+  - one os2 Actions run.
+
+The ARM image moves once more. The lead has agreed, since the public export of 1e816508 sets the baseline first.
+
+## 20. Fast window create and present (12 Nov 2026) [law 0]
+
+After section 19, Tonga's window server is the slowest drawing left behind interrupts masked. Both of its calls
+run in syscall context. A probe that was never pushed timed them on a cloud runner (b0a8f5da, fastest of 8):
+
+| kernel | `win_create` 240x130 | `win_create` 40x20 | `win_present`, 1 window |
+|---|---|---|---|
+| ARM | 5120 us | 5114 us | 5874 us |
+| PC | 6035 us | 5993 us | 5689 us |
+
+The size makes no difference to `win_create`, because it clears all 240 x 130 = 31,200 pixels of the surface in
+a pixel loop with a bounds check on each.
+
+Target: `win_create` and `win_present` (one window) each under 1000 us at opt-level 0, on both kernels, with the
+same pixels as before.
+
+**What changes (only `tonga.rs`, plus one shell verb):**
+- `win_create` clears the surface with one `core::ptr::write_bytes` (memset from compiler_builtins, optimised even
+  in a debug build). The surface is all zero afterwards, as before.
+- `win_present`: the probe splits its time into the wallpaper (the gradient and the bar), the two lines of text,
+  and the windows (chrome and blit). The fix goes where the time is, and that choice is sent to the architect with
+  the before numbers, before the fix commit. The likely place is the gradient: 480 one-row `fill_rect` calls,
+  each with its own `lerp`. A row of the same colour would be filled once and copied down for every row that
+  shares it. Whatever the fix, the screen must match the old code pixel for pixel.
+- Nothing else changes. The callers (nia.rs, process.rs, pc/proc.rs) and their arguments stay as they are.
+- The `saturating_add` guard in `win_fill` and `win_text` stays out. No app can reach an overflow today: Nia passes
+  32-bit values, and only built-in code runs at EL0. **The first loader of outside EL0 code must add it, with a test
+  that feeds 64-bit values,** because pc/proc.rs passes full registers (`f.rcx`, `f.r8`, ...) straight to `win_fill`
+  (the architect's condition 2; the same line goes in the nia-apps OS_REQUESTS, kept by the apps developer).
+
+**How it is measured and proved:**
+- A new shell verb, `fbcon wm`, in its own commit on the old code, so before and after use the same probe. It times
+  8 rounds of:
+  - `win_create` at 240x130 and at 40x20;
+  - `win_present` with that one window, and its three parts on their own.
+
+  It then runs two checks:
+  - **clear:** draw into a window, reset, create it again, and every pixel of the new surface must be 0;
+  - **match:** a hash of the whole screen after `win_present` with two windows, each with a known pattern drawn in
+    (one 240x130, one 40x20, covering both the clipped and the unclipped chrome). The hash is fixed in the suite
+    from the old code's run, so the new code must give exactly the same screen.
+
+  Afterwards it resets the window server and redraws the console. It prints:
+  - `[fbwm] win_create 240x130: fastest A us; 40x20: fastest B us; win_present: fastest C us (wallpaper D, text E, windows F)`
+  - `[fbwm] clear check: 31200 of 31200 pixels zero; screen hash H`
+- The `fbcon-time` suite types `fbcon wm` after `fbcon blit`, in the same two boots. On each kernel it grades:
+  - `win_create` (both sizes) under 1000 us;
+  - `win_present` under 1000 us;
+  - the clear check exact;
+  - the screen hash equal to the old code's hash for that kernel.
+
+  The grader selftest gains cases for the new lines.
+- Proof as for sections 18 and 19:
+  - the cloud runner like-for-like md5 and `llvm-size`;
+  - before and after numbers;
+  - the desk, nia, wasm-*, persist-big and fbcon-time suites, and a full ARM walk;
+  - one os2 Actions run.
+
+The ARM image moves (tonga.rs, shell.rs).
+
+**The architect's conditions (ARCHITECT_REVIEWS, 12 Nov) and what the measurement changed:**
+- `fbcon wm` refuses with one line when a window is in use, the desk is shown, or the console is hidden, and leaves
+  the window table alone. The suite proves it on ARM: after `wm` (3 app windows) and `clear`, `fbcon wm` must print
+  `[fbwm] refused: 3 window(s) in use, desk hidden, console shown ...`.
+- The deferred guard is recorded as above.
+- The split on the old code (the cloud runner, 74d967b6): win_present was wallpaper 4113 us, text 1322 us, windows 358 us
+  (ARM), and 4041, 1351, 328 us (PC). The fix, inside `tonga.rs` only:
+  - the wallpaper is one `fill_rect` per colour band below the bar (about 95 bands), not one call and one `lerp`
+    per row;
+  - the bar and its text are drawn once and copied back after that, from a 70 KiB static (`BAR_PIXELS`).
+- The `win_present` target becomes 3000 us (`WM_PRESENT_BUDGET_US`). It repaints the whole wallpaper, and a
+  whole-screen blit on its own takes 0.8 to 1.3 ms on ARM under QEMU, so 1000 us cannot be met without damage
+  tracking. The old code took about 6000 us, so the budget still catches a slide back. `win_create` keeps 1000 us.

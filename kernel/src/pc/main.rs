@@ -1,16 +1,16 @@
-//! Mansa on a PC — the x86-64 kernel (PC track, step 1; owner's decision, 3 Nov 2026).
+//! Mansa on a PC: the x86-64 kernel (PC track, step 1; owner's decision, 3 Nov 2026).
 //!
 //! A UEFI application: the firmware of every modern PC (and QEMU's `q35` with OVMF)
-//! loads `EFI/BOOT/BOOTX64.EFI` from a FAT partition — a USB stick on real hardware —
+//! loads `EFI/BOOT/BOOTX64.EFI` from a FAT partition (a USB stick on real hardware)
 //! and jumps here. This is the PC counterpart of `main.rs`'s ARM boot path:
 //!
 //!   1. take the console (COM1) and the screen (UEFI GOP framebuffer);
-//!   2. read the firmware's memory map, then EXIT boot services — from that line on
+//!   2. read the firmware's memory map, then EXIT boot services; from that line on
 //!      the firmware is gone and the kernel owns the machine;
 //!   3. install the kernel's own GDT and IDT, and prove the trap path with a breakpoint;
 //!   4. bring up the local APIC and take timer interrupts;
-//!   5. run SHARED kernel code — `heap.rs` (as the global allocator, plus its own
-//!      self-test), `sha256.rs`, `sha512.rs`, `ed25519.rs`, `font.rs` — the very same
+//!   5. run SHARED kernel code: `heap.rs` (as the global allocator, plus its own
+//!      self-test), `sha256.rs`, `sha512.rs`, `ed25519.rs`, `font.rs`, the very same
 //!      files the ARM kernel builds, included by path, not copied.
 //!
 //! Not yet (later PC-track steps, docs/05): the kernel's own page tables, ring-3
@@ -63,7 +63,7 @@ mod ed25519;
 mod font;
 
 // PC track step 2 (docs/05): the ARM kernel's interactive shell, AfriSh, and the
-// arch-neutral modules behind it -- the SAME source files, included by path.
+// arch-neutral modules behind it: the SAME source files, included by path.
 #[allow(dead_code)]
 #[path = "../shell.rs"]
 mod shell;
@@ -88,6 +88,8 @@ mod integrity;
 #[allow(dead_code)]
 #[path = "../nia.rs"]
 mod nia;
+#[path = "../appget.rs"]
+mod appget;
 #[allow(dead_code)]
 #[path = "../store.rs"]
 mod store;
@@ -391,7 +393,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
         early_on(s);
     }
     kprintln!();
-    kprintln!("[pc] Mansa x86-64 (PC) -- started by UEFI firmware");
+    kprintln!("[pc] Mansa x86-64 (PC), started by UEFI firmware");
     if !uart::present() {
         kprintln!("[pc] no COM1 serial port (a laptop): the screen is the console");
     }
@@ -429,7 +431,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
                 s.w, s.h, s.stride, s.base as usize, if s.bgr { "BGR" } else { "RGB" }
             );
         }
-        None => kprintln!("[pc] GOP: no drawable framebuffer -- serial console only"),
+        None => kprintln!("[pc] GOP: no drawable framebuffer, so serial console only"),
     }
 
     // The memory map, read last: nothing may ask the firmware for memory after this
@@ -439,7 +441,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     let mut map = match u.memory_map(buf) {
         Ok(m) => m,
         Err(e) => {
-            kprintln!("[pc] UEFI GetMemoryMap failed (status {:#x}) -- halted", e);
+            kprintln!("[pc] UEFI GetMemoryMap failed (status {:#x}); halted", e);
             cpu::halt_forever();
         }
     };
@@ -451,7 +453,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
             usable += d.pages * 4096;
             // the highest free page below 1 MiB: where a second core's start-up code goes.
             // Conventional memory first; boot-services code/data (types 3, 4: free once the
-            // firmware has exited) as the fallback -- real firmware often marks low memory so.
+            // firmware has exited) as the fallback; real firmware often marks low memory so.
             // Below the 640 KiB video hole, never page 0, never the page we are standing on.
             // (QEMU reports all of low memory as one block from address 0: it counts.)
             // The page below it is taken too: core 1 starts on a copy of the kernel's top-level
@@ -495,10 +497,10 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
         }
     }
     if st_exit != uefi::SUCCESS {
-        kprintln!("[pc] ExitBootServices failed (status {:#x}) -- halted", st_exit);
+        kprintln!("[pc] ExitBootServices failed (status {:#x}); halted", st_exit);
         cpu::halt_forever();
     }
-    kprintln!("[pc] boot services exited -- the firmware is gone, the kernel owns the machine");
+    kprintln!("[pc] boot services exited; the firmware is gone, the kernel owns the machine");
     // The TSC's frequency, measured against the PIT now that the firmware no longer uses it;
     // the shell's clock (`uptime`, `sleep`, `bench`) counts from here.
     timer::init();
@@ -548,7 +550,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
             mmu::cr3(), fw_cr3, bytes >> 30, tables
         ),
         None => {
-            kprintln!("[pc] own page tables: could not be built (frame pool exhausted or RAM too high) -- halted");
+            kprintln!("[pc] own page tables: could not be built (frame pool exhausted or RAM too high); halted");
             cpu::halt_forever();
         }
     }
@@ -663,7 +665,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     };
 
     // Processes (see proc.rs): two programs in separate address spaces that may talk only
-    // through capabilities -- one may SEND on endpoint 0, the other may RECV. Each also tries
+    // through capabilities: one may SEND on endpoint 0, the other may RECV. Each also tries
     // what its capabilities do not allow, and must be refused.
     let ipc_ok = match (
         proc::spawn(proc::code(proc::Prog::Recv), &[(0, proc::RIGHT_RECV)], false),
@@ -862,32 +864,21 @@ extern "sysv64" fn shell_on_kernel_stack() -> ! {
     smp::bring_up();
     screen::pat_check(); // D1c: WC only when every running core's PAT has it
     vfs::seed();
-    vfs::write("hello.wasm", nia::hello_wasm());
-    vfs::write("sum.wasm", nia::sum_wasm());
-    vfs::write("draw.wasm", nia::draw_wasm());
-    vfs::write("fileapp.wasm", nia::file_wasm());
-    vfs::write("clock.wasm", nia::clock_wasm());
-    vfs::write("type.wasm", nia::type_wasm());
-    vfs::write("ai.wasm", nia::ai_wasm());
-    vfs::write("chat.wasm", nia::chat_wasm());
-    vfs::write("notify.wasm", nia::notify_wasm());
-    vfs::write("notify2.wasm", nia::notify2_wasm());
-    vfs::write("net.wasm", nia::net_wasm());
-    vfs::write("rand.wasm", nia::rand_wasm());
+    for (name, bytes) in nia::BUNDLED {
+        vfs::write(name, bytes()); // the bundled apps, from the one table the manifest also uses
+    }
     vfs::write("sample.webapp", web::sample());
     vfs::write("sample.apkmeta", daraja::sample());
     asili::register("ramfs", asili::Class::Storage, 0, true);
     if virtio::blk_present() {
         vfs::load_from_disk();
     }
+    nia::restore_bundled(); // a differing or missing bundled app gets its built-in copy back
     config::boot_apply();
-    for name in [
-        "hello.wasm", "sum.wasm", "draw.wasm", "fileapp.wasm", "clock.wasm", "type.wasm", "ai.wasm",
-        "chat.wasm", "notify.wasm",
-    ] {
-        if let Some(d) = vfs::read_raw(name) {
-            integrity::record(name, d);
-        }
+    // The manifest: each bundled app's hash from its COMPILED-IN bytes, never from the disk copy (a
+    // tampered disk copy must not become "integrity OK"; claude/appget, architect's manifest decision).
+    for (name, bytes) in nia::BUNDLED {
+        integrity::record(name, bytes());
     }
     kprintln!(
         "[pc] starting the AfriSh shell on COM1 (TSC {} MHz, clock {})",

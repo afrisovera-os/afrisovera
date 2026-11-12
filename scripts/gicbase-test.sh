@@ -69,7 +69,7 @@ echo "[B] -smp 2 secondary GICC bring-up:"
 grep -aE "core 1\] online|core 1\] scheduler up|SMP: 2 cores online" "$B" | sed 's/^/    /'
 
 python3 - "$A" "$B" docs/15-hardware-bringup.md kernel/src/gic.rs kernel/src/shell.rs \
-                    kernel/src/main.rs <<'PY'
+                    kernel/src/main.rs kernel/src/shell_exec_cmds.rs <<'PY'
 import re, sys
 a     = open(sys.argv[1], "rb").read().decode("latin1")
 b     = open(sys.argv[2], "rb").read().decode("latin1")
@@ -77,6 +77,9 @@ doc   = open(sys.argv[3], encoding="utf-8").read()
 gic   = open(sys.argv[4], encoding="utf-8").read()
 shell = open(sys.argv[5], encoding="utf-8").read()
 main  = open(sys.argv[6], encoding="utf-8").read()
+# since the exec split, shell::exec's arms (the inspectors among them) also live in
+# shell_exec_cmds.rs, which shell.rs pulls in with include!: read both as one
+shell += open(sys.argv[7], encoding="utf-8").read()
 
 def fail(msg):
     print(f"GICBASE TEST FAILED ({msg})"); sys.exit(1)

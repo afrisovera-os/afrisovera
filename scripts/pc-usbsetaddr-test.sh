@@ -25,7 +25,7 @@ grade() { # grade <serial>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$S"; }
     has '^\[xhci\] 0 device\(s\) connected, no USB keyboard$' || _f "the boot did not start with an empty xHCI"
     has '^  set address: 10 ms for the device to take it, 0 wait\(s\) made; first read 64 bytes descriptor first, 8 plain; last EP0 packet size 0$' ||
         _f "usbaddr bsr did not show the set-address line with nothing addressed yet"

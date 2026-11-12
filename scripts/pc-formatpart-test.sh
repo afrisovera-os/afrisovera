@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PC track step 5 (6 Nov 2026): `formatpart nvme [yes <code>]` -- AfriSovera's partition (the one
+# PC track step 5 (6 Nov 2026): `formatpart nvme [yes <code>]`: AfriSovera's partition (the one
 # `installpart` adds to a GPT) formatted with the VFS on the owner's code, and the shell's files kept
 # INSIDE that partition from then on, with Windows' partitions beside it never written. At boot the NVMe
 # driver finds the partition again (healthy GPT, both headers + entries CRC, AfriSovera's type GUID, no
@@ -27,14 +27,14 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     [ -r "$1" ] && [ -r "$2" ] && [ -r "$3" ] && [ -r "$4" ] || { echo "  FAIL: missing log"; return 1; }
     cl() { tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g'; }
     A="$(cl "$1")"; B="$(cl "$2")"; C="$(cl "$3")"; D="$(cl "$4")"
-    has() { printf '%s\n' "$1" | grep -aqxE "$2"; }
+    has() { grep -aqxE "$2" <<< "$1"; }
     blk() { printf '%s\n' "$1" | awk -v c="afrisovera> $2" '$0==c{on=1;next} /^afrisovera>/{on=0} on'; }
     local IC FC
     IC="$(printf '%s\n' "$A" | grep -aoE 'type exactly: installpart nvme 8 yes [0-9a-f]{4}$' | head -1 | awk '{print $NF}')"
     [ -n "$IC" ] || _f "boot 1: installpart nvme 8 did not show its code"
     FC="$(printf '%s\n' "$B" | grep -aoE 'type exactly: formatpart nvme yes [0-9a-f]{4}$' | head -1 | awk '{print $NF}')"
     [ -n "$FC" ] || _f "boot 2: formatpart nvme did not show its code"
-    has "$(blk "$A" 'formatpart nvme')" 'formatpart: nvme has no AfriSovera partition in a healthy GPT -- make one with installpart first; nothing written' ||
+    has "$(blk "$A" 'formatpart nvme')" 'formatpart: nvme has no AfriSovera partition in a healthy GPT; make one with installpart first; nothing written' ||
         _f "boot 1: formatpart without a partition did not refuse"
     has "$A" 'harness: boot 1: disk images unchanged' || _f "boot 1: a disk image changed"
     has "$(blk "$B" "installpart nvme 8 yes $IC")" "installpart: AfriSovera's partition written as GPT entry 5, LBA 100352-116735 \(8 MiB\), .*" ||
@@ -42,7 +42,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     local B2; B2="$(blk "$B" 'formatpart nvme')"
     has "$B2" "formatpart: nvme: AfriSovera's partition, sectors 100352-116735 \(8 MiB\); whatever is in it now is lost, no other partition is touched" ||
         _f "boot 2: formatpart did not name the partition"
-    has "$(blk "$B" 'formatpart nvme yes zzzz')" 'formatpart: that code does not fit this partition now -- nothing written' || _f "boot 2: a wrong code was not refused"
+    has "$(blk "$B" 'formatpart nvme yes zzzz')" 'formatpart: that code does not fit this partition now; nothing written' || _f "boot 2: a wrong code was not refused"
     has "$(blk "$B" 'formatpart sata')" 'formatpart: say which SATA port, e.g. formatpart sata2 \(see lsparts\); nothing written' || _f "boot 2: formatpart sata (no port) was not refused"
     has "$B" 'harness: boot 2: nvme image: only the four GPT table sectors changed' || _f "boot 2: formatpart (or the install) wrote more than the table"
     has "$C" "\[nvme\] AfriSovera's partition at sector 100352 \(8 MiB\) is not formatted yet \(formatpart nvme\)" ||
@@ -52,7 +52,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     has "$(blk "$C" 'lsnvme')" "  storage: AfriSovera's partition, sectors 100352-116735 \(8 MiB\); nothing outside it is written" ||
         _f "boot 3: lsnvme does not show the partition as storage"
     has "$(printf '%s\n' "$C" | awk -v c="afrisovera> formatpart nvme" '$0==c{on=1;next} /^afrisovera>/{on=0} on')" \
-        "formatpart: nvme already keeps AfriSovera's files in its partition at sector 100352 \(8 MiB\) -- nothing written" ||
+        "formatpart: nvme already keeps AfriSovera's files in its partition at sector 100352 \(8 MiB\); nothing written" ||
         _f "boot 3: formatpart twice was not refused"
     has "$C" 'harness: boot 3: nvme image: every changed sector is inside the partition, AFRIVFS1 at sector 100352' ||
         _f "boot 3: something outside the partition was written (or no AFRIVFS1)"
@@ -67,7 +67,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
 }
 
 M1="afrisovera> formatpart nvme
-formatpart: nvme has no AfriSovera partition in a healthy GPT -- make one with installpart first; nothing written
+formatpart: nvme has no AfriSovera partition in a healthy GPT; make one with installpart first; nothing written
 afrisovera> tablebackup
 tablebackup: nvme: GPT table, 67 sector(s) saved on the USB stick at sectors 2049-2116, CRC 1a2b3c4d, read back OK
 afrisovera> installpart nvme 8
@@ -80,7 +80,7 @@ afrisovera> formatpart nvme
 formatpart: nvme: AfriSovera's partition, sectors 100352-116735 (8 MiB); whatever is in it now is lost, no other partition is touched
 formatpart: nothing written yet. To format it, type exactly: formatpart nvme yes 77ab
 afrisovera> formatpart nvme yes zzzz
-formatpart: that code does not fit this partition now -- nothing written
+formatpart: that code does not fit this partition now; nothing written
 afrisovera> formatpart sata
 formatpart: say which SATA port, e.g. formatpart sata2 (see lsparts); nothing written
 afrisovera>
@@ -96,7 +96,7 @@ afrisovera> lsnvme
 afrisovera> write notes.txt HELLO-PART-6NOV
 afrisovera> sync
 afrisovera> formatpart nvme
-formatpart: nvme already keeps AfriSovera's files in its partition at sector 100352 (8 MiB) -- nothing written
+formatpart: nvme already keeps AfriSovera's files in its partition at sector 100352 (8 MiB); nothing written
 afrisovera>
 harness: boot 3: nvme image: every changed sector is inside the partition, AFRIVFS1 at sector 100352"
 M4="[nvme] AfriSovera's partition at sector 100352 (8 MiB) holds our files
@@ -146,8 +146,8 @@ selftest() {
 }
 
 echo "== PC install: AfriSovera's partition formatted and used for the files, nothing outside it written (PC track step 5) =="
-if ! selftest; then echo "PC FORMATPART TEST FAILED (grader selftest) -- no QEMU run spent"; exit 1; fi
-[ "${1:-}" = "--selftest" ] && { echo "PC FORMATPART SELFTEST ONLY -- no measurement taken"; exit 0; }
+if ! selftest; then echo "PC FORMATPART TEST FAILED (grader selftest); no QEMU run spent"; exit 1; fi
+[ "${1:-}" = "--selftest" ] && { echo "PC FORMATPART SELFTEST ONLY; no measurement taken"; exit 0; }
 
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }
