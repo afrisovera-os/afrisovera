@@ -48,6 +48,37 @@ static mut E0: bool = false;
 static mut ALT: bool = false;
 static mut SUPER: bool = false;
 static mut SUPER_COMBO: bool = false;
+/// Key repeat (14 Nov 2026, the owner's HP: `poweroff` came out as "poweroffff"). The keyboard repeats a held
+/// key by sending its make code again, after a delay the firmware chose (which can be short), and a real i8042
+/// polled each timer tick can hand over a make code twice. So repeats are timed here: a make code for a key
+/// already down is taken only once the key has been down half a second, and then at most 30 a second. A key
+/// whose release was lost counts as down; its next press is then taken once half a second has passed since.
+static mut DOWN_AT: [u64; 256] = [0; 256];
+static mut REP_AT: [u64; 256] = [0; 256];
+static REPEATS_HELD: AtomicU64 = AtomicU64::new(0);
+static REPEATS_TAKEN: AtomicU64 = AtomicU64::new(0);
+
+/// True when this make code is a repeat to drop (see DOWN_AT). `k` is the code, plus 128 for an E0 one.
+unsafe fn repeat_dropped(k: usize, release: bool) -> bool {
+    let now = crate::timer::cycles();
+    let hz = crate::timer::hz().max(1);
+    let (down, rep) = (&mut *core::ptr::addr_of_mut!(DOWN_AT), &mut *core::ptr::addr_of_mut!(REP_AT));
+    if release {
+        down[k] = 0;
+        return false;
+    }
+    if down[k] == 0 {
+        (down[k], rep[k]) = (now.max(1), now);
+        return false;
+    }
+    if now.wrapping_sub(down[k]) < hz / 2 || now.wrapping_sub(rep[k]) < hz / 30 {
+        REPEATS_HELD.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    rep[k] = now;
+    REPEATS_TAKEN.fetch_add(1, Ordering::Relaxed);
+    false
+}
 
 /// A key that is a desktop shortcut while the desktop is shown (set-1 scancodes): Alt+Tab,
 /// Alt+F4, Super+arrows, Esc.
@@ -332,9 +363,7 @@ unsafe fn mouse_byte(b: u8) {
     if PKT_LEN == 4 && z != 0 {
         // the wheel (signed; negative = rolled away from the user): scroll the console back
         WHEEL += (z as i8).unsigned_abs() as u64;
-        if !crate::desk::shown() {
-            crate::uart::console_wheel(z as i8 as i32);
-        }
+        crate::uart::console_wheel(z as i8 as i32); // the console, or the desk's Terminal while the desk shows
     }
     PACKETS += 1;
     MOUSE_USED.store(true, Ordering::Relaxed);
@@ -502,6 +531,9 @@ pub fn poll() {
             E0 = false;
             let release = sc & 0x80 != 0;
             let code = sc & 0x7F;
+            if repeat_dropped(code as usize | (ext as usize) << 7, release) {
+                continue;
+            }
             if code == 0x38 {
                 ALT = !release; // left Alt, or right Alt (E0 38)
                 continue;
@@ -555,6 +587,11 @@ pub fn list() {
         "ps2: i8042 keyboard, polled; {} scancodes read, {} keys typed",
         SCANCODES.load(Ordering::Relaxed),
         KEYS.load(Ordering::Relaxed)
+    );
+    crate::kprintln!(
+        "ps2: key repeat: {} repeats held back, {} taken (a held key repeats after 0.5 s, at most 30 a second)",
+        REPEATS_HELD.load(Ordering::Relaxed),
+        REPEATS_TAKEN.load(Ordering::Relaxed)
     );
     // SAFETY: scalar reads of the mouse counters.
     unsafe {

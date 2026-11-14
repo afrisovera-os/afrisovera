@@ -302,6 +302,7 @@ def main():
     time.sleep(1.0)
     drain()
     drain()
+    mouse_rel = os.environ.get("SHOT_MOUSE_REL", "")  # "dx,dy": move the mouse before the shot (afriui.md section 22)
 
     # Screenshot via QMP -- a DECORATION, and it must not be able to destroy
     # the evidence. 2.772: this reply arrives on a 10s socket timeout, and
@@ -402,6 +403,15 @@ def main():
         qmp_line()                                    # the QMP greeting
         q.sendall(b'{"execute":"qmp_capabilities"}' + NL)
         qmp_line()                                    # capabilities reply
+        # "dx,dy[;dx,dy...]": move the pointer out of the picture first, one move after another (the desk
+        # clamps each to the screen, so a big move then a small one lands a set distance from an edge)
+        for step in filter(None, mouse_rel.split(";")):
+            dx, dy = (int(v) for v in step.split(","))
+            ev = [{"type": "rel", "data": {"axis": "x", "value": dx}},
+                  {"type": "rel", "data": {"axis": "y", "value": dy}}]
+            q.sendall(json.dumps({"execute": "input-send-event", "arguments": {"events": ev}}).encode() + NL)
+            print("mouse:", step, qmp_line().decode().strip())
+            time.sleep(1.5)  # the desk takes the move on its next pass
         # json.dumps escapes backslashes so Windows paths don't break the QMP JSON.
         msg = json.dumps({"execute": "screendump", "arguments": {"filename": out, "format": "png"}})
         q.sendall(msg.encode() + NL)

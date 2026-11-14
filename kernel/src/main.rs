@@ -13,11 +13,13 @@ extern crate alloc;
 
 mod appget;
 mod asili;
+mod dira; // the web browser, milestone M1 (BROWSER_PLAN.md)
 mod board;
 mod config;
 mod cpu;
 mod daraja;
 mod drbg;
+mod drbg_apt;
 mod drbg_kat;
 mod ed25519;
 mod exceptions;
@@ -55,7 +57,7 @@ mod canvas; // the desktop draws straight into the ramfb framebuffer
 mod font_lower;
 mod uart;
 mod uart_ns16550;
-mod virtio;
+mod virtio; mod netparse; // netparse: received-frame readers on slices (gap G1)
 mod voice;
 mod web;
 mod vfs;
@@ -328,6 +330,11 @@ static SECONDARY_AFF0: AtomicU32 = AtomicU32::new(0xffff_ffff);
 
 /// Number of CPU cores currently online: 1 (primary only) or 2 (a secondary
 /// checked in via PSCI on QEMU virt). Honest — reflects the real boot topology.
+/// Cores the machine has (the desktop's About and Settings, 14 Nov): on the phone, the ones running.
+pub fn cores_found() -> u32 {
+    cores_online()
+}
+
 pub fn cores_online() -> u32 {
     if SECONDARY_UP.load(Ordering::Acquire) == 1 {
         2
@@ -1011,10 +1018,7 @@ pub extern "C" fn kernel_main(dtb: u64) -> ! {
 
     // 6) Mount the in-RAM filesystem and register it, then drop into the shell.
     vfs::seed();
-    // Seed the bundled .wasm apps as files so the user can `nia <file>` them.
-    for (name, bytes) in nia::BUNDLED {
-        vfs::write(name, bytes()); // the bundled apps, from the one table the manifest also uses
-    }
+    nia::seed_bundled(); // the bundled apps the VFS can hold, as files (A7: bigger ones stay built in)
     vfs::write("sample.webapp", web::sample());
     vfs::write("sample.apkmeta", daraja::sample());
     asili::register("ramfs", asili::Class::Storage, 0, true);
@@ -1042,6 +1046,7 @@ pub extern "C" fn kernel_main(dtb: u64) -> ! {
     for (name, bytes) in nia::BUNDLED {
         integrity::record(name, bytes());
     }
+    nia::check_bundled(); // every bundled app is in the manifest (A7)
 
     cpu::irq_enable(); // timer keeps ticking
     shell::run();

@@ -1102,7 +1102,11 @@ unsafe fn net_rx_recycle(id: u32) {
     if NET_BASE == 0 {
         return;
     }
-    let i = (id as usize) % NBUF;
+    // An id outside the pool is not ours to hand back (device input; never wrapped onto another buffer).
+    if id as usize >= NBUF {
+        return;
+    }
+    let i = id as usize;
     let rxd = addr_of_mut!(NET_RX_DESC) as *mut Desc;
     write_volatile(
         rxd.add(i),
@@ -1212,20 +1216,19 @@ pub fn net_arp_probe() -> bool {
                 // function returns: the recycle is the `RxSlot` drop below, and a
                 // mark written after an early `return` path would be missed.
                 write_volatile(addr_of_mut!(RX_CONSUMED_IDX), base_rx.wrapping_add(1));
-                let frame = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
-                let et = ((*frame.add(12) as u16) << 8) | (*frame.add(13) as u16);
+                let frame = rx_bytes(&elem);
+                let et = crate::netparse::ethertype(frame).unwrap_or(0);
+                let b = |i: usize| frame.get(i).copied().unwrap_or(0);
                 RX_COUNT += 1;
                 crate::kprintln!(
                     "[virtio-net] RX {} bytes, ethertype {:#06x}, src {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                    (elem.len as usize).saturating_sub(VNET_HDR), et,
-                    *frame.add(6), *frame.add(7), *frame.add(8), *frame.add(9), *frame.add(10), *frame.add(11)
+                    frame.len(), et,
+                    b(6), b(7), b(8), b(9), b(10), b(11)
                 );
-                if et == 0x0806 {
+                if let Some(mac) = crate::netparse::arp_sender_mac(frame) {
                     // Learn the gateway MAC from the ARP reply's sender field
                     // (Ethernet 14 + ARP sender-hardware-address offset 8 = 22).
-                    for i in 0..6 {
-                        GW_MAC[i] = *frame.add(22 + i);
-                    }
+                    GW_MAC = mac;
                     GW_KNOWN = true;
                     crate::kprintln!("[virtio-net] -> ARP reply received (TX + RX round-trip OK)");
                 }
@@ -1329,17 +1332,10 @@ pub fn net_ping() -> bool {
                 RX_RAW_COUNT += 1;
                 spins = 0;
                 let _slot = RxSlot(elem.id);
-                let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
-                let et = ((*fr.add(12) as u16) << 8) | (*fr.add(13) as u16);
-                if et == 0x0800 {
-                    let proto = *fr.add(14 + 9);
-                    let ihl = (*fr.add(14) & 0x0f) as usize * 4;
-                    let icmp_type = *fr.add(14 + ihl);
-                    if proto == 1 && icmp_type == 0 {
-                        RX_COUNT += 1;
-                        crate::kprintln!("[net] ICMP echo reply from 10.0.2.2 (ping OK)");
-                        return true;
-                    }
+                if crate::netparse::icmp_type(rx_bytes(&elem)) == Some(0) {
+                    RX_COUNT += 1;
+                    crate::kprintln!("[net] ICMP echo reply from 10.0.2.2 (ping OK)");
+                    return true;
                 }
             }
             spins += 1;
@@ -1364,62 +1360,6 @@ enum DnsOutcome {
     NoResponse,
     /// A response with >= 1 answer arrived; `Some(ip)` if one answer was an A.
     Answered(Option<[u8; 4]>),
-}
-
-unsafe fn dns_be16(d: *const u8, o: usize) -> u16 {
-    ((*d.add(o) as u16) << 8) | (*d.add(o + 1) as u16)
-}
-
-/// Advance past a DNS name: a run of length-prefixed labels, or a compression
-/// pointer (top two bits set) which is two bytes and ends the name.
-unsafe fn dns_skip_name(d: *const u8, len: usize, mut off: usize) -> usize {
-    while off < len {
-        let b = *d.add(off);
-        if b == 0 {
-            return off + 1;
-        }
-        if b & 0xc0 == 0xc0 {
-            return off + 2;
-        }
-        off += 1 + b as usize;
-    }
-    off
-}
-
-/// The FIRST A record (type 1, rdlength 4) in a DNS response, or `None`.
-///
-/// `None` is a real answer, not an error: a resolver that hands back a CNAME
-/// chain has resolved nothing this stack can dial, and the caller says so.
-/// Mirrors `scripts/dest-parse-2767.py:dns_a_records`, which reads the same
-/// bytes off the wire — the probe and the kernel must agree about what arrived
-/// or the measurement is measuring the parser.
-unsafe fn dns_first_a(d: *const u8, len: usize) -> Option<[u8; 4]> {
-    if len < 12 {
-        return None;
-    }
-    let qd = dns_be16(d, 4) as usize;
-    let an = dns_be16(d, 6) as usize;
-    let mut off = 12usize;
-    for _ in 0..qd {
-        off = dns_skip_name(d, len, off) + 4; // + QTYPE + QCLASS
-    }
-    for _ in 0..an {
-        off = dns_skip_name(d, len, off);
-        if off + 10 > len {
-            return None;
-        }
-        let rtype = dns_be16(d, off);
-        let rdlen = dns_be16(d, off + 8) as usize;
-        let rdata = off + 10;
-        if rdata + rdlen > len {
-            return None;
-        }
-        if rtype == 1 && rdlen == 4 {
-            return Some([*d.add(rdata), *d.add(rdata + 1), *d.add(rdata + 2), *d.add(rdata + 3)]);
-        }
-        off = rdata + rdlen;
-    }
-    None
 }
 
 /// Encode `name` as a DNS QNAME (length-prefixed labels + a zero) into `out`,
@@ -1469,6 +1409,24 @@ fn dns_encode_name(name: &str, out: &mut [u8]) -> Option<usize> {
 /// then returned `bool`: the address was in the datagram it had just parsed and
 /// was thrown away (measured, not read out of the source —
 /// `docs/evidence-2.767-dest-probe.log`). It now hands back what it found.
+/// A caller that can be stopped (Dira, architect's verdict on BROWSER_PLAN.md, Q2: "every Dira wait must check the
+/// close request and return within 100 ms of it") sets this while it waits on the network; the DNS, TCP open and
+/// TCP dial waits ask it every 256 spins and after each run of data. `None`, the default, leaves every wait exactly
+/// as it was. The function itself keeps its own pace (Dira looks at the desk at most every 10 ms).
+static mut NET_ABORT: Option<fn() -> bool> = None;
+
+/// Set or clear the hook above (kernel context, one caller at a time).
+pub fn set_net_abort(f: Option<fn() -> bool>) {
+    // SAFETY: a plain store to a static read only by this file's waits, kernel context.
+    unsafe { write_volatile(addr_of_mut!(NET_ABORT), f) }
+}
+
+/// The caller asked the current wait to stop.
+fn net_abort() -> bool {
+    // SAFETY: a plain load of the static above.
+    unsafe { read_volatile(addr_of!(NET_ABORT)) }.map_or(false, |f| f())
+}
+
 fn dns_query(name: &str) -> DnsOutcome {
     if !net_present() {
         return DnsOutcome::NoResponse;
@@ -1571,15 +1529,9 @@ fn dns_query(name: &str) -> DnsOutcome {
                 RX_RAW_COUNT += 1;
                 spins = 0;
                 let _slot = RxSlot(elem.id);
-                let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
-                let et = ((*fr.add(12) as u16) << 8) | (*fr.add(13) as u16);
-                if et == 0x0800 && *fr.add(14 + 9) == 17 {
-                    let ihl = (*fr.add(14) & 0x0f) as usize * 4;
-                    let sport = ((*fr.add(14 + ihl) as u16) << 8) | (*fr.add(14 + ihl + 1) as u16);
-                    if sport == 53 {
-                        let doff = 14 + ihl + 8;
-                        let rid = ((*fr.add(doff) as u16) << 8) | (*fr.add(doff + 1) as u16);
-                        let ancount = ((*fr.add(doff + 6) as u16) << 8) | (*fr.add(doff + 7) as u16);
+                if let Some(u) = crate::netparse::udp(rx_bytes(&elem)) {
+                    if u.sport == 53 {
+                        let (rid, ancount) = crate::netparse::dns_header(u.payload).unwrap_or((!dns_id, 0));
                         if rid == dns_id && ancount >= 1 {
                             RX_COUNT += 1;
                             // Byte-identical to the pre-2.767 line when `name` is
@@ -1589,15 +1541,9 @@ fn dns_query(name: &str) -> DnsOutcome {
                                 "[net] DNS response for {} received (UDP round-trip OK), {} answer(s)",
                                 name, ancount
                             );
-                            // The response's own length, off the IP header — the
-                            // answer section is only walkable inside the bytes that
-                            // actually arrived.
-                            let ip_total = ((*fr.add(16) as usize) << 8) | (*fr.add(17) as usize);
-                            let a = if ip_total >= ihl + 8 {
-                                dns_first_a(fr.add(doff), ip_total - ihl - 8)
-                            } else {
-                                None
-                            };
+                            // The answer section is walked only inside the UDP payload that arrived
+                            // (bounded by the frame, the IP total length and the UDP length; gap G1).
+                            let a = crate::netparse::dns_first_a(u.payload);
                             match a {
                                 Some(ip) => crate::kprintln!(
                                     "[net] DNS A {}.{}.{}.{} for {}",
@@ -1614,6 +1560,10 @@ fn dns_query(name: &str) -> DnsOutcome {
                 }
             }
             spins += 1;
+            if spins & 0xFF == 0 && net_abort() {
+                crate::kprintln!("[net] dns: stopped by the caller");
+                return DnsOutcome::NoResponse;
+            }
             if spins > 60_000_000 {
                 crate::kprintln!("[net] dns: no response within timeout");
                 return DnsOutcome::NoResponse;
@@ -1777,65 +1727,28 @@ unsafe fn send_dhcp(base: u64, msgtype: u8, req_ip: Option<[u8; 4]>, srv_id: Opt
     w(base, R_QUEUE_NOTIFY, 1);
 }
 
-/// Parse a received DHCP reply frame `fr` (Ethernet start). Fills the DHCP_*
-/// statics (yiaddr + options) and returns the DHCP message type (option 53), or
-/// 0 if this is not a DHCP reply for our transaction.
-unsafe fn parse_dhcp(fr: *const u8) -> u8 {
-    let ihl = (*fr.add(14) & 0x0f) as usize * 4;
-    let doff = 14 + ihl + 8; // start of DHCP payload
-    // Match our transaction id.
-    let xid = ((*fr.add(doff + 4) as u32) << 24)
-        | ((*fr.add(doff + 5) as u32) << 16)
-        | ((*fr.add(doff + 6) as u32) << 8)
-        | (*fr.add(doff + 7) as u32);
-    if *fr.add(doff) != 2 || xid != DHCP_XID {
-        return 0; // not a BOOTREPLY for us
+/// Read a received DHCP reply (crate::netparse::dhcp, bounded by the frame). Fills the DHCP_* statics (yiaddr
+/// and the options present) and returns the DHCP message type (option 53), or 0 if this is not a DHCP reply for
+/// our transaction.
+unsafe fn parse_dhcp(fr: &[u8]) -> u8 {
+    let d = match crate::netparse::dhcp(fr, DHCP_XID) {
+        Some(d) => d,
+        None => return 0, // not a BOOTREPLY for us
+    };
+    DHCP_IP = d.yiaddr;
+    if let Some(v) = d.server {
+        DHCP_SRV = v;
     }
-    for i in 0..4 {
-        DHCP_IP[i] = *fr.add(doff + 16 + i); // yiaddr
+    if let Some(v) = d.mask {
+        DHCP_MASK = v;
     }
-    // Options begin after the 236-byte BOOTP area + 4-byte magic cookie.
-    let mut o = doff + 240;
-    let limit = doff + 548; // bound the walk (BOOTP + options < 548)
-    let mut msgtype = 0u8;
-    while o + 1 < limit {
-        let opt = *fr.add(o);
-        if opt == 255 {
-            break;
-        }
-        if opt == 0 {
-            o += 1;
-            continue; // pad
-        }
-        let len = *fr.add(o + 1) as usize;
-        let v = o + 2;
-        match opt {
-            53 => msgtype = *fr.add(v),
-            54 => {
-                for i in 0..4 {
-                    DHCP_SRV[i] = *fr.add(v + i);
-                }
-            }
-            1 => {
-                for i in 0..4 {
-                    DHCP_MASK[i] = *fr.add(v + i);
-                }
-            }
-            3 => {
-                for i in 0..4 {
-                    DHCP_GW[i] = *fr.add(v + i);
-                }
-            }
-            6 => {
-                for i in 0..4 {
-                    DHCP_DNS[i] = *fr.add(v + i);
-                }
-            }
-            _ => {}
-        }
-        o += 2 + len;
+    if let Some(v) = d.router {
+        DHCP_GW = v;
     }
-    msgtype
+    if let Some(v) = d.dns {
+        DHCP_DNS = v;
+    }
+    d.msgtype
 }
 
 /// Wait (bounded) for a DHCP reply of `want_type` addressed to UDP port 68.
@@ -1850,15 +1763,10 @@ unsafe fn recv_dhcp(base_rx: u16, want_type: u8) -> bool {
             RX_RAW_COUNT += 1;
             spins = 0;
             let _slot = RxSlot(elem.id);
-            let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
-            let et = ((*fr.add(12) as u16) << 8) | (*fr.add(13) as u16);
-            if et == 0x0800 && *fr.add(14 + 9) == 17 {
-                let ihl = (*fr.add(14) & 0x0f) as usize * 4;
-                let dport = ((*fr.add(14 + ihl + 2) as u16) << 8) | (*fr.add(14 + ihl + 3) as u16);
-                if dport == 68 && parse_dhcp(fr) == want_type {
-                    RX_COUNT += 1;
-                    return true;
-                }
+            let fr = rx_bytes(&elem);
+            if crate::netparse::udp(fr).map_or(false, |u| u.dport == 68) && parse_dhcp(fr) == want_type {
+                RX_COUNT += 1;
+                return true;
             }
         }
         spins += 1;
@@ -2139,7 +2047,7 @@ unsafe fn send_tcp_segment(
     // The field report (PC only) talks to a real home network: its own leased
     // address and the next hop's own MAC, for the length of one report.
     #[cfg(feature = "pc")]
-    let route = read_volatile(addr_of!(REPORT_ROUTE));
+    let route = read_volatile(addr_of!(NET_ROUTE));
     #[cfg(feature = "pc")]
     let dmac = match route {
         Some((_, m)) => m,
@@ -2152,9 +2060,9 @@ unsafe fn send_tcp_segment(
         return 0;
     }
     #[cfg(feature = "pc")]
-    if let Some((sip, _)) = route {
-        set_src_ip(&mut frame[..frame_len], &sip);
-    }
+    let frame_len = pc_send_fixups(&mut frame[..], frame_len, flags, route); // M1b: MSS 1460 on a SYN, then the
+    // route's source address (set_src_ip); both fix the checksums. pc_send_fixups is at the end of this file, with
+    // the rest of M1b's PC-only code, so the ARM image's lines stay where they are.
     let txd = addr_of_mut!(NET_TX_DESC) as *mut Desc;
     write_volatile(
         txd.add(0),
@@ -2170,60 +2078,32 @@ unsafe fn send_tcp_segment(
     frame_len
 }
 
-/// The fields of a received TCP segment this stack looks at, including where its
-/// payload starts and how long it is — read from the IP total length rather than
-/// from the frame length, since the wire may pad a short frame to 60 bytes and
-/// that padding is not data.
-struct Seg {
-    /// WHO SENT IT — the IPv4 source address, read out of the header rather than
-    /// assumed. Added at 2.769: before it, `Seg` described a segment's ports and
-    /// sequence space but not its far end, so a listener physically could not
-    /// answer its caller. Every inbound rig this project owns dials from
-    /// `GW_IP`, which is why 683 green suites never caught the assumption.
-    src: [u8; 4],
-    sport: u16,
-    dport: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    doff: usize,
-    dlen: usize,
+/// The fields of a received TCP segment (crate::netparse::Seg): ports, sequence space, the sender, and where the
+/// payload is in the frame. Its `doff + dlen` never passes the bytes that arrived (gap G1).
+use crate::netparse::Seg;
+
+/// The bytes a received element really holds: its buffer after the virtio-net header, `elem.len` long (clamped
+/// to the buffer). Every reader of a received frame works on this slice, never on the IP header's length claim.
+/// An id the device reports outside the buffer pool is DROPPED (an empty frame, which no reader accepts), never
+/// wrapped onto another buffer: `elem.id` and `elem.len` are device input too.
+///
+/// LIFETIME: the `'static` is a lie the type system cannot check. The slice is valid only until this element's
+/// buffer is recycled (`net_rx_recycle`, also run when the element's `RxSlot` drops): from then on the device may
+/// write a new frame into the same bytes. Every reader today finishes with the slice before that. A change that
+/// keeps received bytes past the recycle (a queue of frames, a reply built later, a pointer stored in a static)
+/// must COPY them first (`.to_vec()` or a fixed buffer), never keep this slice.
+unsafe fn rx_bytes(elem: &UsedElem) -> &'static [u8] {
+    let id = elem.id as usize;
+    if id >= NBUF {
+        return &[];
+    }
+    let n = (elem.len as usize).min(2048).saturating_sub(VNET_HDR);
+    core::slice::from_raw_parts((addr_of!(RX_BUFS[id]) as *const u8).add(VNET_HDR), n)
 }
 
-unsafe fn be32(p: *const u8) -> u32 {
-    ((*p as u32) << 24) | ((*p.add(1) as u32) << 16) | ((*p.add(2) as u32) << 8) | (*p.add(3) as u32)
-}
-
-/// Parse an Ethernet frame as IPv4/TCP, or `None` if it is neither.
-unsafe fn parse_tcp(fr: *const u8) -> Option<Seg> {
-    let et = ((*fr.add(12) as u16) << 8) | (*fr.add(13) as u16);
-    if et != 0x0800 || *fr.add(14 + 9) != 6 {
-        return None;
-    }
-    let ihl = (*fr.add(14) & 0x0f) as usize * 4;
-    let ip_total = ((*fr.add(16) as usize) << 8) | (*fr.add(17) as usize);
-    if ihl < 20 || ip_total < ihl + 20 {
-        return None;
-    }
-    let toff = 14 + ihl;
-    let hlen = ((*fr.add(toff + 12) >> 4) as usize) * 4;
-    if hlen < 20 || ihl + hlen > ip_total {
-        return None;
-    }
-    Some(Seg {
-        // The IPv4 source address: frame offset 26..30 (14 Ethernet + 12 into the
-        // IP header). Fixed regardless of `ihl`, since options come AFTER the
-        // addresses — so this is not `14 + ihl`-relative and must not be written
-        // as if it were.
-        src: [*fr.add(26), *fr.add(27), *fr.add(28), *fr.add(29)],
-        sport: ((*fr.add(toff) as u16) << 8) | (*fr.add(toff + 1) as u16),
-        dport: ((*fr.add(toff + 2) as u16) << 8) | (*fr.add(toff + 3) as u16),
-        seq: be32(fr.add(toff + 4)),
-        ack: be32(fr.add(toff + 8)),
-        flags: *fr.add(toff + 13),
-        doff: toff + hlen,
-        dlen: ip_total - ihl - hlen,
-    })
+/// Parse a received frame as IPv4/TCP, or `None` if it is neither or a length in it lies (crate::netparse::tcp).
+fn parse_tcp(fr: &[u8]) -> Option<Seg> {
+    crate::netparse::tcp(fr)
 }
 
 /// Sequence-space "at least": `a >= b` modulo 2^32 (RFC 793's comparison, so an
@@ -2297,7 +2177,7 @@ unsafe fn tcp_open(base: u64, dst_ip: &[u8; 4], src_port: u16, dst_port: u16, is
             RX_RAW_COUNT += 1;
             spins = 0;
             let _slot = RxSlot(elem.id);
-            let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
+            let fr = rx_bytes(&elem);
             if let Some(s) = parse_tcp(fr) {
                 if s.dport == src_port && s.sport == dst_port && s.src == *dst_ip {
                     RX_COUNT += 1;
@@ -2326,6 +2206,10 @@ unsafe fn tcp_open(base: u64, dst_ip: &[u8; 4], src_port: u16, dst_port: u16, is
             }
         }
         spins += 1;
+        if spins & 0xFF == 0 && net_abort() {
+            crate::kprintln!("[net] TCP: stopped by the caller before the peer answered");
+            return TcpOpen::NoReply;
+        }
         if spins > 60_000_000 {
             crate::kprintln!("[net] TCP: no reply within timeout (a valid SYN was transmitted)");
             return TcpOpen::NoReply;
@@ -2407,7 +2291,7 @@ unsafe fn tcp_close_cur(
             RX_RAW_COUNT += 1;
             spins = 0;
             let _slot = RxSlot(elem.id);
-            let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
+            let fr = rx_bytes(&elem);
             let s = match parse_tcp(fr) {
                 Some(s) => s,
                 None => {
@@ -2601,7 +2485,7 @@ unsafe fn tcp_accept(base: u64, port: u16, iss: u32, wait_ms: u64, mut cur: u16)
             RX_RAW_COUNT += 1;
             spins = 0;
             let _slot = RxSlot(elem.id);
-            let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
+            let fr = rx_bytes(&elem);
             let s = match parse_tcp(fr) {
                 Some(s) => s,
                 None => {
@@ -2965,7 +2849,7 @@ pub fn net_tcp_serve_with(port: u16, wait_ms: u64, conns: u32, mut handler: Opti
                     // with, so a missing recycle here is not a latent leak — it is a
                     // listener that goes deaf at frame 9, mid-conversation, every time.
                     let _slot = RxSlot(elem.id);
-                    let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
+                    let fr = rx_bytes(&elem);
                     let s = match parse_tcp(fr) {
                         Some(s) => s,
                         None => continue,
@@ -3034,7 +2918,7 @@ pub fn net_tcp_serve_with(port: u16, wait_ms: u64, conns: u32, mut handler: Opti
                             if off + s.dlen <= TCP_ECHO_CAP {
                                 let dst = addr_of_mut!(TCP_OOO_BUF) as *mut u8;
                                 for i in 0..s.dlen {
-                                    *dst.add(off + i) = *fr.add(s.doff + i);
+                                    *dst.add(off + i) = fr[s.doff + i];
                                 }
                                 ooo = Some((hseq, off + s.dlen));
                                 crate::kprintln!(
@@ -3079,7 +2963,7 @@ pub fn net_tcp_serve_with(port: u16, wait_ms: u64, conns: u32, mut handler: Opti
                             } else {
                                 let dst = addr_of_mut!(TCP_ECHO_BUF) as *mut u8;
                                 for i in 0..n {
-                                    *dst.add(i) = *fr.add(s.doff + skip + i);
+                                    *dst.add(i) = fr[s.doff + skip + i];
                                 }
                                 our_ack = end;
                                 // THE DRAIN (2.766, patch note M4). Here, between the
@@ -3402,7 +3286,7 @@ pub fn net_tcp_sink(port: u16, wait_ms: u64) -> bool {
                 // the pool starts with, so a missing recycle is a listener that
                 // goes deaf mid-stream rather than a latent leak.
                 let _slot = RxSlot(elem.id);
-                let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
+                let fr = rx_bytes(&elem);
                 let s = match parse_tcp(fr) {
                     Some(s) => s,
                     None => {
@@ -3656,7 +3540,7 @@ pub fn net_tcp_data(dst_ip: [u8; 4], dst_port: u16, payload: &[u8]) -> bool {
                 RX_RAW_COUNT += 1;
                 spins = 0;
                 let _slot = RxSlot(elem.id);
-                let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
+                let fr = rx_bytes(&elem);
                 let s = match parse_tcp(fr) {
                     Some(s) => s,
                     None => continue,
@@ -3680,7 +3564,7 @@ pub fn net_tcp_data(dst_ip: [u8; 4], dst_port: u16, payload: &[u8]) -> bool {
                     let n = if s.dlen > TCP_RX_CAP { TCP_RX_CAP } else { s.dlen };
                     let dst = addr_of_mut!(TCP_RX_DATA) as *mut u8;
                     for i in 0..n {
-                        *dst.add(i) = *fr.add(s.doff + i);
+                        *dst.add(i) = fr[s.doff + i];
                     }
                     // Acknowledge the whole segment, including the part we did
                     // not keep: the peer sent those bytes and they are consumed.
@@ -3766,6 +3650,14 @@ pub fn net_tcp_data(dst_ip: [u8; 4], dst_port: u16, payload: &[u8]) -> bool {
     }
 }
 
+/// The caller stopped a dial (`set_net_abort`): a reset ends the connection at once, with no close handshake to
+/// wait for. Returns false (the handler was not done).
+unsafe fn dial_stopped(base: u64, dst_ip: &[u8; 4], src_port: u16, dst_port: u16, seq: u32, ack: u32) -> bool {
+    send_tcp_segment(base, dst_ip, src_port, dst_port, seq, ack, 0x14, &[]); // RST + ACK
+    crate::kprintln!("[net] tcp dial: stopped by the caller (connection reset)");
+    false
+}
+
 /// Dial `dst_ip`:`dst_port`, send `first`, then CONVERSE: every in-order run of bytes the peer sends goes to
 /// `handler`, whose non-empty reply is sent as the next segment (one outstanding reply at a time, resent on the
 /// same RTO schedule as `net_tcp_data`). The handler returns false when it is done; the connection is then
@@ -3819,7 +3711,7 @@ pub fn net_tcp_dial_with(dst_ip: [u8; 4], dst_port: u16, first: &[u8], wait_ms: 
                 RX_RAW_COUNT += 1;
                 spins = 0;
                 let _slot = RxSlot(elem.id);
-                let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
+                let fr = rx_bytes(&elem);
                 let s = match parse_tcp(fr) {
                     Some(s) => s,
                     None => continue,
@@ -3846,7 +3738,7 @@ pub fn net_tcp_dial_with(dst_ip: [u8; 4], dst_port: u16, first: &[u8], wait_ms: 
                         // Not ready for a new run (our previous segment is still unacknowledged, or the
                         // handler is finished): leave these bytes unacknowledged, the peer resends them.
                     } else {
-                        let input = core::slice::from_raw_parts(fr.add(s.doff), s.dlen).to_vec();
+                        let input = fr[s.doff..s.doff + s.dlen].to_vec();
                         our_ack = s.seq.wrapping_add(s.dlen as u32);
                         segs_in += 1;
                         let mut out = alloc::vec::Vec::new();
@@ -3888,12 +3780,18 @@ pub fn net_tcp_dial_with(dst_ip: [u8; 4], dst_port: u16, first: &[u8], wait_ms: 
                         crate::kprintln!("[net] tcp dial: the peer closed before the handler was done");
                     }
                 }
+                if net_abort() {
+                    return dial_stopped(base, dst_ip, src_port, dst_port, our_seq, our_ack);
+                }
                 if (done || peer_fin) && !unacked {
                     break;
                 }
                 continue;
             }
             spins += 1;
+            if spins & 0xFF == 0 && net_abort() {
+                return dial_stopped(base, dst_ip, src_port, dst_port, our_seq, our_ack);
+            }
             if unacked && rto_at != 0 && crate::timer::cycles() >= rto_at {
                 if retx >= TCP_MAX_RETX {
                     crate::kprintln!(
@@ -3946,10 +3844,10 @@ pub fn net_tcp_dial_with(dst_ip: [u8; 4], dst_port: u16, first: &[u8], wait_ms: 
 // other end sends is read as data, let alone as a command.
 // ---------------------------------------------------------------------------
 
-/// While a report is being sent: (our leased address, the next hop's MAC). Read
-/// by `send_tcp_segment`; `None` (the default) leaves every other path as it was.
+/// While a route is open (the field report, or `route_open`: Dira M1b): (our leased address, the next hop's MAC).
+/// Read by `send_tcp_segment`; `None` (the default) leaves every other path as it was.
 #[cfg(feature = "pc")]
-static mut REPORT_ROUTE: Option<([u8; 4], [u8; 6])> = None;
+static mut NET_ROUTE: Option<([u8; 4], [u8; 6])> = None;
 
 /// Put `sip` in a built frame's IPv4 source and recompute both checksums (the IP
 /// header's and the TCP one, whose pseudo-header carries the source too).
@@ -3979,14 +3877,14 @@ fn set_src_ip(frame: &mut [u8], sip: &[u8; 4]) {
     frame[51] = tck as u8;
 }
 
-/// Clears `REPORT_ROUTE` on every way out of `report_send`.
+/// Clears `NET_ROUTE` on every way out of `report_send` (route_open has its own guard, `RouteHold`).
 #[cfg(feature = "pc")]
 struct RouteGuard;
 #[cfg(feature = "pc")]
 impl Drop for RouteGuard {
     fn drop(&mut self) {
         // SAFETY: a plain store to a static only this file uses, kernel context.
-        unsafe { write_volatile(addr_of_mut!(REPORT_ROUTE), None) }
+        unsafe { write_volatile(addr_of_mut!(NET_ROUTE), None) }
     }
 }
 
@@ -4074,23 +3972,12 @@ unsafe fn arp_frame(op: u8, sip: &[u8; 4], tmac: &[u8; 6], tip: &[u8; 4]) -> [u8
 /// If `fr` is an ARP request for `our_ip`, answer it (the receiver's PC asks who
 /// we are before it replies, and asks again whenever its cache entry expires).
 #[cfg(feature = "pc")]
-unsafe fn arp_answer(fr: *const u8, our_ip: &[u8; 4]) {
-    if *fr.add(12) != 0x08 || *fr.add(13) != 0x06 || *fr.add(21) != 1 {
-        return;
-    }
-    let tip = [*fr.add(38), *fr.add(39), *fr.add(40), *fr.add(41)];
-    if tip != *our_ip {
-        return;
-    }
-    let mut smac = [0u8; 6];
-    let mut sip = [0u8; 4];
-    for i in 0..6 {
-        smac[i] = *fr.add(22 + i);
-    }
-    for i in 0..4 {
-        sip[i] = *fr.add(28 + i);
-    }
-    let f = arp_frame(2, our_ip, &smac, &sip);
+unsafe fn arp_answer(fr: &[u8], our_ip: &[u8; 4]) {
+    let a = match crate::netparse::arp(fr) {
+        Some(a) if a.op == 1 && a.tpa == *our_ip => a,
+        _ => return,
+    };
+    let f = arp_frame(2, our_ip, &a.sha, &a.spa);
     tx_raw(&f);
 }
 
@@ -4109,15 +3996,11 @@ unsafe fn arp_resolve(target: &[u8; 4], our_ip: &[u8; 4]) -> Option<[u8; 6]> {
                 cur = cur.wrapping_add(1);
                 RX_RAW_COUNT += 1;
                 let _slot = RxSlot(elem.id);
-                let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
-                if *fr.add(12) == 0x08 && *fr.add(13) == 0x06 {
-                    if *fr.add(21) == 2 && [*fr.add(28), *fr.add(29), *fr.add(30), *fr.add(31)] == *target {
-                        let mut m = [0u8; 6];
-                        for i in 0..6 {
-                            m[i] = *fr.add(22 + i);
-                        }
+                let fr = rx_bytes(&elem);
+                if let Some(a) = crate::netparse::arp(fr) {
+                    if a.op == 2 && a.spa == *target {
                         RX_COUNT += 1;
-                        return Some(m);
+                        return Some(a.sha);
                     }
                     arp_answer(fr, our_ip);
                 }
@@ -4214,7 +4097,7 @@ pub fn report_send(dst_ip: [u8; 4], dst_port: u16, data: &[u8]) -> Result<Report
             if on_link { "receiver" } else { "router" },
             hop[0], hop[1], hop[2], hop[3], mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
-        write_volatile(addr_of_mut!(REPORT_ROUTE), Some((our_ip, mac)));
+        write_volatile(addr_of_mut!(NET_ROUTE), Some((our_ip, mac)));
         let _guard = RouteGuard;
         let base = NET_BASE;
         let dst = &dst_ip;
@@ -4250,7 +4133,7 @@ pub fn report_send(dst_ip: [u8; 4], dst_port: u16, data: &[u8]) -> Result<Report
                     cur = cur.wrapping_add(1);
                     RX_RAW_COUNT += 1;
                     let _slot = RxSlot(elem.id);
-                    let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
+                    let fr = rx_bytes(&elem);
                     arp_answer(fr, &our_ip);
                     if let Some(s) = parse_tcp(fr) {
                         if s.dport == sport && s.sport == dst_port && s.src == *dst {
@@ -4304,7 +4187,7 @@ pub fn report_send(dst_ip: [u8; 4], dst_port: u16, data: &[u8]) -> Result<Report
                 cur = cur.wrapping_add(1);
                 RX_RAW_COUNT += 1;
                 let _slot = RxSlot(elem.id);
-                let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
+                let fr = rx_bytes(&elem);
                 arp_answer(fr, &our_ip);
                 if let Some(s) = parse_tcp(fr) {
                     if s.dport == sport && s.sport == dst_port && s.src == *dst {
@@ -4359,7 +4242,7 @@ pub fn report_send(dst_ip: [u8; 4], dst_port: u16, data: &[u8]) -> Result<Report
                     cur = cur.wrapping_add(1);
                     RX_RAW_COUNT += 1;
                     let _slot = RxSlot(elem.id);
-                    let fr = (addr_of!(RX_BUFS[(elem.id as usize) % NBUF]) as *const u8).add(VNET_HDR);
+                    let fr = rx_bytes(&elem);
                     arp_answer(fr, &our_ip);
                     if let Some(s) = parse_tcp(fr) {
                         if s.dport == sport && s.sport == dst_port && s.src == *dst {
@@ -4808,5 +4691,353 @@ pub fn virtio_entropy(buf: &mut [u8]) -> usize {
             buf[i] = *src.add(i);
         }
         got
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dira M1b: the PC on a real network (DIRA_M1B_PLAN.md; architect's verdict, ARCHITECT_REVIEWS 14 Nov "Dira M1b").
+// All of it is PC-only and sits here at the end of the file, so the ARM image's lines do not move. It reuses the
+// field report's way of reaching a real network (the lease, the next hop, ARP, NET_ROUTE) for any kernel caller,
+// asks the stop hook (`set_net_abort`) in every wait, and asks DNS from the leased address with a random id and
+// port, believing only the answer that passes pc/dnscheck.rs.
+// ---------------------------------------------------------------------------
+
+/// The fix-ups a TCP frame gets on the PC before it is sent: MSS 1460 on a SYN, then the route's source address.
+#[cfg(feature = "pc")]
+fn pc_send_fixups(frame: &mut [u8], len: usize, flags: u8, route: Option<([u8; 4], [u8; 6])>) -> usize {
+    let len = if flags == 0x02 { add_mss(frame, len) } else { len };
+    if let Some((sip, _)) = route {
+        set_src_ip(&mut frame[..len], &sip);
+    }
+    len
+}
+
+/// The SYN carries MSS 1460: without it a server may send only RFC 879's default 536 bytes a segment, each one
+/// ACKed. Appends the 4-byte option to a SYN built with no options (TX_BUF has room), fixes the lengths and both
+/// checksums, and returns the new length.
+#[cfg(feature = "pc")]
+fn add_mss(frame: &mut [u8], len: usize) -> usize {
+    if len != TCP_FRAME_MIN || frame.len() < len + 4 || frame[46] != 0x50 {
+        return len;
+    }
+    frame[len..len + 4].copy_from_slice(&[2, 4, (1460u16 >> 8) as u8, 1460u16 as u8]);
+    frame[46] = 0x60; // data offset: 6 words
+    let total = (20 + 24) as u16;
+    frame[16] = (total >> 8) as u8;
+    frame[17] = total as u8;
+    let src = [frame[26], frame[27], frame[28], frame[29]];
+    set_src_ip(&mut frame[..len + 4], &src); // recomputes both checksums for the new length
+    len + 4
+}
+
+/// Why `route_open` could not open a route.
+#[cfg(feature = "pc")]
+pub enum RouteErr {
+    NoCard,
+    NoLease,
+    NoRoute,
+    NoArp([u8; 4]),
+    /// another caller's route is open (one at a time)
+    Busy,
+    /// the caller asked to stop (`set_net_abort`)
+    Stopped,
+}
+
+/// An open route; dropping it closes the route and gives back the QEMU gateway state it borrowed.
+#[cfg(feature = "pc")]
+pub struct RouteHold {
+    gw_was: bool,
+    pub our_ip: [u8; 4],
+    pub hop: [u8; 4],
+}
+
+#[cfg(feature = "pc")]
+impl Drop for RouteHold {
+    fn drop(&mut self) {
+        // SAFETY: plain stores to statics only kernel-context network code uses.
+        unsafe {
+            write_volatile(addr_of_mut!(NET_ROUTE), None);
+            GW_KNOWN = self.gw_was;
+        }
+    }
+}
+
+/// Open the route to `dst_ip` on a real network for any kernel caller (Dira M1b), the field report's way: our
+/// leased address (a DHCP exchange if there is none yet), the destination itself when it is on our subnet, else the
+/// router, and that next hop's MAC by ARP. Until the hold drops, every TCP segment goes from the leased address to
+/// that MAC. One route at a time: a second caller is refused (Busy), never overwrites the first. `who` prefixes the
+/// line, `receiver` names an on-link destination ("server", "name server").
+///
+/// The TCP waits ask `GW_KNOWN` (QEMU's gateway) before they start; on a real network there is no such gateway, and
+/// the route's MAC is used instead, so the hold marks it known and gives the old value back when it drops.
+#[cfg(feature = "pc")]
+pub fn route_open(dst_ip: [u8; 4], who: &str, receiver: &str) -> Result<RouteHold, RouteErr> {
+    if !net_present() {
+        return Err(RouteErr::NoCard);
+    }
+    // SAFETY: exclusive kernel-context access to the device + rings/buffers and the network statics.
+    unsafe {
+        if read_volatile(addr_of!(NET_ROUTE)).is_some() {
+            return Err(RouteErr::Busy);
+        }
+        if !DHCP_HAVE {
+            rx_reclaim();
+            if !dhcp_stoppable() {
+                return Err(if net_abort() { RouteErr::Stopped } else { RouteErr::NoLease });
+            }
+        }
+        let (our_ip, mask, gw) = (DHCP_IP, DHCP_MASK, DHCP_GW);
+        let back = rx_reclaim();
+        if back > 0 {
+            crate::kprintln!("{} {} unread network buffer(s) handed back to the card", who, back);
+        }
+        let on_link = (0..4).all(|i| dst_ip[i] & mask[i] == our_ip[i] & mask[i]);
+        let hop = if on_link { dst_ip } else { gw };
+        if hop == [0; 4] {
+            return Err(RouteErr::NoRoute);
+        }
+        let mac = match arp_resolve_stoppable(&hop, &our_ip) {
+            Some(m) => m,
+            None if net_abort() => return Err(RouteErr::Stopped),
+            None => return Err(RouteErr::NoArp(hop)),
+        };
+        crate::kprintln!(
+            "{} from {}.{}.{}.{}, {} {}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            who,
+            our_ip[0], our_ip[1], our_ip[2], our_ip[3],
+            if on_link { receiver } else { "router" },
+            hop[0], hop[1], hop[2], hop[3], mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        );
+        write_volatile(addr_of_mut!(NET_ROUTE), Some((our_ip, mac)));
+        let gw_was = GW_KNOWN;
+        GW_KNOWN = true;
+        Ok(RouteHold { gw_was, our_ip, hop })
+    }
+}
+
+/// `arp_resolve` that also asks the stop hook while it waits (the report's own stays as it was).
+#[cfg(feature = "pc")]
+unsafe fn arp_resolve_stoppable(target: &[u8; 4], our_ip: &[u8; 4]) -> Option<[u8; 6]> {
+    for _ in 0..3 {
+        let mut cur = read_volatile(addr_of!(NET_RX_USED.idx));
+        let f = arp_frame(1, our_ip, &[0; 6], target);
+        tx_raw(&f);
+        let end = tcp_rto_deadline(1000);
+        let mut spins = 0u32;
+        loop {
+            if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+                let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
+                let elem = read_volatile(uring.add((cur as usize) % QSZ));
+                cur = cur.wrapping_add(1);
+                RX_RAW_COUNT += 1;
+                let _slot = RxSlot(elem.id);
+                let fr = rx_bytes(&elem);
+                if let Some(a) = crate::netparse::arp(fr) {
+                    if a.op == 2 && a.spa == *target {
+                        RX_COUNT += 1;
+                        return Some(a.sha);
+                    }
+                    arp_answer(fr, our_ip);
+                }
+                continue;
+            }
+            if end == 0 || crate::timer::cycles() >= end {
+                break;
+            }
+            spins = spins.wrapping_add(1);
+            if spins & 0xFF == 0 && net_abort() {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+    }
+    None
+}
+
+/// `net_dhcp` that asks the stop hook while it waits for the OFFER and the ACK (`net_dhcp` itself is shared with the
+/// ARM kernel and stays as it was). The same messages, xid and lines.
+#[cfg(feature = "pc")]
+unsafe fn dhcp_stoppable() -> bool {
+    let base = NET_BASE;
+    let base_rx = read_volatile(addr_of!(NET_RX_USED.idx));
+    send_dhcp(base, 1, None, None); // DISCOVER
+    crate::kprintln!("[net] DHCP DISCOVER sent (broadcast, xid {:#010x})", DHCP_XID);
+    if !recv_dhcp_stoppable(base_rx, 2) {
+        crate::kprintln!("[net] DHCP: no OFFER within timeout");
+        return false;
+    }
+    let (offered, server) = (DHCP_IP, DHCP_SRV);
+    crate::kprintln!(
+        "[net] DHCP OFFER: {}.{}.{}.{} (server {}.{}.{}.{})",
+        offered[0], offered[1], offered[2], offered[3], server[0], server[1], server[2], server[3]
+    );
+    let base_rx2 = read_volatile(addr_of!(NET_RX_USED.idx));
+    send_dhcp(base, 3, Some(offered), Some(server)); // REQUEST
+    crate::kprintln!("[net] DHCP REQUEST sent (requesting {}.{}.{}.{})", offered[0], offered[1], offered[2], offered[3]);
+    if !recv_dhcp_stoppable(base_rx2, 5) {
+        crate::kprintln!("[net] DHCP: no ACK within timeout");
+        return false;
+    }
+    DHCP_HAVE = true;
+    crate::kprintln!(
+        "[net] DHCP: IP {}.{}.{}.{}, mask {}.{}.{}.{}, gw {}.{}.{}.{}, dns {}.{}.{}.{}",
+        DHCP_IP[0], DHCP_IP[1], DHCP_IP[2], DHCP_IP[3],
+        DHCP_MASK[0], DHCP_MASK[1], DHCP_MASK[2], DHCP_MASK[3],
+        DHCP_GW[0], DHCP_GW[1], DHCP_GW[2], DHCP_GW[3],
+        DHCP_DNS[0], DHCP_DNS[1], DHCP_DNS[2], DHCP_DNS[3]
+    );
+    true
+}
+
+#[cfg(feature = "pc")]
+unsafe fn recv_dhcp_stoppable(base_rx: u16, want_type: u8) -> bool {
+    let mut cur = base_rx;
+    let mut spins = 0u64;
+    loop {
+        if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+            let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
+            let elem = read_volatile(uring.add((cur as usize) % QSZ));
+            cur = cur.wrapping_add(1);
+            RX_RAW_COUNT += 1;
+            spins = 0;
+            let _slot = RxSlot(elem.id);
+            let fr = rx_bytes(&elem);
+            if crate::netparse::udp(fr).map_or(false, |u| u.dport == 68) && parse_dhcp(fr) == want_type {
+                RX_COUNT += 1;
+                return true;
+            }
+        }
+        spins += 1;
+        if spins & 0xFF == 0 && net_abort() {
+            return false;
+        }
+        if spins > 60_000_000 {
+            return false;
+        }
+    }
+}
+
+/// The name server the lease named (`dhcp_dns`), asked through an open route (Dira M1b, the must-fix): a random id
+/// and a random source port from 49152, and an answer believed only if it passes `dnscheck::check`. Two tries of
+/// 2 s. Every dropped answer is counted and the count is printed. `None`: no route, a bad name, no answer, a stop.
+#[cfg(feature = "pc")]
+pub fn dns_resolve_routed(name: &str) -> Option<[u8; 4]> {
+    use crate::dnscheck::{self, Verdict};
+    // SAFETY: exclusive kernel-context access to the device + rings/buffers.
+    unsafe {
+        let (our_ip, mac) = read_volatile(addr_of!(NET_ROUTE))?;
+        let server = DHCP_DNS;
+        let mut q = [0u8; 260];
+        let qlen = match dnscheck::question(name, &mut q) {
+            Some(l) => l,
+            None => {
+                crate::kprintln!("[net] dns: '{}' is not a name this stack can ask about", name);
+                return None;
+            }
+        };
+        let id = crate::rng::next_u32() as u16;
+        let port = dnscheck::PORT_LO + (crate::rng::next_u32() % 16384) as u16;
+        let mut msg = [0u8; dnscheck::QUERY_MAX];
+        let mlen = dnscheck::query(id, &q[..qlen], &mut msg);
+        // Ethernet (to the next hop), IPv4 (leased address to the name server), UDP (our port to 53)
+        let mut fr = [0u8; 14 + 20 + 8 + dnscheck::QUERY_MAX];
+        fr[..6].copy_from_slice(&mac);
+        fr[6..12].copy_from_slice(&read_volatile(addr_of!(NET_MAC)));
+        fr[12] = 0x08;
+        let total = 20 + 8 + mlen;
+        fr[14] = 0x45;
+        fr[16] = (total >> 8) as u8;
+        fr[17] = total as u8;
+        fr[22] = 64;
+        fr[23] = 17;
+        fr[26..30].copy_from_slice(&our_ip);
+        fr[30..34].copy_from_slice(&server);
+        let ipck = inet_checksum(&fr[14..34]);
+        fr[24] = (ipck >> 8) as u8;
+        fr[25] = ipck as u8;
+        fr[34] = (port >> 8) as u8;
+        fr[35] = port as u8;
+        fr[36] = 0;
+        fr[37] = 53;
+        fr[38] = ((8 + mlen) >> 8) as u8;
+        fr[39] = (8 + mlen) as u8; // UDP checksum 0: allowed on IPv4
+        fr[42..42 + mlen].copy_from_slice(&msg[..mlen]);
+        let flen = 42 + mlen;
+        let mut dropped = 0u32;
+        let mut answer = None;
+        'tries: for _ in 0..2 {
+            let mut cur = read_volatile(addr_of!(NET_RX_USED.idx));
+            tx_raw(&fr[..flen]);
+            crate::kprintln!(
+                "[net] dns query {} -> {}.{}.{}.{}:53 (UDP) from {}.{}.{}.{}",
+                name, server[0], server[1], server[2], server[3], our_ip[0], our_ip[1], our_ip[2], our_ip[3]
+            );
+            let end = tcp_rto_deadline(2000);
+            let mut spins = 0u32;
+            loop {
+                if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+                    let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
+                    let elem = read_volatile(uring.add((cur as usize) % QSZ));
+                    cur = cur.wrapping_add(1);
+                    RX_RAW_COUNT += 1;
+                    let _slot = RxSlot(elem.id);
+                    let rf = rx_bytes(&elem);
+                    arp_answer(rf, &our_ip);
+                    match dnscheck::check(rf, server, port, id, &q[..qlen]) {
+                        Verdict::Answer(a) => {
+                            RX_COUNT += 1;
+                            answer = Some(a);
+                            break 'tries;
+                        }
+                        Verdict::Dropped => dropped += 1,
+                        Verdict::Other => {}
+                    }
+                    continue;
+                }
+                if end == 0 || crate::timer::cycles() >= end {
+                    break;
+                }
+                spins = spins.wrapping_add(1);
+                if spins & 0xFF == 0 && net_abort() {
+                    crate::kprintln!("[net] dns: stopped by the caller");
+                    break 'tries;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        if dropped > 0 {
+            crate::kprintln!("[net] dns: {} answers dropped (wrong id, port, source or question)", dropped);
+        }
+        match answer {
+            Some(Some(ip)) => {
+                crate::kprintln!("[net] DNS A {}.{}.{}.{} for {}", ip[0], ip[1], ip[2], ip[3], name);
+                Some(ip)
+            }
+            Some(None) => {
+                crate::kprintln!("[net] dns: the answer for {} has no A record", name);
+                None
+            }
+            None => {
+                crate::kprintln!("[net] dns: no answer for {} from the name server", name);
+                None
+            }
+        }
+    }
+}
+
+/// Make sure there is a lease (a DHCP exchange that the stop hook can end), for a caller that needs the name server
+/// before it opens a route (Dira's DNS). True with a lease.
+#[cfg(feature = "pc")]
+pub fn lease_stoppable() -> bool {
+    if !net_present() {
+        return false;
+    }
+    // SAFETY: exclusive kernel-context access to the device + rings/buffers.
+    unsafe {
+        if !DHCP_HAVE {
+            rx_reclaim();
+            return dhcp_stoppable();
+        }
+        true
     }
 }

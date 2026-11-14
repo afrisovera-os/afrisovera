@@ -92,6 +92,14 @@ fn has_word(line: &[u8], word: &[u8]) -> bool {
 fn line_done(s: &mut State) {
     let n = s.llen.min(s.line.len());
     let text = core::str::from_utf8(&s.line[..n]).unwrap_or("");
+    // the shared list says how the ARM kernel does these (PSCI); on the PC (14 Nov 2026)
+    let text = if text.trim_start().starts_with("reboot ") && text.contains("PSCI") {
+        "  reboot, restart  save the files, then restart the PC (the firmware, then ACPI, then the chipset)"
+    } else if text.trim_start().starts_with("poweroff ") && text.contains("PSCI") {
+        "  poweroff, shutdown  save the files, then switch the PC off (the firmware, then ACPI S5)"
+    } else {
+        text
+    };
     let title = !s.titled && text.trim() == "commands:";
     if title {
         s.titled = true;
@@ -100,7 +108,7 @@ fn line_done(s: &mut State) {
     }
     let show = match s.mode {
         Mode::Off | Mode::All => true,
-        Mode::Word => title || has_word(&s.line[..n], &s.word[..s.wlen]),
+        Mode::Word => title || has_word(text.as_bytes(), &s.word[..s.wlen]),
         Mode::Page(p) => title || (p >= 1 && s.lines > (p - 1) * PER && s.lines <= p * PER),
     };
     if show {

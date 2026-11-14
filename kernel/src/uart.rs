@@ -321,7 +321,11 @@ pub fn getc() -> Option<u8> {
 /// (the IRQ path itself never prints, so there is no re-entrancy/deadlock).
 pub fn _print(args: core::fmt::Arguments) {
     let prev = console_lock();
-    let _ = Tee.write_fmt(args);
+    if crate::shell::capturing() {
+        crate::shell::capture(args); // `more <cmd>`, `<cmd> | more`, `<cmd> > file` (afriui.md section 28)
+    } else {
+        let _ = Tee.write_fmt(args);
+    }
     console_unlock(prev);
 }
 

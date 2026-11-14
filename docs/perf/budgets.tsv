@@ -1,0 +1,36 @@
+# Performance budgets (suites perf and pc-perf, scripts/perf-bench.py). 13 Nov 2026, first version.
+# arch<TAB>metric (a glob is allowed)<TAB>limit (- = none)<TAB>tolerance % against docs/perf/baseline.tsv (- = not compared)<TAB>required (yes|no)<TAB>note
+# Metrics ending _mibs, _kibs_host or _bytes are better when higher: their limit is a floor. All others are ceilings.
+# The limits are the owner-facing promises; the tolerances catch a slowdown the day it lands.
+*	boot.kernel_ms	-	15	yes	kernel clock at the prompt, 1 GHz instruction clock
+pc	boot.kernel_ms	3000	15	yes	PC: under 3 s of kernel time to the shell (5.59 s on master, 2.58 s after the AHCI fix); next target 1.5 s
+arm	boot.kernel_ms	2000	15	yes	phone/board: under 2 s
+*	mem.idle_total_kib	-	10	yes	image + frames in use at the idle prompt
+pc	mem.idle_total_kib	262144	10	yes	PC: the whole OS idles in 256 MiB or less (6% of a 4 GB laptop)
+arm	mem.idle_total_kib	65536	10	yes	phone/board: 64 MiB or less
+*	mem.idle_heap_kib	-	20	yes
+*	mem.idle_frames_kib	-	20	yes
+*	mem.heap_arena_kib	-	10	no
+*	mem.apps3_peak_heap_kib	3072	25	no	3 small apps with a window each: 1 MiB of kernel heap per app at most
+*	mem.apps3_left_kib	-	25	no	what 3 finished apps leave behind (first run)
+pc	mem.apps_rerun_growth_kib	0	-	no	the same 3 apps again leave nothing more (PC leak fixed 13 Nov)
+*	mem.apps_rerun_growth_kib	-	0	no	ARM: 72 KiB per 3-app run today (kernel stacks, process.rs, shared ARM file); target 0, never more
+*	image.total	-	5	yes	kernel RAM: code + data + zeroed data
+*	image.text	-	5	no
+*	image.rodata	-	10	no
+*	image.data	-	-	no	a few KiB: too small to grade by percent, tracked only
+*	image.bss	-	5	no
+*	cpu.sha256_us	-	10	yes
+*	cpu.sha256_mibs	-	10	no
+arm	draw.desk.touch-*.full_us	-	15	no	ARM touch mode, the phone's own: at most 115% of the kept frame (architect, step 2 verdict 14 Nov)
+arm-rel	draw.desk.touch-*.full_us	-	15	no	the same on the release build
+*	draw.desk.touch-*	-	-	no	touch mode partial frames, and the PC's touch layout: tracked only
+*	draw.desk.pointer-*	-	-	no	pointer mode (a Pi 4 with a mouse): tracked only, so a later step cannot add to it quietly
+*	draw.desk.title_worst20_us	-	-	no	the title's worst of 20: tracked
+*	draw.desk.copy*	-	-	no	copy to the screen: depends on how many rows changed last, tracked only
+*	draw.desk.motion*	-	-	no	depends on whether a motion frame ran, tracked only
+*	draw.*	-	25	no	drawing timers; small numbers jump, hence 25%
+*	timer.sleep50_over_ms	20	-	no	sleep 50 ms: at most 20 ms late
+*	net.sink_kibs_host	-	-	no	host clock: varies with the runner (31 MB to 12 MB seen), tracked only
+*	net.sink_bytes	-	-	no	host clock: varies with the runner (31 MB to 12 MB seen), tracked only
+*	boot.host_s	-	-	no	the runner's speed, informational only

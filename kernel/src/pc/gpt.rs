@@ -234,8 +234,15 @@ fn show(rd: &mut dyn FnMut(u64, &mut [u8; 512]) -> bool, cap512: u64, bs: u64, w
         }
         return None;
     };
+    if !in_disk(&h, blocks, per) {
+        crate::kprintln!("  gpt: the header's usable area or entry array lies outside the disk: not trusted");
+        if want > 0 {
+            crate::kprintln!("  plan: none; a damaged table is never changed");
+        }
+        return None;
+    }
     let alt = u64le(&h, 32);
-    let bh = if alt < blocks { header(rd, alt, per) } else { None };
+    let bh = if alt < blocks { header(rd, alt, per).filter(|b| in_disk(b, blocks, per)) } else { None };
     let backup = bh.is_some();
     let (first, last) = (u64le(&h, 40), u64le(&h, 48));
     let (elba, n_ent, esz) = (u64le(&h, 72), u32le(&h, 80) as u64, u32le(&h, 84) as u64);
@@ -248,6 +255,7 @@ fn show(rd: &mut dyn FnMut(u64, &mut [u8; 512]) -> bool, cap512: u64, bs: u64, w
     let mut used: [(u64, u64); 128] = [(0, 0); 128];
     let mut nu = 0usize;
     let mut free_slot = 0usize; // the first empty entry, 1-based (0: none)
+    let mut outside = false; // an entry that ends before it starts, or lies outside first..=last
     let per_sector = 512 / esz;
     let sectors = (n_ent * esz).div_ceil(512);
     let mut idx = 0u64;
@@ -289,7 +297,9 @@ fn show(rd: &mut dyn FnMut(u64, &mut [u8; 512]) -> bool, cap512: u64, bs: u64, w
                 mib(b.saturating_sub(a) + 1, bs),
                 core::str::from_utf8(&name[..nl]).unwrap_or("?")
             );
-            if nu < used.len() {
+            if a > b || a < first || b > last {
+                outside = true; // listed, but never counted as used space: the table is damaged
+            } else if nu < used.len() {
                 used[nu] = (a, b);
                 nu += 1;
             }
@@ -347,11 +357,14 @@ fn show(rd: &mut dyn FnMut(u64, &mut [u8; 512]) -> bool, cap512: u64, bs: u64, w
     if overlap {
         crate::kprintln!("  WARNING: partitions overlap; this table is not safe to change");
     }
+    if outside {
+        crate::kprintln!("  WARNING: a partition ends before it starts or lies outside the usable area; this table is not safe to change");
+    }
     if !backup || !entries_ok {
         crate::kprintln!("  WARNING: this GPT is damaged; not safe to change");
     }
     if want > 0 {
-        if overlap || !backup || !entries_ok {
+        if overlap || outside || !backup || !entries_ok {
             crate::kprintln!("  plan: none; a damaged table is never changed");
         } else if free_slot == 0 {
             crate::kprintln!("  plan: none; all {} GPT entries are in use", n_ent);
@@ -404,6 +417,20 @@ fn mbr_plan(mbr: &[(u8, u64, u64); 4], blocks: u64, bs: u64, want: u64) {
 }
 
 /// The GPT header in block `lba`, if its signature and CRC are right.
+/// A GPT header's numbers lie on this disk of `blocks` blocks (security finding of 13 Nov 2026, fuzz target
+/// disk_image): the usable area first..=last inside the disk, and the entry array (n_ent x esz bytes from block
+/// elba) too. A table that passes keeps every block number, gap and sum of gaps below the disk's size, so nothing
+/// computed from it can overflow; one that fails is not trusted.
+pub(crate) fn in_disk(h: &[u8; 512], blocks: u64, per: u64) -> bool {
+    let (first, last, elba) = (u64le(h, 40), u64le(h, 48), u64le(h, 72));
+    let sectors = (u32le(h, 80) as u64 * u32le(h, 84) as u64).div_ceil(512);
+    let Some(end) = blocks.checked_mul(per) else { return false };
+    first <= last
+        && last < blocks
+        && elba >= 1
+        && elba.checked_mul(per).and_then(|x| x.checked_add(sectors)).is_some_and(|e| e <= end)
+}
+
 pub(crate) fn header(rd: &mut dyn FnMut(u64, &mut [u8; 512]) -> bool, lba: u64, per: u64) -> Option<[u8; 512]> {
     let mut h = [0u8; 512];
     if !rd(lba * per, &mut h) || &h[..8] != b"EFI PART" {
@@ -583,6 +610,9 @@ fn table_runs(dk: Disk, cap512: u64, bs: u64) -> Result<([(u64, u64); 5], usize,
     let Some(h) = header(&mut rd, 1, per) else {
         return Err("the GPT's primary header is damaged (a damaged table is never changed)");
     };
+    if !in_disk(&h, blocks, per) {
+        return Err("the GPT's header points outside the disk (a damaged table is never changed)");
+    }
     let (n_ent, esz) = (u32le(&h, 80) as u64, u32le(&h, 84) as u64);
     let ns = (n_ent * esz).div_ceil(512);
     runs[1] = (per, 1);
@@ -590,7 +620,7 @@ fn table_runs(dk: Disk, cap512: u64, bs: u64) -> Result<([(u64, u64); 5], usize,
     let mut nr = 3;
     let alt = u64le(&h, 32);
     if alt < blocks {
-        if let Some(b) = header(&mut rd, alt, per) {
+        if let Some(b) = header(&mut rd, alt, per).filter(|b| in_disk(b, blocks, per)) {
             runs[3] = (u64le(&b, 72) * per, ns);
             runs[4] = (alt * per, 1);
             nr = 5;
@@ -798,6 +828,17 @@ impl Disk {
         }
     }
 
+    /// The end of an install step that wrote this disk (12 Nov 2026, architect's follow-up to NVMe slice 1):
+    /// what the disk acknowledged is put on the medium, not left in its volatile write cache, before the
+    /// step says it is done. An NVMe Flush when the controller has a write cache; the other disks already
+    /// flush in their own write paths or have no cache step here yet. Once per step, not once per write.
+    pub(crate) fn settle(self) -> bool {
+        match self {
+            Disk::Nvme => crate::nvme::settle(),
+            _ => true,
+        }
+    }
+
     /// `data` (whole 512-byte sectors, at most RUN) from sector `n` on: one command and read back on
     /// a SATA disk (AHCI or IDE mode, the IDE one also one cache flush) or an NVMe disk (installdisk,
     /// bootcopy); other disks one sector at a time as `write`.
@@ -955,7 +996,7 @@ pub fn install(which: &str, want: u64, given: Option<&str>) {
     };
     // the backup copy first, then the primary: cut off half way, the firmware still finds a
     // whole, valid primary table (the old one) and repairs the other copy from it
-    let ok = dk.write(bsec, &s) && dk.write(p.alt * per, &bh) && dk.write(psec, &s) && dk.write(per, &ph);
+    let ok = dk.write(bsec, &s) && dk.write(p.alt * per, &bh) && dk.write(psec, &s) && dk.write(per, &ph) && dk.settle();
     // read everything back
     let mut rd = |k: u64, o: &mut [u8; 512]| dk.read(k, o);
     let back = ok
@@ -1117,6 +1158,7 @@ pub fn restore(which: &str, given: Option<&str>) {
             }
         }
     }
+    let ok = ok && dk.settle();
     if !ok || !matches!(compare(i, &ds[..nd]).1, Cmp::Same(_)) {
         crate::kprintln!("tablerestore: writing or reading back FAILED; the saved copy is still on the USB stick, so try again");
         return;
@@ -1150,7 +1192,7 @@ fn ours(dk: Disk, cap512: u64, bs: u64) -> Option<(u64, u64)> {
     }
     let h = header(&mut rd, 1, per)?;
     let alt = u64le(&h, 32);
-    if alt >= blocks {
+    if alt >= blocks || !in_disk(&h, blocks, per) {
         return None;
     }
     let b = header(&mut rd, alt, per)?;
@@ -1734,6 +1776,10 @@ pub fn install_disk(which: &str, given: Option<&str>) {
                 break;
             }
         }
+    }
+    if !dk.settle() {
+        crate::kprintln!("installdisk: the disk's cache Flush FAILED: what was written may not be on the disk yet");
+        return;
     }
     if found != Some((afri.0 * per, afri.1 * per)) || !fileok {
         crate::kprintln!("installdisk: reading back FAILED (table {}, boot file {})", if found.is_some() { "found" } else { "not found" }, if fileok { "ok" } else { "differs" });

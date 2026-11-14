@@ -17,20 +17,22 @@
 //! RTL8125 (2.5 GbE) moves the poll and interrupt registers and is not claimed.
 
 use crate::mmu;
+use crate::hwdb;
 use crate::pci;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 
-/// The parts this driver knows, by (vendor, device); wifi.rs names them too. The 8139 counts
-/// only from revision 0x20 (the C+ chip; older 8139s have no descriptor rings).
-pub(crate) const PARTS: &[(u16, u16, &str)] = &[
-    (0x10EC, 0x8139, "RTL8139C+ (8139cp)"),
-    (0x10EC, 0x8168, "RTL8111/8168 (r8169)"),
-    (0x10EC, 0x8161, "RTL8111/8168 (r8169)"),
-    (0x10EC, 0x8136, "RTL8101/8102/8103 (r8169)"),
-    (0x10EC, 0x8169, "RTL8169/8110 (r8169)"),
-    (0x10EC, 0x8167, "RTL8169SC/8110SC (r8169)"),
-    (0x1186, 0x4300, "D-Link DGE-528T, RTL8169 (r8169)"),
-    (0x1186, 0x4302, "D-Link DGE-530T, RTL8169 (r8169)"),
+/// The parts this driver knows (Asili v0 BINDS, pc/hwdb.rs): its probe decides from this table; wifi.rs and
+/// hwscan name them from it too. The 8139 counts only from revision 0x20 (the C+ chip; older 8139s have no
+/// descriptor rings).
+pub(crate) const BINDS: &[hwdb::Part] = &[
+    hwdb::pci_rev(0x10EC, 0x8139, 0x20, "RTL8139C+ (8139cp)"),
+    hwdb::pci(0x10EC, 0x8168, "RTL8111/8168 (r8169)"),
+    hwdb::pci(0x10EC, 0x8161, "RTL8111/8168 (r8169)"),
+    hwdb::pci(0x10EC, 0x8136, "RTL8101/8102/8103 (r8169)"),
+    hwdb::pci(0x10EC, 0x8169, "RTL8169/8110 (r8169)"),
+    hwdb::pci(0x10EC, 0x8167, "RTL8169SC/8110SC (r8169)"),
+    hwdb::pci(0x1186, 0x4300, "D-Link DGE-528T, RTL8169 (r8169)"),
+    hwdb::pci(0x1186, 0x4302, "D-Link DGE-530T, RTL8169 (r8169)"),
 ];
 
 // shared by the 8139C+ and the r8169 family
@@ -190,17 +192,13 @@ fn link() -> bool {
 /// Find a known Realtek NIC, reset it and bring up its RX and TX rings. True when ready.
 pub fn init() -> bool {
     let mut name = "";
-    let hit = |b, d, f, id: u32| {
-        let (v, dv) = ((id & 0xFFFF) as u16, (id >> 16) as u16);
-        match PARTS.iter().find(|p| p.0 == v && p.1 == dv) {
-            // an 8139 before the C+ (revision < 0x20) has no descriptor rings
-            Some(_) if dv == 0x8139 && pci::cfg_read32(b, d, f, 0x08) & 0xFF < 0x20 => false,
-            Some(&(_, _, n)) => {
-                name = n;
-                true
-            }
-            None => false,
+    // an 8139 before the C+ (revision < 0x20) has no descriptor rings: its BINDS entry starts at 0x20
+    let hit = |b, d, f, id: u32| match hwdb::pci_part(BINDS, b, d, f, id) {
+        Some(p) => {
+            name = p.name;
+            true
         }
+        None => false,
     };
     let Some((b, d, f)) = pci::find_by(8, hit) else { return false };
     let bar = mem_bar(b, d, f);
@@ -497,4 +495,10 @@ fn dma_line() {
 pub fn present() -> bool {
     // SAFETY: scalar read.
     unsafe { BAR != 0 }
+}
+
+/// The PCI function this driver took, for `hwscan`.
+pub fn at() -> Option<(u8, u8, u8)> {
+    // SAFETY: scalar reads of boot-time state.
+    unsafe { (BAR != 0).then_some(PCI_AT) }
 }

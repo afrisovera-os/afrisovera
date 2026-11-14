@@ -31,6 +31,9 @@ grade() { # grade <boot1 log> <boot2 log>
     hasA '^lsusb late0: an answer was left unread on endpoint 0; the next request passed \(descriptor of 18 bytes, type 1\), took its own answer, 1 late event\(s\) set aside: OK$' ||
         _f "lsusb late0: a late endpoint 0 answer was taken as a later request's, or the check did not run"
     hasA '^  control: [0-9]+ late endpoint 0 answer' && _f "a late endpoint 0 answer was seen before the test switch ran"
+    hasA '^lsusb stall0: a request the device refuses was refused \(completion code 6\); endpoint 0 was reset 1 time\(s\); the next request passed \(descriptor of 18 bytes, type 1\): OK$' ||
+        _f "lsusb stall0: endpoint 0 was left halted after a STALL, or the check did not run"
+    hasA '^  control: endpoint 0 reset [0-9]+ time' && _f "endpoint 0 was halted and reset before the test switch ran"
     hasA '^\[vfs\] synced [0-9]+ files to disk$' || _f "boot 1: the VFS never synced to the stick"
     hasB '^\[vfs\] VFS restored from disk: [0-9]+ files$' || _f "boot 2: the VFS was not restored from the stick"
     hasB '^HELLO-USB-STICK-5NOV$' || _f "boot 2: notes.txt did not come back from the stick"
@@ -49,6 +52,8 @@ afrisovera> lsusb late
 lsusb late: 2 answers were left unread; the next read of block 0 passed (same data), 2 late event(s) set aside, 0 recoveries: OK
 afrisovera> lsusb late0
 lsusb late0: an answer was left unread on endpoint 0; the next request passed (descriptor of 18 bytes, type 1), took its own answer, 1 late event(s) set aside: OK
+afrisovera> lsusb stall0
+lsusb stall0: a request the device refuses was refused (completion code 6); endpoint 0 was reset 1 time(s); the next request passed (descriptor of 18 bytes, type 1): OK
 afrisovera> write notes.txt HELLO-USB-STICK-5NOV
 [vfs] synced 18 files to disk"
 B2="[vfs] VFS restored from disk: 18 files
@@ -82,9 +87,12 @@ selftest() {
     arm late0-taken red "$(printf '%s\n' "$B1" | sed 's/^lsusb late0: .*/lsusb late0: an answer was left unread on endpoint 0; the next request passed (descriptor of 0 bytes, type 0), took ANOTHER request'"'"'s answer, 0 late event(s) set aside: WRONG/')" "$B2"
     arm no-late0-check red "$(printf '%s\n' "$B1" | grep -v '^lsusb late0')" "$B2"
     arm late0-at-boot red "$(printf '%s\n' "$B1" | sed 's/^  storage: slot.*/&\n  control: 1 late endpoint 0 answer(s) set aside, not taken as a later request'"'"'s/')" "$B2"
+    arm stall0-halted red "$(printf '%s\n' "$B1" | sed 's/^lsusb stall0: .*/lsusb stall0: a request the device refuses was refused (completion code 6); endpoint 0 was reset 0 time(s); the next request FAILED (descriptor of 0 bytes, type 0): WRONG/')" "$B2"
+    arm no-stall0-check red "$(printf '%s\n' "$B1" | grep -v '^lsusb stall0')" "$B2"
+    arm stall0-at-boot red "$(printf '%s\n' "$B1" | sed 's/^  storage: slot.*/&\n  control: endpoint 0 reset 1 time(s) after the controller halted it/')" "$B2"
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 16 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 19 ]
 }
 
 echo "== PC USBSTICK disk (PC track step 3) =="
@@ -118,8 +126,8 @@ boot() { # boot <serial port> <log> <shell commands...>
     kill "$q" 2> /dev/null
     wait "$q" 2> /dev/null
 }
-echo "  --- boot 1: lsusb, lsusb late, lsusb late0, write notes.txt, sync ---"
-boot 4824 "$W/boot1.log" "lsusb" "lsusb late" "lsusb late0" "write notes.txt HELLO-USB-STICK-5NOV" "sync"
+echo "  --- boot 1: lsusb, lsusb late, lsusb late0, lsusb stall0, write notes.txt, sync ---"
+boot 4824 "$W/boot1.log" "lsusb" "lsusb late" "lsusb late0" "lsusb stall0" "write notes.txt HELLO-USB-STICK-5NOV" "sync"
 echo "  --- boot 2: the same disk, cat notes.txt ---"
 boot 4826 "$W/boot2.log" "cat notes.txt"
 cat "$W/boot1.log" "$W/boot2.log" | tr -d '\r' | grep -aE 'USB storage|^  storage:|^  control:|^lsusb late|^\[vfs\]|HELLO' | sed 's/^/  | /'

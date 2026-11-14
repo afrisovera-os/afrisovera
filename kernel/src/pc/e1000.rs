@@ -15,53 +15,55 @@
 //! 7.2.2, 8.10; QEMU's `igb` is the 82576.
 
 use crate::mmu;
+use crate::hwdb;
 use crate::pci;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 
-/// The parts this driver knows, by PCI device id (vendor 0x8086); wifi.rs names them too.
-pub(crate) const PARTS: &[(u16, &str)] = &[
-    (0x100E, "82540EM (e1000)"),
-    (0x100F, "82545EM (e1000)"),
-    (0x10D3, "82574L (e1000e)"),
-    (0x10F5, "82567LM (e1000e)"),
-    (0x1502, "82579LM (e1000e)"),
-    (0x153A, "I217-LM (e1000e)"),
-    (0x15A3, "I218-V (e1000e)"),
+/// The parts this driver knows (Asili v0 BINDS, pc/hwdb.rs): its probe decides from this table; wifi.rs and
+/// hwscan name them from it too.
+pub(crate) const BINDS: &[hwdb::Part] = &[
+    hwdb::pci(0x8086, 0x100E, "82540EM (e1000)"),
+    hwdb::pci(0x8086, 0x100F, "82545EM (e1000)"),
+    hwdb::pci(0x8086, 0x10D3, "82574L (e1000e)"),
+    hwdb::pci(0x8086, 0x10F5, "82567LM (e1000e)"),
+    hwdb::pci(0x8086, 0x1502, "82579LM (e1000e)"),
+    hwdb::pci(0x8086, 0x153A, "I217-LM (e1000e)"),
+    hwdb::pci(0x8086, 0x15A3, "I218-V (e1000e)"),
     // I219 (2015 onwards: most Intel laptops and desktops); LM and V variants by chipset
-    (0x156F, "I219-LM (e1000e)"),
-    (0x1570, "I219-V (e1000e)"),
-    (0x15B7, "I219-LM (e1000e)"),
-    (0x15B8, "I219-V (e1000e)"),
-    (0x15BB, "I219-LM (e1000e)"),
-    (0x15BC, "I219-V (e1000e)"),
-    (0x15BD, "I219-LM (e1000e)"),
-    (0x15BE, "I219-V (e1000e)"),
-    (0x15D7, "I219-LM (e1000e)"),
-    (0x15D8, "I219-V (e1000e)"),
-    (0x15E3, "I219-LM (e1000e)"),
-    (0x15D6, "I219-V (e1000e)"),
-    (0x0D4E, "I219-LM (e1000e)"),
-    (0x0D4F, "I219-V (e1000e)"),
-    (0x0D4C, "I219-LM (e1000e)"),
-    (0x0D4D, "I219-V (e1000e)"),
-    (0x0D53, "I219-LM (e1000e)"),
-    (0x0D55, "I219-V (e1000e)"),
-    (0x15FB, "I219-LM (e1000e)"),
-    (0x15FC, "I219-V (e1000e)"),
+    hwdb::pci(0x8086, 0x156F, "I219-LM (e1000e)"),
+    hwdb::pci(0x8086, 0x1570, "I219-V (e1000e)"),
+    hwdb::pci(0x8086, 0x15B7, "I219-LM (e1000e)"),
+    hwdb::pci(0x8086, 0x15B8, "I219-V (e1000e)"),
+    hwdb::pci(0x8086, 0x15BB, "I219-LM (e1000e)"),
+    hwdb::pci(0x8086, 0x15BC, "I219-V (e1000e)"),
+    hwdb::pci(0x8086, 0x15BD, "I219-LM (e1000e)"),
+    hwdb::pci(0x8086, 0x15BE, "I219-V (e1000e)"),
+    hwdb::pci(0x8086, 0x15D7, "I219-LM (e1000e)"),
+    hwdb::pci(0x8086, 0x15D8, "I219-V (e1000e)"),
+    hwdb::pci(0x8086, 0x15E3, "I219-LM (e1000e)"),
+    hwdb::pci(0x8086, 0x15D6, "I219-V (e1000e)"),
+    hwdb::pci(0x8086, 0x0D4E, "I219-LM (e1000e)"),
+    hwdb::pci(0x8086, 0x0D4F, "I219-V (e1000e)"),
+    hwdb::pci(0x8086, 0x0D4C, "I219-LM (e1000e)"),
+    hwdb::pci(0x8086, 0x0D4D, "I219-V (e1000e)"),
+    hwdb::pci(0x8086, 0x0D53, "I219-LM (e1000e)"),
+    hwdb::pci(0x8086, 0x0D55, "I219-V (e1000e)"),
+    hwdb::pci(0x8086, 0x15FB, "I219-LM (e1000e)"),
+    hwdb::pci(0x8086, 0x15FC, "I219-V (e1000e)"),
     // the igb/igc family: advanced descriptors, rings at 0xC000/0xE000 (see the top of the file)
-    (0x10C9, "82576 (igb)"),
-    (0x150E, "82580 (igb)"),
-    (0x1521, "I350 (igb)"),
-    (0x1533, "I210 (igb)"),
-    (0x1536, "I210 (igb)"),
-    (0x157B, "I210 (igb)"),
-    (0x1539, "I211 (igb)"),
-    (0x15F2, "I225-LM (igc)"),
-    (0x15F3, "I225-V (igc)"),
-    (0x15F8, "I225-I (igc)"),
-    (0x125B, "I226-LM (igc)"),
-    (0x125C, "I226-V (igc)"),
-    (0x125D, "I226-IT (igc)"),
+    hwdb::pci(0x8086, 0x10C9, "82576 (igb)"),
+    hwdb::pci(0x8086, 0x150E, "82580 (igb)"),
+    hwdb::pci(0x8086, 0x1521, "I350 (igb)"),
+    hwdb::pci(0x8086, 0x1533, "I210 (igb)"),
+    hwdb::pci(0x8086, 0x1536, "I210 (igb)"),
+    hwdb::pci(0x8086, 0x157B, "I210 (igb)"),
+    hwdb::pci(0x8086, 0x1539, "I211 (igb)"),
+    hwdb::pci(0x8086, 0x15F2, "I225-LM (igc)"),
+    hwdb::pci(0x8086, 0x15F3, "I225-V (igc)"),
+    hwdb::pci(0x8086, 0x15F8, "I225-I (igc)"),
+    hwdb::pci(0x8086, 0x125B, "I226-LM (igc)"),
+    hwdb::pci(0x8086, 0x125C, "I226-V (igc)"),
+    hwdb::pci(0x8086, 0x125D, "I226-IT (igc)"),
 ];
 
 /// True for a part of the igb/igc family (advanced descriptors, queue registers).
@@ -254,9 +256,9 @@ const TX_MS: u64 = 1_000;
 /// Find a known Intel NIC, reset it and bring up its RX and TX rings. True when ready.
 pub fn init() -> bool {
     let mut name = "";
-    let hit = |_, _, _, id: u32| match PARTS.iter().find(|p| id & 0xFFFF == 0x8086 && p.0 as u32 == id >> 16) {
-        Some(&(_, n)) => {
-            name = n;
+    let hit = |b, d, f, id: u32| match hwdb::pci_part(BINDS, b, d, f, id) {
+        Some(p) => {
+            name = p.name;
             true
         }
         None => false,
@@ -582,6 +584,12 @@ fn dma_line() {
     } else {
         crate::kprintln!("  memory: {} of {} rings and buffers outside their limits (first: {})", bad, total, first);
     }
+}
+
+/// The PCI function this driver took, for `hwscan`.
+pub fn at() -> Option<(u8, u8, u8)> {
+    // SAFETY: scalar reads of boot-time state.
+    unsafe { (BAR != 0).then_some(PCI_AT) }
 }
 
 /// True once init found and set up a NIC.

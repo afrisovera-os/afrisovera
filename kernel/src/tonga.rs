@@ -113,13 +113,27 @@ pub fn win_fill(id: usize, rx: usize, ry: usize, rw: usize, rh: usize, color: u3
         if id >= NWIN || !(*win(id)).used {
             return;
         }
+        // Fast at opt-level 0 (afriui.md section 21): clip once (saturating, so 64-bit sizes from pc/proc.rs stop at
+        // the edge), write the first row by doubling copies, then copy it into each row below (compiler_builtins'
+        // memcpy). An empty clip returns before anything is written. Same pixels as the old per-pixel loop.
         let wi = win(id);
-        let ww = (*wi).w;
-        let hh = (*wi).h;
-        for j in ry..(ry + rh).min(hh) {
-            for i in rx..(rx + rw).min(ww) {
-                (*wi).buf[j * CW + i] = color;
-            }
+        let x1 = rx.saturating_add(rw).min((*wi).w);
+        let y1 = ry.saturating_add(rh).min((*wi).h);
+        if rx >= x1 || ry >= y1 {
+            return;
+        }
+        let n = x1 - rx;
+        let buf = core::ptr::addr_of_mut!((*wi).buf) as *mut u32;
+        let row = buf.add(ry * CW + rx);
+        row.write(color);
+        let mut done = 1;
+        while done < n {
+            let k = done.min(n - done);
+            core::ptr::copy_nonoverlapping(row, row.add(done), k);
+            done += k;
+        }
+        for y in ry + 1..y1 {
+            core::ptr::copy_nonoverlapping(row, buf.add(y * CW + rx), n);
         }
     }
 }
@@ -136,8 +150,9 @@ pub fn win_text(id: usize, x: usize, y: usize, ch: u8, color: u32) {
         for (row, bits) in g.iter().enumerate() {
             for col in 0..8 {
                 if (bits >> (7 - col)) & 1 == 1 {
-                    let px = x + col;
-                    let py = y + row;
+                    // Saturating: pc/proc.rs passes 64-bit x and y (afriui.md section 21).
+                    let px = x.saturating_add(col);
+                    let py = y.saturating_add(row);
                     if px < (*wi).w && py < (*wi).h {
                         (*wi).buf[py * CW + px] = color;
                     }
@@ -186,7 +201,7 @@ fn present_text() {
         }
         fb::fill_rect(0, 0, W, BAR_H, BAR);
         fb::draw_string(10, 6, "AFRISOVERA OS", GOLD, 2);
-        fb::draw_string(W - 232, 10, "TONGA WM  --  APP SURFACES", DIM, 1);
+        fb::draw_string(W - 232, 10, "TONGA WM: APP SURFACES", DIM, 1); // afriui.md section 22
         core::ptr::copy_nonoverlapping(fb::pixels(), kept, W * BAR_H);
         BAR_KEPT = true;
     }
@@ -290,6 +305,34 @@ pub fn wm_time() {
     let id = win_create(0, CW, CH) as usize;
     // SAFETY: shell mainline; `id` is the slot just created.
     let zero = unsafe { (*win(id)).buf.iter().filter(|&&p| p == 0).count() };
+    // Fill time and clip check (afriui.md section 21).
+    wm_reset();
+    let fa = win_create(0, CW, CH) as usize;
+    let fs = win_create(0, 40, 20) as usize;
+    let (mut fbig, mut fsmall) = (u64::MAX, u64::MAX);
+    for k in 0..8u32 {
+        let t0 = crate::timer::cycles();
+        win_fill(fa, 0, 0, CW, CH, 0x0012_3400 + k);
+        fbig = fbig.min(us(t0));
+        let t0 = crate::timer::cycles();
+        win_fill(fs, 0, 0, 40, 20, 0x0012_3400 + k);
+        fsmall = fsmall.min(us(t0));
+    }
+    let (inside, rest1) = fill_check(200, 100, 100, 100);
+    let corner = SATURATING_CLIP.then(|| fill_check(230, 120, usize::MAX, usize::MAX));
+    let rest_ok = rest1 == 0 && corner.map_or(true, |(_, r)| r == 0);
+    // Empty clips write nothing (the architect's condition 1): a fill starting at the right edge, and one 0 wide.
+    let (e1, e2) = (fill_check(CW, 0, 10, 10), fill_check(10, 10, 0, 10));
+    let empty = e1.0 + e1.1 + e2.0 + e2.1;
+    // Text far outside the surface writes nothing and does not wrap (condition 2; run once the clip saturates).
+    let far = SATURATING_CLIP.then(|| {
+        wm_reset();
+        let id = win_create(0, CW, CH) as usize;
+        win_text(id, usize::MAX - 3, 5, b'A', WHITE);
+        win_text(id, 5, usize::MAX - 3, b'A', WHITE);
+        // SAFETY: shell mainline; `id` is the slot just created.
+        unsafe { (*win(id)).buf.iter().filter(|&&p| p != 0).count() }
+    });
     // Match check: two windows with known patterns, then a hash of the whole screen.
     wm_reset();
     let a = win_create(1, CW, CH) as usize;
@@ -316,4 +359,42 @@ pub fn wm_time() {
         CW, CH, big, small, present, wall, text, wins
     );
     crate::kprintln!("[fbwm] clear check: {} of {} pixels zero; screen hash {:016x}", zero, CW * CH, h);
+    let (mut cb, mut fb2) = ([0u8; 12], [0u8; 12]);
+    let (cn, cs) = match corner {
+        Some((c, _)) => (fmt_u32(c as u32, &mut cb), " of 100 corner"),
+        None => ("corner not run", ""),
+    };
+    let (fnn, fs2) = match far {
+        Some(n) => (fmt_u32(n as u32, &mut fb2), " from far text"),
+        None => ("far text not run", ""),
+    };
+    crate::kprintln!(
+        "[fbwm] win_fill {}x{}: fastest {} us; 40x20: fastest {} us; clip check: {} of 1200 inside, {}{}, {} from empty fills, {}{}, rest {}",
+        CW, CH, fbig, fsmall, inside, cn, cs, empty, fnn, fs2,
+        if rest_ok { "unchanged" } else { "CHANGED" }
+    );
+}
+
+/// The corner and far-text cases feed `usize::MAX`-sized values; only the saturating clip survives them, so the
+/// probe runs them once `win_fill` and `win_text` saturate (afriui.md section 21).
+const SATURATING_CLIP: bool = true;
+
+/// `fbcon wm`'s clip check: on a fresh 240x130 surface, fill (x, y, w, h) and count the pixels coloured inside
+/// [x, CW) x [y, CH) and the pixels changed outside it, over the whole CW*CH buffer (the architect's condition 3).
+fn fill_check(x: usize, y: usize, w: usize, h: usize) -> (usize, usize) {
+    const COL: u32 = 0x00FE_DCBA;
+    wm_reset();
+    let id = win_create(0, CW, CH) as usize;
+    win_fill(id, x, y, w, h, COL);
+    let (mut inside, mut changed) = (0, 0);
+    // SAFETY: shell mainline; `id` is the slot just created.
+    let buf = unsafe { &(*win(id)).buf };
+    for (p, &px) in buf.iter().enumerate() {
+        if p % CW >= x && p / CW >= y {
+            inside += (px == COL) as usize;
+        } else {
+            changed += (px != 0) as usize;
+        }
+    }
+    (inside, changed)
 }

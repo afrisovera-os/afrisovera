@@ -83,6 +83,8 @@ static mut RX_TAIL: usize = 0; // next free slot
 /// A byte typed on another keyboard (the USB one, xhci.rs) joins the console input ring as
 /// if COM1 had received it. Called with interrupts off (from the timer interrupt).
 pub fn inject(b: u8) {
+    // a key typed on the PC's own keyboard brings the desk's Terminal back to its bottom (afriui.md section 28)
+    crate::desk::term_bottom();
     // SAFETY: interrupts are off in the caller; `getc` takes the ring with them off.
     unsafe {
         put(b);
@@ -357,7 +359,9 @@ pub fn _print(args: core::fmt::Arguments) {
     while PRINT_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
         core::hint::spin_loop();
     }
-    if crate::helpview::on() {
+    if crate::shell::capturing() {
+        crate::shell::capture(args); // `more <cmd>`, `<cmd> | more`, `<cmd> > file` (afriui.md section 28)
+    } else if crate::helpview::on() && !crate::shell::paging() {
         crate::helpview::feed(args); // `help <word>` / `help <page>` (helpview.rs)
     } else {
         let _ = Tee.write_fmt(args);
@@ -387,6 +391,32 @@ pub fn tee_fmt(args: core::fmt::Arguments) {
     let _ = Tee.write_fmt(args);
 }
 
+/// The screen only: not COM1, not a USB serial cable, not the report's log (Bluetooth: remote devices' names,
+/// ARCHITECT_REVIEWS 14 Nov). Takes the print lock as `_print` does.
+pub fn screen_fmt(args: core::fmt::Arguments) {
+    struct Screen;
+    impl Write for Screen {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            crate::conback::live();
+            crate::conback::feed(s);
+            crate::framebuffer::console_write(s);
+            crate::screen::mark();
+            Ok(())
+        }
+    }
+    let flags: u64;
+    // SAFETY: save RFLAGS and mask interrupts on this core for the length of the print, as `_print`.
+    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags) };
+    while PRINT_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    let _ = Screen.write_fmt(args);
+    PRINT_LOCK.store(false, Ordering::Release);
+    if flags & 0x200 != 0 {
+        crate::cpu::sti();
+    }
+}
+
 /// COM1 only (not the screen): conback.rs's notes, with the print lock already held.
 pub fn com1_fmt(args: core::fmt::Arguments) {
     let _ = Com1.write_fmt(args);
@@ -395,6 +425,10 @@ pub fn com1_fmt(args: core::fmt::Arguments) {
 /// Shift+PgUp (`up`) / Shift+PgDn from the keyboards' polls (interrupts off): the console
 /// scrollback, under the print lock so the other core's prints wait (conback.rs).
 pub fn console_page(up: bool) {
+    if crate::desk::shown() {
+        crate::desk::term_page(up); // the desk's Terminal (afriui.md section 28)
+        return;
+    }
     while PRINT_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
         core::hint::spin_loop();
     }
@@ -404,6 +438,10 @@ pub fn console_page(up: bool) {
 
 /// Mouse-wheel notches (ps2.rs): scroll the console three lines a notch, under the print lock.
 pub fn console_wheel(notches: i32) {
+    if crate::desk::shown() {
+        crate::desk::term_wheel(notches); // the desk's Terminal, under the pointer (afriui.md section 28)
+        return;
+    }
     while PRINT_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
         core::hint::spin_loop();
     }

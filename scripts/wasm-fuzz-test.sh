@@ -77,4 +77,29 @@ verdict "overflow: type result count" "parse error: truncated type"
 verdict "overflow: export name length" "parse error: truncated export name"
 verdict "overflow: code body size" "parse error: truncated code body"
 verdict "local groups past the body's end" "TRAP: truncated code body"
+# A br_table label count the body cannot hold (claude/nia-brtable, fuzz finding 1): it froze the kernel
+# (bt1, bt3) or overflowed count + 1 (bt2); now each is a TRAP and the shell answers.
+verdict "br_table: count about 2^42" "TRAP: truncated br_table"
+verdict "br_table: 10-byte count in a block" "TRAP: truncated br_table"
+verdict "br_table: count about 2^42 in a block" "TRAP: truncated br_table"
+# Control frames (claude/nia-ctrl). A branch back to a typed loop carries no value; `else` only in an `if`
+# (fuzz finding 2: el1 froze the kernel, past the Ctrl+C poll). prints() is the case's print values, in order,
+# up to its verdict line.
+prints() {
+    local got
+    got=$(awk -v want="=== $1 ===" '
+        index($0, want) {f = 1; next}
+        f && /\[nia\] (TRAP|parse error|.run. returned cleanly)/ {exit}
+        f && match($0, /print\(-?[0-9]+\)/) {printf "%s ", substr($0, RSTART + 6, RLENGTH - 7)}' "$OUT")
+    [ "$got" = "$2 " ] || { echo "WASM-FUZZ TEST FAILED (case '$1' printed '$got', wanted '$2')"; exit 1; }
+}
+verdict "loop result: branch back, empty stack" "returned cleanly"
+prints "loop result: branch back, empty stack" "7"
+verdict "loop result: a value under the loop" "returned cleanly"
+prints "loop result: a value under the loop" "7 5"
+verdict "loop result: falls through its end" "returned cleanly"
+prints "loop result: falls through its end" "42"
+verdict "else in a loop (fuzzer input)" "TRAP: else outside an if"
+verdict "else in a loop" "TRAP: else outside an if"
+verdict "else in a block" "TRAP: else outside an if"
 echo "WASM-FUZZ TEST PASSED  (malformed modules rejected; no panic; shell still alive)"

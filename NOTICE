@@ -11,6 +11,12 @@ licensed separately under the GNU GPL v2; QEMU is not distributed with this
 repository. The UEFI firmware used by the PC tests (EDK II / OVMF) comes from
 the QEMU build and is licensed under the BSD-2-Clause-Patent licence.
 
+This repository also includes third-party code, fonts and data under their own
+licences: the Rust crates in vendor/, font outlines from Noto (SIL Open Font
+License 1.1) and Unicode data (Unicode License v3). THIRD_PARTY.md lists each
+one with its licence, and the licence texts are kept beside them (each crate's
+own licence files, fonts/OFL.txt, firmware/licences/).
+
 "AfriSovera", "Mansa", "Asili", "Nia", "Sankofa", "Daraja", "Tonga" and the
 AfriSovera logo are names and marks of the AfriSovera OS project. The Apache
 License does not grant permission to use them except as needed to describe the

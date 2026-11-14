@@ -9,7 +9,12 @@ sends one plain-text report from that PC to the owner's main PC over the home ne
 - **Owner-driven.** Nothing is sent unless the owner types `report`. Nothing runs at boot.
 - **One-way.** One TCP connection, to the address typed, port 7700 by default. Whatever the far
   end sends is never read as data or as a command (only its TCP acknowledgements count).
-- **No disk writes.** The report is built in memory (96 KiB) and sent.
+- **No disk writes, except `report save`.** The report is built in memory (96 KiB) and sent. `report save`
+  (below) is the one exception: a new file on the USB stick AfriSovera started from.
+- **No full MAC and no serial numbers.** Every MAC address in the report (the `from:` line, ifconfig, the
+  boot log) is cut to its maker half, `3c:52:82:--:--:--`, as hwscan does. No probe prints a serial number.
+- **The console tail is the owner's typing.** The latest 16 KiB can hold anything typed there; `report`'s
+  help says not to send or save it right after typing anything private.
 - **Receive-only receiver.** Python standard library. It writes the bytes to a `.txt` file and
   nothing else: no reply, no parsing, nothing run. Capped at 1 MiB; private-network senders only
   (unless `--any`). The file is named from the sender's IP address, not from the report's text.
@@ -22,7 +27,8 @@ Title line, `commit:` (stamped by `kernel/build.rs` from git, `unknown` without 
 `build:` (debug/release), `from:` (leased address, MAC, card), `to:`, `cores:`/`memory:`. Then the
 output of each read-only probe, each under `== <command> ==`: date, fwinfo, screeninfo, cpuinfo,
 acpiinfo, mem, uptime, ifconfig, devices (the Asili list), lsvirtio, lsusb, lsps2, lsnvme, lsahci,
-lse1000, lsrtl, lssd, lshda, wifi. Then the console lines that look like trouble (PANIC,
+lside, lse1000, lsrtl, lssd, lshda, wifi, hwscan, usbaddr and camera (the list only; `camera on` is refused
+while a report is being collected). Then the console lines that look like trouble (PANIC,
 EXCEPTION, FAIL, stuck, timed out ...), the boot log (the first 16 KiB printed since power-on), the
 latest 16 KiB of console, and an end line that counts the bytes before it, so a lost or doubled
 byte is visible on arrival.
@@ -47,12 +53,43 @@ below the edit in `virtio.rs` move, and a debug build records line numbers):
 It works on every card the PC kernel drives (Intel e1000/e1000e/igb, Realtek, USB Ethernet),
 because they all sit behind the same emulated virtio-net device.
 
+## `report save`: the same report onto the boot stick (14 Nov 2026)
+
+A laptop online through a phone's tethering sits on the phone's own small network, so the main PC is out of
+reach, and many laptops have no network socket. `report save` writes the report as a new file
+`\AFREPORT\<n>.TXT` on the USB stick AfriSovera started from; `tools/report-from-stick.bat` (the receiver's
+`--from-stick`) copies the reports to the main PC. The owner's page is docs/owner/REPORT_HOME.md. Rules
+(ARCHITECT_REVIEWS 13 Nov night):
+
+- **Only the USB stick it started from.** The firmware's device path for the boot device must hold a USB node
+  (uefi.rs `boot_medium`), and the stick the xHCI driver holds must hold this very boot file (size and first
+  64 KiB). An internal SATA, NVMe or eMMC disk is refused even when AfriSovera started from it.
+- **bootcopy's checks and order** (esp.rs, now written for any `SectW`: a disk or the stick): the FAT32 closed
+  cleanly and both FAT copies equal first; the file's clusters, then the first time `\AFREPORT`'s own cluster
+  ("." "..", the file's entry), each before its FAT entries in both copies; FSInfo; the entry that names the
+  new file or folder last. At least 1 MiB stays free.
+- **Names:** 8.3 upper case, `<n>.TXT` with n one more than the highest there; at most 64 files.
+- **Saved means on the stick:** flushed, the file read back and compared, the FATs equal and the clean bit
+  still set, before `SAVED`.
+- **The receiver's `--from-stick`** takes only `AFREPORT\<digits>.TXT` of at most 1 MiB, builds its own
+  output names, writes new files only, never changes the stick, refuses the system drive. `--out` refuses a
+  folder inside a git working tree unless git ignores it (`build/field-reports/` is ignored).
+- A FAT32 stick is never the VFS stick, so the xHCI driver's `msc_attached` (it answers sector reads and
+  writes) lets esp.rs reach it; the VFS still asks `msc_present`. This also lets the firmware files be read
+  from a real FAT32 stick, which `msc_present` had stopped.
+
 ## Tests
 
-`scripts/pc-report-test.sh` (suite `pc-report`): two QEMU boots, Intel 82574L and Realtek
-RTL8139C+, each against the real receiver. Usage text, a refused port, then a full report: the
+`scripts/pc-report-test.sh` (suite `pc-report`): three QEMU boots, Intel 82574L, Realtek
+RTL8139C+ and a USB Ethernet adapter (CDC-ECM), each against the real receiver, each with an NVMe disk whose
+serial and the card's full MAC must not appear in the report. Usage text, a refused port, then a full report: the
 guest's byte count, the receiver's and the file's must agree, the end line must count exactly,
-every section in order, the card named in its probe and boot log. Grader selftest: 20 arms.
+every section in order, the card named in its probe and boot log. Grader selftest: 25 arms.
+
+`scripts/pc-reportsave-test.sh` (suite `pc-reportsave`): five boots with a FAT32 stick image
+(scripts/lib/fat32img.py): two saves read back from the image (every other file unchanged, FATs equal, clean
+bit set, FSInfo right) and copied by `--from-stick`; refusals on a read-only stick, after starting from an
+internal disk, on a stick not closed cleanly, and at the 65th report. Plus the receiver's own selftest.
 
 ## Later
 

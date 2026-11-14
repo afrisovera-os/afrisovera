@@ -13,6 +13,8 @@ Paths (the file name the guest asks for):
   nolen.wasm    big.wasm with no Content-Length
   swap.wasm     v2.wasm's bytes (asked for with big.wasm's hash: a swapped valid module)
   re.wasm       big.wasm the first time, v2.wasm after (reinstall with new bytes)
+  permbad.wasm  v2.wasm with an afri.permissions section asking print and 'teleport' (unknown: refused)
+  permnet.wasm  netapp.wasm with an afri.permissions section asking print and net (claude/nia-perms)
   anything else 404
 """
 import hashlib
@@ -47,12 +49,21 @@ def module(imports, body):
     return b"\x00asm\x01\x00\x00\x00" + types + imp + funcs + exp + code
 
 
+def perms(names):
+    """An afri.permissions custom section (claude/nia-perms) naming these permissions."""
+    tag = b"afri.permissions"
+    return sec(0, uleb(len(tag)) + tag + uleb(len(names)) + b"".join(uleb(len(n)) + n for n in names))
+
+
 def make(d):
     big = open(os.path.join(d, "big.wasm"), "rb").read()  # made by mkvfs-big.py bigwasm
     files = {
         "v2.wasm": module([(b"print", 0)], b"\x41\xcd\x00\x10\x00\x0b"),                      # print(77)
         "netapp.wasm": module([(b"net", 2), (b"print", 0)], b"\x41\x00\x10\x00\x10\x01\x0b"),  # print(net(0))
         "notwasm.wasm": b"this is not a WebAssembly module, just some text\n",
+        "permbad.wasm": module([(b"print", 0)], b"\x41\xcd\x00\x10\x00\x0b") + perms([b"print", b"teleport"]),
+        "permnet.wasm": module([(b"net", 2), (b"print", 0)], b"\x41\x00\x10\x00\x10\x01\x0b")
+        + perms([b"print", b"net"]),
         "huge.wasm": b"\x00asm\x01\x00\x00\x00" + bytes(20000 - 8),
     }
     for n, b in files.items():
@@ -82,7 +93,8 @@ def serve(d, portfile):
 
         def do_GET(self):
             n = self.path.lstrip("/")
-            if n in ("big.wasm", "v2.wasm", "netapp.wasm", "notwasm.wasm", "huge.wasm"):
+            if n in ("big.wasm", "v2.wasm", "netapp.wasm", "notwasm.wasm", "huge.wasm", "permbad.wasm",
+                     "permnet.wasm"):
                 self.send(rd(n))
             elif n == "extra.wasm":
                 self.send(rd("big.wasm"), extra=b"X" * 300)

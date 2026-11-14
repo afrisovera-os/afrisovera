@@ -294,7 +294,37 @@ pub fn clear(rgb: u32) {
 /// write-combined frame is out of the CPU's buffers when it returns (`flush` comes here too).
 pub fn present() {
     present_now();
+    cam_overlay();
     crate::mmu::wc_fence();
+}
+
+/// The camera's picture box and its CAMERA ON mark (uvc.rs), drawn last, over the console, the desktop and the
+/// pointer, so nothing drawn before can cover the mark.
+fn cam_overlay() {
+    if !ON.load(Ordering::Relaxed) || !crate::uvc::mark_on() {
+        return;
+    }
+    // SAFETY: GOP was set once at attach; uvc::draw writes inside the mode the firmware reported.
+    unsafe {
+        let g = GOP;
+        crate::uvc::draw(g.base, g.w, g.h, g.stride, g.bgr);
+    }
+}
+
+/// A new camera picture (uvc::idle, mainline): the box and the mark now, without waiting for a redraw.
+pub fn cam_draw() {
+    cam_overlay();
+    crate::mmu::wc_fence();
+}
+
+/// The camera stopped: the frame painted afresh and everything copied again, so no picture or mark is left.
+pub fn repaint_all() {
+    if !ON.load(Ordering::Relaxed) {
+        return;
+    }
+    clear(FRAME);
+    FULL.store(true, Ordering::Relaxed);
+    DIRTY.store(true, Ordering::Relaxed);
 }
 
 fn present_now() {

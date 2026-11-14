@@ -57,3 +57,5 @@ mesh-kernel    -- `mesh selftest` / `mesh id`: the mesh module is in the ARM ker
 mesh-phase0    -- two ARM machines over virtio-net + scripts/mesh-bridge.py
 stackwater     -- `stack`: paint high-water of the ARM boot and secondary stacks (kernel/src/stackwater.rs)
 stackguard     -- `stack guards` / `stack overflow-test`: the ARM boot-stack guards (paging::init L2K/L3S)
+perf           -- the ARM benchmark rig (qemu-system-aarch64 -kernel); pc-perf is its PC twin
+perf-release   -- the ARM benchmark rig, release build; pc-perf-release is its PC twin

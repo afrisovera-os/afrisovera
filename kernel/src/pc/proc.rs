@@ -101,15 +101,20 @@ struct Endpoint {
 }
 
 static mut PROCS: [Proc; N] = [FREE; N];
-/// The kernel stack of the process in each slot (its base; 0 = none yet). Every spawn
-/// takes a new 16 KiB stack from the heap, as the ARM kernel's `process::spawn` does, so
-/// `stacks served` counts spawns on both kernels. Like the ARM kernel (its `ps` says so),
-/// the PC does not yet give a reaped process's stack back: reclaiming kernel stacks on
-/// reap is one change for both kernels, not a PC-only divergence.
+/// The kernel stack of the process in each slot (its base; 0 = none). Every spawn takes a
+/// new 16 KiB stack from the heap, as the ARM kernel's `process::spawn` does, so `stacks
+/// served` counts spawns on both kernels. Since 13 Nov 2026 the PC gives each stack back
+/// when its slot is cleared (`release_kstack`: `run_all`'s end and every failed spawn), so a
+/// finished program leaves nothing behind. The ARM kernel does not yet; the performance
+/// plan's S2 brings it to the same rule.
 static mut KSTACKS: [usize; N] = [0; N];
 
 /// A new kernel stack for `slot`; a refusal is named on the console, as on ARM.
 fn kstack_top(slot: usize) -> Option<u64> {
+    // Every path clears a slot's entry before the slot is used again; a path that forgot would
+    // leak the old stack here, so the suites (debug builds) stop on it.
+    // SAFETY: single core; only touched from the kernel with interrupts masked.
+    debug_assert_eq!(unsafe { (*core::ptr::addr_of!(KSTACKS))[slot] }, 0, "kernel stack of slot {} not released", slot);
     match crate::heap::alloc_stack() {
         Ok(p) => {
             // SAFETY: single core; only touched from the kernel with interrupts masked.
@@ -119,6 +124,21 @@ fn kstack_top(slot: usize) -> Option<u64> {
         Err(why) => {
             crate::kprintln!("[proc] P{} NOT spawned: no kernel stack ({})", slot, why);
             None
+        }
+    }
+}
+
+/// Give `slot`'s kernel stack back to the heap (performance plan, 13 Nov 2026: every spawn took a fresh 16 KiB
+/// stack and none was ever returned, so each finished program left 16 KiB behind for good; the perf suites
+/// measured it as `mem.apps_rerun_growth_kib`). Only for a slot whose program can no longer run on it.
+fn release_kstack(slot: usize) {
+    // SAFETY: single core, interrupts masked (as kstack_top); the slot's program is not running.
+    let base = unsafe { core::mem::replace(&mut (*core::ptr::addr_of_mut!(KSTACKS))[slot], 0) };
+    if base != 0 {
+        if let Ok(layout) = core::alloc::Layout::from_size_align(crate::heap::STACK_SIZE, crate::heap::STACK_ALIGN) {
+            // SAFETY: `base` came from heap::alloc_stack, which allocates exactly this layout from the global
+            // allocator, and it is freed once (the slot's entry was cleared above).
+            unsafe { alloc::alloc::dealloc(base as *mut u8, layout) };
         }
     }
 }
@@ -152,12 +172,16 @@ fn procs() -> &'static mut [Proc; N] {
 pub fn spawn(code: &[u8], caps: &[(usize, u8)], preemptible: bool) -> Option<usize> {
     let slot = procs().iter().position(|p| p.state == State::Free)?;
     kstack_top(slot)?;
-    let root = mmu::new_space()?;
+    let Some(root) = mmu::new_space() else {
+        release_kstack(slot);
+        return None;
+    };
     // code: as many read-only pages as the program needs (filled with int3 past its end)
     let pages = code.len().div_ceil(4096).clamp(1, CODE_PAGES);
     if code.len() > CODE_PAGES * 4096 {
         crate::kprintln!("[proc] P{} NOT spawned: program is {} bytes, more than {} KiB", slot, code.len(), CODE_PAGES * 4);
         mmu::free_space(root);
+        release_kstack(slot);
         return None;
     }
     let mut ok = true;
@@ -184,6 +208,7 @@ pub fn spawn(code: &[u8], caps: &[(usize, u8)], preemptible: bool) -> Option<usi
     if !ok {
         // a frame or table refused: give back what this space already took
         mmu::free_space(root);
+        release_kstack(slot);
         return None;
     }
     let p = &mut procs()[slot];
@@ -219,11 +244,12 @@ pub fn run_all() -> u64 {
     crate::cpu::set_rsp0(0);
     ACTIVE.store(false, Ordering::Relaxed);
     mmu::switch_to(mmu::root());
-    for p in procs().iter_mut() {
+    for (slot, p) in procs().iter_mut().enumerate() {
         if p.state != State::Free {
             mmu::free_space(p.root); // its pages and page tables back to the frame pool
         }
         *p = FREE;
+        release_kstack(slot); // and its kernel stack back to the heap
     }
     rc
 }

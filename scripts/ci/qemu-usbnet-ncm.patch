@@ -1,0 +1,432 @@
+GPL-2.0-or-later, a test-only change to QEMU; not part of AfriSovera
+TEST EQUIPMENT ONLY (13 Nov 2026, CDC-NCM plan B, architect's N2): a CDC-NCM mode for QEMU's usb-net,
+applied to QEMU's own source when the CI builds QEMU (ci.yml), never part of AfriSovera. GitHub's runner
+kernel (7.0.0-azure) has no dummy_hcd, so plan A (the runner's Linux NCM gadget) could not run; this is the
+weaker kind of evidence, because the same engineer wrote both ends; pc-usbncm grades it together with the
+block parser's selftest built from the NCM 1.0 spec. usb-net without ncm=on is unchanged.
+
+--- a/hw/usb/dev-network.c
++++ b/hw/usb/dev-network.c
+@@ -38,6 +38,7 @@
+ #include "qemu/module.h"
+ #include "qemu/cutils.h"
+ #include "qom/object.h"
++#include "qemu/timer.h"
+ 
+ /*#define TRAFFIC_DEBUG*/
+ /* Thanks to NetChip Technologies for donating this product ID.
+@@ -62,10 +63,36 @@
+     STRING_SUBSET,
+     STRING_RNDIS,
+     STRING_SERIALNUMBER,
++    STRING_NCM,
+ };
+ 
+ #define DEV_CONFIG_VALUE                1       /* CDC or a subset */
+ #define DEV_RNDIS_CONFIG_VALUE          2       /* RNDIS; optional */
++#define DEV_NCM_CONFIG_VALUE            3       /* CDC-NCM; only with ncm=on */
++
++/*
++ * AfriSovera test patch (13 Nov 2026): a CDC-NCM mode for usb-net, test equipment for the AfriSovera PC
++ * kernel's NCM driver (pc-usbncm), applied when its CI builds QEMU. With ncm=on the device offers an NCM
++ * configuration and the CDC-ECM one (no RNDIS); NCM 1.0, 16-bit transfer blocks. Frames to the host are
++ * gathered for up to 2 ms (as real NCM devices do) so one block carries several. ncm-badparams=on reports
++ * an out divisor of 3, which a host must refuse (the fallback test).
++ */
++#define USB_CDC_SUBCLASS_NCM            0x0d
++#define USB_CDC_NCM_TYPE                0x1a
++#define USB_CDC_GET_NTB_PARAMETERS      0x80
++#define USB_CDC_SET_NTB_FORMAT          0x84
++#define USB_CDC_SET_NTB_INPUT_SIZE      0x86
++#define NCM_NTB_MAX                     16384
++#define NCM_NTH16                       0x484d434eU     /* "NCMH" */
++#define NCM_NDP16                       0x304d434eU     /* "NCM0" */
++#define NCM_NDP_AT                      12
++#define NCM_MAX_DG                      32
++#define NCM_DATA_AT                     (NCM_NDP_AT + 8 + 4 * (NCM_MAX_DG + 1))
++#define NCM_HOLD_NS                     (2 * SCALE_MS)
++#define NCM_GATHER                      4       /* send at once when this many frames wait */
++#define NCM_OUT_ALIGN                   16      /* the host must put its table on 16 bytes ... */
++#define NCM_OUT_DIV                     4       /* ... and each frame at 2 mod 4 */
++#define NCM_OUT_REM                     2
+ 
+ #define USB_CDC_SUBCLASS_ACM            0x02
+ #define USB_CDC_SUBCLASS_ETHERNET       0x06
+@@ -109,6 +136,7 @@
+     [STRING_SUBSET]             = "QEMU USB Net Subset",
+     [STRING_RNDIS]              = "QEMU USB Net RNDIS",
+     [STRING_SERIALNUMBER]       = "1",
++    [STRING_NCM]                = "QEMU USB Net NCM",
+ };
+ 
+ static const USBDescIface desc_iface_rndis[] = {
+@@ -264,6 +292,73 @@
+     }
+ };
+ 
++static const USBDescIface desc_iface_ncm[] = {
++    {
++        /* NCM Communication Interface */
++        .bInterfaceNumber              = 0,
++        .bNumEndpoints                 = 1,
++        .bInterfaceClass               = USB_CLASS_COMM,
++        .bInterfaceSubClass            = USB_CDC_SUBCLASS_NCM,
++        .bInterfaceProtocol            = USB_CDC_PROTO_NONE,
++        .iInterface                    = STRING_CONTROL,
++        .ndesc                         = 4,
++        .descs = (USBDescOther[]) {
++            {
++                .data = (uint8_t[]) {
++                    0x05, USB_DT_CS_INTERFACE, USB_CDC_HEADER_TYPE, 0x10, 0x01,
++                },
++            },{
++                .data = (uint8_t[]) {
++                    0x05, USB_DT_CS_INTERFACE, USB_CDC_UNION_TYPE, 0x00, 0x01,
++                },
++            },{
++                .data = (uint8_t[]) {
++                    0x0d, USB_DT_CS_INTERFACE, USB_CDC_ETHERNET_TYPE, STRING_ETHADDR,
++                    0x00, 0x00, 0x00, 0x00, ETH_FRAME_LEN & 0xff, ETH_FRAME_LEN >> 8,
++                    0x00, 0x00, 0x00,
++                },
++            },{
++                /* NCM functional descriptor: version 1.00, no optional requests */
++                .data = (uint8_t[]) {
++                    0x06, USB_DT_CS_INTERFACE, USB_CDC_NCM_TYPE, 0x00, 0x01, 0x00,
++                },
++            },
++        },
++        .eps = (USBDescEndpoint[]) {
++            {
++                .bEndpointAddress      = USB_DIR_IN | 0x01,
++                .bmAttributes          = USB_ENDPOINT_XFER_INT,
++                .wMaxPacketSize        = STATUS_BYTECOUNT,
++                .bInterval             = 1 << LOG2_STATUS_INTERVAL_MSEC,
++            },
++        }
++    },{
++        .bInterfaceNumber              = 1,
++        .bAlternateSetting             = 0,
++        .bNumEndpoints                 = 0,
++        .bInterfaceClass               = USB_CLASS_CDC_DATA,
++        .bInterfaceProtocol            = 0x01,
++    },{
++        .bInterfaceNumber              = 1,
++        .bAlternateSetting             = 1,
++        .bNumEndpoints                 = 2,
++        .bInterfaceClass               = USB_CLASS_CDC_DATA,
++        .bInterfaceProtocol            = 0x01,      /* NTB */
++        .iInterface                    = STRING_DATA,
++        .eps = (USBDescEndpoint[]) {
++            {
++                .bEndpointAddress      = USB_DIR_IN | 0x02,
++                .bmAttributes          = USB_ENDPOINT_XFER_BULK,
++                .wMaxPacketSize        = 0x40,
++            },{
++                .bEndpointAddress      = USB_DIR_OUT | 0x02,
++                .bmAttributes          = USB_ENDPOINT_XFER_BULK,
++                .wMaxPacketSize        = 0x40,
++            }
++        }
++    }
++};
++
+ static const USBDescDevice desc_device_net = {
+     .bcdUSB                        = 0x0200,
+     .bDeviceClass                  = USB_CLASS_COMM,
+@@ -290,6 +385,45 @@
+     },
+ };
+ 
++static const USBDescDevice desc_device_net_ncm = {
++    .bcdUSB                        = 0x0200,
++    .bDeviceClass                  = USB_CLASS_COMM,
++    .bMaxPacketSize0               = 0x40,
++    .bNumConfigurations            = 2,
++    .confs = (USBDescConfig[]) {
++        {
++            .bNumInterfaces        = 2,
++            .bConfigurationValue   = DEV_NCM_CONFIG_VALUE,
++            .iConfiguration        = STRING_NCM,
++            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
++            .bMaxPower             = 0x32,
++            .nif = ARRAY_SIZE(desc_iface_ncm),
++            .ifs = desc_iface_ncm,
++        },{
++            .bNumInterfaces        = 2,
++            .bConfigurationValue   = DEV_CONFIG_VALUE,
++            .iConfiguration        = STRING_CDC,
++            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
++            .bMaxPower             = 0x32,
++            .nif = ARRAY_SIZE(desc_iface_cdc),
++            .ifs = desc_iface_cdc,
++        }
++    },
++};
++
++static const USBDesc desc_net_ncm = {
++    .id = {
++        .idVendor          = CDC_VENDOR_NUM,
++        .idProduct         = CDC_PRODUCT_NUM,
++        .bcdDevice         = 0,
++        .iManufacturer     = STRING_MANUFACTURER,
++        .iProduct          = STRING_PRODUCT,
++        .iSerialNumber     = STRING_SERIALNUMBER,
++    },
++    .full = &desc_device_net_ncm,
++    .str  = usb_net_stringtable,
++};
++
+ static const USBDesc desc_net = {
+     .id = {
+         .idVendor          = RNDIS_VENDOR_NUM,
+@@ -637,10 +771,16 @@
+     uint16_t connection;
+ 
+     unsigned int out_ptr;
+-    uint8_t out_buf[2048];
++    uint8_t out_buf[NCM_NTB_MAX];
+ 
+     unsigned int in_ptr, in_len;
+-    uint8_t in_buf[2048];
++    uint8_t in_buf[NCM_NTB_MAX];
++
++    bool ncm, ncm_badparams, ncm_hold_over;
++    uint32_t ncm_in_max;
++    uint16_t ncm_seq;
++    unsigned int ncm_count;
++    QEMUTimer *ncm_timer;
+ 
+     USBEndpoint *intr;
+     USBEndpoint *bulk_in;
+@@ -660,6 +800,12 @@
+             s->dev.config->bConfigurationValue == DEV_RNDIS_CONFIG_VALUE : 0;
+ }
+ 
++static int is_ncm(USBNetState *s)
++{
++    return s->dev.config ?
++            s->dev.config->bConfigurationValue == DEV_NCM_CONFIG_VALUE : 0;
++}
++
+ static int ndis_query(USBNetState *s, uint32_t oid,
+                       uint8_t *inbuf, unsigned int inlen, uint8_t *outbuf,
+                       size_t outlen)
+@@ -1118,6 +1264,38 @@
+ #endif
+         break;
+ 
++    case ClassInterfaceRequest | USB_CDC_GET_NTB_PARAMETERS:
++        if (!is_ncm(s) || length < 28) {
++            goto fail;
++        }
++        memset(data, 0, 28);
++        stw_le_p(data, 28);
++        stw_le_p(data + 2, 0x0003);                 /* 16- and 32-bit blocks */
++        stl_le_p(data + 4, NCM_NTB_MAX);            /* dwNtbInMaxSize */
++        stw_le_p(data + 8, 4);                      /* wNdpInDivisor */
++        stw_le_p(data + 12, 4);                     /* wNdpInAlignment */
++        stl_le_p(data + 16, NCM_NTB_MAX);           /* dwNtbOutMaxSize */
++        stw_le_p(data + 20, s->ncm_badparams ? 3 : NCM_OUT_DIV);
++        stw_le_p(data + 22, NCM_OUT_REM);
++        stw_le_p(data + 24, NCM_OUT_ALIGN);
++        stw_le_p(data + 26, 1);                     /* wNtbOutMaxDatagrams */
++        p->actual_length = 28;
++        break;
++
++    case ClassInterfaceOutRequest | USB_CDC_SET_NTB_FORMAT:
++        if (!is_ncm(s) || value != 0) {             /* 16-bit only from this host */
++            goto fail;
++        }
++        break;
++
++    case ClassInterfaceOutRequest | USB_CDC_SET_NTB_INPUT_SIZE:
++        if (!is_ncm(s) || (length != 4 && length != 8) ||
++            ldl_le_p(data) < 2048 || ldl_le_p(data) > NCM_NTB_MAX) {
++            goto fail;
++        }
++        s->ncm_in_max = ldl_le_p(data);
++        break;
++
+     case ClassInterfaceOutRequest | USB_CDC_SET_ETHERNET_PACKET_FILTER:
+         if (is_rndis(s)) {
+             goto fail;
+@@ -1180,6 +1358,17 @@
+         p->status = USB_RET_NAK;
+         return;
+     }
++    if (is_ncm(s) && s->in_ptr == 0) {
++        if (s->ncm_count < NCM_GATHER && !s->ncm_hold_over) {
++            p->status = USB_RET_NAK;
++            return;
++        }
++        timer_del(s->ncm_timer);
++        if ((s->in_len & (64 - 1)) == 0) {
++            s->in_buf[s->in_len++] = 0;
++            stw_le_p(s->in_buf + 8, s->in_len);
++        }
++    }
+     len = s->in_len - s->in_ptr;
+     if (len > p->iov.size) {
+         len = p->iov.size;
+@@ -1198,6 +1387,48 @@
+ #endif
+ }
+ 
++/* one block from the host: every frame its tables list, checked against the block and this device's layout */
++static void ncm_parse_out(USBNetState *s)
++{
++    uint8_t *b = s->out_buf;
++    uint32_t blen, ndp, nl, k, di, dl;
++    int t;
++
++    if (s->out_ptr < 12 || ldl_le_p(b) != NCM_NTH16 || lduw_le_p(b + 4) != 12) {
++        fprintf(stderr, "usbnet: NCM block from the host has a bad header\n");
++        return;
++    }
++    blen = lduw_le_p(b + 8);
++    if (blen == 0 || blen > s->out_ptr) {
++        blen = s->out_ptr;
++    }
++    ndp = lduw_le_p(b + 10);
++    for (t = 0; t < 8 && ndp; t++) {
++        if (ndp < 12 || ndp % NCM_OUT_ALIGN || ndp + 8 > blen || ldl_le_p(b + ndp) != NCM_NDP16) {
++            fprintf(stderr, "usbnet: NCM table from the host at %u breaks the layout\n", ndp);
++            return;
++        }
++        nl = lduw_le_p(b + ndp + 4);
++        if (nl < 16 || ndp + nl > blen) {
++            fprintf(stderr, "usbnet: NCM table length %u from the host is bad\n", nl);
++            return;
++        }
++        for (k = ndp + 8; k + 4 <= ndp + nl; k += 4) {
++            di = lduw_le_p(b + k);
++            dl = lduw_le_p(b + k + 2);
++            if (!di || !dl) {
++                break;
++            }
++            if (di % NCM_OUT_DIV != NCM_OUT_REM || di + dl > blen || dl < 14) {
++                fprintf(stderr, "usbnet: NCM frame from the host at %u (%u bytes) breaks the layout\n", di, dl);
++                continue;
++            }
++            qemu_send_packet(qemu_get_queue(s->nic), b + di, dl);
++        }
++        ndp = lduw_le_p(b + ndp + 6);
++    }
++}
++
+ static void usb_net_handle_dataout(USBNetState *s, USBPacket *p)
+ {
+     int sz = sizeof(s->out_buf) - s->out_ptr;
+@@ -1216,6 +1447,13 @@
+     usb_packet_copy(p, &s->out_buf[s->out_ptr], sz);
+     s->out_ptr += sz;
+ 
++    if (is_ncm(s)) {
++        if (p->iov.size % 64 || p->iov.size == 0) {
++            ncm_parse_out(s);
++            s->out_ptr = 0;
++        }
++        return;
++    }
+     if (!is_rndis(s)) {
+         if (p->iov.size % 64 || p->iov.size == 0) {
+             qemu_send_packet(qemu_get_queue(s->nic), s->out_buf, s->out_ptr);
+@@ -1282,6 +1520,58 @@
+     }
+ }
+ 
++/* one frame from the network into the block being gathered for the host (0: not now, QEMU queues it) */
++static ssize_t ncm_receive(USBNetState *s, const uint8_t *buf, size_t size)
++{
++    uint32_t at;
++    uint8_t *e;
++
++    if (size < 14 || size > ETH_FRAME_LEN + 4) {
++        return size;
++    }
++    if (s->in_len > 0 && (s->in_ptr > 0 || s->ncm_count >= NCM_MAX_DG)) {
++        return 0;
++    }
++    if (s->in_len == 0) {
++        memset(s->in_buf, 0, NCM_DATA_AT);
++        stl_le_p(s->in_buf, NCM_NTH16);
++        stw_le_p(s->in_buf + 4, 12);
++        stw_le_p(s->in_buf + 6, s->ncm_seq++);
++        stw_le_p(s->in_buf + 10, NCM_NDP_AT);
++        stl_le_p(s->in_buf + NCM_NDP_AT, NCM_NDP16);
++        stw_le_p(s->in_buf + NCM_NDP_AT + 4, 8 + 4 * (NCM_MAX_DG + 1));
++        s->in_len = NCM_DATA_AT;
++        s->in_ptr = 0;
++        s->ncm_count = 0;
++        s->ncm_hold_over = false;
++        timer_mod(s->ncm_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NCM_HOLD_NS);
++    }
++    at = ROUND_UP(s->in_len, 4);
++    if (at + size + 1 > s->ncm_in_max) {
++        return s->ncm_count ? 0 : size;
++    }
++    memset(s->in_buf + s->in_len, 0, at - s->in_len);
++    memcpy(s->in_buf + at, buf, size);
++    e = s->in_buf + NCM_NDP_AT + 8 + 4 * s->ncm_count;
++    stw_le_p(e, at);
++    stw_le_p(e + 2, size);
++    s->ncm_count++;
++    s->in_len = at + size;
++    stw_le_p(s->in_buf + 8, s->in_len);
++    if (s->ncm_count >= NCM_GATHER) {
++        usb_wakeup(s->bulk_in, 0);
++    }
++    return size;
++}
++
++static void ncm_timer_cb(void *opaque)
++{
++    USBNetState *s = opaque;
++
++    s->ncm_hold_over = true;
++    usb_wakeup(s->bulk_in, 0);
++}
++
+ static ssize_t usbnet_receive(NetClientState *nc, const uint8_t *buf, size_t size)
+ {
+     USBNetState *s = qemu_get_nic_opaque(nc);
+@@ -1291,6 +1581,9 @@
+     if (!s->dev.config) {
+         return -1;
+     }
++    if (is_ncm(s)) {
++        return ncm_receive(s, buf, size);
++    }
+ 
+     if (is_rndis(s)) {
+         if (s->rndis_state != RNDIS_DATA_INITIALIZED) {
+@@ -1347,6 +1640,7 @@
+ 
+     /* TODO: remove the nd_table[] entry */
+     rndis_clear_responsequeue(s);
++    timer_free(s->ncm_timer);
+     qemu_del_nic(s->nic);
+ }
+ 
+@@ -1361,6 +1655,11 @@
+ {
+     USBNetState *s = USB_NET(dev);
+ 
++    if (s->ncm) {
++        dev->usb_desc = &desc_net_ncm;
++    }
++    s->ncm_in_max = NCM_NTB_MAX;
++    s->ncm_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ncm_timer_cb, s);
+     usb_desc_create_serial(dev);
+     usb_desc_init(dev);
+ 
+@@ -1409,6 +1708,8 @@
+ 
+ static const Property net_properties[] = {
+     DEFINE_NIC_PROPERTIES(USBNetState, conf),
++    DEFINE_PROP_BOOL("ncm", USBNetState, ncm, false),
++    DEFINE_PROP_BOOL("ncm-badparams", USBNetState, ncm_badparams, false),
+ };
+ 
+ static void usb_net_class_initfn(ObjectClass *klass, const void *data)

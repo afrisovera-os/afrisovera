@@ -141,6 +141,8 @@ pub fn run_niavm() {
 }
 pub fn run_rtc_demo() { absent("userspace RTC driver (EL0)") }
 pub fn run_sgi_el0_probe() { absent("SGI probe from EL0") }
+/// `el0-ptr` (gap G2): the PC already checks every user pointer (pc/proc.rs user_range).
+pub fn run_el0_ptr_probe() { absent("EL0 user-pointer probe (the PC checks pointers in pc/proc.rs user_range)") }
 /// `syssleep`: a ring-3 process asks the kernel, by system call, to block it ~300 ms
 /// (pc/proc.rs SYS_SLEEP), prints the measured time and exits; the shell resumes after.
 pub fn run_sleep_demo() {

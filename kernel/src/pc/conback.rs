@@ -59,6 +59,7 @@ pub fn feed(s: &str) {
             match c {
                 b'\n' => newline(),
                 b'\r' => {}
+                0x08 => COL = COL.saturating_sub(1), // backspace steps back, as the console does (14 Nov)
                 _ => {
                     if COL >= COLS {
                         newline();

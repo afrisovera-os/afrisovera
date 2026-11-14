@@ -7,6 +7,9 @@
 # the VFS's in-order save is gathered by device block into runs of up to 8 KiB sent with one
 # Write; each way is checked once against one block at a time first (reads at start-up, writes at
 # the first save, read back).
+# 12 Nov 2026 (claude/nvme-queue): reads and the write-gather are 64 KiB runs (PRP lists), sent as one or
+# more commands; the lines now say both "blocks per read/write" (the run) and "per command" (the controller's
+# limit). pc-nvmequeue grades the split into several commands in flight.
 # Four boots: boots 1-2 a blank 8 MiB NVMe drive of 512-byte blocks (16 per command), boots 3-4
 # the same with 4096-byte blocks (2 per command). Boots 1 and 3: claimdisk nvme, write a file,
 # sync, lsnvme. Boots 2 and 4: cat the file, lsnvme. Graded: the "on" lines, at most one write
@@ -35,13 +38,13 @@ grade() { # grade <boot1 log> <boot2 log> <blocks> <block bytes> <blocks per com
     hasA "^\[nvme\] namespace 1: $nb blocks of $bs B \(8 MiB\), blank: not used unless claimed \(claimdisk nvme\)$" ||
         _f "boot 1: the blank $bs-byte-block NVMe drive was not identified (and kept unused until claimed)"
     hasA '^claimdisk: the blank nvme disk now holds AfriSovera.s files$' || _f "boot 1: claimdisk nvme did not take the blank drive"
-    hasA "^\[nvme\] multi-block reads on \(up to $k blocks per command; the first $k equal one at a time\)$" ||
+    hasA "^\[nvme\] multi-block reads on \(up to $k blocks per read, [0-9]+ per command; the first $k equal one at a time\)$" ||
         _f "boot 1: multi-block reads were not switched on at start-up"
-    hasA "^\[nvme\] multi-block writes on \(up to $k blocks per command; the first $k read back equal\)$" ||
+    hasA "^\[nvme\] multi-block writes on \(up to $k blocks per write, [0-9]+ per command; the first [0-9]+ read back equal\)$" ||
         _f "boot 1: multi-block writes were not switched on at the first save"
     hasB "^\[nvme\] namespace 1: $nb blocks of $bs B \(8 MiB\), ours \(AFRIVFS1\): used for storage$" ||
         _f "boot 2: the claimed drive was not recognised as ours"
-    hasB "^\[nvme\] multi-block reads on \(up to $k blocks per command" || _f "boot 2: multi-block reads were not switched on"
+    hasB "^\[nvme\] multi-block reads on \(up to $k blocks per read" || _f "boot 2: multi-block reads were not switched on"
     n="$(printf '%s\n' "$A" | grep -aE '^  writes: ' | tail -1)"
     if [[ "$n" =~ $RE_W ]]; then
         local w=${BASH_REMATCH[1]} wm=${BASH_REMATCH[2]} w1=${BASH_REMATCH[3]}
@@ -71,10 +74,10 @@ grade() { # grade <boot1 log> <boot2 log> <blocks> <block bytes> <blocks per com
 
 B1="[nvme] namespace 1: 16384 blocks of 512 B (8 MiB), blank: not used unless claimed (claimdisk nvme)
 [nvme] controller 00:03.0 (NVMe 1.4), I/O queue pair ready
-[nvme] multi-block reads on (up to 16 blocks per command; the first 16 equal one at a time)
+[nvme] multi-block reads on (up to 128 blocks per read, 128 per command; the first 128 equal one at a time)
 afrisovera> claimdisk nvme
 claimdisk: the blank nvme disk now holds AfriSovera's files
-[nvme] multi-block writes on (up to 16 blocks per command; the first 16 read back equal)
+[nvme] multi-block writes on (up to 128 blocks per write, 128 per command; the first 49 read back equal)
 [vfs] synced 17 files to disk
 afrisovera> write notes.txt HELLO-NVME-MULTI-10NOV
 [vfs] synced 18 files to disk
@@ -88,7 +91,7 @@ nvme: controller 00:03.0 BAR0 0xc000000000, NVMe 1.4, ready
   writes: 147 sector(s), 9 multi-block command(s), 3 single (on)"
 B2="[nvme] namespace 1: 16384 blocks of 512 B (8 MiB), ours (AFRIVFS1): used for storage
 [nvme] controller 00:03.0 (NVMe 1.4), I/O queue pair ready
-[nvme] multi-block reads on (up to 16 blocks per command; the first 16 equal one at a time)
+[nvme] multi-block reads on (up to 128 blocks per read, 128 per command; the first 128 equal one at a time)
 [vfs] VFS restored from disk: 18 files
 afrisovera> cat notes.txt
 HELLO-NVME-MULTI-10NOV
@@ -102,14 +105,14 @@ selftest() {
     arm() { # arm <name> <expect> <boot1 text> <boot2 text> [blocks bytes k]
         local got
         printf '%s\n' "$3" > "$D/a"; printf '%s\n' "$4" > "$D/b"
-        if grade "$D/a" "$D/b" "${5:-16384}" "${6:-512}" "${7:-16}" HELLO-NVME-MULTI-10NOV > "$D/log" 2>&1; then got=green; else got=red; fi
+        if grade "$D/a" "$D/b" "${5:-16384}" "${6:-512}" "${7:-128}" HELLO-NVME-MULTI-10NOV > "$D/log" 2>&1; then got=green; else got=red; fi
         if [ "$got" = "$2" ]; then pass=$((pass+1)); echo "    arm $1: $got (expected $2) OK"
         else bad=$((bad+1)); echo "    arm $1: $got but expected $2  <-- GRADER BUG"; sed 's/^/      /' "$D/log"; fi
     }
-    k4() { printf '%s\n' "$1" | sed 's/16384 blocks of 512 B/2048 blocks of 4096 B/; s/up to 16 blocks/up to 2 blocks/; s/the first 16 /the first 2 /'; }
+    k4() { printf '%s\n' "$1" | sed 's/16384 blocks of 512 B/2048 blocks of 4096 B/; s/up to 128 blocks/up to 16 blocks/; s/128 per command/16 per command/; s/the first 128 /the first 16 /; s/the first 49 /the first 7 /'; }
     echo "  --- grader selftest (no QEMU) ---"
     arm sample-512 green "$B1" "$B2"
-    arm sample-4k green "$(k4 "$B1")" "$(k4 "$B2")" 2048 4096 2
+    arm sample-4k green "$(k4 "$B1")" "$(k4 "$B2")" 2048 4096 16
     arm crlf green "$(printf '%s\n' "$B1" | sed 's/$/\r/')" "$(printf '%s\n' "$B2" | sed 's/$/\r/')"
     arm 4k-graded-as-512 red "$(k4 "$B1")" "$(k4 "$B2")"
     arm reads-off red "$(printf '%s\n' "$B1" | sed 's/^\[nvme\] multi-block reads on .*/[nvme] multi-block reads off (the controller refused one): one block per command/')" "$B2"
@@ -162,7 +165,7 @@ ok=1
 for bs in 512 4096; do
     img="$W/nvme$bs.img"
     head -c 8388608 /dev/zero > "$img" # a fresh, blank 8 MiB NVMe drive
-    if [ "$bs" = 512 ]; then sp=5460; nb=16384; k=16; else sp=5464; nb=2048; k=2; fi
+    if [ "$bs" = 512 ]; then sp=5460; nb=16384; k=128; else sp=5464; nb=2048; k=16; fi
     word="HELLO-NVME-$bs-10NOV"
     echo "  --- $bs-byte blocks, boot 1: claimdisk nvme, write notes.txt, sync, lsnvme ---"
     boot "$img" "$bs" "$sp" "$W/b$bs-1.log" "claimdisk nvme" "write notes.txt $word" "sync" "lsnvme"

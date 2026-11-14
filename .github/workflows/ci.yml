@@ -30,6 +30,7 @@ env:
   CORE_ARM: smoke,smp,heap,wasm-ops,tcp,persist,hash
   CORE_PC: pc-boot,pc-paging,pc-ring3,pc-ipc
   MAX_SUITES: 25
+  CARGO_NET_OFFLINE: "true"   # F2: every build uses vendor/ (.cargo/config.toml); a crate missing from it fails here
 
 jobs:
   build:

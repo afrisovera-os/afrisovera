@@ -5,7 +5,7 @@
 - **Deciders:** chief architect, on the OS lead's request (review follow-up F3 of the mesh window)
 - **Related:** `kernel/src/drbg.rs` (SP 800-90A HMAC_DRBG, SP 800-90B health tests, fail-closed `fill_secret`),
   `kernel/src/pc/compat/rng.rs`, ADR 0006 (PCs are a full target), AFR-0009 (mesh link and bundles),
-  ADR 0007 (crypto crates; cited in the tree, file not yet written)
+  ADR 0007 (crypto crates, `0007-crypto-crate-dependencies.md`)
 
 ## Context
 
@@ -119,3 +119,18 @@ number. Step 3 is the TPM driver, reviewed separately.
 - RDRAND or RDSEED become available on every machine we target (then jitter stays only as an extra).
 - The TPM driver shows TPM 1.2 RNG faults in the field (stuck output caught by the RCT): then the TPM drops to
   mixed-in, not counted.
+
+## Follow-up, step 3 (13 Nov 2026): the TPM driver
+
+Built as `kernel/src/pc/tpm.rs` (TIS FIFO, TPM 1.2 and 2.0) with `kernel/src/pc/tpm_wire.rs`; design note
+`docs/design-f3-step3-tpm.md`. Three points recorded here, as the architect asked:
+
+- **The bus is trusted.** A discrete TPM 1.2 or 2.0 on LPC or SPI answers GetRandom without authentication or
+  encryption. Someone with the machine open and an interposer on the bus can feed chosen bytes, and the kernel counts
+  them as if the bus were honest. That attacker already has the machine in hand. The TPM's output is still mixed with
+  the uncounted jitter hash and clock context at every (re)seed, so it is never the only input, only the only counted
+  one on a PC without RDRAND.
+- **A TPM 1.2 switched off in firmware is not counted**, even if GetRandom answers: the setting is respected. The
+  driver reads the permanent `disable` and volatile `deactivated` flags first.
+- **MAX_SOURCES is 4** since this step (array sizes only, no change in behaviour), so step 2b's jitter source needs no
+  change to the shared drbg.rs.

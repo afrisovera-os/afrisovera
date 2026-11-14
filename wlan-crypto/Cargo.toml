@@ -1,0 +1,36 @@
+# wlan-crypto: the cryptographic primitives of AfriSovera's Wi-Fi (WPA2-Personal), for the PC kernel's
+# kernel/src/wlan/crypto.rs and nothing else (ADR 0007 row "Wi-Fi primitives", architect's verdict 14 Nov 2026).
+#
+# The primitives come from RustCrypto crates, exact pins, no default features. The functions in src/lib.rs are thin
+# and core-only: they choose the parameters 802.11 needs (HMAC-SHA1, PBKDF2 with 4096 rounds, the 802.11 PRF, AES key
+# wrap, AES-CCM with an 8-octet tag and a 13-octet nonce, AES-CMAC). The protocol (EAPOL, the key hierarchy, the
+# handshakes, CCMP framing, nonces) is ours and lives in kernel/src/wlan/, not here.
+#
+# No SIMD or CPU-feature paths in the PC kernel (the PC kernel saves no SIMD state): `aes` is built with
+# `--cfg aes_force_soft` for x86_64-unknown-uefi (.cargo/config.toml), and `sha1` with its `force-soft` feature.
+# src/lib.rs refuses to build for UEFI without the cfg, and scripts/wifi-crypto-test.sh disassembles the result.
+#
+# The empty [workspace] table detaches this crate from the kernel workspace, like mesh-crypto. Host tests:
+#   cd wlan-crypto && cargo test
+[package]
+name = "wlan-crypto"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Wi-Fi (WPA2-Personal) primitives for the AfriSovera PC kernel: thin core-only wrappers over pinned RustCrypto crates."
+publish = false
+
+[dependencies]
+sha1 = { version = "=0.10.6", default-features = false, features = ["force-soft"] }
+hmac = { version = "=0.12.1", default-features = false }
+pbkdf2 = { version = "=0.12.2", default-features = false, features = ["hmac"] }
+aes = { version = "=0.8.4", default-features = false }
+ccm = { version = "=0.5.0", default-features = false }
+aes-kw = { version = "=0.2.1", default-features = false }
+cmac = { version = "=0.7.2", default-features = false }
+subtle = { version = "=2.6.1", default-features = false }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aes_force_soft)'] }
+
+[workspace]

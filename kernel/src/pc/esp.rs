@@ -35,10 +35,77 @@ pub const FILE: &str = "\\EFI\\afrisovera\\afrisovera.efi";
 /// any EFI system partition.
 const FAT_MAX: u64 = 131_072;
 
+/// Something that reads 512-byte sectors: a disk the drivers know, or the USB stick (firmware files,
+/// 13 Nov 2026). Reading is all the FAT walk needs, so the same code reads either, and a host-side fuzz target
+/// can read an image from memory.
+pub(crate) trait Sect: Copy {
+    fn read(&self, n: u64, out: &mut [u8; 512]) -> bool;
+}
+
+impl Sect for Disk {
+    fn read(&self, n: u64, out: &mut [u8; 512]) -> bool {
+        Disk::read(*self, n, out)
+    }
+}
+
+/// The USB stick or disk the xHCI driver holds (shell context only, as the VFS uses it).
+#[derive(Clone, Copy)]
+struct Stick;
+
+impl Sect for Stick {
+    fn read(&self, n: u64, out: &mut [u8; 512]) -> bool {
+        crate::xhci::msc_read(n, out)
+    }
+}
+
+/// Something the FAT writer may write: an internal disk (bootcopy, on the owner's code) or the USB stick
+/// AfriSovera started from (`report save`, report home 13 Nov 2026). `settle` puts what was written on the medium.
+pub(crate) trait SectW: Sect {
+    fn write(&self, n: u64, s: &[u8; 512]) -> bool;
+    fn write_run(&self, n: u64, data: &[u8]) -> bool;
+    fn settle(&self) -> bool;
+}
+
+impl SectW for Disk {
+    fn write(&self, n: u64, s: &[u8; 512]) -> bool {
+        Disk::write(*self, n, s)
+    }
+    fn write_run(&self, n: u64, data: &[u8]) -> bool {
+        Disk::write_run(*self, n, data)
+    }
+    fn settle(&self) -> bool {
+        Disk::settle(*self)
+    }
+}
+
+/// The USB stick AfriSovera started from, for WRITING (architect, 14 Nov: one door). Its only constructor is
+/// `report_save`, after the boot-medium and boot-file checks; every other use of the stick goes through `Stick`,
+/// which implements only reading. scripts/pc-reportsave-test.sh greps that `BootStick(())` appears once.
+#[derive(Clone, Copy)]
+struct BootStick(());
+
+impl Sect for BootStick {
+    fn read(&self, n: u64, out: &mut [u8; 512]) -> bool {
+        crate::xhci::msc_read(n, out)
+    }
+}
+
+impl SectW for BootStick {
+    fn write(&self, n: u64, s: &[u8; 512]) -> bool {
+        crate::xhci::msc_write(n, s)
+    }
+    fn write_run(&self, n: u64, data: &[u8]) -> bool {
+        data.chunks_exact(512).enumerate().all(|(j, s)| crate::xhci::msc_write(n + j as u64, s.try_into().unwrap()))
+    }
+    fn settle(&self) -> bool {
+        crate::xhci::msc_settle()
+    }
+}
+
 /// A FAT32 file system as its boot sector describes it. Sector numbers are 512-byte sectors
 /// of the disk.
-struct Fat {
-    dk: Disk,
+struct Fat<D: Sect = Disk> {
+    dk: D,
     part: u64,     // the partition's first 512-byte sector
     bps: u64,      // bytes per FAT sector
     spc: u64,      // FAT sectors per cluster
@@ -48,6 +115,7 @@ struct Fat {
     data0: u64,    // cluster 2's first 512-byte sector
     clusters: u64, // data clusters (numbered 2 ..= clusters + 1)
     root: u32,
+    plen: u64, // the partition's length in 512-byte sectors, as opened
 }
 
 /// One directory entry: its 8.3 name, its long name if it has one (ASCII, '?' for others),
@@ -90,10 +158,10 @@ impl Ent {
     }
 }
 
-impl Fat {
+impl<D: Sect> Fat<D> {
     /// The boot sector of the partition at `part` (512-byte sectors), `len` sectors long:
     /// a FAT32 we can trust, or why not.
-    fn open(dk: Disk, part: u64, len: u64) -> Result<Fat, &'static str> {
+    fn open(dk: D, part: u64, len: u64) -> Result<Fat<D>, &'static str> {
         let mut s = [0u8; 512];
         if !dk.read(part, &mut s) {
             return Err("could not read its first sector");
@@ -146,11 +214,17 @@ impl Fat {
             data0: part + meta * per,
             clusters,
             root,
+            plen: len,
         })
     }
 
     fn cluster_bytes(&self) -> u64 {
         self.bps * self.spc
+    }
+
+    /// The partition's length in 512-byte sectors, as it was opened.
+    fn len(&self) -> u64 {
+        self.plen
     }
 
     /// The FAT entry of cluster `c` (first FAT copy).
@@ -312,7 +386,7 @@ impl Fat {
 
 /// An EFI system partition found in a healthy GPT: (entry number, first and last LBA, its
 /// unique GUID as stored).
-fn esps(dk: Disk, cap512: u64, bs: u64, out: &mut [(u64, u64, u64, [u8; 16]); 4]) -> Result<usize, &'static str> {
+fn esps<D: Sect>(dk: D, cap512: u64, bs: u64, out: &mut [(u64, u64, u64, [u8; 16]); 4]) -> Result<usize, &'static str> {
     let per = (bs / 512).max(1);
     let blocks = cap512 / per;
     let mut s = [0u8; 512];
@@ -329,6 +403,9 @@ fn esps(dk: Disk, cap512: u64, bs: u64, out: &mut [(u64, u64, u64, [u8; 16]); 4]
     let Some(h) = gpt::header(&mut rd, 1, per) else {
         return Err("the GPT's primary header is damaged (a damaged table is never changed)");
     };
+    if !gpt::in_disk(&h, blocks, per) {
+        return Err("the GPT's header points outside the disk (a damaged table is never changed)");
+    }
     let alt = u64le(&h, 32);
     if alt >= blocks || gpt::header(&mut rd, alt, per).is_none() {
         return Err("the GPT's backup header is missing or damaged (a damaged table is never changed)");
@@ -650,10 +727,29 @@ fn lfn(name: &str, short: &[u8; 11], out: &mut [[u8; 32]; 4]) -> usize {
     pieces
 }
 
+/// Where `Fat::take` gets a file's bytes. It asks in order, never going back, so a source may be a stream read
+/// once from a USB stick (safe updates U3, AFR-0010): the file is never needed whole in memory.
+pub(crate) trait Source {
+    /// Fills `out` (already zeroed) with the file's bytes from byte `from`, as far as the file goes; false stops
+    /// the write (nothing points at the clusters written so far).
+    fn fill(&mut self, from: usize, out: &mut [u8]) -> bool;
+}
+
+/// A file already in memory (bootcopy's own boot file, report save's report, an empty folder).
+impl Source for &[u8] {
+    fn fill(&mut self, from: usize, out: &mut [u8]) -> bool {
+        if from < self.len() {
+            let to = (from + out.len()).min(self.len());
+            out[..to - from].copy_from_slice(&self[from..to]);
+        }
+        true
+    }
+}
+
 /// Fat::take's run of cluster sectors (shell context only).
 static mut BIG: [u8; crate::gpt::RUN * 512] = [0; crate::gpt::RUN * 512];
 
-impl Fat {
+impl<D: Sect> Fat<D> {
     /// 512-byte sectors per cluster.
     fn c512(&self) -> u64 {
         self.spc * self.bps / 512
@@ -664,6 +760,20 @@ impl Fat {
         self.data0 + (c as u64 - 2) * self.c512()
     }
 
+    /// The FAT entry of `c`, the FAT sector kept in `cache` between calls.
+    fn next_c(&self, c: u32, cache: &mut (u64, [u8; 512])) -> Option<u32> {
+        let k = c as u64 / 128;
+        if cache.0 != k {
+            if !self.dk.read(self.fat0 + k, &mut cache.1) {
+                return None;
+            }
+            cache.0 = k;
+        }
+        Some(u32le(&cache.1, (c as usize % 128) * 4) & 0x0FFF_FFFF)
+    }
+}
+
+impl<D: SectW> Fat<D> {
     /// FAT sector `k` (512 bytes) written to every FAT copy (they were checked equal).
     fn fat_put(&self, k: u64, s: &[u8; 512]) -> bool {
         (0..self.nfats).all(|i| self.dk.write(self.fat0 + i * self.fat512 + k, s))
@@ -679,18 +789,6 @@ impl Fat {
         let old = u32le(&s, o);
         s[o..o + 4].copy_from_slice(&((old & 0xF000_0000) | v).to_le_bytes());
         self.fat_put(k, &s)
-    }
-
-    /// The FAT entry of `c`, the FAT sector kept in `cache` between calls.
-    fn next_c(&self, c: u32, cache: &mut (u64, [u8; 512])) -> Option<u32> {
-        let k = c as u64 / 128;
-        if cache.0 != k {
-            if !self.dk.read(self.fat0 + k, &mut cache.1) {
-                return None;
-            }
-            cache.0 = k;
-        }
-        Some(u32le(&cache.1, (c as usize % 128) * 4) & 0x0FFF_FFFF)
     }
 
     /// The length of the chain from `c` (clusters), or None if it is damaged.
@@ -719,7 +817,7 @@ impl Fat {
 
     /// Takes `need` free clusters, lowest first, as one chain; `data` (zero filled after its
     /// end) is written into each cluster BEFORE its FAT entry changes. The chain's first cluster.
-    fn take(&self, need: u64, data: &[u8]) -> Result<u32, &'static str> {
+    fn take(&self, need: u64, data: &mut impl Source) -> Result<u32, &'static str> {
         let last = self.clusters + 1;
         let cb = self.cluster_bytes() as usize;
         let (mut first, mut prev, mut got) = (0u32, 0u32, 0u64);
@@ -763,10 +861,8 @@ impl Fat {
                     // SAFETY: shell context only; nothing else uses BIG while a copy runs.
                     let run = unsafe { &mut (&mut *core::ptr::addr_of_mut!(BIG))[pn * 512..(pn + n) * 512] };
                     run.fill(0);
-                    let from = got as usize * cb + q as usize * 512;
-                    if from < data.len() {
-                        let to = (from + n * 512).min(data.len());
-                        run[..to - from].copy_from_slice(&data[from..to]);
+                    if !data.fill(got as usize * cb + q as usize * 512, run) {
+                        return Err("the file could not be read");
                     }
                     pn += n;
                     q += n as u64;
@@ -1081,14 +1177,14 @@ pub fn copy(given: Option<&str>) {
     // 1: the file's clusters, 2: the folder's, both written before their FAT entries change;
     // 3: the folder's entries; 4: \EFI's entry last, so a cut-off copy leaves only clusters
     // no folder points at (Windows' chkdsk frees them), never an entry pointing at nothing
-    let fc = match fat.take(nfile, file) {
+    let fc = match fat.take(nfile, &mut &file[..]) {
         Ok(c) => c,
         Err(why) => {
             crate::kprintln!("bootcopy: {}; \\EFI was not changed, and chkdsk in Windows frees any clusters already taken", why);
             return;
         }
     };
-    let dc = match fat.take(1, &[]) {
+    let dc = match fat.take(1, &mut &[][..]) {
         Ok(c) => c,
         Err(why) => {
             crate::kprintln!("bootcopy: {}; \\EFI was not changed, and chkdsk in Windows frees any clusters already taken", why);
@@ -1118,7 +1214,8 @@ pub fn copy(given: Option<&str>) {
     let ok = s.dk.write(fat.at(dc), &d)
         && fat.put_slot(run[0].0, run[0].1, &dp[0])
         && fat.put_slot(run[1].0, run[1].1, &de)
-        && fat.fsinfo(-((nfile + 1) as i64));
+        && fat.fsinfo(-((nfile + 1) as i64))
+        && s.dk.settle();
     if !ok {
         crate::kprintln!("bootcopy: a write FAILED part way; bootcopy remove (or chkdsk in Windows) puts it right");
         return;
@@ -1249,7 +1346,7 @@ pub fn remove(given: Option<&str>) {
     }
     // the entry first (marked deleted, its long-name pieces too), then its clusters freed
     let mut ok = (0..found).rev().all(|i| fat.put_slot(at[i].0, at[i].1, &[0xE5]));
-    ok = ok && (fc == 0 || fat.release(fc)) && fat.release(s.ours) && fat.fsinfo((flen + dlen) as i64);
+    ok = ok && (fc == 0 || fat.release(fc)) && fat.release(s.ours) && fat.fsinfo((flen + dlen) as i64) && s.dk.settle();
     if !ok {
         crate::kprintln!("bootcopy remove: a write FAILED part way; chkdsk in Windows puts the partition right");
         return;
@@ -1286,4 +1383,631 @@ pub(crate) fn placed() -> Result<([u8; 32], u64, u64, u64, [u8; 16]), &'static s
     let fat = Fat::open(s.dk, s.part, s.len).map_err(|_| "the EFI partition holding it could not be opened")?;
     fat.same_file(s.efi, file).map_err(|_| "\\EFI\\afrisovera\\afrisovera.efi is not the boot file this PC was started with (bootcopy remove, then bootcopy)")?;
     Ok((s.label, s.ent, s.a, s.z - s.a + 1, s.guid))
+}
+
+// --- device firmware files, read only (13 Nov 2026, FIRMWARE_PLAN.md, architect's verdict of 13 Nov) ---
+//
+// A driver's firmware file lives in \EFI\afrisovera\firmware\ on an EFI system partition. Anyone who boots the PC
+// can write that partition, so this is a parser of hostile storage: it takes only a name from fwdb.rs (never a
+// path from a device or a person), never writes, reads at most the size fwdb.rs gives (not the size in the
+// directory entry), and checks every cluster number and the chain's length. The caller hashes what comes back
+// before a byte goes to a device (fwdb.rs).
+
+/// The folders a firmware file sits in, from the partition's root.
+const FW_DIR: [&str; 3] = ["EFI", "afrisovera", "firmware"];
+/// The most clusters one file may use: fwdb::MAX in the smallest cluster (512 bytes).
+const FW_CHAIN: usize = crate::fwdb::MAX / 512;
+/// The clusters of the file being read, to find a chain that comes back on itself (shell context only).
+static mut CHAIN: [u32; FW_CHAIN] = [0; FW_CHAIN];
+
+/// What reading one firmware file gave.
+pub(crate) enum FwRead {
+    /// the file's bytes are in `out[..size]`
+    Read,
+    /// no EFI system partition has the file
+    Missing,
+    /// the directory entry's size differs from fwdb.rs's (nothing was read)
+    WrongSize(u32),
+    /// the file or the way to it is damaged
+    Bad(&'static str),
+}
+
+impl<D: Sect> Fat<D> {
+    /// The firmware file `name`, exactly `want` bytes, into `out[..want]`.
+    fn fw_file(&self, name: &str, want: usize, out: &mut [u8]) -> FwRead {
+        let mut c = self.root;
+        for d in FW_DIR {
+            match self.sub(c, d) {
+                Ok(Some((k, true))) => c = k,
+                Ok(Some((_, false))) => return FwRead::Bad("a folder on the way to it is a file"),
+                Ok(None) => return FwRead::Missing,
+                Err(why) => return FwRead::Bad(why),
+            }
+        }
+        let mut found = None;
+        if let Err(why) = self.dir(c, &mut |e| {
+            if e.is(name) {
+                found = Some((e.clus, e.size, e.attr));
+                return true;
+            }
+            false
+        }) {
+            return FwRead::Bad(why);
+        }
+        let Some((first, size, attr)) = found else { return FwRead::Missing };
+        if attr & 0x10 != 0 {
+            return FwRead::Bad("it is a folder, not a file");
+        }
+        if size as usize != want {
+            return FwRead::WrongSize(size);
+        }
+        if want == 0 || want > out.len() {
+            return FwRead::Bad("its size is outside what a firmware file may be");
+        }
+        let per = self.bps / 512;
+        let cb = self.cluster_bytes() as usize;
+        let need = want.div_ceil(cb);
+        if need > FW_CHAIN {
+            return FwRead::Bad("it uses more clusters than a firmware file may");
+        }
+        // SAFETY: shell context only (the `firmware` command and drivers' setup from it), one reader at a time
+        // (fwdb::load holds its lock around this call).
+        let chain = unsafe { &mut *core::ptr::addr_of_mut!(CHAIN) };
+        let (mut fs, mut fbuf) = (u64::MAX, [0u8; 512]); // the FAT sector last read
+        let (mut c, mut off) = (first, 0usize);
+        for i in 0..need {
+            if c < 2 || c as u64 > self.clusters + 1 {
+                return FwRead::Bad("its cluster chain points outside the partition");
+            }
+            chain[i] = c;
+            let at = self.data0 + (c as u64 - 2) * self.spc * per;
+            for k in 0..self.spc * per {
+                if off >= want {
+                    break;
+                }
+                let mut s = [0u8; 512];
+                if !self.dk.read(at + k, &mut s) {
+                    return FwRead::Bad("a sector of it could not be read");
+                }
+                let n = (want - off).min(512);
+                out[off..off + n].copy_from_slice(&s[..n]);
+                off += n;
+            }
+            if i + 1 == need {
+                break;
+            }
+            let fat_at = c as u64 * 4;
+            let sec = self.fat0 + fat_at / 512;
+            if sec != fs {
+                if !self.dk.read(sec, &mut fbuf) {
+                    return FwRead::Bad("its FAT could not be read");
+                }
+                fs = sec;
+            }
+            let n = u32le(&fbuf, (fat_at % 512) as usize) & 0x0FFF_FFFF;
+            if n >= 0x0FFF_FFF8 {
+                return FwRead::Bad("its cluster chain ends before the file's size");
+            }
+            c = n; // 0, 1, a bad-cluster mark or a number past the end is refused at the top of the loop
+        }
+        // a chain that comes back to a cluster it already used reads the same bytes twice; refused whatever the
+        // hash would say
+        let used = &mut chain[..need];
+        used.sort_unstable();
+        if used.windows(2).any(|w| w[0] == w[1]) {
+            return FwRead::Bad("its cluster chain loops back on itself");
+        }
+        FwRead::Read
+    }
+}
+
+/// The firmware file `name` (from fwdb.rs only), exactly `want` bytes, into `out[..want]`: from the USB stick
+/// first, then every internal disk, in the first EFI system partition that has it. The disk it came from is
+/// written into `from`. Shell context only.
+pub(crate) fn read_file(name: &str, want: usize, out: &mut [u8], from: &mut [u8; 32]) -> FwRead {
+    // the stick (the usual way AfriSovera is started today), then the internal disks; a FAT32 stick is not a VFS
+    // stick, so it is reached by msc_attached (14 Nov 2026), not msc_present
+    if crate::xhci::msc_attached() {
+        let r = fw_on_stick(name, want, out);
+        if !matches!(r, FwRead::Missing) {
+            *from = [0; 32];
+            from[..9].copy_from_slice(b"usb stick");
+            return r;
+        }
+    }
+    let (ds, nd) = gpt::disks();
+    for &(dk, cap, bs) in &ds[..nd] {
+        let r = fw_on_disk(dk, cap, bs, name, want, out);
+        if !matches!(r, FwRead::Missing) {
+            *from = dk.label();
+            return r;
+        }
+    }
+    FwRead::Missing
+}
+
+/// The file on one disk's EFI system partitions (Missing when none has it, or the disk has none we can read).
+fn fw_on_disk<D: Sect>(dk: D, cap: u64, bs: u64, name: &str, want: usize, out: &mut [u8]) -> FwRead {
+    let mut found = [(0u64, 0u64, 0u64, [0u8; 16]); 4];
+    let Ok(n) = esps(dk, cap, bs, &mut found) else { return FwRead::Missing };
+    let per = (bs / 512).max(1);
+    for &(_, a, z, _) in &found[..n] {
+        let Ok(fat) = Fat::open(dk, a * per, (z - a + 1) * per) else { continue };
+        match fat.fw_file(name, want, out) {
+            FwRead::Missing => continue,
+            r => return r,
+        }
+    }
+    FwRead::Missing
+}
+
+/// The file on the USB stick. A stick made the way make-pc-usb.sh says (Windows' Format, FAT32) has either no
+/// partition table at all (the FAT32 starts at sector 0) or an MBR with one FAT32 partition; a GPT stick is
+/// read like an internal disk. Each start and length is checked against the stick's size.
+fn fw_on_stick(name: &str, want: usize, out: &mut [u8]) -> FwRead {
+    let cap = crate::xhci::msc_capacity();
+    if let Ok(fat) = Fat::open(Stick, 0, cap) {
+        return fat.fw_file(name, want, out);
+    }
+    let mut s = [0u8; 512];
+    if !Stick.read(0, &mut s) || s[510] != 0x55 || s[511] != 0xAA {
+        return FwRead::Missing;
+    }
+    if (0..4).any(|i| s[446 + 16 * i + 4] == 0xEE) {
+        return fw_on_disk(Stick, cap, crate::xhci::msc_block_size(), name, want, out);
+    }
+    let per = (crate::xhci::msc_block_size() / 512).max(1); // MBR numbers count the stick's own blocks
+    for i in 0..4 {
+        let e = &s[446 + 16 * i..446 + 16 * (i + 1)];
+        let (a, n) = (u32le(e, 8) as u64 * per, u32le(e, 12) as u64 * per);
+        // 0x0B and 0x0C: FAT32; 0xEF: an EFI system partition on an MBR disk
+        if !matches!(e[4], 0x0B | 0x0C | 0xEF) || a == 0 || n == 0 || a + n > cap {
+            continue;
+        }
+        let Ok(fat) = Fat::open(Stick, a, n) else { continue };
+        match fat.fw_file(name, want, out) {
+            FwRead::Missing => continue,
+            r => return r,
+        }
+    }
+    FwRead::Missing
+}
+
+// --- `report save`: the field report written to the USB stick AfriSovera started from (report home, 13 Nov 2026,
+// ARCHITECT_REVIEWS "report home plan") ---
+//
+// Only on a USB mass-storage stick the firmware started us from (never an internal disk, even one we booted from),
+// only as a NEW file \AFREPORT\<n>.TXT (8.3 names, n one more than the highest there, at most 64 files), at most
+// the report's 96 KiB, and only when at least 1 MiB stays free. bootcopy's checks and order: the stick's FAT32
+// closed cleanly with both FAT copies equal before anything is written; the file's clusters, then (the first time)
+// \AFREPORT's own cluster with "." and ".." and the file's entry, each written before its FAT entries in both
+// copies; then FSInfo; the entry that names the new file or folder last. Then the stick is flushed and the file
+// read back and compared before it is called saved.
+
+/// Most report files kept in \AFREPORT.
+const SAVE_MAX: u32 = 64;
+const SAVE_DIR: &[u8; 11] = b"AFREPORT   ";
+
+/// (start, length) in 512-byte sectors of each FAT32 the stick may hold: the whole stick (no partition table), the
+/// FAT32 partitions of an MBR, or the EFI system partitions of a GPT; how many.
+fn stick_parts(out: &mut [(u64, u64); 4]) -> usize {
+    let cap = crate::xhci::msc_capacity();
+    if Fat::open(Stick, 0, cap).is_ok() {
+        out[0] = (0, cap);
+        return 1;
+    }
+    let mut s = [0u8; 512];
+    if !Stick.read(0, &mut s) || s[510] != 0x55 || s[511] != 0xAA {
+        return 0;
+    }
+    let bs = crate::xhci::msc_block_size();
+    let per = (bs / 512).max(1);
+    if (0..4).any(|i| s[446 + 16 * i + 4] == 0xEE) {
+        let mut found = [(0u64, 0u64, 0u64, [0u8; 16]); 4];
+        let Ok(n) = esps(Stick, cap, bs, &mut found) else { return 0 };
+        for (i, &(_, a, z, _)) in found[..n].iter().enumerate() {
+            out[i] = (a * per, (z - a + 1) * per);
+        }
+        return n;
+    }
+    let mut k = 0;
+    for i in 0..4 {
+        let e = &s[446 + 16 * i..446 + 16 * (i + 1)];
+        let (a, n) = (u32le(e, 8) as u64 * per, u32le(e, 12) as u64 * per);
+        if matches!(e[4], 0x0B | 0x0C | 0xEF) && a != 0 && n != 0 && a + n <= cap {
+            out[k] = (a, n);
+            k += 1;
+        }
+    }
+    k
+}
+
+/// The FAT time and date of now (the firmware clock), or noon on the build's fixed date.
+fn fat_now() -> (u16, u16) {
+    match crate::uefi::get_time() {
+        Ok(t) if (1980..2108).contains(&t.year) && (1..=12).contains(&t.month) && (1..=31).contains(&t.day) => (
+            (t.hour as u16) << 11 | (t.minute as u16) << 5 | (t.second as u16 / 2),
+            (t.year - 1980) << 9 | (t.month as u16) << 5 | t.day as u16,
+        ),
+        _ => (12 << 11, ((2026 - 1980) << 9) | (11 << 5) | 13),
+    }
+}
+
+/// A directory entry as gpt::dirent makes it, stamped with `when` (time, date).
+fn dirent_at(d: &mut [u8], name: &[u8; 11], attr: u8, clus: u32, size: u32, when: (u16, u16)) {
+    gpt::dirent(d, name, attr, clus, size);
+    for (o, v) in [(14, when.0), (16, when.1), (18, when.1), (22, when.0), (24, when.1)] {
+        d[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// `<n>.<ext>` as an 8.3 name; None past 8 digits.
+fn txt_name(n: u32, ext: &[u8; 3]) -> Option<[u8; 11]> {
+    let mut d = [0u8; 10];
+    let mut k = 0;
+    let mut v = n;
+    loop {
+        d[k] = b'0' + (v % 10) as u8;
+        k += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    if k > 8 {
+        return None;
+    }
+    let mut s = [b' '; 11];
+    for i in 0..k {
+        s[i] = d[k - 1 - i];
+    }
+    s[8..].copy_from_slice(ext);
+    Some(s)
+}
+
+/// The number of an 8.3 name `<digits>.TXT` or `<digits>.BIN` (one numbering for both: a report and a saved table
+/// set never share a number).
+fn txt_number(short: &[u8; 11]) -> Option<u32> {
+    if &short[8..] != b"TXT" && &short[8..] != b"BIN" {
+        return None;
+    }
+    let digits = short[..8].iter().take_while(|&&c| c != b' ').count();
+    if digits == 0 || short[digits..8].iter().any(|&c| c != b' ') {
+        return None;
+    }
+    let mut v = 0u32;
+    for &c in &short[..digits] {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + (c - b'0') as u32;
+    }
+    Some(v)
+}
+
+impl<D: Sect> Fat<D> {
+    /// The file at `path` (backslashes, from the root) starts with the first `cmp` bytes of `want` and is exactly
+    /// `want.len()` bytes long: the boot file AfriSovera was started from is on this file system.
+    fn holds(&self, path: &str, want: &[u8], cmp: usize) -> Result<bool, &'static str> {
+        let mut c = self.root;
+        let parts = path.split('\\').filter(|p| !p.is_empty());
+        let n = parts.clone().count();
+        if n == 0 {
+            return Ok(false);
+        }
+        for (i, name) in parts.enumerate() {
+            let mut got = None;
+            self.dir(c, &mut |e| {
+                if e.is(name) {
+                    got = Some((e.clus, e.attr, e.size));
+                    return true;
+                }
+                false
+            })?;
+            let Some((clus, attr, size)) = got else { return Ok(false) };
+            if i + 1 < n {
+                if attr & 0x10 == 0 {
+                    return Ok(false);
+                }
+                c = clus;
+                continue;
+            }
+            if attr & 0x10 != 0 || size as usize != want.len() {
+                return Ok(false);
+            }
+            // the first `cmp` bytes, sector by sector along the chain
+            let (mut cl, mut off) = (clus, 0usize);
+            let mut s = [0u8; 512];
+            let mut cache = (u64::MAX, [0u8; 512]);
+            let cmp = cmp.min(want.len());
+            while off < cmp {
+                if cl < 2 || cl as u64 > self.clusters + 1 {
+                    return Ok(false);
+                }
+                for q in 0..self.c512() {
+                    if off >= cmp {
+                        break;
+                    }
+                    if !self.dk.read(self.at(cl) + q, &mut s) {
+                        return Err("could not read the boot file");
+                    }
+                    let to = (off + 512).min(cmp);
+                    if s[..to - off] != want[off..to] {
+                        return Ok(false);
+                    }
+                    off = to;
+                }
+                match self.next_c(cl, &mut cache) {
+                    Some(nx) if nx >= 0x0FFF_FFF8 => break,
+                    Some(nx) if nx >= 2 => cl = nx,
+                    _ => return Ok(false),
+                }
+            }
+            return Ok(off >= cmp);
+        }
+        Ok(false)
+    }
+
+    /// The file `name` in the folder at `dirc` read back and compared with `want`: Ok when its size, first
+    /// cluster and every byte are as written.
+    fn reads_back(&self, dirc: u32, name: &[u8; 11], first: u32, want: &[u8]) -> Result<(), &'static str> {
+        let mut got = None;
+        self.dir(dirc, &mut |e| {
+            if &e.short == name && e.attr & 0x10 == 0 {
+                got = Some((e.clus, e.size));
+                return true;
+            }
+            false
+        })?;
+        let Some((c0, size)) = got else { return Err("the file's entry is not there") };
+        if c0 != first || size as usize != want.len() {
+            return Err("the file's entry does not read back as written");
+        }
+        let (mut c, mut off) = (c0, 0usize);
+        let mut s = [0u8; 512];
+        let mut cache = (u64::MAX, [0u8; 512]);
+        loop {
+            if c < 2 || c as u64 > self.clusters + 1 {
+                return Err("the file's cluster chain is damaged");
+            }
+            for q in 0..self.c512() {
+                if off >= want.len() {
+                    break;
+                }
+                if !self.dk.read(self.at(c) + q, &mut s) {
+                    return Err("could not read the file back");
+                }
+                let to = (off + 512).min(want.len());
+                if s[..to - off] != want[off..to] {
+                    return Err("the file does not read back the same");
+                }
+                off = to;
+            }
+            let nx = self.next_c(c, &mut cache).ok_or("could not read the FAT")?;
+            if off >= want.len() {
+                return if nx >= 0x0FFF_FFF8 { Ok(()) } else { Err("the file's chain is too long") };
+            }
+            if nx >= 0x0FFF_FFF8 || nx == 0 {
+                return Err("the file's chain is too short");
+            }
+            c = nx;
+        }
+    }
+}
+
+/// `report save`: `body` written to the USB stick AfriSovera started from as \AFREPORT\<n>.TXT. One line per
+/// outcome; true when it was saved and read back.
+pub fn report_save(body: &[u8]) -> bool {
+    stick_save("report save", body, b"TXT")
+}
+
+/// `acpisave` (AML rung C2, ARCHITECT_REVIEWS 14 Nov): the firmware's DSDT, SSDTs and FACP, put together by
+/// hwscan::acpi_save, written the same way as \AFREPORT\<n>.BIN.
+pub fn acpi_save(body: &[u8]) -> bool {
+    stick_save("acpisave", body, b"BIN")
+}
+
+/// The one door (ARCHITECT_REVIEWS 14 Nov): `body` as a new file \AFREPORT\<n>.<ext> on the USB stick AfriSovera
+/// started from, after the boot-medium and boot-file checks; `who` starts every line.
+fn stick_save(who: &'static str, body: &[u8], ext: &[u8; 3]) -> bool {
+    use crate::uefi::Medium;
+    match crate::uefi::boot_medium() {
+        Medium::Usb => {}
+        Medium::Other(k) => {
+            crate::kprintln!("{}: AfriSovera started from {} (not a USB stick), and {} writes only to the USB stick it started from; nothing written.{}", who, k, who, if who == "report save" { " Use  report <address>  instead." } else { "" });
+            return false;
+        }
+        Medium::Unknown => {
+            crate::kprintln!("{}: the firmware did not say what AfriSovera started from, so nothing is written (it writes only to the USB stick it started from)", who);
+            return false;
+        }
+    }
+    if !crate::xhci::msc_attached() {
+        crate::kprintln!("{}: AfriSovera started from a USB stick, but the stick is not reachable now (was it pulled out?); nothing written", who);
+        return false;
+    }
+    let Some(own) = crate::uefi::own_image() else {
+        crate::kprintln!("{}: the boot file was not kept at power-on, so the stick it came from cannot be recognised; nothing written", who);
+        return false;
+    };
+    // the stick the driver holds must be the one we started from: it holds our boot file, byte for byte at the start
+    let mut parts = [(0u64, 0u64); 4];
+    let np = stick_parts(&mut parts);
+    let mut fat = None;
+    for &(a, n) in &parts[..np] {
+        let Ok(f) = Fat::open(Stick, a, n) else { continue };
+        if let Ok(true) = f.holds(crate::uefi::own_path(), own, 64 * 1024) {
+            fat = Some(f);
+            break;
+        }
+    }
+    let Some(seen) = fat else {
+        crate::kprintln!("{}: the USB stick plugged in is not the one AfriSovera started from (its FAT32 does not hold this boot file); nothing written", who);
+        return false;
+    };
+    // the one door: the only place the stick is opened for writing, after both checks above
+    let Ok(fat) = Fat::open(BootStick(()), seen.part, seen.len()) else {
+        crate::kprintln!("{}: the stick's FAT32 could not be opened again; nothing written", who);
+        return false;
+    };
+    match fat.free() {
+        Err(why) => {
+            crate::kprintln!("{}: the stick's file system {}; nothing written", who, why);
+            return false;
+        }
+        Ok((_, false, _)) => {
+            crate::kprintln!("{}: the stick's two FAT copies differ (let Windows check it); nothing written", who);
+            return false;
+        }
+        Ok((_, _, false)) => {
+            crate::kprintln!("{}: the stick was not closed cleanly (pulled out without Safely Remove, or Windows found errors). Put it in Windows, let it check the stick, eject it safely, then try again; nothing written", who);
+            return false;
+        }
+        Ok(_) => {}
+    }
+    let (free0, _, _) = fat.free().unwrap_or((0, false, false));
+    let cb = fat.cluster_bytes();
+    // \AFREPORT: there or not, the reports in it, a free slot
+    let mut dir: Option<u32> = None;
+    let mut not_dir = false;
+    let r = fat.dir(fat.root, &mut |e| {
+        if &e.short == SAVE_DIR {
+            if e.attr & 0x10 != 0 {
+                dir = Some(e.clus);
+            } else {
+                not_dir = true;
+            }
+            return true;
+        }
+        false
+    });
+    if let Err(why) = r {
+        crate::kprintln!("{}: the stick's top folder: {}; nothing written", who, why);
+        return false;
+    }
+    if not_dir {
+        crate::kprintln!("{}: the stick has a FILE named AFREPORT where the reports' folder goes; nothing written", who);
+        return false;
+    }
+    let (mut count, mut high) = (0u32, 0u32);
+    let mut slot = None;
+    let mut ended = false;
+    let home = dir.unwrap_or(fat.root);
+    if let Some(dc) = dir {
+        let r = fat.dir(dc, &mut |e| {
+            if let Some(n) = txt_number(&e.short) {
+                if e.attr & 0x18 == 0 {
+                    count += 1;
+                    high = high.max(n);
+                }
+            }
+            false
+        });
+        if let Err(why) = r {
+            crate::kprintln!("{}: \\AFREPORT: {}; nothing written", who, why);
+            return false;
+        }
+        if count >= SAVE_MAX {
+            crate::kprintln!("{}: \\AFREPORT already holds {} reports. Move them to the main PC (report-from-stick), delete them from the stick, then try again; nothing written", who, count);
+            return false;
+        }
+    }
+    let r = fat.slots(home, &mut |n, o, e| {
+        if e[0] == 0 {
+            ended = true;
+        }
+        if ended || e[0] == 0xE5 {
+            slot = Some((n, o));
+            return true;
+        }
+        false
+    });
+    if let Err(why) = r {
+        crate::kprintln!("{}: {}; nothing written", who, why);
+        return false;
+    }
+    let Some(slot) = slot else {
+        crate::kprintln!("{}: the stick's {} folder is full (it would have to grow); nothing written", who, if dir.is_some() { "\\AFREPORT" } else { "top" });
+        return false;
+    };
+    let n = high + 1;
+    let Some(name) = txt_name(n, ext) else {
+        crate::kprintln!("{}: the next report number is too large for an 8.3 name; nothing written", who);
+        return false;
+    };
+    let nfile = (body.len() as u64).div_ceil(cb).max(1);
+    let used = nfile + dir.is_none() as u64;
+    let keep = (1024 * 1024u64).div_ceil(cb);
+    if free0 < used + keep {
+        crate::kprintln!("{}: the stick has {} KiB free; the report needs {} KiB and 1 MiB must stay free; nothing written", who, kib(free0 * cb), kib(used * cb));
+        return false;
+    }
+    let when = fat_now();
+    // 1: the file's clusters (data, then both FAT copies)
+    let fc = match fat.take(nfile, &mut &body[..]) {
+        Ok(c) => c,
+        Err(why) => {
+            crate::kprintln!("{}: {}. No folder entry was written, so the stick shows no new file; Windows' check frees any clusters already taken", who, why);
+            return false;
+        }
+    };
+    let mut fe = [0u8; 32];
+    dirent_at(&mut fe, &name, 0x20, fc, body.len() as u32, when);
+    let ok = if dir.is_some() {
+        // 2: FSInfo; 3: the file's entry in \AFREPORT, last
+        fat.fsinfo(-(nfile as i64)) && fat.put_slot(slot.0, slot.1, &fe)
+    } else {
+        // 2: \AFREPORT's own cluster: take() writes it zeroed, then its FAT entry; then its first sector gets
+        // "." "..", and the file's entry; 3: FSInfo; 4: the top folder's entry naming \AFREPORT, last
+        let mut d = [0u8; 96];
+        match fat.take(1, &mut &[][..]) {
+            Err(why) => {
+                crate::kprintln!("{}: {}. No folder entry was written, so the stick shows no new file; Windows' check frees any clusters already taken", who, why);
+                return false;
+            }
+            Ok(dc) => {
+                dirent_at(&mut d[0..32], b".          ", 0x10, dc, 0, when);
+                dirent_at(&mut d[32..64], b"..         ", 0x10, 0, 0, when);
+                d[64..96].copy_from_slice(&fe);
+                let mut s = [0u8; 512];
+                s[..96].copy_from_slice(&d);
+                let mut de = [0u8; 32];
+                dirent_at(&mut de, SAVE_DIR, 0x10, dc, 0, when);
+                dir = Some(dc);
+                // the cluster was zeroed by take; its first sector now holds the three entries
+                fat.dk.write(fat.at(dc), &s) && fat.fsinfo(-(used as i64)) && fat.put_slot(slot.0, slot.1, &de)
+            }
+        }
+    };
+    let ok = ok && fat.dk.settle();
+    if !ok {
+        crate::kprintln!("{}: a write FAILED part way. The entry naming the report was {}; Windows' check of the stick puts it right", who, if dir.is_some() { "perhaps not written" } else { "not written" });
+        return false;
+    }
+    // read it all back from the stick (a fresh look at the file system)
+    let back = Fat::open(Stick, fat.part, fat.len()).and_then(|f| {
+        let dc = dir.ok_or("the folder is not known")?;
+        f.reads_back(dc, &name, fc, body)?;
+        let (free, same, clean) = f.free()?;
+        if !same || !clean || free + used != free0 {
+            return Err("the FAT does not read back as written");
+        }
+        Ok(free)
+    });
+    let mut shown = [0u8; 12];
+    let k = name[..8].iter().take_while(|&&c| c != b' ').count();
+    shown[..k].copy_from_slice(&name[..k]);
+    shown[k] = b'.';
+    shown[k + 1..k + 4].copy_from_slice(ext);
+    let shown = core::str::from_utf8(&shown[..k + 4]).unwrap_or("?");
+    match back {
+        Ok(free) => {
+            crate::kprintln!("{}: SAVED \\AFREPORT\\{} ({} bytes), read back the same; {} KiB free on the stick", who, shown, body.len(), kib(free * cb));
+            true
+        }
+        Err(why) => {
+            crate::kprintln!("{}: written as \\AFREPORT\\{}, but reading it back FAILED: {}. Do not rely on it; try again", who, shown, why);
+            false
+        }
+    }
 }

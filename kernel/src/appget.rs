@@ -269,8 +269,8 @@ pub fn run(args: &str, getkey: fn() -> u8) {
             core::str::from_utf8(&g).unwrap_or("?")
         );
     }
-    let needs = match crate::nia::check_module(bytes) {
-        Ok(caps) => caps,
+    let (needs, asked) = match crate::nia::check_module(bytes) {
+        Ok(r) => r,
         Err(e) => return crate::kprintln!("appget: {} is not a Nia app ({}); nothing written", name, e),
     };
 
@@ -280,8 +280,20 @@ pub fn run(args: &str, getkey: fn() -> u8) {
     crate::kprintln!("appget: {}, {} bytes", name, bytes.len());
     crate::kprintln!("  SHA-256 matches the one you gave: {}", core::str::from_utf8(&full).unwrap_or("?"));
     crate::kprintln!("  unsigned (no publisher), downloaded over plain HTTP (not encrypted)");
-    crate::nia::print_caps("  it uses: ", needs, "  (none)");
-    crate::nia::print_caps("  it will NOT get: ", needs & !crate::nia::CAP_SIDELOAD, "  (nothing withheld)");
+    match asked {
+        // The app lists what it needs (afri.permissions, claude/nia-perms): it gets that, within what an
+        // unverified app may have, and nothing else.
+        Some(asked) => {
+            crate::nia::print_caps("  it asks for: ", asked, "  (nothing)");
+            crate::nia::print_caps("  it will get: ", asked & crate::nia::CAP_SIDELOAD, "  (nothing)");
+            crate::nia::print_caps("  it will NOT get: ", asked & !crate::nia::CAP_SIDELOAD, "  (nothing withheld)");
+            crate::nia::print_caps("  it uses but did not ask for (refused if called): ", needs & !asked, "  (none)");
+        }
+        None => {
+            crate::nia::print_caps("  it uses: ", needs, "  (none)");
+            crate::nia::print_caps("  it will NOT get: ", needs & !crate::nia::CAP_SIDELOAD, "  (nothing withheld)");
+        }
+    }
     match crate::vfs::read_full(name) {
         Some(old) => crate::kprintln!("  replaces the existing {} ({} bytes)", name, old.len()),
         None => crate::kprintln!("  a new file"),

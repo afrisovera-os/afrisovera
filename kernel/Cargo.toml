@@ -31,6 +31,12 @@ board-raspi = []
 board-rpi4 = []
 board-pine64 = []
 pc = []
+# A build marked for release (PC: --features pc,release). It refuses to compile while any demo key is trusted
+# (AFR-0010 section 7, pc/update.rs); off in every test build, so it changes nothing there.
+release = []
+# Test only (pc-releaseguard): a release build with one planted row, the demo update key's bytes marked
+# `demo: false`, to prove the byte check catches it. Never for a real build.
+releaseguard-plant = ["release"]
 
 [dependencies]
 # ADR 0007 (kernel dependencies): third-party crates for CRYPTOGRAPHIC PRIMITIVES only, exact `=` pins, no
@@ -44,3 +50,10 @@ pc = []
 mesh-crypto = { path = "../mesh-crypto" }
 mesh-noise = { path = "../mesh-noise" }
 mesh-hpke = { path = "../mesh-hpke" }
+
+# ADR 0007 row "Wi-Fi primitives" (architect, 14 Nov 2026): the PC kernel's Wi-Fi takes its primitives (SHA-1, HMAC,
+# PBKDF2, AES, CCM, AES key wrap, CMAC) from pinned RustCrypto crates through our path crate wlan-crypto, used only
+# by kernel/src/wlan/crypto.rs. x86_64 only: the ARM kernel links none of it. Software AES only (aes_force_soft in
+# .cargo/config.toml, checked by scripts/wifi-crypto-test.sh): the PC kernel saves no SIMD state.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+wlan-crypto = { path = "../wlan-crypto" }

@@ -22,6 +22,27 @@ fn is_wasm(name: &str) -> bool {
     b.len() > 5 && &b[b.len() - 5..] == b".wasm"
 }
 
+/// The catalog: the bundled apps that exist only in the kernel image (A7) first, so a full VFS cannot hide them,
+/// then the VFS's apps; at most 12.
+fn apps(names: &mut [&'static str; 12], sizes: &mut [usize; 12]) -> usize {
+    let mut n = 0;
+    for (name, _) in crate::nia::BUNDLED {
+        if let (Some(b), true) = (crate::nia::built_in_only(name), n < 12) {
+            names[n] = name;
+            sizes[n] = b.len();
+            n += 1;
+        }
+    }
+    for i in 0..vfs::MAX_FILES {
+        if vfs::is_used(i) && is_wasm(vfs::name_of(i)) && !crate::nia::is_big_bundled(vfs::name_of(i)) && n < 12 {
+            names[n] = vfs::name_of(i);
+            sizes[n] = vfs::size_of(i);
+            n += 1;
+        }
+    }
+    n
+}
+
 fn lerp(a: u32, b: u32, t: usize, d: usize) -> u32 {
     let ch = |s: u32| -> u32 {
         let av = ((a >> s) & 0xff) as i32;
@@ -50,6 +71,7 @@ fn fmt_u32(mut v: u32, buf: &mut [u8; 12]) -> &str {
 }
 
 fn getkey() -> u8 {
+    crate::shell::end_catch(); // inside more or >: show the question instead of hanging (afriui.md section 28)
     loop {
         if let Some(c) = crate::uart::getc() {
             return c;
@@ -62,14 +84,11 @@ fn getkey() -> u8 {
 /// launch it, any key to come back, 'q' to exit to the console.
 pub fn open() {
     crate::kprintln!("AfriStore -- installed WASM apps (sideload freely, no gatekeeper):");
-    let mut names: [&str; 12] = [""; 12];
-    let mut n = 0;
-    for i in 0..vfs::MAX_FILES {
-        if vfs::is_used(i) && is_wasm(vfs::name_of(i)) && n < 12 {
-            crate::kprintln!("  [{}] {:<16} {:>5} B", n + 1, vfs::name_of(i), vfs::size_of(i));
-            names[n] = vfs::name_of(i);
-            n += 1;
-        }
+    let mut names: [&'static str; 12] = [""; 12];
+    let mut sizes = [0usize; 12];
+    let n = apps(&mut names, &mut sizes);
+    for i in 0..n {
+        crate::kprintln!("  [{}] {:<16} {:>5} B", i + 1, names[i], sizes[i]);
     }
     crate::kprintln!("  ({} apps. Press a number to launch, 'q' to exit.)", n);
 
@@ -128,16 +147,15 @@ fn draw_catalog(count: usize) {
 
     // App cards.
     let accents = [0xE0_3A_3A, 0xF2_B7_05, 0x2E_CC_71, 0x2A_6B_E0, 0x9B_59_F6, 0x1F_B6_C9];
-    let mut idx = 0;
-    for i in 0..vfs::MAX_FILES {
-        if vfs::is_used(i) && is_wasm(vfs::name_of(i)) {
-            let col = idx % 3;
-            let row = idx / 3;
-            let cardx = 16 + col * 204;
-            let cardy = 92 + row * 116;
-            draw_card(cardx, cardy, vfs::name_of(i), vfs::size_of(i) as u32, accents[idx % 6], idx + 1);
-            idx += 1;
-        }
+    let mut names: [&'static str; 12] = [""; 12];
+    let mut sizes = [0usize; 12];
+    let n = apps(&mut names, &mut sizes);
+    for idx in 0..n {
+        let col = idx % 3;
+        let row = idx / 3;
+        let cardx = 16 + col * 204;
+        let cardy = 92 + row * 116;
+        draw_card(cardx, cardy, names[idx], sizes[idx] as u32, accents[idx % 6], idx + 1);
     }
 
     // Footer bar.
@@ -185,7 +203,7 @@ fn draw_card(x: usize, y: usize, name: &str, size: u32, accent: u32, num: usize)
     }
 
     // Trust badge (crypto verdict) at the card's bottom-left, under the icon.
-    let data = vfs::read_raw(name).unwrap_or(&[]);
+    let data = crate::nia::bundled(name).or_else(|| vfs::read_raw(name)).unwrap_or(&[]);
     let (label, bg, fg) = match crate::integrity::trust(name, data) {
         crate::integrity::Trust::Signed => ("SIGNED", GREEN, 0x08_1A_10),
         crate::integrity::Trust::Verified => ("VERIFIED", 0x2E_6A_C8, WHITE),

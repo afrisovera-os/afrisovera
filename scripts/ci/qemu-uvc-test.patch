@@ -1,0 +1,498 @@
+GPL-2.0-or-later, a test-only change to QEMU; not part of AfriSovera
+TEST EQUIPMENT ONLY (13 Nov 2026, UVC plan, architect's Q3): a USB Video Class test camera for QEMU
+(usb-uvc-test), applied to QEMU's own source when the CI builds QEMU (ci.yml, cloud/job.sh), never part of
+AfriSovera. QEMU 11 has no USB camera, so this is the weaker kind of evidence, because the same engineer wrote
+both ends; pc-usbcam grades it together with the driver's selftest built from the UVC 1.5 specification.
+No other QEMU device changes.
+
+--- a/hw/usb/meson.build
++++ b/hw/usb/meson.build
+@@ -44,6 +44,7 @@
+ system_ss.add(when: 'CONFIG_USB_AUDIO', if_true: files('dev-audio.c'))
+ system_ss.add(when: 'CONFIG_USB_SERIAL', if_true: files('dev-serial.c'))
+ system_ss.add(when: 'CONFIG_USB_NETWORK', if_true: files('dev-network.c'))
++system_ss.add(when: 'CONFIG_USB', if_true: files('dev-uvc-test.c'))  # AfriSovera test camera (test patch)
+ if host_os != 'windows'
+   system_ss.add(when: 'CONFIG_USB_STORAGE_MTP', if_true: files('dev-mtp.c'))
+ endif
+--- /dev/null
++++ b/hw/usb/dev-uvc-test.c
+@@ -0,0 +1,478 @@
++/*
++ * AfriSovera test camera (13 Nov 2026): a USB Video Class 1.1 device for the AfriSovera PC kernel's webcam
++ * driver (pc-usbcam), applied to QEMU's source when the AfriSovera CI builds QEMU. TEST EQUIPMENT ONLY, never
++ * part of AfriSovera. QEMU 11 has no USB camera; this one is the weaker kind of evidence (the same engineer
++ * wrote both ends), graded together with the driver's own selftest built from the UVC 1.5 specification.
++ *
++ * High speed, one video function (an interface association): a VideoControl interface (a camera input
++ * terminal and a streaming output terminal) and a VideoStreaming interface with YUY2 320x240 and 640x480 (15
++ * and 30 frames a second) and one MJPEG size the driver must pass over. Alternate settings 1 and 2 carry an
++ * isochronous IN endpoint of 1024 and 3 x 1024 bytes a microframe. The probe control answers 3072 bytes a
++ * packet, so a host picks alternate setting 2.
++ *
++ * The picture is a known pattern a grader can rebuild: eight colour bars, each row's luma lowered by
++ * (row + frame number) mod 8, and the frame number in the first four bytes (little-endian). Frames start
++ * every frame interval of the virtual clock; between frames the device sends header-only packets, as real
++ * cameras do. With bad=on, frames go hostile in turn: a header length of 0, of 1, of 13, the error bit, a
++ * frame 100 bytes too long, then one good frame.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/usb/usb.h"
++#include "migration/vmstate.h"
++#include "desc.h"
++#include "qom/object.h"
++
++#define TYPE_USB_UVC_TEST "usb-uvc-test"
++OBJECT_DECLARE_SIMPLE_TYPE(USBUVCTestState, USB_UVC_TEST)
++
++#define UVC_VENDOR      0x46f4  /* QEMU's vendor id, as the other QEMU devices */
++#define UVC_PRODUCT     0xaf01  /* the AfriSovera test camera */
++#define UVC_PAYLOAD     3072    /* bytes a packet the probe answers (alternate setting 2) */
++#define UVC_HDR         12      /* payload header with PTS and SCR */
++#define UVC_MAX_W       640
++#define UVC_MAX_H       480
++
++#define U16(x) ((x) & 0xff), (((x) >> 8) & 0xff)
++#define U32(x) ((x) & 0xff), (((x) >> 8) & 0xff), (((x) >> 16) & 0xff), (((x) >> 24) & 0xff)
++
++enum {
++    STR_MANUFACTURER = 1,
++    STR_PRODUCT,
++    STR_SERIALNUMBER,
++};
++
++static const USBDescStrings uvc_strings = {
++    [STR_MANUFACTURER] = "AfriSovera test equipment",
++    [STR_PRODUCT]      = "AfriSovera Test Camera",
++    [STR_SERIALNUMBER] = "1",
++};
++
++/* the frame sizes, by format 1 frame index */
++static const uint16_t frame_w[3] = { 0, 320, 640 };
++static const uint16_t frame_h[3] = { 0, 240, 480 };
++
++static const USBDescIface uvc_ifaces[] = {
++    {
++        .bInterfaceNumber   = 0,
++        .bNumEndpoints      = 0,
++        .bInterfaceClass    = 0x0e,         /* video */
++        .bInterfaceSubClass = 0x01,         /* video control */
++        .ndesc              = 3,
++        .descs = (USBDescOther[]) {
++            { .data = (uint8_t[]) {
++                13, 0x24, 0x01, U16(0x0110), U16(13 + 18 + 9), U32(48000000), 1, 1 } },
++            /* input terminal 1: a camera */
++            { .data = (uint8_t[]) {
++                18, 0x24, 0x02, 1, U16(0x0201), 0, 0, U16(0), U16(0), U16(0), 3, 0, 0, 0 } },
++            /* output terminal 2: the streaming interface, from 1 */
++            { .data = (uint8_t[]) {
++                9, 0x24, 0x03, 2, U16(0x0101), 0, 1, 0 } },
++        },
++    }, {
++        .bInterfaceNumber   = 1,
++        .bAlternateSetting  = 0,
++        .bNumEndpoints      = 0,
++        .bInterfaceClass    = 0x0e,
++        .bInterfaceSubClass = 0x02,         /* video streaming */
++        .ndesc              = 6,
++        .descs = (USBDescOther[]) {
++            /* input header: 2 formats, endpoint 0x81, terminal 2 */
++            { .data = (uint8_t[]) {
++                15, 0x24, 0x01, 2, U16(15 + 27 + 34 + 34 + 11 + 30), 0x81, 0, 2, 0, 0, 0, 1, 0, 0 } },
++            /* format 1: uncompressed YUY2, 2 frames */
++            { .data = (uint8_t[]) {
++                27, 0x24, 0x04, 1, 2,
++                0x59, 0x55, 0x59, 0x32, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
++                16, 1, 0, 0, 0, 0 } },
++            { .data = (uint8_t[]) {
++                34, 0x24, 0x05, 1, 0, U16(320), U16(240), U32(320 * 240 * 16 * 15), U32(320 * 240 * 16 * 30),
++                U32(320 * 240 * 2), U32(666666), 2, U32(333333), U32(666666) } },
++            { .data = (uint8_t[]) {
++                34, 0x24, 0x05, 2, 0, U16(640), U16(480), U32(640 * 480 * 16 * 15), U32(640 * 480 * 16 * 30),
++                U32(640 * 480 * 2), U32(666666), 2, U32(333333), U32(666666) } },
++            /* format 2: MJPEG, one 1280x720 frame (the driver passes it over in slice 1) */
++            { .data = (uint8_t[]) {
++                11, 0x24, 0x06, 2, 1, 1, 1, 0, 0, 0, 0 } },
++            { .data = (uint8_t[]) {
++                30, 0x24, 0x07, 1, 0, U16(1280), U16(720), U32(1000000), U32(30000000),
++                U32(1280 * 720 * 2), U32(333333), 1, U32(333333) } },
++        },
++    }, {
++        .bInterfaceNumber   = 1,
++        .bAlternateSetting  = 1,
++        .bNumEndpoints      = 1,
++        .bInterfaceClass    = 0x0e,
++        .bInterfaceSubClass = 0x02,
++        .eps = (USBDescEndpoint[]) {
++            {
++                .bEndpointAddress = USB_DIR_IN | 0x01,
++                .bmAttributes     = 0x05,       /* isochronous, asynchronous */
++                .wMaxPacketSize   = 0x0400,     /* 1024 x 1 */
++                .bInterval        = 1,
++            },
++        },
++    }, {
++        .bInterfaceNumber   = 1,
++        .bAlternateSetting  = 2,
++        .bNumEndpoints      = 1,
++        .bInterfaceClass    = 0x0e,
++        .bInterfaceSubClass = 0x02,
++        .eps = (USBDescEndpoint[]) {
++            {
++                .bEndpointAddress = USB_DIR_IN | 0x01,
++                .bmAttributes     = 0x05,
++                .wMaxPacketSize   = 0x1400,     /* 1024 x 3 */
++                .bInterval        = 1,
++            },
++        },
++    },
++};
++
++static const USBDescIfaceAssoc uvc_iad = {
++    .bFirstInterface   = 0,
++    .bInterfaceCount   = 2,
++    .bFunctionClass    = 0x0e,
++    .bFunctionSubClass = 0x03,              /* video interface collection */
++    .nif               = ARRAY_SIZE(uvc_ifaces),
++    .ifs               = uvc_ifaces,
++};
++
++static const USBDescDevice uvc_device_high = {
++    .bcdUSB             = 0x0200,
++    .bDeviceClass       = 0xef,             /* miscellaneous, with an interface association */
++    .bDeviceSubClass    = 0x02,
++    .bDeviceProtocol    = 0x01,
++    .bMaxPacketSize0    = 64,
++    .bNumConfigurations = 1,
++    .confs = (USBDescConfig[]) {
++        {
++            .bNumInterfaces      = 2,
++            .bConfigurationValue = 1,
++            .bmAttributes        = USB_CFG_ATT_ONE,
++            .bMaxPower           = 250,
++            .nif_groups          = 1,
++            .if_groups           = &uvc_iad,
++        },
++    },
++};
++
++static const USBDesc uvc_desc = {
++    .id = {
++        .idVendor      = UVC_VENDOR,
++        .idProduct     = UVC_PRODUCT,
++        .bcdDevice     = 0x0100,
++        .iManufacturer = STR_MANUFACTURER,
++        .iProduct      = STR_PRODUCT,
++        .iSerialNumber = STR_SERIALNUMBER,
++    },
++    .high = &uvc_device_high,
++    .str  = uvc_strings,
++};
++
++struct USBUVCTestState {
++    USBDevice dev;
++    bool bad;
++    uint8_t probe[34];
++    uint8_t commit[34];
++    bool streaming;
++    int w, h;
++    uint32_t interval;          /* 100 ns units */
++    uint32_t frame_no;
++    uint8_t fid;
++    size_t pos;                 /* bytes of the frame sent */
++    size_t size;                /* the frame's size (more in the too-long case) */
++    int pkt_in_frame;
++    int64_t next_ns;            /* when the next frame may start */
++    uint8_t *frame;
++};
++
++/* the pattern; scripts/pc-usbcam-test.sh rebuilds it in Python */
++static void uvc_pattern(uint8_t *f, int w, int h, uint32_t n)
++{
++    static const uint8_t bars[8][3] = {
++        { 235, 128, 128 }, { 210, 16, 146 }, { 170, 166, 16 }, { 145, 54, 34 },
++        { 106, 202, 222 }, { 81, 90, 240 }, { 41, 240, 110 }, { 16, 128, 128 },
++    };
++    int x, y;
++
++    for (y = 0; y < h; y++) {
++        for (x = 0; x < w; x += 2) {
++            const uint8_t *b = bars[(x * 8) / w];
++            uint8_t luma = b[0] - ((y + n) & 7);
++            uint8_t *p = f + ((size_t)y * w + x) * 2;
++            p[0] = luma;
++            p[1] = b[1];
++            p[2] = luma;
++            p[3] = b[2];
++        }
++    }
++    f[0] = n & 0xff;
++    f[1] = (n >> 8) & 0xff;
++    f[2] = (n >> 16) & 0xff;
++    f[3] = (n >> 24) & 0xff;
++}
++
++static void uvc_fill_probe(USBUVCTestState *s, uint8_t *pr)
++{
++    int fi = pr[3];
++
++    if (pr[2] != 1 || fi < 1 || fi > 2) {
++        pr[2] = 1;
++        fi = pr[3] = 2;
++    }
++    uint32_t iv = pr[4] | pr[5] << 8 | pr[6] << 16 | (uint32_t)pr[7] << 24;
++    if (iv != 333333 && iv != 666666) {
++        iv = 666666;
++    }
++    uint32_t size = frame_w[fi] * frame_h[fi] * 2;
++    uint8_t v[] = { U32(iv) };
++    uint8_t m[] = { U32(size) };
++    uint8_t q[] = { U32(UVC_PAYLOAD) };
++    uint8_t c[] = { U32(48000000) };
++
++    memcpy(pr + 4, v, 4);
++    memcpy(pr + 18, m, 4);
++    memcpy(pr + 22, q, 4);
++    memcpy(pr + 26, c, 4);
++    pr[30] = 3;                     /* bmFramingInfo: FID and EOF used */
++    pr[31] = 1;
++    pr[32] = 1;
++    pr[33] = 1;
++}
++
++static void uvc_handle_control(USBDevice *dev, USBPacket *p, int request, int value, int index,
++                               int length, uint8_t *data)
++{
++    USBUVCTestState *s = USB_UVC_TEST(dev);
++    int sel = value >> 8;
++    int ret;
++
++    ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
++    if (ret >= 0) {
++        return;
++    }
++    if ((index & 0xff) != 1 || (sel != 1 && sel != 2)) {
++        p->status = USB_RET_STALL;      /* only the streaming interface's probe and commit */
++        return;
++    }
++    uint8_t *ctl = sel == 1 ? s->probe : s->commit;
++    switch (request) {
++    case ClassInterfaceOutRequest | 0x01:   /* SET_CUR */
++        memset(ctl, 0, sizeof(s->probe));
++        memcpy(ctl, data, MIN(length, (int)sizeof(s->probe)));
++        uvc_fill_probe(s, ctl);
++        if (sel == 2) {
++            memcpy(s->probe, ctl, sizeof(s->probe));
++        }
++        p->actual_length = 0;
++        break;
++    case ClassInterfaceRequest | 0x81:      /* GET_CUR */
++    case ClassInterfaceRequest | 0x82:      /* GET_MIN */
++    case ClassInterfaceRequest | 0x83:      /* GET_MAX */
++    case ClassInterfaceRequest | 0x87:      /* GET_DEF */
++        if (request != (ClassInterfaceRequest | 0x81)) {
++            memset(data, 0, sizeof(s->probe));
++            data[2] = 1;
++            data[3] = 2;
++            uvc_fill_probe(s, data);
++        } else {
++            if (ctl[2] == 0) {
++                uvc_fill_probe(s, ctl);
++            }
++            memcpy(data, ctl, sizeof(s->probe));
++        }
++        p->actual_length = MIN(length, (int)sizeof(s->probe));
++        break;
++    case ClassInterfaceRequest | 0x86:      /* GET_INFO */
++        data[0] = 3;
++        p->actual_length = MIN(length, 1);
++        break;
++    case ClassInterfaceRequest | 0x85:      /* GET_LEN */
++        data[0] = sizeof(s->probe);
++        data[1] = 0;
++        p->actual_length = MIN(length, 2);
++        break;
++    default:
++        p->status = USB_RET_STALL;
++        break;
++    }
++}
++
++static void uvc_start(USBUVCTestState *s)
++{
++    int fi = s->commit[3] >= 1 && s->commit[3] <= 2 ? s->commit[3] : 2;
++
++    s->w = frame_w[fi];
++    s->h = frame_h[fi];
++    s->interval = s->commit[4] | s->commit[5] << 8 | s->commit[6] << 16 | (uint32_t)s->commit[7] << 24;
++    if (s->interval == 0) {
++        s->interval = 666666;
++    }
++    s->streaming = true;
++    s->pos = 0;
++    s->size = 0;
++    s->pkt_in_frame = 0;
++    s->next_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++}
++
++static void uvc_set_interface(USBDevice *dev, int iface, int old, int value)
++{
++    USBUVCTestState *s = USB_UVC_TEST(dev);
++
++    if (iface != 1) {
++        return;
++    }
++    if (value != 0) {
++        uvc_start(s);
++    } else {
++        s->streaming = false;
++    }
++}
++
++static void uvc_handle_reset(USBDevice *dev)
++{
++    USBUVCTestState *s = USB_UVC_TEST(dev);
++
++    s->streaming = false;
++    memset(s->probe, 0, sizeof(s->probe));
++    memset(s->commit, 0, sizeof(s->commit));
++}
++
++/* which hostile thing frame n carries (bad=on): 0 header length 0, 1 length 1, 2 length 13, 3 error bit,
++ * 4 100 bytes too long, 5 good */
++static int uvc_bad_kind(USBUVCTestState *s)
++{
++    return s->bad ? (int)(s->frame_no % 6) : 5;
++}
++
++static void uvc_handle_data(USBDevice *dev, USBPacket *p)
++{
++    USBUVCTestState *s = USB_UVC_TEST(dev);
++    uint8_t hdr[UVC_HDR];
++    size_t room, n;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    int kind;
++
++    if (p->pid != USB_TOKEN_IN || p->ep->nr != 1) {
++        p->status = USB_RET_STALL;
++        return;
++    }
++    if (!s->streaming) {
++        return;                         /* an empty packet (an isochronous IN is never NAKed) */
++    }
++    room = MIN(usb_packet_size(p), (size_t)UVC_PAYLOAD);
++    if (room < UVC_HDR + 1) {
++        return;
++    }
++    memset(hdr, 0, sizeof(hdr));
++    hdr[0] = UVC_HDR;
++    hdr[1] = 0x80 | 0x08 | 0x04 | s->fid;  /* end of header, SCR, PTS, the frame toggle */
++    if (s->pos == 0 && s->size == 0) {
++        if (now < s->next_ns) {
++            hdr[0] = 2;
++            usb_packet_copy(p, hdr, 2); /* between frames: header only */
++            return;
++        }
++        /* a new frame */
++        uvc_pattern(s->frame, s->w, s->h, s->frame_no);
++        s->size = (size_t)s->w * s->h * 2;
++        if (uvc_bad_kind(s) == 4) {
++            s->size += 100;             /* the frame buffer is big enough: see realize */
++            memset(s->frame + (size_t)s->w * s->h * 2, 0x55, 100);
++        }
++        s->pkt_in_frame = 0;
++        s->next_ns = MAX(s->next_ns + (int64_t)s->interval * 100, now);
++    }
++    kind = uvc_bad_kind(s);
++    s->pkt_in_frame++;
++    if (s->pkt_in_frame == 4 && kind <= 2) {
++        /* a hostile header in the middle of the frame; its data is not part of the frame */
++        hdr[0] = kind == 0 ? 0 : kind == 1 ? 1 : 13;
++        usb_packet_copy(p, hdr, sizeof(hdr));
++        usb_packet_copy(p, s->frame, MIN(room - UVC_HDR, (size_t)64));
++        return;
++    }
++    if (kind == 3 && s->pkt_in_frame == 1) {
++        hdr[1] |= 0x40;                 /* the error bit */
++    }
++    n = MIN(room - UVC_HDR, s->size - s->pos);
++    if (s->pos + n == s->size) {
++        hdr[1] |= 0x02;                 /* end of frame */
++    }
++    usb_packet_copy(p, hdr, UVC_HDR);
++    usb_packet_copy(p, s->frame + s->pos, n);
++    s->pos += n;
++    if (s->pos == s->size) {
++        s->pos = 0;
++        s->size = 0;
++        s->fid ^= 1;
++        s->frame_no++;
++    }
++}
++
++static void uvc_realize(USBDevice *dev, Error **errp)
++{
++    USBUVCTestState *s = USB_UVC_TEST(dev);
++
++    dev->usb_desc = &uvc_desc;
++    usb_desc_create_serial(dev);
++    usb_desc_init(dev);
++    s->frame = g_malloc0((size_t)UVC_MAX_W * UVC_MAX_H * 2 + 128);
++    s->w = 640;
++    s->h = 480;
++}
++
++static void uvc_unrealize(USBDevice *dev)
++{
++    USBUVCTestState *s = USB_UVC_TEST(dev);
++
++    g_free(s->frame);
++    s->frame = NULL;
++}
++
++static const VMStateDescription vmstate_uvc_test = {
++    .name = TYPE_USB_UVC_TEST,
++    .unmigratable = 1,
++};
++
++static const Property uvc_properties[] = {
++    DEFINE_PROP_BOOL("bad", USBUVCTestState, bad, false),
++};
++
++static void uvc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    USBDeviceClass *k = USB_DEVICE_CLASS(klass);
++
++    dc->vmsd = &vmstate_uvc_test;
++    device_class_set_props(dc, uvc_properties);
++    set_bit(DEVICE_CATEGORY_USB, dc->categories);
++    k->product_desc   = "AfriSovera Test Camera";
++    k->realize        = uvc_realize;
++    k->handle_attach  = usb_desc_attach;   /* the high-speed descriptors once the speed is known */
++    k->unrealize      = uvc_unrealize;
++    k->handle_reset   = uvc_handle_reset;
++    k->handle_control = uvc_handle_control;
++    k->handle_data    = uvc_handle_data;
++    k->set_interface  = uvc_set_interface;
++}
++
++static const TypeInfo uvc_test_info = {
++    .name          = TYPE_USB_UVC_TEST,
++    .parent        = TYPE_USB_DEVICE,
++    .instance_size = sizeof(USBUVCTestState),
++    .class_init    = uvc_class_init,
++};
++
++static void uvc_test_register_types(void)
++{
++    type_register_static(&uvc_test_info);
++}
++
++type_init(uvc_test_register_types)

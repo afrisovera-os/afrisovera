@@ -69,6 +69,18 @@ const RIGHT_RECV: u8 = 1 << 1;
 /// Value returned to userspace when a syscall is refused.
 const EPERM: u64 = u64::MAX;
 
+/// Gap G2 (docs/security-model.md): may the kernel follow this user pointer for `len` bytes? Every process's
+/// tables keep the kernel's DRAM mapped EL1 read/write, so an unchecked pointer would let EL0 code make the
+/// kernel read or write kernel memory. Reads may come from the code or stack block (both mapped for every
+/// process); writes only into the stack block (the code block is read-only at EL1 too, so a write there faults).
+fn user_range(ptr: u64, len: u64, write: bool) -> bool {
+    let lo = if write { USER_ENTRY + TWO_MIB as u64 } else { USER_ENTRY };
+    match ptr.checked_add(len) {
+        Some(end) => ptr >= lo && end <= USER_STACK_TOP,
+        None => false,
+    }
+}
+
 // --- User-block descriptor attributes (AArch64 stage-1) ----------------------
 const AP_EL0_RW: u64 = 0b01 << 6; // EL0 + EL1 read/write
 const AP_EL0_RO: u64 = 0b11 << 6; // EL0 + EL1 read-only
@@ -192,6 +204,8 @@ extern "C" {
     static user_sleep_end: u8;
     static user_fault_start: u8;
     static user_fault_end: u8;
+    static user_ptr_start: u8;
+    static user_ptr_end: u8;
     static user_gui_start: u8;
     static user_gui_end: u8;
     static user_edit_start: u8;
@@ -498,6 +512,31 @@ pub fn run_fault_demo() {
     unsafe {
         if spawn_or_refuse(3, &user_fault_start as *const u8, &user_fault_end as *const u8, false, false) {
             schedule_switch();
+        }
+    }
+}
+
+/// Gap G2 probe (`el0-ptr`): an EL0 program hands SYS_AI a KERNEL address as its reply buffer and SYS_SPEAK a
+/// kernel address as its text. `G2_CANARY` is that kernel memory. A kernel that follows user pointers unchecked
+/// overwrites the canary and speaks its bytes; a fixed one refuses both calls and the canary stays as it was.
+/// The same program then calls WIN_CREATE, WIN_FILL and WIN_TEXT with u64::MAX coordinates and sizes: they take no
+/// pointer, but must clip rather than overflow (a panic stops the debug kernel), then prints 0x5afe.
+#[no_mangle]
+static mut G2_CANARY: [u8; 16] = *b"G2-CANARY-INTACT";
+
+pub fn run_el0_ptr_probe() {
+    // SAFETY: single-core, shell (idle) context; the sole driver here.
+    unsafe {
+        *addr_of_mut!(G2_CANARY) = *b"G2-CANARY-INTACT";
+        crate::tonga::wm_reset(); // a free window for the u64::MAX WIN_FILL / WIN_TEXT case
+        if spawn_or_refuse(3, &user_ptr_start as *const u8, &user_ptr_end as *const u8, false, false) {
+            schedule_switch();
+        }
+        let c = *addr_of_mut!(G2_CANARY);
+        if &c == b"G2-CANARY-INTACT" {
+            crate::kprintln!("G2-CANARY intact");
+        } else {
+            crate::kprintln!("G2-CANARY OVERWRITTEN by an EL0 pointer: \"{}\"", core::str::from_utf8(&c).unwrap_or("?"));
         }
     }
 }
@@ -866,6 +905,12 @@ extern "C" fn rust_svc_dispatch(frame: *mut u64) {
                 let (pptr, plen, optr, ocap) = (a0 as usize, a1 as usize, a2 as usize, a3 as usize);
                 let mut pb = [0u8; 128];
                 let pn = plen.min(128);
+                // G2: both buffers must be the caller's own memory (the reply at most 256 bytes is written).
+                if !user_range(pptr as u64, pn as u64, false) || !user_range(optr as u64, ocap.min(256) as u64, true) {
+                    crate::kprintln!("    [P{} @EL0] AI refused: a buffer is outside the process's memory", pid);
+                    *frame.add(0) = EPERM;
+                    return;
+                }
                 for i in 0..pn {
                     pb[i] = core::ptr::read_volatile((pptr + i) as *const u8);
                 }
@@ -884,6 +929,11 @@ extern "C" fn rust_svc_dispatch(frame: *mut u64) {
                 let (tptr, tlen) = (a0 as usize, a1 as usize);
                 let mut tb = [0u8; 160];
                 let tn = tlen.min(160);
+                if !user_range(tptr as u64, tn as u64, false) {
+                    crate::kprintln!("    [P{} @EL0] SPEAK refused: the text is outside the process's memory", pid);
+                    *frame.add(0) = EPERM;
+                    return;
+                }
                 for i in 0..tn {
                     tb[i] = core::ptr::read_volatile((tptr + i) as *const u8);
                 }
@@ -1192,6 +1242,95 @@ user_fault_start:
     str  x0, [x0]          // store to it -> translation fault -> kernel kills us
 0:  b 0b                   // (never reached)
 user_fault_end:
+
+// ---- G2 probe (`el0-ptr`): pass KERNEL addresses to SYS_AI (reply buffer) and SYS_SPEAK (text). The literal
+// pool holds G2_CANARY's absolute address (the kernel is identity mapped), so it is copied with the program.
+.global user_ptr_start
+.global user_ptr_end
+user_ptr_start:
+    sub  sp, sp, #16
+    movz w9, #0x6968       // "hi", the prompt, on our own stack
+    strh w9, [sp]
+    mov  x0, sp            // prompt: ours
+    mov  x1, #2
+    ldr  x2, =G2_CANARY    // reply buffer: the KERNEL's
+    mov  x3, #16
+    mov  x8, #13           // SYS_AI
+    svc  #0
+    mov  x8, #0            // SYS_DEBUG: the result (EPERM once G2 is fixed)
+    svc  #0
+    ldr  x0, =G2_CANARY    // text: the KERNEL's
+    mov  x1, #16
+    mov  x8, #14           // SYS_SPEAK
+    svc  #0
+    mov  x8, #0            // SYS_DEBUG
+    svc  #0
+    // Full 64-bit window arguments (WIN_FILL and WIN_TEXT take no pointer, but x + w and x + col must not wrap):
+    // a window of u64::MAX by u64::MAX, then fills and glyphs at u64::MAX. The kernel must clip, not panic.
+    mvn  x0, xzr           // w = u64::MAX
+    mvn  x1, xzr           // h = u64::MAX
+    mov  x8, #5            // SYS_WIN_CREATE
+    svc  #0
+    mov  x19, x0           // wid
+    cmn  x0, #1            // -1: no free window, nothing below would run
+    b.eq 7f
+    mov  x0, x19           // FILL(wid, x = MAX, y = 0, w = 1, h = 1)
+    mvn  x1, xzr
+    mov  x2, #0
+    mov  x3, #1
+    mov  x4, #1
+    mov  x5, #0xff
+    mov  x8, #6
+    svc  #0
+    mov  x0, x19           // FILL(wid, 1, 1, w = MAX, h = MAX)
+    mov  x1, #1
+    mov  x2, #1
+    mvn  x3, xzr
+    mvn  x4, xzr
+    mov  x5, #0xff
+    mov  x8, #6
+    svc  #0
+    mov  x0, x19           // FILL(wid, MAX, MAX, MAX, MAX)
+    mvn  x1, xzr
+    mvn  x2, xzr
+    mvn  x3, xzr
+    mvn  x4, xzr
+    mov  x5, #0xff
+    mov  x8, #6
+    svc  #0
+    mov  x0, x19           // TEXT(wid, x = MAX, y = MAX, 'A')
+    mvn  x1, xzr
+    mvn  x2, xzr
+    mov  x3, #0x41
+    mov  x4, #0xff
+    mov  x8, #9
+    svc  #0
+    mov  x0, x19           // TEXT(wid, x = MAX, y = 0, 'A')
+    mvn  x1, xzr
+    mov  x2, #0
+    mov  x3, #0x41
+    mov  x4, #0xff
+    mov  x8, #9
+    svc  #0
+    mov  x0, x19           // TEXT(wid, x = 0, y = MAX, 'A')
+    mov  x1, #0
+    mvn  x2, xzr
+    mov  x3, #0x41
+    mov  x4, #0xff
+    mov  x8, #9
+    svc  #0
+    movz x0, #0x5afe       // SYS_DEBUG 0x5afe: every max-argument call returned
+    mov  x8, #0
+    svc  #0
+    b    8f
+7:  movz x0, #0xbad1       // SYS_DEBUG 0xbad1: no window, the case did not run
+    mov  x8, #0
+    svc  #0
+8:  mov  x8, #3            // SYS_EXIT
+    svc  #0
+0:  b 0b
+.ltorg
+user_ptr_end:
 
 // ---- GUI app: get pid, create a window, draw a little UI, present, exit.
 // One program, spawned 3x; each colors its surface by its pid so the windows

@@ -14,9 +14,13 @@
 
 use core::cell::Cell;
 use core::ptr::addr_of_mut;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-const MAX_TYPES: usize = 16;
-const MAX_FUNCS: usize = 16;
+// Types and defined functions per module (16 each until claude/nia-a1a3, OS_REQUESTS item 10 A1). Module keeps
+// them in narrow element types (u8 type index, u32 code offset and length, u16 counts), each stored through a
+// checked conversion, so the Module frame grows by about 640 bytes, not 2.9 KB.
+const MAX_TYPES: usize = 32;
+const MAX_FUNCS: usize = 128;
 const MAX_IMPORTS: usize = 16; // imported functions per module (8 until claude/nia-imports)
 const STACK_CAP: usize = 256;
 const LOCALS_CAP: usize = 32;
@@ -73,6 +77,16 @@ const HOST_RANDOM: u8 = 13;
 const HOST_PRINTQ: u8 = 14; // host "print64"(i64) -> prints a 64-bit integer
 const HOST_POLLKEY: u8 = 15; // host "pollkey"() -> the next key or -1, never waits (claude/nia-poll)
 const HOST_SLEEP: u8 = 16; // host "sleep_ms"(ms) -> the ms slept, at most SLEEP_MAX_MS per call
+// The cell window calls (docs/design/afriui.md section 25; the codes and packing are in crate::desk::cell_abi).
+const HOST_CELL_OPEN: u8 = 17; // cell_open(min_cols, min_rows) -> 1 or an error
+const HOST_CELL_PUT: u8 = 18; // cell_put(win, col, row, ptr, len) -> cells written or an error
+const HOST_CELL_CURSOR: u8 = 19; // cell_cursor(win, col, row, shape) -> 0 or an error
+const HOST_CELL_SIZE: u8 = 20; // cell_size(win) -> cols << 14 | rows, or an error
+const HOST_CELL_EVENT: u8 = 21; // cell_event(timeout_ms) -> an event, 0 (no event in time) or an error
+// win_text_run(win, x, y, ptr, len, color): one row of text in one call (OS_REQUESTS item 10 A3).
+const HOST_WIN_TEXT_RUN: u8 = 22;
+/// The most characters win_text_run draws: one row of the widest window (CW / 8); a longer run is cut, not refused.
+const TEXT_RUN_MAX: usize = 30;
 const HOST_UNKNOWN: u8 = 255;
 
 /// Owner id shown on windows a WASM app creates via the compositor.
@@ -430,8 +444,10 @@ fn keyq_pop() -> Option<u8> {
     }
 }
 
-/// Called on every branch back to a loop label: one console read per POLL_EVERY.
+/// Called on every branch back to a loop label: the forced-close check every time (one relaxed load), then one
+/// desk tick and one console read per POLL_EVERY.
 fn loop_poll() -> Result<(), &'static str> {
+    cell_forced_check()?;
     // SAFETY: single-threaded interpreter; a plain counter.
     unsafe {
         LOOP_BRANCHES = LOOP_BRANCHES.wrapping_add(1);
@@ -439,13 +455,115 @@ fn loop_poll() -> Result<(), &'static str> {
             return Ok(());
         }
     }
+    crate::desk::app_tick(); // only while the app owns a cell window, at most every 10 ms
     console_key()
+}
+
+/// "Close anyway" was chosen on the app's cell window: the app stops here (afriui.md section 25).
+const FORCED: &str = "closed by the person (Close anyway)";
+
+fn cell_forced_check() -> Result<(), &'static str> {
+    if crate::desk::cell_forced() {
+        return Err(FORCED);
+    }
+    Ok(())
+}
+
+/// One row of cells: `cell_put` caps its length here before doubling it to bytes.
+const CELL_PUT_MAX: usize = 120;
+
+/// Set by `run_app_in` for the whole run (afriui.md section 25): a second start while one app runs (the shell's
+/// run, appget, a desk tile, a plan step) is refused before it touches anything.
+static APP_RUNNING: AtomicBool = AtomicBool::new(false);
+/// The running app's name and whether it is signed (a bundled or manifest app), for the cell window's title.
+static mut APP_NAME: [u8; 24] = [0; 24];
+static mut APP_NAME_LEN: usize = 0;
+static mut APP_SIGNED: bool = false;
+
+/// An app is running now (stage 4's Andika tile greys itself on this).
+#[allow(dead_code)] // the desk's tile uses it in stage 4
+pub fn app_running() -> bool {
+    APP_RUNNING.load(Ordering::Relaxed)
+}
+
+fn refuse_nested(label: &str) -> bool {
+    if APP_RUNNING.load(Ordering::Relaxed) {
+        crate::kprintln!("[nia] REFUSED '{}': an app is already running", label);
+        return true;
+    }
+    false
+}
+
+fn set_app_name(label: &str) {
+    let b = label.as_bytes();
+    let n = b.len().min(24);
+    // SAFETY: single-threaded; no app is running yet (APP_RUNNING was just set by this run).
+    unsafe {
+        (&mut *addr_of_mut!(APP_NAME))[..n].copy_from_slice(&b[..n]);
+        APP_NAME_LEN = n;
+    }
+}
+
+fn set_app_signed(signed: bool) {
+    // SAFETY: single-threaded; read by cell_open during the run that follows.
+    unsafe { APP_SIGNED = signed };
+}
+
+/// The stack line for the desk drawn 16 call levels deep (`cell_event` at depth 16, afriui.md section 25): the
+/// unused stack below this frame is painted, the desk runs, and the lowest word it changed shows how much was
+/// left. Returns the painted range, or None when the stack bounds are not known.
+const CELL_PAINT: usize = 0x5AFE_C311_5AFE_C311u64 as usize;
+
+/// The stack probe is a test tool: it paints about 850 KB of stack, so it runs only after `nia --stackprobe`
+/// (desk-cell-app sends it), until the next boot. A real app never pays for it (architect's follow-up 2).
+static STACK_PROBE: AtomicBool = AtomicBool::new(false);
+
+/// `nia --stackprobe`: turn the cell stack probe on.
+pub fn stack_probe_on() {
+    STACK_PROBE.store(true, Ordering::Relaxed);
+    crate::kprintln!("[nia] stack probe on (test only)");
+}
+
+#[inline(never)]
+fn cell_stack_paint() -> Option<(usize, usize)> {
+    let (bottom, _top) = shell_stack();
+    let here = core::ptr::addr_of!(bottom) as usize;
+    let lo = (bottom + 64) & !7;
+    let hi = here.saturating_sub(2048) & !7; // keep clear of this frame and the calls just below it
+    if bottom == 0 || hi <= lo {
+        return None;
+    }
+    let mut a = lo;
+    while a < hi {
+        // SAFETY: [lo, hi) is the unused part of the stack the interpreter runs on, below every live frame.
+        unsafe { core::ptr::write_volatile(a as *mut usize, CELL_PAINT) };
+        a += 8;
+    }
+    Some((lo, hi))
+}
+
+fn cell_stack_report((lo, hi): (usize, usize)) {
+    let (bottom, _top) = shell_stack();
+    let mut a = lo;
+    // SAFETY: reads of the range painted above.
+    while a < hi && unsafe { core::ptr::read_volatile(a as *const usize) } == CELL_PAINT {
+        a += 8;
+    }
+    crate::kprintln!("[nia] cell stack: {} bytes left at depth {}", a.saturating_sub(bottom), MAX_CALL_DEPTH);
 }
 
 /// The one non-blocking console read the interpreter does outside `getkey` (the loop poll, `pollkey` and
 /// `sleep_ms` all come here): Ctrl+C stops the app (checked before the queue limit, so a full queue never hides
 /// it), any other key joins the queue (dropped when it is full).
 fn console_key() -> Result<(), &'static str> {
+    if crate::desk::cell_owned() {
+        // Every byte is the desk's while the app owns a cell window: a key event, Ctrl+C (3) included, and Ctrl+\
+        // the close request or, 3 s after an unanswered one, "Close anyway" (afriui.md section 25).
+        while let Some(c) = crate::uart::getc() {
+            crate::desk::cell_serial_byte(c);
+        }
+        return cell_forced_check();
+    }
     // SAFETY: single-threaded interpreter; indexes stay below KEYQ_CAP.
     unsafe {
         if let Some(c) = crate::uart::getc() {
@@ -466,6 +584,9 @@ fn console_key() -> Result<(), &'static str> {
 /// `console_key` (so a Ctrl+C TRAPs and is never returned or queued), then the oldest queued key is returned.
 fn host_pollkey() -> Result<i32, &'static str> {
     console_key()?;
+    if crate::desk::cell_owned() {
+        return Ok(-1); // its keys are cell events (afriui.md section 25)
+    }
     Ok(match keyq_pop() {
         Some(c) => c as i32,
         None => -1,
@@ -493,6 +614,8 @@ fn host_sleep_ms(ms: i32) -> Result<i32, &'static str> {
         elapsed = now.wrapping_sub(t0);
         if now.wrapping_sub(last) >= step {
             last = now;
+            cell_forced_check()?;
+            crate::desk::app_tick(); // the desk keeps drawing while the app sleeps (only with a cell window)
             console_key()?;
         }
         core::hint::spin_loop();
@@ -1690,21 +1813,50 @@ fn name_in<'m>(m: &'m [u8], c: &mut usize, end: usize) -> Option<&'m [u8]> {
 /// so it is printed as escaped bytes: printable ASCII as it is, anything else (ESC, bidi, any byte from 0x80) as
 /// \xNN, and at most 32 bytes of it (architect's A3).
 fn refuse_module(module: &[u8]) {
-    crate::kprint!("[nia] import from module '");
-    for &b in module.iter().take(32) {
+    crate::kprint!("[nia] import from module ");
+    print_quoted(module);
+    crate::kprintln!(" (Nia offers only 'afri')");
+}
+
+/// An app's own bytes on the console, safely: in quotes, printable ASCII as it is, anything else (ESC, bidi,
+/// any byte from 0x80, backslash, quote) as \xNN, at most 32 bytes, then "and N more bytes".
+fn print_quoted(text: &[u8]) {
+    crate::kprint!("'");
+    for &b in text.iter().take(32) {
         if (b' '..=b'~').contains(&b) && b != b'\\' && b != b'\'' {
             crate::kprint!("{}", b as char);
         } else {
             crate::kprint!("\\x{:02x}", b);
         }
     }
-    if module.len() > 32 {
-        crate::kprint!("' and {} more bytes", module.len() - 32);
+    if text.len() > 32 {
+        crate::kprint!("' and {} more bytes", text.len() - 32);
     } else {
         crate::kprint!("'");
     }
-    crate::kprintln!(" (Nia offers only 'afri')");
 }
+
+/// The capability bit for one permission name in an `afri.permissions` section (AFR-0003 section 6), exact
+/// bytes. An unknown name gives None and the module is refused (fail closed): a newer app asking for a
+/// permission this kernel does not know will not load here.
+fn perm_bit(name: &[u8]) -> Option<u32> {
+    Some(match name {
+        b"print" => CAP_PRINT,
+        b"putc" => CAP_PUTC,
+        b"draw" => CAP_DRAW,
+        b"file" => CAP_FILE,
+        b"time" => CAP_TIME,
+        b"input" => CAP_INPUT,
+        b"ai" => CAP_AI,
+        b"voice" => CAP_VOICE,
+        b"net" => CAP_NET,
+        b"random" => CAP_RANDOM,
+        _ => return None,
+    })
+}
+
+/// Most names an `afri.permissions` section may hold.
+const MAX_PERMS: usize = 16;
 
 // --- LEB128 (bounds-safe: never index past the module; malformed input just
 // stops early instead of panicking, and the parser's length guards reject it) --
@@ -1767,10 +1919,20 @@ fn instr_end(code: &[u8], pc: usize) -> usize {
         }
         0x0E => {
             // br_table: a uleb count, then count+1 label ulebs (labels + default).
+            // The count comes from the app: each label takes at least one byte, so a count
+            // that is not below the bytes left is refused before the loop (and before
+            // count + 1), and a read that takes no bytes stops it. Returning the body's end
+            // makes matching() report an unclosed block (claude/nia-brtable, fuzz finding 1).
             let (count, a) = uleb(code, p);
             let mut q = p + a;
+            if count >= code.len().saturating_sub(q) {
+                return code.len();
+            }
             for _ in 0..count + 1 {
                 let (_, a2) = uleb(code, q);
+                if a2 == 0 {
+                    return code.len();
+                }
                 q += a2;
             }
             q
@@ -1820,6 +1982,64 @@ fn matching(code: &[u8], from: usize) -> (Option<usize>, usize) {
             }
             _ => pc = instr_end(code, pc),
         }
+    }
+}
+
+// Nia speed, step 1 (claude/nia-fast): the block-end memo. `matching` walks forward to a block's `end` every
+// time a block or an `if` is entered, so a loop with blocks inside paid for a scan of those blocks on every pass.
+// The answer depends only on the code bytes, and they do not change while an app runs, so it is kept here
+// after the first scan. A slot is used only when the place (the address of the block's first byte) AND the
+// end of the function's code are the same as when it was stored, so it always gives what `matching` would.
+// `parse` empties it before every app: a slot from an earlier app is never seen by the next.
+// 64 slots x 24 bytes = 1.5 KiB in .bss. A miss, or a value too big to store, just calls `matching`.
+const MEMO_SLOTS: usize = 64;
+#[derive(Clone, Copy)]
+struct Memo {
+    at: usize,       // address of the byte after the block type (0 = empty slot)
+    code_end: usize, // address just past the function's code
+    end_pc: u32,
+    else_pc: u32, // 0 = no else (a real else_pc is always at least 1)
+}
+const MEMO_EMPTY: Memo = Memo { at: 0, code_end: 0, end_pc: 0, else_pc: 0 };
+static mut MEMO: [Memo; MEMO_SLOTS] = [MEMO_EMPTY; MEMO_SLOTS];
+// `wasmbench` turns the memo off to time the old way in the same kernel; everything else leaves it on.
+static mut MEMO_ON: bool = true;
+
+fn memo_reset() {
+    // SAFETY: single-threaded (one Nia app at a time, nested runs are refused).
+    unsafe {
+        *addr_of_mut!(MEMO) = [MEMO_EMPTY; MEMO_SLOTS];
+    }
+}
+
+fn memo_on() -> bool {
+    // SAFETY: single-threaded, as memo_reset.
+    unsafe { MEMO_ON }
+}
+
+/// `matching(code, from)`, from the memo when it has it.
+fn block_ends(code: &[u8], from: usize) -> (Option<usize>, usize) {
+    // SAFETY: single-threaded, as memo_reset.
+    unsafe {
+        if !MEMO_ON {
+            return matching(code, from);
+        }
+        let base = code.as_ptr() as usize;
+        let at = base + from;
+        let code_end = base + code.len();
+        let slot = (at ^ (at >> 6)) % MEMO_SLOTS;
+        let memo = &mut *addr_of_mut!(MEMO);
+        let e = memo[slot];
+        if e.at == at && e.code_end == code_end {
+            let else_pc = if e.else_pc == 0 { None } else { Some(e.else_pc as usize) };
+            return (else_pc, e.end_pc as usize);
+        }
+        let (else_pc, end_pc) = matching(code, from);
+        let el = else_pc.unwrap_or(0);
+        if end_pc <= u32::MAX as usize && el <= u32::MAX as usize {
+            memo[slot] = Memo { at, code_end, end_pc: end_pc as u32, else_pc: el as u32 };
+        }
+        (else_pc, end_pc)
     }
 }
 
@@ -1901,6 +2121,10 @@ impl Stack {
 
 struct Ctrl {
     is_loop: bool,
+    // Set only by `if` (0x04): `else` (0x05) is refused in any other frame (claude/nia-ctrl). In a loop frame
+    // cont_pc is the loop's start, so an unchecked `else` jumped back into the body without passing `branch()`,
+    // the only place loop_poll runs: an endless loop Ctrl+C could not stop.
+    is_if: bool,
     cont_pc: usize,
     stack_base: usize,
     arity: usize,
@@ -1908,10 +2132,10 @@ struct Ctrl {
 
 struct Module<'a> {
     bytes: &'a [u8],
-    types: [(usize, usize); MAX_TYPES],
-    func_type: [usize; MAX_FUNCS],
-    code_off: [usize; MAX_FUNCS],
-    code_len: [usize; MAX_FUNCS],
+    types: [(u16, u16); MAX_TYPES], // (params, results); more than 65,535 is refused at load
+    func_type: [u8; MAX_FUNCS],     // a type index, below MAX_TYPES
+    code_off: [u32; MAX_FUNCS],
+    code_len: [u32; MAX_FUNCS],
     import_host: [u8; MAX_IMPORTS],
     import_type: [usize; MAX_IMPORTS],
     nfuncs: usize,
@@ -1919,6 +2143,10 @@ struct Module<'a> {
     import_count: usize,
     run_index: usize,
     caps: u32,
+    // The app's `afri.permissions` section (claude/nia-perms, OS_REQUESTS item 8 step B): whether it has one,
+    // and the permissions it names. With a section, `caps` is narrowed to `caps & asked` after the parse.
+    listed: bool,
+    asked: u32,
     // WASM functions active now (Nia guard). A fresh Module per run_app, so it
     // starts at 0 for every app; `invoke` brings it back down on every way out.
     depth: Cell<usize>,
@@ -1995,6 +2223,16 @@ pub fn rand_wasm() -> &'static [u8] {
     WASM_RAND
 }
 
+/// Andika, the text editor (native apps engineer, nia-apps): the first bundled app over 16 KiB, so it runs only from
+/// these bytes (A7). Built by nia-apps tools/build.sh at a334eb1 (branch andika) on nightly-2026-11-10 with
+/// immediate-abort panics; 29,238 bytes, SHA-256 c1568f5a1727baefc971b4fb6b0f9628cd10f0e8421418d7a4f7f86748043a90.
+/// Its afri.permissions section is exactly what it uses: draw (the five cell calls) and file (file_read and
+/// file_write). Not input or time, which the 12 Nov condition named: its keys come as cell events, under draw.
+static WASM_ANDIKA: &[u8] = include_bytes!("andika.wasm");
+pub fn andika_wasm() -> &'static [u8] {
+    WASM_ANDIKA
+}
+
 // rand.wasm: run() { print(random()); print(random()); } — draws twice from the
 // capability-gated `random` host function (needs CAP_RANDOM).
 //   types: t0 ()->i32 [random], t1 (i32)->() [print], t2 ()->() [run]
@@ -2048,6 +2286,92 @@ static WASM_OPS: &[u8] = &[
     0x0A, 0x12, 0x01, 0x10, 0x00,
         0x41, 0x05, 0x41, 0x02, 0x74, 0x41, 0xE4, 0x00, 0x41, 0x03, 0x76, 0x6A, 0x10, 0x00, 0x0B,
 ];
+
+// --- wasmbench (claude/nia-fast): Nia speed, measured in the running kernel. ---------------------------
+// Two apps in the shape rustc and clang emit (scripts/lib/bench-wasm.py writes the same bytes; --expect gives
+// the print values): b1 runs an `if` and a `block` inside a 20,000-pass loop, b2 calls a small function with an
+// `if` 5,000 times. Each is timed the old way (block-end memo off: a scan to every block's end on every entry)
+// and the new way, three runs each, best run kept, in the same kernel, so the two numbers are like for like.
+#[rustfmt::skip]
+static WASM_BENCH_B1: [u8; 139] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0D, 0x03, 0x60, 0x01, 0x7F, 0x00, 0x60,
+    0x00, 0x00, 0x60, 0x01, 0x7F, 0x01, 0x7F, 0x02, 0x0E, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05,
+    0x70, 0x72, 0x69, 0x6E, 0x74, 0x00, 0x00, 0x03, 0x02, 0x01, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72,
+    0x75, 0x6E, 0x00, 0x01, 0x0A, 0x55, 0x01, 0x53, 0x01, 0x02, 0x7F, 0x41, 0x00, 0x21, 0x00, 0x02,
+    0x40, 0x03, 0x40, 0x20, 0x00, 0x41, 0xA0, 0x9C, 0x01, 0x4E, 0x0D, 0x01, 0x20, 0x00, 0x41, 0x01,
+    0x71, 0x04, 0x40, 0x20, 0x01, 0x20, 0x00, 0x41, 0x03, 0x6C, 0x41, 0x05, 0x73, 0x6A, 0x21, 0x01,
+    0x05, 0x20, 0x01, 0x20, 0x00, 0x6B, 0x21, 0x01, 0x0B, 0x02, 0x40, 0x20, 0x00, 0x41, 0x07, 0x71,
+    0x45, 0x0D, 0x00, 0x20, 0x01, 0x41, 0x01, 0x6A, 0x21, 0x01, 0x0B, 0x20, 0x00, 0x41, 0x01, 0x6A,
+    0x21, 0x00, 0x0C, 0x00, 0x0B, 0x0B, 0x20, 0x01, 0x10, 0x00, 0x0B,
+];
+#[rustfmt::skip]
+static WASM_BENCH_B2: [u8; 123] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0D, 0x03, 0x60, 0x01, 0x7F, 0x00, 0x60,
+    0x00, 0x00, 0x60, 0x01, 0x7F, 0x01, 0x7F, 0x02, 0x0E, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05,
+    0x70, 0x72, 0x69, 0x6E, 0x74, 0x00, 0x00, 0x03, 0x03, 0x02, 0x02, 0x01, 0x07, 0x07, 0x01, 0x03,
+    0x72, 0x75, 0x6E, 0x00, 0x02, 0x0A, 0x44, 0x02, 0x15, 0x00, 0x20, 0x00, 0x41, 0x01, 0x71, 0x04,
+    0x7F, 0x20, 0x00, 0x41, 0x03, 0x6A, 0x05, 0x20, 0x00, 0x41, 0x01, 0x6B, 0x0B, 0x0B, 0x2C, 0x01,
+    0x02, 0x7F, 0x41, 0x00, 0x21, 0x00, 0x02, 0x40, 0x03, 0x40, 0x20, 0x00, 0x41, 0x88, 0x27, 0x4E,
+    0x0D, 0x01, 0x20, 0x01, 0x20, 0x00, 0x10, 0x01, 0x6A, 0x21, 0x01, 0x20, 0x00, 0x41, 0x01, 0x6A,
+    0x21, 0x00, 0x0C, 0x00, 0x0B, 0x0B, 0x20, 0x01, 0x10, 0x00, 0x0B,
+];
+
+/// One timed run of `run` in `bytes`, nothing printed by the runtime itself (only the app's own print).
+/// Returns the time in microseconds, or the TRAP or parse error.
+fn bench_once(bytes: &[u8]) -> Result<u64, &'static str> {
+    putc_reset();
+    keyq_reset();
+    let m = parse(bytes, CAP_PRINT)?;
+    let mut st = Stack::new();
+    let f = crate::timer::hz();
+    let t0 = crate::timer::cycles();
+    let r = m.invoke(m.run_index, &mut st);
+    let t1 = crate::timer::cycles();
+    finish_putc();
+    r?;
+    let cyc = t1.wrapping_sub(t0);
+    Ok(if f > 0 { cyc.saturating_mul(1_000_000) / f } else { 0 })
+}
+
+/// The best of three runs, with the memo on or off.
+fn bench_best(bytes: &[u8], on: bool) -> Result<u64, &'static str> {
+    // SAFETY: single-threaded; MEMO_ON goes back to true on every way out.
+    unsafe { MEMO_ON = on };
+    let mut best = u64::MAX;
+    let mut out = Ok(0);
+    for _ in 0..3 {
+        match bench_once(bytes) {
+            Ok(us) => best = best.min(us),
+            Err(e) => {
+                out = Err(e);
+                break;
+            }
+        }
+    }
+    unsafe { MEMO_ON = true };
+    out.map(|_| best)
+}
+
+/// Shell `wasmbench`: each bench app the old way and the new way, with the speed-up.
+pub fn bench() {
+    let apps: [(&str, &[u8]); 2] = [("b1 loop+if+block", &WASM_BENCH_B1), ("b2 calls", &WASM_BENCH_B2)];
+    crate::kprintln!("[bench] Nia speed: old = scan to each block's end on entry, new = block-end memo");
+    for (name, bytes) in apps {
+        let old = bench_best(bytes, false);
+        let new = bench_best(bytes, true);
+        match (old, new) {
+            (Ok(o), Ok(n)) => {
+                let x10 = if n > 0 { o.saturating_mul(10) / n } else { 0 };
+                crate::kprintln!(
+                    "[bench] {}: old {} us, new {} us, {}.{}x",
+                    name, o, n, x10 / 10, x10 % 10
+                );
+            }
+            (Err(e), _) | (_, Err(e)) => crate::kprintln!("[bench] {}: TRAP: {}", name, e),
+        }
+    }
+    crate::kprintln!("[bench] done");
+}
 
 /// Run a WASM module that uses the shift opcodes and prints (5<<2)+(100>>3) = 32.
 pub fn ops_demo() {
@@ -2399,7 +2723,23 @@ pub fn fuzz() {
     let ov_ov4: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00, 0x0A, 0x13, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     // run's body is one byte, 0x7F: 127 local groups and no bytes for them (ov5)
     let ov_ov5: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00, 0x0A, 0x03, 0x01, 0x01, 0x7F];
-    let cases: [(&str, &[u8]); 13] = [
+    // br_table label counts from the app (claude/nia-brtable, fuzz finding 1; scripts/lib/brtable-wasm.py
+    // makes the same bytes): bt1 is the fuzzer's input (about 2^42 labels, the interpreter's loop), bt2 a
+    // 10-byte count inside a block (count + 1 overflowed in instr_end), bt3 about 2^42 inside a block.
+    let bt1: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0C, 0x03, 0x60, 0x01, 0x7F, 0x00, 0x60, 0x01, 0x7E, 0x00, 0x60, 0x00, 0x00, 0x02, 0x1D, 0x02, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x00, 0x00, 0x04, 0x61, 0x66, 0x72, 0x69, 0x07, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x36, 0x34, 0x00, 0x01, 0x03, 0x02, 0x01, 0x02, 0x05, 0x03, 0x01, 0x00, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x02, 0x0A, 0x27, 0x01, 0x25, 0x00, 0x41, 0x05, 0x10, 0x00, 0x41, 0xF8, 0xFF, 0x03, 0x42, 0x88, 0x3D, 0x0E, 0x98, 0xA8, 0xC0, 0xE0, 0x80, 0x81, 0x01, 0x37, 0x03, 0x00, 0x41, 0xF8, 0xFF, 0x03, 0x29, 0x03, 0x00, 0x10, 0x01, 0x41, 0xE3, 0x00, 0x10, 0x00, 0x0B];
+    let bt2: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00, 0x0A, 0x15, 0x01, 0x13, 0x00, 0x02, 0x40, 0x41, 0x00, 0x0E, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x0B, 0x0B];
+    let bt3: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00, 0x0A, 0x12, 0x01, 0x10, 0x00, 0x02, 0x40, 0x41, 0x00, 0x0E, 0x98, 0xA8, 0xC0, 0xE0, 0x80, 0x81, 0x01, 0x00, 0x0B, 0x0B];
+    // Control frames (claude/nia-ctrl; scripts/lib/ctrl-wasm.py makes the same bytes): a branch back to a
+    // `loop (result i32)` carries no value (lr1 TRAPped, lr2 copied a value from under the loop), a typed loop
+    // falling through keeps its result (lr3), and `else` only in an `if` (fuzz finding 2: el1 is the
+    // fuzzer's input, which froze the kernel; el2 `loop else`, el3 `block else`).
+    let lr1: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60, 0x01, 0x7F, 0x00, 0x60, 0x00, 0x00, 0x02, 0x0E, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x00, 0x00, 0x03, 0x02, 0x01, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x01, 0x0A, 0x19, 0x01, 0x17, 0x01, 0x01, 0x7F, 0x03, 0x7F, 0x20, 0x00, 0x41, 0x01, 0x6A, 0x22, 0x00, 0x41, 0x03, 0x49, 0x0D, 0x00, 0x41, 0x07, 0x0B, 0x10, 0x00, 0x0B];
+    let lr2: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60, 0x01, 0x7F, 0x00, 0x60, 0x00, 0x00, 0x02, 0x0E, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x00, 0x00, 0x03, 0x02, 0x01, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x01, 0x0A, 0x1D, 0x01, 0x1B, 0x01, 0x01, 0x7F, 0x41, 0x05, 0x03, 0x7F, 0x20, 0x00, 0x41, 0x01, 0x6A, 0x22, 0x00, 0x41, 0x03, 0x49, 0x0D, 0x00, 0x41, 0x07, 0x0B, 0x10, 0x00, 0x10, 0x00, 0x0B];
+    let lr3: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60, 0x01, 0x7F, 0x00, 0x60, 0x00, 0x00, 0x02, 0x0E, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x00, 0x00, 0x03, 0x02, 0x01, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x01, 0x0A, 0x0B, 0x01, 0x09, 0x00, 0x03, 0x7F, 0x41, 0x2A, 0x0B, 0x10, 0x00, 0x0B];
+    let el1: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60, 0x01, 0x7F, 0x00, 0x60, 0x00, 0x00, 0x02, 0x0C, 0x01, 0x03, 0x65, 0x6E, 0x76, 0x04, 0x70, 0x75, 0x74, 0x63, 0x00, 0x00, 0x03, 0x02, 0x01, 0x01, 0x05, 0x03, 0x01, 0x00, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x01, 0x0A, 0x29, 0x01, 0x27, 0x01, 0x02, 0x7F, 0x41, 0x00, 0x21, 0x00, 0x02, 0x40, 0x03, 0x32, 0x20, 0x00, 0x2D, 0x00, 0x00, 0x21, 0x01, 0x20, 0x01, 0x05, 0x0D, 0x01, 0x20, 0x01, 0x10, 0x00, 0x20, 0x00, 0x41, 0x01, 0x6A, 0x21, 0x00, 0x0C, 0x00, 0x0B, 0x0B, 0x0B, 0x0B, 0x16, 0x02, 0x0C, 0x01, 0x2A, 0x41, 0x00, 0x0B, 0x10, 0x48, 0x45, 0x4C, 0x4C, 0x4F, 0x20, 0x46, 0x52, 0x4F, 0x4D, 0x20, 0x57, 0x41, 0x53, 0x4D, 0x00];
+    let el2: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60, 0x01, 0x7F, 0x00, 0x60, 0x00, 0x00, 0x02, 0x0E, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x00, 0x00, 0x03, 0x02, 0x01, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x01, 0x0A, 0x08, 0x01, 0x06, 0x00, 0x03, 0x40, 0x05, 0x0B, 0x0B];
+    let el3: &[u8] = &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60, 0x01, 0x7F, 0x00, 0x60, 0x00, 0x00, 0x02, 0x0E, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x00, 0x00, 0x03, 0x02, 0x01, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x01, 0x0A, 0x08, 0x01, 0x06, 0x00, 0x02, 0x40, 0x05, 0x0B, 0x0B];
+    let cases: [(&str, &[u8]); 22] = [
         ("empty", empty),
         ("magic-only (no run)", magic_only),
         ("truncated section", trunc_section),
@@ -2413,6 +2753,15 @@ pub fn fuzz() {
         ("overflow: export name length", ov_ov3),
         ("overflow: code body size", ov_ov4),
         ("local groups past the body's end", ov_ov5),
+        ("br_table: count about 2^42", bt1),
+        ("br_table: 10-byte count in a block", bt2),
+        ("br_table: count about 2^42 in a block", bt3),
+        ("loop result: branch back, empty stack", lr1),
+        ("loop result: a value under the loop", lr2),
+        ("loop result: falls through its end", lr3),
+        ("else in a loop (fuzzer input)", el1),
+        ("else in a loop", el2),
+        ("else in a block", el3),
     ];
     crate::kprintln!("[fuzz] feeding {} malformed modules to the WASM parser...", cases.len());
     for (name, bytes) in cases.iter() {
@@ -2425,14 +2774,10 @@ pub fn fuzz() {
 
 // --- Nia guard test modules (claude/nia-guard; made by a script, checked with the
 // nia-apps emulator). Each one used to crash the kernel or overrun its stack. ---
-static WASM_BAD_17FUNCS: [u8; 97] = [
-    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x12,
-    0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x00, 0x0A, 0x34, 0x11, 0x02, 0x00,
-    0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B,
-    0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02,
-    0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00, 0x0B, 0x02, 0x00,
-    0x0B,
+// A function section that declares 129 functions, one past MAX_FUNCS (17 until claude/nia-a1a3): refused at
+// the count, before any entry is read. The whole 129-function app is wasm-textrun's f129.
+static WASM_BAD_129FUNCS: [u8; 18] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02, 0x81, 0x01,
 ];
 static WASM_BAD_NOCODE: [u8; 27] = [
     0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02,
@@ -2540,7 +2885,7 @@ fn guard_cases() {
     let mut flood = [0u8; 600];
     let fl = flood_module(&mut flood);
     let bad: [(&str, &[u8]); 6] = [
-        ("guard: 17 functions", &WASM_BAD_17FUNCS),
+        ("guard: 129 functions", &WASM_BAD_129FUNCS),
         ("guard: code count differs", &WASM_BAD_NOCODE),
         ("guard: branch out of the function", &WASM_BAD_BROUT),
         ("guard: 33 nested blocks", &WASM_BAD_DEEP),
@@ -2661,8 +3006,10 @@ pub fn dice_demo(n: usize) {
 
 /// The bundled apps: one table for seeding the VFS, recording the integrity manifest (from these
 /// compiled-in bytes) and restoring them after a disk load, so the lists cannot drift apart. appget refuses
-/// these names.
-pub const BUNDLED: [(&str, fn() -> &'static [u8]); 12] = [
+/// these names. Since A7 a bundled name always RUNS from these bytes (run_file), never from a VFS file, and an
+/// app over 16 KiB (the VFS's biggest file) is never written into the VFS: 16 KiB for disk apps, larger for
+/// bundled apps.
+pub const BUNDLED: [(&str, fn() -> &'static [u8]); 13] = [
     ("hello.wasm", hello_wasm),
     ("sum.wasm", sum_wasm),
     ("draw.wasm", draw_wasm),
@@ -2675,22 +3022,107 @@ pub const BUNDLED: [(&str, fn() -> &'static [u8]); 12] = [
     ("notify2.wasm", notify2_wasm),
     ("net.wasm", net_wasm),
     ("rand.wasm", rand_wasm),
+    ("andika.wasm", andika_wasm),
 ];
+
+/// A bundled app's compiled-in bytes (A7): what `nia NAME` runs for a bundled name.
+pub fn bundled(name: &str) -> Option<&'static [u8]> {
+    BUNDLED.iter().find(|(n, _)| *n == name).map(|(_, bytes)| bytes())
+}
+
+/// Whether a bundled app also gets a VFS copy (A7): only one the VFS can hold. A bigger one exists only in the
+/// kernel image; `ls` and the store list it as built in.
+fn bundled_in_vfs(bytes: &[u8]) -> bool {
+    bytes.len() <= crate::vfs::MAX_BIG_FILE_BYTES
+}
+
+/// At boot, before any disk load: write each bundled app the VFS can hold as a file (the one table the manifest
+/// also uses).
+pub fn seed_bundled() {
+    for (name, bytes) in BUNDLED {
+        let b = bytes();
+        if bundled_in_vfs(b) {
+            crate::vfs::write_full(name, b);
+        }
+    }
+}
+
+/// Bundled apps the boot check refused (bit i is BUNDLED[i]): never listed, never run.
+static BUNDLED_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn bundled_index(name: &str) -> Option<usize> {
+    BUNDLED.iter().position(|(n, _)| *n == name)
+}
+
+fn bundled_refused(i: usize) -> bool {
+    BUNDLED_REFUSED.load(Ordering::Relaxed) & (1 << i) != 0
+}
+
+/// A bundled app that passed the boot check (A7): the desk's Circle draws a tile only for these (afriui.md section 32).
+pub fn bundled_ok(name: &str) -> bool {
+    bundled_index(name).is_some_and(|i| !bundled_refused(i))
+}
+
+/// A bundled app that exists only in the kernel image (over 16 KiB) and passed the boot check: what `ls` and the
+/// store list as built in.
+pub fn built_in_only(name: &str) -> Option<&'static [u8]> {
+    let i = bundled_index(name)?;
+    let b = BUNDLED[i].1();
+    if bundled_in_vfs(b) || bundled_refused(i) {
+        None
+    } else {
+        Some(b)
+    }
+}
+
+/// Whether `name` is a bundled app the VFS cannot hold (a VFS file of that name is the person's, never run).
+pub fn is_big_bundled(name: &str) -> bool {
+    bundled(name).map_or(false, |b| !bundled_in_vfs(b))
+}
+
+/// After the manifest is recorded (A7 condition 3, the architect's changes 2 and 3): every bundled app's bytes
+/// must match it, and one over 16 KiB must carry its `afri.permissions` section, so what it gets is declared, not
+/// CAP_ALL by default. An app that fails is named, refused (never listed, never run) and counted.
+pub fn check_bundled() {
+    let mut ok = 0;
+    for (i, (name, bytes)) in BUNDLED.iter().enumerate() {
+        let b = bytes();
+        let fault = if !matches!(crate::integrity::check(name, b), crate::integrity::Verdict::Ok) {
+            Some("MISMATCH with the integrity manifest")
+        } else if !bundled_in_vfs(b) && !matches!(check_module(b), Ok((_, Some(_)))) {
+            Some("over 16 KiB with no afri.permissions section")
+        } else {
+            None
+        };
+        match fault {
+            None => ok += 1,
+            Some(why) => {
+                BUNDLED_REFUSED.fetch_or(1 << i, Ordering::Relaxed);
+                crate::kprintln!("[nia] bundled app {}: {}; refused (not listed, not run)", name, why);
+            }
+        }
+    }
+    crate::kprintln!("[nia] bundled apps: {} of {} match the manifest", ok, BUNDLED.len());
+}
 
 /// After `vfs::load_from_disk`: a bundled name whose disk copy differs from the built-in bytes gets the
 /// built-in copy back (an old disk after a kernel upgrade, or a tampered one), with one line; a missing one is
-/// seeded again.
+/// seeded again. A file with the name of a bundled app the VFS cannot hold is the person's own file: it is kept
+/// (never deleted at boot) and never run, and `ls` says so (the architect's A7 change 1).
 pub fn restore_bundled() {
     for (name, bytes) in BUNDLED {
         let want = bytes();
+        if !bundled_in_vfs(want) {
+            continue;
+        }
         match crate::vfs::read_full(name) {
             Some(have) if have == want => {}
             Some(_) => {
-                crate::vfs::write(name, want);
+                crate::vfs::write_full(name, want);
                 crate::kprintln!("[vfs] {}: the disk copy differed from the bundled app; bundled copy restored", name);
             }
             None => {
-                if !crate::vfs::write(name, want) {
+                if !crate::vfs::write_full(name, want) {
                     crate::kprintln!("[vfs] {}: no free file slot to restore the bundled app", name);
                 }
             }
@@ -2700,48 +3132,90 @@ pub fn restore_bundled() {
 
 /// Load a `.wasm` app from the filesystem and run it (granted all host caps).
 pub fn run_file(name: &str) {
-    // The whole file (up to 16 KiB, claude/vfs-big), not the 512-byte view.
-    match crate::vfs::read_full(name) {
-        Some(bytes) if bytes.len() >= 8 => {
-            // Integrity gate: verify the app's bytes against the manifest BEFORE
-            // running it. Tamper/corruption defense at load, layered under the
-            // capability sandbox. (Authorship — who signed it — is Ed25519, future.)
-            match crate::integrity::check(name, bytes) {
-                crate::integrity::Verdict::Tampered => {
-                    crate::kprintln!(
-                        "[nia] REFUSED '{}': integrity check FAILED (hash != manifest)",
-                        name
-                    );
-                    return;
-                }
-                crate::integrity::Verdict::Ok => {
-                    crate::kprintln!("[nia] integrity OK for '{}' (matches manifest)", name);
-                }
-                crate::integrity::Verdict::Unverified => {
-                    crate::kprintln!(
-                        "[nia] '{}' unverified (not in manifest); sandboxed run allowed",
-                        name
-                    );
-                }
-            }
-            // Manifest apps keep every capability; anything else (a sideloaded app) runs without
-            // file, net, AI and voice (claude/appget, change B).
-            let caps = match crate::integrity::check(name, bytes) {
-                crate::integrity::Verdict::Ok => CAP_ALL,
-                _ => {
-                    crate::kprintln!(
-                        "[nia] '{}' runs without file, net, AI and voice (not in the manifest)",
-                        name
-                    );
-                    CAP_SIDELOAD
-                }
-            };
-            crate::kprintln!("[nia] loaded '{}' from the filesystem ({} bytes)", name, bytes.len());
-            crate::tonga::wm_reset(); // fresh window server for a graphical app
-            run_app(name, bytes, caps);
+    // No re-entry (afriui.md section 25): checked before the file is read, the integrity line printed or the
+    // window server reset, so the running app keeps everything it has.
+    if refuse_nested(name) {
+        return;
+    }
+    // A7: a bundled name runs the kernel's own bytes, in place. They are in the kernel image, so nothing the app
+    // writes can change them (F1's reason for the copy does not apply) and they may be bigger than NIA_CODE. A VFS
+    // file of that name is never read for running, so a disk or appget file cannot stand in for a system app.
+    if let Some(bytes) = bundled(name) {
+        if bundled_index(name).map_or(false, bundled_refused) {
+            crate::kprintln!("[nia] REFUSED '{}': the bundled app failed its boot check", name);
+            return;
         }
+        crate::kprintln!("[nia] '{}' is built in: running the kernel's own copy", name);
+        return run_verified(name, bytes, "the kernel image");
+    }
+    // The whole file (up to 16 KiB, claude/vfs-big), not the 512-byte view, copied into Nia's own buffer
+    // (F1, claude/nia-fast): the hash, the parse and the run all see these bytes, and nothing the app writes to
+    // the VFS (its own file included) can change them under it. After refuse_nested, so a refused nested run
+    // never touches the running app's copy.
+    let file = crate::vfs::read_full(name);
+    if let Some(b) = file {
+        if b.len() > CODE_CAP {
+            // Never cut an app short (apps developer's review): today read_full gives at most 16 KiB.
+            crate::kprintln!("[nia] REFUSED '{}': bigger than Nia's 16 KiB code limit", name);
+            return;
+        }
+    }
+    match file.map(copy_code) {
+        Some(bytes) if bytes.len() >= 8 => run_verified(name, bytes, "the filesystem"),
         Some(_) => crate::kprintln!("[nia] '{}' is too small to be a WASM module", name),
         None => crate::kprintln!("[nia] no such file: {}  (try 'ls')", name),
+    }
+}
+
+/// The integrity gate and the run, for an app's bytes from `from` (a bundled app's or Nia's copy of a file).
+fn run_verified(name: &str, bytes: &[u8], from: &str) {
+    // Integrity gate: verify the app's bytes against the manifest BEFORE
+    // running it. Tamper/corruption defense at load, layered under the
+    // capability sandbox. (Authorship, who signed it, is Ed25519, future.)
+    // One verdict decides both the caps and the cell window's mark: only Verdict::Ok is signed.
+    // Manifest apps keep every capability; anything else (a sideloaded app) runs without
+    // file, net, AI and voice (claude/appget, change B).
+    let (caps, signed) = match crate::integrity::check(name, bytes) {
+        crate::integrity::Verdict::Tampered => {
+            crate::kprintln!(
+                "[nia] REFUSED '{}': integrity check FAILED (hash != manifest)",
+                name
+            );
+            return;
+        }
+        crate::integrity::Verdict::Ok => {
+            crate::kprintln!("[nia] integrity OK for '{}' (matches manifest)", name);
+            (CAP_ALL, true)
+        }
+        crate::integrity::Verdict::Unverified => {
+            crate::kprintln!(
+                "[nia] '{}' unverified (not in manifest); sandboxed run allowed",
+                name
+            );
+            crate::kprintln!(
+                "[nia] '{}' runs without file, net, AI and voice (not in the manifest)",
+                name
+            );
+            (CAP_SIDELOAD, false)
+        }
+    };
+    crate::kprintln!("[nia] loaded '{}' from {} ({} bytes)", name, from, bytes.len());
+    crate::tonga::wm_reset(); // fresh window server for a graphical app
+    run_app_in(name, bytes, caps, true, signed); // the cell window's title marks an unsigned app
+}
+
+// F1 (claude/nia-fast): the code of the app run_file runs. 16 KiB of .bss, the VFS's biggest file. Written only
+// by copy_code, which only run_file calls, after its nested-run refusal; one app runs at a time.
+const CODE_CAP: usize = 16384;
+static mut NIA_CODE: [u8; CODE_CAP] = [0; CODE_CAP];
+
+/// Copy `src` into NIA_CODE and give back the copy (run_file has refused anything over CODE_CAP).
+fn copy_code(src: &[u8]) -> &'static [u8] {
+    let n = src.len().min(CODE_CAP);
+    // SAFETY: single-threaded; no Module borrows NIA_CODE here, because nested runs are refused before this.
+    unsafe {
+        (&mut *addr_of_mut!(NIA_CODE))[..n].copy_from_slice(&src[..n]);
+        &(&*core::ptr::addr_of!(NIA_CODE))[..n]
     }
 }
 
@@ -2751,7 +3225,8 @@ fn host_cap(host: u8) -> (u32, &'static str) {
         HOST_PRINT => (CAP_PRINT, "print"),
         HOST_PRINTQ => (CAP_PRINT, "print64"),
         HOST_PUTC => (CAP_PUTC, "putc"),
-        HOST_WIN_CREATE | HOST_WIN_FILL | HOST_WIN_PRESENT | HOST_WIN_TEXT => (CAP_DRAW, "draw"),
+        HOST_WIN_CREATE | HOST_WIN_FILL | HOST_WIN_PRESENT | HOST_WIN_TEXT | HOST_WIN_TEXT_RUN => (CAP_DRAW, "draw"),
+        HOST_CELL_OPEN | HOST_CELL_PUT | HOST_CELL_CURSOR | HOST_CELL_SIZE | HOST_CELL_EVENT => (CAP_DRAW, "draw"),
         HOST_FILE_WRITE | HOST_FILE_READ => (CAP_FILE, "file"),
         HOST_TIME | HOST_SLEEP => (CAP_TIME, "time"),
         HOST_GETKEY | HOST_POLLKEY => (CAP_INPUT, "input"),
@@ -2789,8 +3264,10 @@ pub fn print_caps(label: &str, mask: u32, none: &str) {
 }
 
 /// Parse a module exactly as `run_file` would and NEVER run it (appget). All capabilities are allowed for the
-/// parse only, so imports are listed, not refused. Returns the capabilities its imports need.
-pub fn check_module(bytes: &[u8]) -> Result<u32, &'static str> {
+/// parse only, so imports are listed, not refused. Returns the capabilities its imports need, and what its
+/// `afri.permissions` section asks for (None when it has no section). A section refused here is refused at
+/// launch too: one parser, one rule.
+pub fn check_module(bytes: &[u8]) -> Result<(u32, Option<u32>), &'static str> {
     if bytes.len() < 8 {
         return Err("too small to be a WASM module");
     }
@@ -2799,10 +3276,31 @@ pub fn check_module(bytes: &[u8]) -> Result<u32, &'static str> {
     for i in 0..m.import_count.min(MAX_IMPORTS) {
         need |= host_cap(m.import_host[i]).0;
     }
-    Ok(need)
+    Ok((need, if m.listed { Some(m.asked) } else { None }))
 }
 
 fn run_app(label: &str, bytes: &[u8], caps: u32) {
+    run_app_in(label, bytes, caps, false, true); // the built-in demos are the kernel's own bytes: signed
+}
+
+/// `from_file`: the app came from the VFS (`run_file`), so an app with no `afri.permissions` section gets a
+/// line saying it runs on the v0 grant. Built-in demos (`run_app`) print nothing new.
+/// `signed`: the app's bytes are the kernel's own or match the manifest (integrity Verdict::Ok). Set here, after the
+/// re-entry check, so a refused nested start never changes the running app's mark; back to false after the run, so
+/// a run path that forgets it shows "unsigned" (fail closed, the architect's cell stage 2 follow-up).
+fn run_app_in(label: &str, bytes: &[u8], caps: u32, from_file: bool, signed: bool) {
+    if refuse_nested(label) {
+        return;
+    }
+    APP_RUNNING.store(true, Ordering::Relaxed);
+    set_app_name(label);
+    set_app_signed(signed);
+    run_app_body(label, bytes, caps, from_file);
+    set_app_signed(false);
+    APP_RUNNING.store(false, Ordering::Relaxed);
+}
+
+fn run_app_body(label: &str, bytes: &[u8], caps: u32, from_file: bool) {
     crate::kprintln!();
     crate::kprintln!("[nia] === {} ===", label);
     crate::kprintln!("[nia] loading module ({} bytes), granted caps = {:#04x}", bytes.len(), caps);
@@ -2810,9 +3308,17 @@ fn run_app(label: &str, bytes: &[u8], caps: u32) {
     keyq_reset(); // N1: one app's keys never reach the next
     match parse(bytes, caps) {
         Ok(m) => {
+            if m.listed {
+                print_caps("[nia] permissions asked: ", m.asked, "none");
+                print_caps("[nia] permissions granted: ", m.caps, "none");
+                print_caps("[nia] permissions withheld: ", m.asked & !m.caps, "nothing");
+            } else if from_file {
+                crate::kprintln!("[nia] permissions: none listed; granted by kind (v0)");
+            }
             crate::kprintln!("[nia] executing 'run' in the sandbox...");
             let mut st = Stack::new();
             let r = m.invoke(m.run_index, &mut st);
+            crate::desk::cell_app_ended(); // its cell window closes, on the clean return and on the TRAP alike
             finish_putc(); // the app's last putc line ends before the run's own line, whichever way it ended
             match r {
                 Ok(()) => crate::kprintln!("[nia] 'run' returned cleanly"),
@@ -2837,6 +3343,7 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
             *g = 0;
         }
     }
+    memo_reset(); // no block-end memo from an earlier app (claude/nia-fast)
     let mut md = Module {
         bytes: m,
         types: [(0, 0); MAX_TYPES],
@@ -2850,6 +3357,8 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
         import_count: 0,
         run_index: usize::MAX,
         caps,
+        listed: false,
+        asked: 0,
         depth: Cell::new(0),
     };
     // Code bodies seen (section 10). Must equal the function count (section 3).
@@ -2869,11 +3378,45 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
             _ => return Err("truncated section"),
         };
         match id {
+            0 => {
+                // A custom section: its name, then its bytes. Only `afri.permissions` is read; any other
+                // (`name`, `producers`, ...) is skipped as before.
+                let sname = name_in(m, &mut c, end).ok_or("truncated custom section name")?;
+                if sname == b"afri.permissions" {
+                    if md.listed {
+                        return Err("two afri.permissions sections");
+                    }
+                    md.listed = true;
+                    if c >= end {
+                        return Err("bad afri.permissions section");
+                    }
+                    let (cnt, a) = uleb(m, c);
+                    c += a;
+                    if cnt > MAX_PERMS {
+                        return Err("too many permissions (Nia holds 16)");
+                    }
+                    for _ in 0..cnt {
+                        let pn = name_in(m, &mut c, end).ok_or("bad afri.permissions section")?;
+                        match perm_bit(pn) {
+                            Some(bit) => md.asked |= bit,
+                            None => {
+                                crate::kprint!("[nia] unknown permission ");
+                                print_quoted(pn);
+                                crate::kprintln!();
+                                return Err("unknown permission");
+                            }
+                        }
+                    }
+                    if c != end {
+                        return Err("bad afri.permissions section");
+                    }
+                }
+            }
             1 => {
                 let (cnt, a) = uleb(m, c);
                 c += a;
                 if cnt > MAX_TYPES {
-                    return Err("too many types (Nia holds 16)");
+                    return Err("too many types (Nia holds 32)");
                 }
                 for i in 0..cnt {
                     // 0x60, then the parameter and result type vectors (one byte each), read with
@@ -2884,7 +3427,10 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
                     c += 1;
                     let np = name_in(m, &mut c, end).ok_or("truncated type")?.len();
                     let nr = name_in(m, &mut c, end).ok_or("truncated type")?.len();
-                    md.types[i] = (np, nr);
+                    md.types[i] = (
+                        u16::try_from(np).map_err(|_| "too many parameters")?,
+                        u16::try_from(nr).map_err(|_| "too many results")?,
+                    );
                 }
                 md.ntypes = cnt;
             }
@@ -2933,6 +3479,12 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
                                 b"print64" => HOST_PRINTQ,
                                 b"pollkey" => HOST_POLLKEY,
                                 b"sleep_ms" => HOST_SLEEP,
+                                b"cell_open" => HOST_CELL_OPEN,
+                                b"cell_put" => HOST_CELL_PUT,
+                                b"cell_cursor" => HOST_CELL_CURSOR,
+                                b"cell_size" => HOST_CELL_SIZE,
+                                b"cell_event" => HOST_CELL_EVENT,
+                                b"win_text_run" => HOST_WIN_TEXT_RUN,
                                 _ => HOST_UNKNOWN,
                             };
                             md.import_type[md.import_count] = desc; // type index
@@ -2945,7 +3497,7 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
                 let (cnt, a) = uleb(m, c);
                 c += a;
                 if cnt > MAX_FUNCS {
-                    return Err("too many functions (Nia holds 16)");
+                    return Err("too many functions (Nia holds 128)");
                 }
                 for i in 0..cnt {
                     let (ti, a) = uleb(m, c);
@@ -2953,7 +3505,7 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
                     if ti >= md.ntypes {
                         return Err("function has a bad type index");
                     }
-                    md.func_type[i] = ti;
+                    md.func_type[i] = u8::try_from(ti).map_err(|_| "function has a bad type index")?;
                 }
                 md.nfuncs = cnt;
             }
@@ -2978,13 +3530,13 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
                 let (cnt, a) = uleb(m, c);
                 c += a;
                 if cnt > MAX_FUNCS {
-                    return Err("too many functions (Nia holds 16)");
+                    return Err("too many functions (Nia holds 128)");
                 }
                 for i in 0..cnt {
                     // a body's size, then its bytes: within the section, a checked add (step A2)
                     let body = name_in(m, &mut c, end).ok_or("truncated code body")?;
-                    md.code_off[i] = c - body.len();
-                    md.code_len[i] = body.len();
+                    md.code_off[i] = u32::try_from(c - body.len()).map_err(|_| "module too big")?;
+                    md.code_len[i] = u32::try_from(body.len()).map_err(|_| "module too big")?;
                 }
                 ncode = cnt;
             }
@@ -3086,6 +3638,11 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
     if md.run_index == usize::MAX {
         return Err("no exported 'run'");
     }
+    // The grant, once, after every section (a custom section may come anywhere). The section can only narrow,
+    // never widen: what an app gets is always within what its kind allows (`caps`).
+    if md.listed {
+        md.caps = caps & md.asked;
+    }
     Ok(md)
 }
 
@@ -3118,7 +3675,7 @@ impl<'a> Module<'a> {
         if ti >= MAX_TYPES {
             return Err("bad type index");
         }
-        let (np, nr) = self.types[ti];
+        let (np, nr) = (usize::from(self.types[ti].0), usize::from(self.types[ti].1));
         let mut a = [0i32; 8];
         for k in (0..np.min(8)).rev() {
             a[k] = caller.pop();
@@ -3142,6 +3699,12 @@ impl<'a> Module<'a> {
             HOST_RANDOM => (CAP_RANDOM, "random"),
             HOST_POLLKEY => (CAP_INPUT, "pollkey"),
             HOST_SLEEP => (CAP_TIME, "sleep_ms"),
+            HOST_CELL_OPEN => (CAP_DRAW, "cell_open"),
+            HOST_CELL_PUT => (CAP_DRAW, "cell_put"),
+            HOST_CELL_CURSOR => (CAP_DRAW, "cell_cursor"),
+            HOST_CELL_SIZE => (CAP_DRAW, "cell_size"),
+            HOST_CELL_EVENT => (CAP_DRAW, "cell_event"),
+            HOST_WIN_TEXT_RUN => (CAP_DRAW, "win_text_run"),
             _ => (0xFFFF_FFFF, "unknown"),
         };
         if host == HOST_UNKNOWN || (self.caps & req) == 0 {
@@ -3170,23 +3733,42 @@ impl<'a> Module<'a> {
             HOST_GETKEY => {
                 // The next key: first any the loop poll queued, else block on the
                 // console. Ctrl+C stops the app (N1), so an app that ignores
-                // every key can still be left.
-                let k = match keyq_pop() {
-                    Some(c) => c,
-                    None => loop {
-                        if let Some(c) = crate::uart::getc() {
-                            break c;
-                        }
-                        core::hint::spin_loop();
-                    },
-                };
-                if k == STOP_KEY {
-                    return Err(STOPPED);
+                // every key can still be left. While the app owns a cell window its keys
+                // are cell events, so getkey returns -2 (no window for it) at once
+                // (afriui.md section 25).
+                cell_forced_check()?;
+                if crate::desk::cell_owned() {
+                    result = Some(crate::desk::cell_abi::ERR_NO_WINDOW);
+                } else {
+                    let k = match keyq_pop() {
+                        Some(c) => c,
+                        None => loop {
+                            cell_forced_check()?;
+                            if let Some(c) = crate::uart::getc() {
+                                break c;
+                            }
+                            core::hint::spin_loop();
+                        },
+                    };
+                    if k == STOP_KEY {
+                        return Err(STOPPED);
+                    }
+                    result = Some(k as i32);
                 }
-                result = Some(k as i32);
             }
             HOST_WIN_TEXT => {
                 crate::tonga::win_text(u(a[0]), u(a[1]), u(a[2]), a[3] as u8, a[4] as u32);
+            }
+            HOST_WIN_TEXT_RUN => {
+                // win_text_run(win, x, y, ptr, len, color): the length is capped at one row first, then the bytes
+                // are checked (a run past the 64 KiB is a TRAP), then each glyph goes through win_text, which
+                // clips to the window; x + 8 * i saturates, so a huge x stops at the edge (afriui.md section 21).
+                let n = ulen(a[4], TEXT_RUN_MAX);
+                let p = mem_range(a[3], n)?;
+                let (id, x, y, color) = (u(a[0]), u(a[1]), u(a[2]), a[5] as u32);
+                for i in 0..n {
+                    crate::tonga::win_text(id, x.saturating_add(8 * i), y, mem_read8(p + i), color);
+                }
             }
             HOST_AI => {
                 // ai(prompt_ptr, prompt_len, out_ptr, out_cap) -> out_len.
@@ -3241,6 +3823,34 @@ impl<'a> Module<'a> {
             HOST_SLEEP => {
                 result = Some(host_sleep_ms(a[0])?);
             }
+            HOST_CELL_OPEN => {
+                // SAFETY: single-threaded interpreter; the name and verdict run_app_in stored for this run.
+                let (name, signed) = unsafe { (&(&*addr_of_mut!(APP_NAME))[..APP_NAME_LEN], APP_SIGNED) };
+                result = Some(crate::desk::app_cell_open(name, signed, a[0], a[1]));
+            }
+            HOST_CELL_PUT => {
+                // len is in cells: negative is -5 before any cast, then capped at one row (120) before it is
+                // doubled to bytes, and the bytes must lie in linear memory (a TRAP otherwise, as for every pointer).
+                result = Some(if a[4] < 0 {
+                    crate::desk::cell_abi::ERR_BAD_ARG
+                } else {
+                    let n = (a[4] as usize).min(CELL_PUT_MAX);
+                    let p = mem_range(a[3], 2 * n)?;
+                    // SAFETY: single-threaded interpreter; p + 2n is inside WASM_MEM (mem_range).
+                    let cells = unsafe { &(&*core::ptr::addr_of!(WASM_MEM))[p..p + 2 * n] };
+                    crate::desk::app_cell_put(a[0], a[1], a[2], cells)
+                });
+            }
+            HOST_CELL_CURSOR => result = Some(crate::desk::app_cell_cursor(a[0], a[1], a[2], a[3])),
+            HOST_CELL_SIZE => result = Some(crate::desk::app_cell_size(a[0])),
+            HOST_CELL_EVENT => {
+                let deep = self.depth.get() >= MAX_CALL_DEPTH && STACK_PROBE.load(Ordering::Relaxed);
+                let mark = if deep { cell_stack_paint() } else { None };
+                result = Some(crate::desk::app_cell_event(a[0]));
+                if let Some(m) = mark {
+                    cell_stack_report(m);
+                }
+            }
             HOST_RANDOM => {
                 // random() -> i32. Reached only with CAP_RANDOM. A fresh draw from
                 // the hardware-seeded PRNG.
@@ -3275,11 +3885,11 @@ impl<'a> Module<'a> {
         if li >= self.nfuncs {
             return Err("bad function index");
         }
-        let ft = self.func_type[li];
+        let ft = usize::from(self.func_type[li]);
         if ft >= MAX_TYPES {
             return Err("bad type index");
         }
-        let (nparams, nresults) = self.types[ft];
+        let (nparams, nresults) = (usize::from(self.types[ft].0), usize::from(self.types[ft].1));
         if nparams > LOCALS_CAP {
             return Err("too many params");
         }
@@ -3291,7 +3901,8 @@ impl<'a> Module<'a> {
             locals[k] = caller.pop_i64();
         }
         caller.check()?;
-        let (co, cl) = (self.code_off[li], self.code_len[li]);
+        // u32 to usize widens on both kernels (64-bit); no value is lost.
+        let (co, cl) = (self.code_off[li] as usize, self.code_len[li] as usize);
         if co + cl > self.bytes.len() {
             return Err("truncated code body");
         }
@@ -3338,7 +3949,7 @@ impl<'a> Module<'a> {
 
     fn run_body(&self, code: &[u8], locals: &mut [i64], st: &mut Stack) -> Result<(), &'static str> {
         let mut ctrl: [Ctrl; CTRL_CAP] =
-            core::array::from_fn(|_| Ctrl { is_loop: false, cont_pc: 0, stack_base: 0, arity: 0 });
+            core::array::from_fn(|_| Ctrl { is_loop: false, is_if: false, cont_pc: 0, stack_base: 0, arity: 0 });
         let mut cp = 0usize;
         let mut pc = 0usize;
         loop {
@@ -3360,22 +3971,32 @@ impl<'a> Module<'a> {
                     let bt = code[pc + 1];
                     let arity = if bt == 0x40 { 0 } else { 1 };
                     let body_start = pc + 2;
-                    let (else_pc, end_pc) = matching(code, body_start);
+                    // A loop's label is its start, so it never needs its end: no scan at all (claude/nia-fast).
+                    let (else_pc, end_pc) = if op == 0x03 && memo_on() {
+                        (None, 0)
+                    } else {
+                        block_ends(code, body_start)
+                    };
                     if op == 0x04 {
                         let cond = st.pop();
-                        ctrl[cp] = Ctrl { is_loop: false, cont_pc: end_pc + 1, stack_base: st.sp, arity };
+                        ctrl[cp] = Ctrl { is_loop: false, is_if: true, cont_pc: end_pc + 1, stack_base: st.sp, arity };
                         cp += 1;
                         pc = if cond != 0 { body_start } else { else_pc.unwrap_or(end_pc) };
                     } else {
                         let cont = if op == 0x03 { body_start } else { end_pc + 1 };
-                        ctrl[cp] = Ctrl { is_loop: op == 0x03, cont_pc: cont, stack_base: st.sp, arity };
+                        // A loop's label is its start and carries no values (WebAssembly 1.0), whatever its result
+                        // type: a branch back keeps nothing. Its result stays on the stack when it falls through
+                        // its `end`, which never reads arity (claude/nia-ctrl).
+                        let arity = if op == 0x03 { 0 } else { arity };
+                        ctrl[cp] = Ctrl { is_loop: op == 0x03, is_if: false, cont_pc: cont, stack_base: st.sp, arity };
                         cp += 1;
                         pc = body_start;
                     }
                 }
                 0x05 => {
-                    if cp == 0 {
-                        return Err("else outside a block");
+                    // Only an `if` frame can meet its `else` (claude/nia-ctrl, fuzz finding 2).
+                    if cp == 0 || !ctrl[cp - 1].is_if {
+                        return Err("else outside an if");
                     }
                     pc = ctrl[cp - 1].cont_pc - 1;
                 }
@@ -3405,20 +4026,32 @@ impl<'a> Module<'a> {
                 0x0E => {
                     // br_table: pop an i32 index; branch to labels[index] if it is
                     // in range, else to the default label (indexed multi-way branch).
+                    // The count comes from the app; refuse one the body cannot hold (each
+                    // label is at least one byte) and stop on a read that takes no bytes, so
+                    // a huge count cannot spin here (claude/nia-brtable, fuzz finding 1).
                     let (count, a) = uleb(code, pc + 1);
                     let mut p = pc + 1 + a;
+                    if count >= code.len().saturating_sub(p) {
+                        return Err("truncated br_table");
+                    }
                     let idx = st.pop();
                     let mut chosen = 0usize;
                     let mut found = false;
                     for k in 0..count {
                         let (l, a2) = uleb(code, p);
+                        if a2 == 0 {
+                            return Err("truncated br_table");
+                        }
                         p += a2;
                         if !found && idx >= 0 && (idx as usize) == k {
                             chosen = l;
                             found = true;
                         }
                     }
-                    let (deflt, _a3) = uleb(code, p);
+                    let (deflt, a3) = uleb(code, p);
+                    if a3 == 0 {
+                        return Err("truncated br_table");
+                    }
                     if !found {
                         chosen = deflt;
                     }

@@ -238,7 +238,8 @@ writing a state the owner did not see — a stale screen, a swapped disk, a tabl
 
 - **Secure Boot:** a signed shim (Microsoft UEFI CA) that verifies an AfriSovera-signed kernel, or enrolment
   of the owner's own key by the owner in firmware setup. AfriSovera never enrols keys itself.
-- **A/B system partitions:** two AfriSovera system partitions (type GUID suffix `…000002` A, `…000003` B) and
+- **A/B system partitions:** REPLACED by AFR-0010 (safe updates: two boot files in the EFI partition, the
+  firmware's one-shot BootNext as the rollback). The earlier design, kept for the record: two AfriSovera system partitions (type GUID suffix `…000002` A, `…000003` B) and
   one data partition (`…000001`, today's type); boot file reads a `boot-state` record (active slot, tries
   left, successful flag) and falls back to the other slot after 3 failed boots (docs/02 "Update & integrity").
 - **MBR disks:** read and planned today; writing requires converting to GPT, which is out of scope until a

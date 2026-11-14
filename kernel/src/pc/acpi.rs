@@ -13,8 +13,27 @@ static mut CPUS: [u32; MAX_CPUS] = [0; MAX_CPUS];
 static mut NCPUS: usize = 0;
 static mut IOAPIC: u64 = 0;
 static mut FOUND: bool = false;
+/// The RSDT or XSDT (its address, whether it is the 64-bit XSDT), once its checksum passed: for `hwscan`.
+static mut ROOT: Option<(u64, bool)> = None;
 /// The ACPI power-management timer's I/O port (3.579545 MHz), from the FADT; 0 = none.
 static mut PM_TMR: u16 = 0;
+
+/// The TPM tables the XSDT lists (ADR 0008 step 1, read-only: nothing talks to a TPM). TCPA describes a TPM 1.2,
+/// TPM2 a TPM 2.0; each is (length, revision) of a table whose checksum is good, length 0 = not listed. For TPM2
+/// also its Start Method (offset 48: 2 ACPI start, 6 memory-mapped FIFO/TIS, 7 CRB, 8 CRB with ACPI start ...).
+#[derive(Clone, Copy)]
+pub struct TpmTables {
+    pub tcpa: (u32, u8),
+    pub tpm2: (u32, u8),
+    pub tpm2_start: u32,
+}
+static mut TPM: TpmTables = TpmTables { tcpa: (0, 0), tpm2: (0, 0), tpm2_start: 0 };
+
+/// What the XSDT said about a TPM, for `rng sources`.
+pub fn tpm_tables() -> TpmTables {
+    // SAFETY: written once by `init` at boot, read-only afterwards.
+    unsafe { TPM }
+}
 
 /// The PC's power button as the FADT describes it (7 Nov 2026). A short press sets
 /// PWRBTN_STS (bit 8 of PM1_STS) once the OS has set PWRBTN_EN (bit 8 of PM1_EN) and switched
@@ -35,6 +54,66 @@ struct PowerButton {
     acpi_mode_by_us: bool,
     presses: u32,
 }
+/// Switching off and restarting by ACPI (14 Nov 2026), used when the firmware's ResetSystem does not act:
+/// SLP_TYPa/b of \_S5 (read from the DSDT's `Name (_S5, Package () {a, b, ...})`), PM1a/PM1b_CNT, and the
+/// FADT's reset register (a Generic Address and the value to write).
+#[derive(Clone, Copy)]
+struct Power {
+    cnt_b: u16,
+    s5: Option<(u8, u8)>,
+    /// (address space: 0 memory, 1 I/O; address; value), when the FADT says the register is there
+    reset: Option<(u8, u64, u8)>,
+    /// the FACS (X_FIRMWARE_CTRL at 132 when the FADT is long enough and it is set, else FIRMWARE_CTRL at 36):
+    /// where the ACPI global lock lives (battery.rs, AML C1)
+    facs: u64,
+}
+static mut PWR: Power = Power { cnt_b: 0, s5: None, reset: None, facs: 0 };
+/// The DSDT's checksum was wrong, so \_S5 was not read from it.
+static mut DSDT_BAD: bool = false;
+/// FADT flag bit 10: RESET_REG_SUP.
+const F_RESET_REG: u32 = 1 << 10;
+
+/// SLP_TYPa and SLP_TYPb of \_S5 in the AML at `a`, `len` bytes: the bytes `_S5_` named by a NameOp (0x08,
+/// perhaps with a root prefix), then a PackageOp (0x12), its length, its element count, and two integers
+/// (ZeroOp, OneOp, or BytePrefix 0x0A and a byte). The usual way to read it without an AML interpreter; only
+/// that exact shape is taken.
+unsafe fn find_s5(a: u64, len: u64) -> Option<(u8, u8)> {
+    if len < 40 || len > 1 << 20 {
+        return None;
+    }
+    let mut i = 36u64;
+    while i + 12 < len {
+        if rd::<[u8; 4]>(a + i) == *b"_S5_" {
+            let before = rd::<u8>(a + i - 1);
+            let named = before == 0x08 || (before == b'\\' && rd::<u8>(a + i - 2) == 0x08);
+            if named && rd::<u8>(a + i + 4) == 0x12 {
+                let lead = rd::<u8>(a + i + 5);
+                let mut p = a + i + 6 + ((lead >> 6) as u64); // the package length's extra bytes
+                p += 1; // the element count
+                let mut int = || -> Option<u8> {
+                    let op = rd::<u8>(p);
+                    let (v, step) = match op {
+                        0x00 => (0, 1),
+                        0x01 => (1, 1),
+                        0x0A => (rd::<u8>(p + 1), 2),
+                        _ => return None,
+                    };
+                    p += step;
+                    Some(v)
+                };
+                let sa = int()?;
+                let sb = int().unwrap_or(0);
+                if sa <= 7 && sb <= 7 {
+                    return Some((sa, sb));
+                }
+                return None;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 static mut PB: PowerButton = PowerButton {
     smi_cmd: 0,
     acpi_enable: 0,
@@ -101,6 +180,7 @@ pub fn init(n_config: usize, config_table: u64) {
             crate::kprintln!("[pc] ACPI: the {} checksum is wrong; not used", if wide { "XSDT" } else { "RSDT" });
             return;
         }
+        ROOT = Some((root, wide));
         let step = if wide { 8 } else { 4 };
         let mut madt = 0u64;
         let mut off = 36u64;
@@ -125,6 +205,25 @@ pub fn init(n_config: usize, config_table: u64) {
                         let v: u32 = rd(t + o);
                         if v < 0x10000 { v as u16 } else { 0 }
                     };
+                    // \_S5 from the DSDT (X_DSDT at 140 when the FADT is long enough, else DSDT at 40),
+                    // PM1b_CNT (68), the reset register (116, its value at 128) when flag RESET_REG_SUP is set
+                    let dsdt: u64 = if flen >= 148 && rd::<u64>(t + 140) != 0 { rd(t + 140) } else { rd::<u32>(t + 40) as u64 };
+                    let dlen = if dsdt != 0 { rd::<u32>(dsdt + 4) as u64 } else { 0 };
+                    let dsdt_ok = dsdt != 0 && rd::<[u8; 4]>(dsdt) == *b"DSDT" && sum_ok(dsdt, dlen);
+                    DSDT_BAD = dsdt != 0 && !dsdt_ok;
+                    let s5 = if dsdt_ok { find_s5(dsdt, dlen) } else { None };
+                    let flags: u32 = rd(t + 112);
+                    // only an 8-bit register in I/O space below 0x10000 (architect, 14 Nov): a memory-space one
+                    // may lie outside the 1:1 map, so it is not a way we use and the chipset reset runs instead
+                    let reset = if flen >= 129 && flags & F_RESET_REG != 0 && rd::<u8>(t + 116) == 1 && rd::<u8>(t + 117) == 8 {
+                        let addr: u64 = rd(t + 120);
+                        if addr != 0 && addr < 0x10000 { Some((1u8, addr, rd::<u8>(t + 128))) } else { None }
+                    } else {
+                        None
+                    };
+                    let xfacs: u64 = if flen >= 140 { rd(t + 132) } else { 0 };
+                    let facs = if xfacs != 0 { xfacs } else { rd::<u32>(t + 36) as u64 };
+                    PWR = Power { cnt_b: io(68), s5, reset, facs };
                     PB = PowerButton {
                         smi_cmd: io(48),
                         acpi_enable: rd(t + 52),
@@ -139,6 +238,17 @@ pub fn init(n_config: usize, config_table: u64) {
             }
             if t != 0 && madt == 0 && rd::<[u8; 4]>(t) == *b"APIC" && sum_ok(t, rd::<u32>(t + 4) as u64) {
                 madt = t;
+            }
+            if t != 0 {
+                let (sig, tl): ([u8; 4], u32) = (rd(t), rd(t + 4));
+                if (sig == *b"TCPA" || sig == *b"TPM2") && tl >= 36 && sum_ok(t, tl as u64) {
+                    if sig == *b"TCPA" {
+                        TPM.tcpa = (tl, rd(t + 8));
+                    } else {
+                        TPM.tpm2 = (tl, rd(t + 8));
+                        TPM.tpm2_start = if tl >= 52 { rd(t + 48) } else { 0 };
+                    }
+                }
             }
             off += step;
         }
@@ -182,6 +292,12 @@ pub fn init(n_config: usize, config_table: u64) {
             { IOAPIC }
         );
     }
+}
+
+/// The firmware's RSDT or XSDT (address, true for the XSDT), when it was found with a good checksum.
+pub fn root() -> Option<(u64, bool)> {
+    // SAFETY: scalar read of boot-time state.
+    unsafe { ROOT }
 }
 
 /// The local-APIC id of a core other than `me`, to wake: the first one the MADT lists.
@@ -299,13 +415,89 @@ pub fn power_button_pressed() -> bool {
 /// firmware switches the PC off (as `poweroff` does).
 pub fn power_off_pressed() -> ! {
     crate::kprintln!("[pc] power button pressed: saving AfriSovera's files, then switching off");
+    save_files("power button");
+    crate::psci::poweroff()
+}
+
+/// The shell's files written to the disk in use (as `sync` does) before switching off or restarting.
+pub fn save_files(who: &str) {
     if crate::virtio::blk_present() {
         crate::vfs::sync_to_disk();
-        crate::kprintln!("[pc] power button: files saved to the disk");
+        crate::kprintln!("[pc] {}: files saved to the disk", who);
     } else {
-        crate::kprintln!("[pc] power button: no disk in use, nothing to save (files were in memory only)");
+        crate::kprintln!("[pc] {}: no disk in use, nothing to save (files were in memory only)", who);
     }
-    crate::psci::poweroff()
+}
+
+/// "S5 by PM1 control, SLP_TYP a/b" for acpiinfo, in a static buffer.
+fn alloc_fmt_s5(a: u8, b: u8) -> &'static str {
+    static mut BUF: [u8; 40] = *b"S5 by PM1 control, SLP_TYP a=0 b=0      ";
+    // SAFETY: shell context only (acpiinfo), one caller at a time.
+    unsafe {
+        let buf = &mut *core::ptr::addr_of_mut!(BUF);
+        buf[29] = b'0' + (a & 7);
+        buf[33] = b'0' + (b & 7);
+        core::str::from_utf8(&buf[..34]).unwrap_or("S5")
+    }
+}
+
+/// Switch the PC off by ACPI: SLP_TYP of \_S5 with SLP_EN into PM1a_CNT (and PM1b_CNT). Returns only if the
+/// PC is still on 200 ms later (or the tables gave no way), with why.
+pub fn sleep_s5() -> &'static str {
+    // SAFETY: read-only after init; port writes whose only effect is to switch the machine off.
+    unsafe {
+        let (p, w) = (PB, PWR);
+        let Some((a, b)) = w.s5 else { return "the DSDT has no \\_S5 the kernel can read" };
+        if p.cnt_a == 0 {
+            return "the FADT has no PM1a control register";
+        }
+        // SLP_TYP first, then SLP_TYP with SLP_EN, as Linux does: some chipsets ignore one combined write
+        for en in [0u16, 1 << 13] {
+            for (port, typ) in [(p.cnt_a, a), (w.cnt_b, b)] {
+                if port != 0 {
+                    let v = (inw(port) & !(7 << 10 | 1 << 13)) | (typ as u16) << 10 | en;
+                    core::arch::asm!("out dx, ax", in("dx") port, in("ax") v, options(nomem, nostack));
+                }
+            }
+        }
+        crate::timer::busywait_ms(200);
+        "PM1 control was written but the PC stayed on"
+    }
+}
+
+/// The FACS's address as the FADT gives it (0: none). hwscan::facs_lock checks it before use.
+pub fn facs() -> u64 {
+    // SAFETY: written once by `init` at boot, read-only afterwards.
+    unsafe { PWR.facs }
+}
+
+/// GBL_RLS (bit 2 of PM1_CNT): the OS tells the firmware it gave the global lock back while the firmware waited
+/// for it (ACPI spec 5.2.10.1). Read-modify-write; SLP_EN reads as 0, so nothing else changes.
+pub fn gbl_release() {
+    // SAFETY: read-only after init; a PM1 control write whose only effect is the firmware's lock-released event.
+    unsafe {
+        let (p, w) = (PB, PWR);
+        for port in [p.cnt_a, w.cnt_b] {
+            if port != 0 {
+                let v = inw(port) | 1 << 2;
+                core::arch::asm!("out dx, ax", in("dx") port, in("ax") v, options(nomem, nostack));
+            }
+        }
+    }
+}
+
+/// Restart the PC through the FADT's reset register, when it has one. Returns only if the PC did not restart.
+pub fn reset_register() -> &'static str {
+    // SAFETY: read-only after init; the write's only effect is a machine reset.
+    unsafe {
+        let Some((space, addr, val)) = PWR.reset else { return "the FADT has no reset register" };
+        if space != 1 || addr >= 0x10000 {
+            return "the reset register is not an I/O port the kernel writes";
+        }
+        core::arch::asm!("out dx, al", in("dx") addr as u16, in("al") val, options(nomem, nostack));
+        crate::timer::busywait_ms(100);
+        "the reset register was written but the PC did not restart"
+    }
 }
 
 /// `acpiinfo`.
@@ -319,6 +511,14 @@ pub fn info() {
         let (cpus, n, io) = (CPUS, NCPUS, IOAPIC);
         crate::kprintln!("acpi: {} core(s), local-APIC ids {:?}, I/O APIC at {:#x}", n, &cpus[..n], io);
         crate::kprintln!("acpi: PM timer at I/O port {:#x}", { PM_TMR });
+        let w = PWR;
+        match (w.s5, w.reset) {
+            (s5, reset) => crate::kprintln!(
+                "acpi: switching off: {}; restarting: {}",
+                match s5 { Some((a, b)) => alloc_fmt_s5(a, b), None if DSDT_BAD => "the DSDT's checksum is wrong, so \\_S5 was not read (the firmware's ResetSystem only)", None => "no \\_S5 found (the firmware's ResetSystem only)" },
+                match reset { Some(_) => "the FADT reset register (I/O)", None => "no FADT reset register (the firmware, then the chipset's 0xCF9)" }
+            ),
+        }
         let p = PB;
         crate::kprintln!(
             "acpi: power button {} (PM1a events {:#x}, control {:#x}, SMI_CMD {:#x}, ACPI mode {}, presses {})",

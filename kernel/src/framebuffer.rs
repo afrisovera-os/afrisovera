@@ -57,6 +57,174 @@ pub fn fill_rect(x0: usize, y0: usize, w: usize, h: usize, rgb: u32) {
     }
 }
 
+/// Mix a block of text coverage into a buffer of pixels (afriui.md section 26), shared by both desks' canvases:
+/// `buf` is `stride` pixels a row, the block is `w`x`h` at (x0, y0) and must already be clipped to the buffer;
+/// `a` holds the block's coverage, `astride` bytes a row; each byte goes through `gamma`, 0 is skipped, 255 is a
+/// plain write, and only the edge pixels read the pixel below and mix. Integer only, the same on ARM and PC.
+pub fn blend_into(buf: &mut [u32], stride: usize, x0: usize, y0: usize, w: usize, h: usize, a: &[u8], astride: usize, rgb: u32, gamma: &[u8; 256]) {
+    // red and blue mixed together in one word, green in another (two multiplies each); alpha 0..255 is taken as
+    // 0..256 so the divide is a shift. Written with raw pointers in the row: the kernel is built at opt-level 0,
+    // where iterator adaptors and bounds checks cost more than the mixing.
+    let (srb, sg) = (rgb & 0xFF_00FF, rgb & 0x00_FF00);
+    let g = gamma.as_ptr();
+    for r in 0..h {
+        let (Some(dst), Some(src)) = (buf.get_mut((y0 + r) * stride + x0..(y0 + r) * stride + x0 + w), a.get(r * astride..r * astride + w)) else {
+            return;
+        };
+        // SAFETY: d and q walk the w pixels of `dst` and the w bytes of `src` (both just bounds-checked); g indexes a
+        // 256-entry table with a byte.
+        unsafe {
+            let mut d = dst.as_mut_ptr();
+            let end = d.add(w);
+            let mut q = src.as_ptr();
+            while d < end {
+                let c = *q;
+                if c != 0 {
+                    let al = *g.add(c as usize) as u32;
+                    if al == 255 {
+                        *d = rgb;
+                    } else {
+                        MIXED += 1;
+                        let k = al + (al >> 7);
+                        let nk = 256 - k;
+                        let v = *d;
+                        let rb = (((v & 0xFF_00FF) * nk + srb * k) >> 8) & 0xFF_00FF;
+                        let gg = (((v & 0x00_FF00) * nk + sg * k) >> 8) & 0x00_FF00;
+                        *d = rb | gg;
+                    }
+                }
+                d = d.add(1);
+                q = q.add(1);
+            }
+        }
+    }
+}
+
+/// Black mixed over a block at the alphas in `a` (`astride` bytes a row, 0 for one row read again): the soft
+/// shadows of afriui.md section 30. The same result as `blend_into` with black and no gamma, without the colour or
+/// the table (one pair of multiplies a pixel). The block must already be clipped to the buffer.
+pub fn shade_into(buf: &mut [u32], stride: usize, x0: usize, y0: usize, w: usize, h: usize, a: &[u8], astride: usize) {
+    for r in 0..h {
+        let (Some(dst), Some(src)) = (buf.get_mut((y0 + r) * stride + x0..(y0 + r) * stride + x0 + w), a.get(r * astride..r * astride + w)) else {
+            return;
+        };
+        // SAFETY: d and q walk the w pixels of `dst` and the w bytes of `src`, both just bounds-checked.
+        unsafe {
+            let mut d = dst.as_mut_ptr();
+            let end = d.add(w);
+            let mut q = src.as_ptr();
+            while d < end {
+                let al = *q as u32;
+                if al != 0 {
+                    MIXED += 1;
+                    let nk = 256 - (al + (al >> 7));
+                    let v = *d;
+                    *d = ((((v & 0xFF_00FF) * nk) >> 8) & 0xFF_00FF) | ((((v & 0x00_FF00) * nk) >> 8) & 0x00_FF00);
+                }
+                d = d.add(1);
+                q = q.add(1);
+            }
+        }
+    }
+}
+
+/// Black at one alpha `al` over a block (the shadows' straight runs): two pixels a step, their red and blue lanes and
+/// their green lanes each in one 64-bit multiply. The same pixels as `shade_into` at that alpha. Clipped by the caller.
+pub fn shade_const_into(buf: &mut [u32], stride: usize, x0: usize, y0: usize, w: usize, h: usize, al: u32) {
+    if al == 0 {
+        return;
+    }
+    let nk = (256 - (al + (al >> 7))) as u64;
+    for r in 0..h {
+        let Some(dst) = buf.get_mut((y0 + r) * stride + x0..(y0 + r) * stride + x0 + w) else {
+            return;
+        };
+        // SAFETY: a scalar counter, mainline only.
+        unsafe { MIXED += w as u64 };
+        // SAFETY: d walks the w pixels of `dst` (just bounds-checked), two at a time, then the odd one; raw pointers
+        // because the kernel is built at opt-level 0, where slice iterators cost more than the mixing.
+        unsafe {
+            let mut d = dst.as_mut_ptr();
+            let end = d.add(w & !1);
+            while d < end {
+                let v = (*d as u64) | ((*d.add(1) as u64) << 32);
+                let rb = (((v & 0x00FF_00FF_00FF_00FF) * nk) >> 8) & 0x00FF_00FF_00FF_00FF;
+                let g = (((v & 0x0000_FF00_0000_FF00) * nk) >> 8) & 0x0000_FF00_0000_FF00;
+                let o = rb | g;
+                *d = o as u32;
+                *d.add(1) = (o >> 32) as u32;
+                d = d.add(2);
+            }
+            if w & 1 == 1 {
+                let v = *d as u64;
+                *d = (((((v & 0xFF_00FF) * nk) >> 8) & 0xFF_00FF) | ((((v & 0x00_FF00) * nk) >> 8) & 0x00_FF00)) as u32;
+            }
+        }
+    }
+}
+
+/// Black at one alpha over the framebuffer, clipped to the screen.
+#[allow(dead_code)] // the PC kernel shades its own canvas
+pub fn shade_const(x0: usize, y0: usize, w: usize, h: usize, al: u32) {
+    let (w, h) = (w.min(WIDTH.saturating_sub(x0)), h.min(HEIGHT.saturating_sub(y0)));
+    if w == 0 || h == 0 {
+        return;
+    }
+    // SAFETY: the framebuffer is a static array; single writer (mainline).
+    let fb = unsafe { &mut (*addr_of_mut!(FB)).0 };
+    shade_const_into(fb, WIDTH, x0, y0, w, h, al);
+}
+
+/// One pixel of `rgb` mixed at alpha `al` (1 to 254) over buf[i] (the edge pixels of corners and outlines).
+pub fn mix_into(buf: &mut [u32], i: usize, rgb: u32, al: u32) {
+    if let Some(d) = buf.get_mut(i) {
+        // SAFETY: a scalar counter, mainline only.
+        unsafe { MIXED += 1 };
+        let k = al + (al >> 7);
+        let nk = 256 - k;
+        let v = *d;
+        *d = ((((v & 0xFF_00FF) * nk + (rgb & 0xFF_00FF) * k) >> 8) & 0xFF_00FF) | ((((v & 0x00_FF00) * nk + (rgb & 0x00_FF00) * k) >> 8) & 0x00_FF00);
+    }
+}
+
+/// Black at the alphas `a` over the framebuffer (the phone's desk canvas), clipped to the screen.
+#[allow(dead_code)] // the PC kernel shades its own canvas
+pub fn shade(x0: usize, y0: usize, w: usize, h: usize, a: &[u8], astride: usize) {
+    let (w, h) = (w.min(WIDTH.saturating_sub(x0)), h.min(HEIGHT.saturating_sub(y0)));
+    if w == 0 || h == 0 {
+        return;
+    }
+    // SAFETY: the framebuffer is a static array; single writer (mainline).
+    let fb = unsafe { &mut (*addr_of_mut!(FB)).0 };
+    shade_into(fb, WIDTH, x0, y0, w, h, a, astride);
+}
+
+/// One pixel mixed into the framebuffer, on the screen.
+#[allow(dead_code)] // the PC kernel mixes into its own canvas
+pub fn mix(x: usize, y: usize, rgb: u32, al: u32) {
+    if x < WIDTH && y < HEIGHT {
+        // SAFETY: as above.
+        let fb = unsafe { &mut (*addr_of_mut!(FB)).0 };
+        mix_into(fb, y * WIDTH + x, rgb, al);
+    }
+}
+
+/// Pixels mixed with the pixel below (read and written) since boot: text edges, corners, shadows, see-through
+/// panels (afriui.md section 30: on the phone these are reads of the scan-out buffer until P3's back buffer).
+pub static mut MIXED: u64 = 0;
+
+/// Text coverage mixed into the framebuffer (the phone's desk canvas), clipped to the screen.
+#[allow(dead_code)] // the PC kernel blends into its own canvas
+pub fn blend(x0: usize, y0: usize, w: usize, h: usize, a: &[u8], astride: usize, rgb: u32, gamma: &[u8; 256]) {
+    let (w, h) = (w.min(WIDTH.saturating_sub(x0)), h.min(HEIGHT.saturating_sub(y0)));
+    if w == 0 || h == 0 {
+        return;
+    }
+    // SAFETY: the framebuffer is a static array; single writer (mainline).
+    let fb = unsafe { &mut (*addr_of_mut!(FB)).0 };
+    blend_into(fb, WIDTH, x0, y0, w, h, a, astride, rgb, gamma);
+}
+
 /// Copy a `w`x`h` pixel block from `src` (row stride `stride`) to (dx, dy).
 /// Used by the compositor to blit an app's surface buffer onto the screen.
 ///
@@ -255,6 +423,17 @@ unsafe fn con_putc(c: u8) {
     match c {
         b'\n' => con_newline(),
         b'\r' => {}
+        // backspace steps back one cell (the shell erases with backspace, space, backspace, and history recall with
+        // one per character): it used to draw as a box, which is the "hwscan: .. .. .." on the owner's HP, 14 Nov.
+        // At the start of a wrapped row it steps back to the end of the row above.
+        0x08 => {
+            if CCOL > 0 {
+                CCOL -= 1;
+            } else if CROW > 0 {
+                CROW -= 1;
+                CCOL = CON_COLS - 1;
+            }
+        }
         _ => {
             if CCOL >= CON_COLS {
                 con_newline();
@@ -439,20 +618,129 @@ pub fn blit_time() {
         }
     }
     let edge = px(WIDTH - 21, HEIGHT - 11) == 0 && px(WIDTH - 21, HEIGHT - 1) == 0 && px(WIDTH - 1, HEIGHT - 11) == 0;
+    let text = text_probe();
     console_init();
     crate::kprintln!("[fbblit] console block {}x{}: fastest {} us; whole screen {}x{}: fastest {} us", cw, chh, con, WIDTH, HEIGHT, full);
     crate::kprintln!("[fbblit] copy check: {} of 192 pixels right; clip check: {} of 200 inside, edge {}", right, inside, if edge { "unchanged" } else { "CHANGED" });
+    let (one, two, chars, h, ends, corner, rest, far) = text;
+    crate::kprintln!("[fbtext] draw_string 26 chars at scale 1: fastest {} us; at scale 2: fastest {} us; draw_char 26 at scale 1: fastest {} us", one, two, chars);
+    let rest = if rest { "unchanged" } else { "CHANGED" };
+    if SATURATING_TEXT {
+        crate::kprintln!("[fbtext] text check: screen hash {:016x}, end x {}; clip check: {} lit in the corner, rest {}, far text {}", h, ends, corner, rest, far);
+    } else {
+        crate::kprintln!("[fbtext] text check: screen hash {:016x}, end x {}; clip check: {} lit in the corner, rest {}, far text not run", h, ends, corner, rest);
+    }
+}
+
+/// Text calls with a usize::MAX - 3 start run only once the text clip saturates (afriui.md section 23); the old
+/// code would overflow and panic in a debug build.
+const SATURATING_TEXT: bool = true;
+
+/// The `[fbtext]` part of `fbcon blit` (afriui.md section 23): the time of `draw_string` and `draw_char`, a hash of a
+/// screen of sample text (it must not change when the code does), the end x the calls return, a clip check in the
+/// bottom right corner and far text. Leaves the screen dirty; the caller redraws the console.
+fn text_probe() -> (u64, u64, u64, u64, usize, usize, bool, usize) {
+    let hz = crate::timer::hz().max(1);
+    let us = |t0: u64| crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / hz;
+    const AZ: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let (mut one, mut two, mut chars) = (u64::MAX, u64::MAX, u64::MAX);
+    for _ in 0..8 {
+        let t0 = crate::timer::cycles();
+        draw_string(10, 10, AZ, 0xF2_C1_4E, 1);
+        one = one.min(us(t0));
+        let t0 = crate::timer::cycles();
+        draw_string(10, 30, AZ, 0xF2_C1_4E, 2);
+        two = two.min(us(t0));
+        let t0 = crate::timer::cycles();
+        for (i, &c) in AZ.as_bytes().iter().enumerate() {
+            draw_char(10 + i * 8, 60, c, 0xF2_C1_4E, 1);
+        }
+        chars = chars.min(us(t0));
+    }
+    // text check: sample lines at scales 1 to 4, then a hash of the whole screen
+    fill_rect(0, 0, WIDTH, HEIGHT, 0);
+    let mut ends = 0usize;
+    ends += draw_string(10, 10, "TONGA WM: APP SURFACES", 0x8F_7A_52, 1);
+    ends += draw_string(10, 24, "AFRISOVERA OS 0123456789", 0xF2_C1_4E, 2);
+    ends += draw_string(10, 50, "I W . , : ; - + = ( ) / ? !", 0xFF_FF_FF, 3);
+    ends += draw_string(10, 90, "MANSA 2026", 0x2E_9E_6A, 4);
+    ends += draw_string(10, 130, "", 0xFF_FF_FF, 1);
+    for (i, &c) in b"DRAW CHAR 42".iter().enumerate() {
+        draw_char(10 + i * 9, 140, c, 0xC4_56_2B, 1);
+        draw_char(10 + i * 18, 152, c, 0xC4_56_2B, 2);
+    }
+    let fb = addr_of_mut!(FB) as *const u32;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for i in 0..WIDTH * HEIGHT {
+        // SAFETY: FB holds WIDTH * HEIGHT pixels.
+        h = (h ^ unsafe { *fb.add(i) } as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    // clip check: text hanging past the bottom right corner colours only pixels inside the screen there
+    fill_rect(0, 0, WIDTH, HEIGHT, 0);
+    draw_string(WIDTH - 10, HEIGHT - 6, "WWWW", 0xFF_FF_FF, 2);
+    draw_char(WIDTH - 5, HEIGHT - 20, b'M', 0xFF_FF_FF, 3);
+    let (mut corner, mut rest) = (0usize, true);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            // SAFETY: x < WIDTH, y < HEIGHT.
+            let lit = unsafe { *fb.add(y * WIDTH + x) } != 0;
+            if x >= WIDTH - 10 && y >= HEIGHT - 20 {
+                corner += lit as usize;
+            } else if lit {
+                rest = false;
+            }
+        }
+    }
+    // far text: starts at usize::MAX - 3 in x and in y must colour nothing
+    let mut far = 0usize;
+    if SATURATING_TEXT {
+        fill_rect(0, 0, WIDTH, HEIGHT, 0);
+        draw_string(usize::MAX - 3, 10, "WM", 0xFF_FF_FF, 2);
+        draw_string(10, usize::MAX - 3, "WM", 0xFF_FF_FF, 2);
+        draw_char(usize::MAX - 3, 10, b'W', 0xFF_FF_FF, 2);
+        draw_char(10, usize::MAX - 3, b'W', 0xFF_FF_FF, 2);
+        for i in 0..WIDTH * HEIGHT {
+            // SAFETY: as above.
+            far += (unsafe { *fb.add(i) } != 0) as usize;
+        }
+    }
+    (one, two, chars, h, ends, corner, rest, far)
 }
 
 /// Draw a single glyph at scale, transparent background (only lit pixels drawn).
 pub fn draw_char(x0: usize, y0: usize, c: u8, fg: u32, scale: usize) {
-    let g = font::glyph(c);
-    for (row, bits) in g.iter().enumerate() {
-        for col in 0..8 {
-            if (bits >> (7 - col)) & 1 == 1 {
-                fill_rect(x0 + col * scale, y0 + row * scale, scale, scale, fg);
+    for (row, &bits) in font::glyph(c).iter().enumerate() {
+        glyph_row(bits, 0, x0, y0.saturating_add(row.saturating_mul(scale)), fg, scale);
+    }
+}
+
+/// One glyph row from column `l` on, drawn at (x, y), scale rows tall (afriui.md section 23). When the whole row box
+/// (8 - l columns) is on the screen, each run of lit columns is written straight into the framebuffer; otherwise each
+/// run is one `fill_rect`, which clips. Positions saturate, so a start near usize::MAX draws nothing.
+fn glyph_row(bits: u8, l: usize, x: usize, y: usize, fg: u32, scale: usize) {
+    let mut m = bits & (0xFF >> l);
+    let inside = x.saturating_add((8 - l).saturating_mul(scale)) <= WIDTH && y.saturating_add(scale) <= HEIGHT;
+    let fb = addr_of_mut!(FB) as *mut u32;
+    while m != 0 {
+        let start = m.leading_zeros() as usize;
+        let len = (!(m << start)).leading_zeros() as usize;
+        if inside {
+            let (rx, n) = (x + (start - l) * scale, len * scale);
+            for dy in 0..scale {
+                // SAFETY: `inside` puts columns rx..rx + n and row y + dy on the screen; single writer.
+                unsafe {
+                    let p = fb.add((y + dy) * WIDTH + rx);
+                    let mut i = 0;
+                    while i < n {
+                        p.add(i).write(fg);
+                        i += 1;
+                    }
+                }
             }
+        } else {
+            fill_rect(x.saturating_add((start - l).saturating_mul(scale)), y, len.saturating_mul(scale), scale, fg);
         }
+        m = if start + len >= 8 { 0 } else { m & (0xFF >> (start + len)) };
     }
 }
 
@@ -463,38 +751,18 @@ pub fn draw_char(x0: usize, y0: usize, c: u8, fg: u32, scale: usize) {
 pub fn draw_string(x0: usize, y0: usize, s: &str, fg: u32, scale: usize) -> usize {
     let mut x = x0;
     for &b in s.as_bytes() {
-        if b == b' ' {
-            x += 4 * scale;
+        let g = if b == b' ' { [0; 8] } else { font::glyph(b) };
+        // Ink bounds (leftmost and rightmost lit column) from one OR of the rows.
+        let ink = g.iter().fold(0u8, |a, &r| a | r);
+        if ink == 0 {
+            x = x.saturating_add(scale.saturating_mul(4)); // a space or a blank glyph
             continue;
         }
-        let g = font::glyph(b);
-        // Measure ink bounds (leftmost/rightmost lit column).
-        let mut l = 8usize;
-        let mut r = 0usize;
-        for &bits in g.iter() {
-            for col in 0..8usize {
-                if (bits >> (7 - col)) & 1 == 1 {
-                    if col < l {
-                        l = col;
-                    }
-                    if col > r {
-                        r = col;
-                    }
-                }
-            }
+        let (l, r) = (ink.leading_zeros() as usize, 7 - ink.trailing_zeros() as usize);
+        for (row, &bits) in g.iter().enumerate() {
+            glyph_row(bits, l, x, y0.saturating_add(row.saturating_mul(scale)), fg, scale);
         }
-        if r < l {
-            x += 4 * scale; // blank glyph
-            continue;
-        }
-        for (row, bits) in g.iter().enumerate() {
-            for col in l..=r {
-                if (bits >> (7 - col)) & 1 == 1 {
-                    fill_rect(x + (col - l) * scale, y0 + row * scale, scale, scale, fg);
-                }
-            }
-        }
-        x += (r - l + 2) * scale; // ink width + 1px gap
+        x = x.saturating_add((r - l + 2).saturating_mul(scale)); // ink width + 1px gap
     }
     x
 }

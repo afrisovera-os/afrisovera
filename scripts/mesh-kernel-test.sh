@@ -3,13 +3,14 @@
 #
 # Boot 1, WITH a virtio-rng device (a counted, health-tested strong source):
 #   - `rng`         : the HMAC_DRBG boot KAT (NIST CAVP COUNT=0) says PASS and virtio-rng is healthy;
-#   - `rng secret`  : a fail-closed secret draw succeeds;
+#   - `rng secret`  : a fail-closed secret draw succeeds, and prints no byte of it;
 #   - `mesh selftest`: SHA-256 kernel == mesh-crypto (review S3), DRBG KAT, fresh distinct ephemerals (S4), Noise
 #                     XX + KK in memory, a flipped byte and a wrong KK static rejected, bundle seal/open with
 #                     tamper and wrong-sender rejects, bundle size = bucket 0; F1: a Secret and a DRBG state
 #                     read back all zero after their destructors ran; F4: peer text with ESC, CR/LF, a bidi
 #                     override and a closing quote comes out escaped; review M1: after `forget` the
-#                     identity's own bytes in the static read zero. Every line PASS, N/N (at least 16 rows).
+#                     identity's own bytes in the static read zero; F5a: a bundle opens inside CLOCK_SKEW of
+#                     its expiry and is refused as Expired at it. Every line PASS, N/N (at least 16 rows).
 #   - `mesh id`, `mesh forget`, `mesh id`: the identity is dropped (and so wiped) and a NEW one is made.
 # Boot 2, WITHOUT any strong source (QEMU cortex-a72 has no RNDR, no virtio-rng):
 #   - `rng secret`  : REFUSED (NoStrongSource): the fail-closed half, which a test only of the happy path
@@ -62,12 +63,15 @@ need(re.search(r"\[rng\] HMAC_DRBG-SHA256 kat=PASS", a), "boot 1: DRBG boot KAT 
 need(re.search(r"\[rng\] source virtio-rng: healthy samples=(\d+)", a), "boot 1: virtio-rng not healthy")
 m = re.search(r"\[rng\] source virtio-rng: healthy samples=(\d+)", a)
 need(m and int(m.group(1)) >= 1024, "boot 1: fewer than 1024 start-up samples through the health tests")
-need(re.search(r"\[rng\] secret OK [0-9a-f]{8}", a), "boot 1: rng secret was not OK")
+need(re.search(r"\[rng\] secret OK, 16 bytes, not shown\r?$", a, re.M), "boot 1: rng secret was not OK")
+need(not re.search(r"\[rng\] secret OK [0-9a-f]", a), "boot 1: rng secret printed bytes of the secret")
 rows = re.findall(r"\[mesh\] selftest ([a-z0-9-]+): (PASS|FAIL)", a)
 need(len(rows) >= 16, "boot 1: expected >= 16 mesh selftest rows, got %d" % len(rows))
 names = [r[0] for r in rows]
 for n in ("secret-drop-wipes", "drbg-drop-wipes", "peer-text-console-safe", "forget-wipes-identity-in-static"):
     need(n in names, "boot 1: selftest row %s missing (F1/F4)" % n)
+for n in ("bundle-open-within-clock-skew", "bundle-expired-rejected", "bundle-expiry-edges"):
+    need(n in names, "boot 1: selftest row %s missing (F5a, expiry against the clock)" % n)
 need(all(r[1] == "PASS" for r in rows), "boot 1: failing selftest rows: %s" % [r[0] for r in rows if r[1] != "PASS"])
 t = re.search(r"\[mesh\] selftest (\d+)/(\d+) PASS", a)
 need(t and t.group(1) == t.group(2), "boot 1: mesh selftest total not N/N")

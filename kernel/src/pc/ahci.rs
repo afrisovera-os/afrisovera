@@ -92,7 +92,9 @@ static mut MODEL: [u8; 40] = [b' '; 40];
 /// Multi-block commands on DISK_PORT: the read-ahead (RA_N device blocks from RA_AT) and the
 /// gathered writes (WB_N device blocks from WB_AT), 8 KiB each, each one PRD.
 const RA_BYTES: usize = 8192;
-#[repr(C, align(8192))]
+// 4 KiB, not 8: an AHCI PRD needs only an even address, and the UEFI loader keeps no alignment above 4 KiB at run
+// time (13 Nov 2026: an 8 KiB-aligned buffer ran 4 KiB off it, and the debug build's alignment check stops there).
+#[repr(C, align(4096))]
 struct Ahead([u8; RA_BYTES]);
 static mut RA: Ahead = Ahead([0; RA_BYTES]);
 static mut RA_AT: u64 = 0;
@@ -287,9 +289,18 @@ fn buf() -> &'static mut [u8; 4096] {
     unsafe { &mut (*addr_of_mut!(BUF)).0 }
 }
 
+/// Asili v0 BINDS (pc/hwdb.rs): the probe below decides from this table.
+pub(crate) const BINDS: &[crate::hwdb::Part] = &[crate::hwdb::pci_class(0x01_06_01, 0xFF_FF_FF, "AHCI SATA controller")];
+
+/// The PCI function this driver took, for `hwscan`.
+pub fn at() -> Option<(u8, u8, u8)> {
+    // SAFETY: scalar reads of boot-time state.
+    unsafe { ({ PCI_AT } != (0, 0, 0)).then_some(PCI_AT) }
+}
+
 /// Find the controller, bring up every SATA disk, and choose the one the VFS may use.
 pub fn init() {
-    let Some((b, d, f)) = pci::find_class(0x01_06_01, 8) else { return };
+    let Some((b, d, f)) = pci::find_by(8, |b, d, f, id| crate::hwdb::pci_part(BINDS, b, d, f, id).is_some()) else { return };
     let abar = (pci::cfg_read32(b, d, f, 0x24) & !0xF) as u64; // BAR5 (always 32-bit in AHCI)
     if abar == 0 || !mmu::map_mmio(abar, 0x1100) {
         crate::kprintln!("[ahci] controller at {:02x}:{:02x}.{} has no usable ABAR", b, d, f);
@@ -321,22 +332,93 @@ pub fn init() {
         VERSION = hba(VS);
     }
     let cap = hba(CAP);
+    // Every port whose link is down (a sleeping SSD after a cold boot, or nothing plugged in) gets its COMRESET
+    // and up to a second to come up, as before, but ALL AT ONCE (performance plan, 13 Nov 2026): one port at a
+    // time cost a full second per EMPTY port, 4.0 s of a 5.1 s PC boot on QEMU's six-port controller, and the
+    // same on a laptop with unused SATA ports. The wait ends early once every reset port has a link, and a port
+    // whose PxSSTS.DET stays 0 (no device even detected) for 100 ms in a row after its COMRESET is given up
+    // (Linux's debounce length; driver engineer's condition): a port that shows DET 1 or 3 at any point keeps
+    // the whole second, for a drive still powering up after a cold boot.
+    // A controller with staggered spin-up (CAP.SSS: desktops and servers with several hard disks) keeps the old
+    // path, one port at a time, so the motors start one after another as SSS asks (driver engineer, 13 Nov).
+    let sss = cap & 1 << 27 != 0;
+    let mut reset = 0u32;
+    if !sss {
+        for p in 0..32u32 {
+            if pi & (1 << p) == 0 {
+                continue;
+            }
+            // power the device on (cold presence detect)
+            if cap & 1 << 24 != 0 && port(p, P_CMD) & 1 << 2 == 0 {
+                port_w(p, P_CMD, port(p, P_CMD) | 1 << 2);
+            }
+            if port(p, P_SSTS) & 0xF != 3 {
+                port_w(p, P_SCTL, (port(p, P_SCTL) & !0xF) | 1); // COMRESET (AHCI 10.4.2), held for 2 ms below
+                reset |= 1 << p;
+            }
+        }
+    }
+    if reset != 0 {
+        crate::timer::busywait_ms(2);
+        for p in (0..32u32).filter(|p| reset & (1 << p) != 0) {
+            port_w(p, P_SCTL, port(p, P_SCTL) & !0xF);
+        }
+        let (t0, hz) = (crate::timer::cycles(), crate::timer::hz().max(1));
+        let mut seen = 0u32; // ports that showed DET 1 or 3 at least once: they keep the whole second
+        loop {
+            let waited = crate::timer::cycles() - t0;
+            let mut pending = false;
+            for p in (0..32u32).filter(|p| reset & (1 << p) != 0) {
+                let det = port(p, P_SSTS) & 0xF;
+                // DET 1 (device there, no link yet) or 3 (link up) is a device; 4 is the PHY switched off, which
+                // a laptop's unused ports often report, and counts as nothing there (the driver engineer's rule)
+                if det == 1 || det == 3 {
+                    seen |= 1 << p;
+                }
+                if det != 3 && (seen & (1 << p) != 0 || waited < hz / 10) {
+                    pending = true;
+                }
+            }
+            if !pending || waited >= hz {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        let waited_ms = (crate::timer::cycles() - t0) * 1000 / hz;
+        // one line for real-hardware boots: how long the shared wait took and what each reset port showed
+        crate::kprint!("[ahci] link wait {} ms; DET after reset:", waited_ms);
+        for p in (0..32u32).filter(|p| reset & (1 << p) != 0) {
+            crate::kprint!(" port {}={}", p, port(p, P_SSTS) & 0xF);
+        }
+        crate::kprintln!();
+        if (0..32u32).any(|p| reset & (1 << p) != 0 && port(p, P_SSTS) & 0xF == 3) {
+            crate::timer::busywait_ms(10); // let the drives settle before their first command
+        }
+    }
     for p in 0..32u32 {
         if pi & (1 << p) == 0 {
             continue;
         }
-        // spin the device up and power it on (staggered spin-up / cold presence detect)
-        let want = if cap & 1 << 27 != 0 { 1 << 1 } else { 0 } | if cap & 1 << 24 != 0 { 1 << 2 } else { 0 };
-        if want != 0 && port(p, P_CMD) & want != want {
-            port_w(p, P_CMD, port(p, P_CMD) | want);
-        }
-        // a link that is not up (a sleeping SSD after a cold boot): COMRESET, then wait for it
-        if port(p, P_SSTS) & 0xF != 3 {
-            if !comreset(p) {
+        if sss {
+            // staggered spin-up: spin this device up and power it on, then reset and wait for it alone
+            let want = 1 << 1 | if cap & 1 << 24 != 0 { 1 << 2 } else { 0 };
+            if port(p, P_CMD) & want != want {
+                port_w(p, P_CMD, port(p, P_CMD) | want);
+            }
+            if port(p, P_SSTS) & 0xF != 3 {
+                if !comreset(p) {
+                    continue; // nothing there
+                }
+                crate::timer::busywait_ms(10); // let the drive settle before its first command
+                port_w(p, P_SERR, 0xFFFF_FFFF);
+            }
+        } else {
+            if port(p, P_SSTS) & 0xF != 3 {
                 continue; // nothing there
             }
-            crate::timer::busywait_ms(10); // let the drive settle before its first command
-            port_w(p, P_SERR, 0xFFFF_FFFF);
+            if reset & (1 << p) != 0 {
+                port_w(p, P_SERR, 0xFFFF_FFFF);
+            }
         }
         if port(p, P_SIG) != SIG_ATA {
             continue;

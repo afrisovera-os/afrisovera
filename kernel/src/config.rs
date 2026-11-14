@@ -41,6 +41,31 @@ fn saved_boots() -> u32 {
     0
 }
 
+/// The longest language code kept (ISO 639 codes are 2 or 3 letters; room for a regional tag later).
+pub const LANG_MAX: usize = 8;
+
+/// Is this a language code the config keeps: 2 to LANG_MAX lowercase ASCII letters. Anything else in the file reads
+/// as English, so a damaged line can never reach the desk as text.
+fn lang_ok(c: &str) -> bool {
+    (2..=LANG_MAX).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_lowercase())
+}
+
+/// The desk's language as saved (LANGUAGES_PLAN.md): the `lang=` line, or "en" when there is none or it is not a
+/// plain code.
+pub fn lang() -> &'static str {
+    if let Some(s) = crate::vfs::read_str(CONF) {
+        for line in s.lines() {
+            if let Some(v) = line.strip_prefix("lang=") {
+                let v = v.trim();
+                if lang_ok(v) {
+                    return v;
+                }
+            }
+        }
+    }
+    "en"
+}
+
 /// Render the configuration text into a caller-owned buffer — **pure**, and the whole
 /// of what used to be a `format!`.
 ///
@@ -54,15 +79,17 @@ pub fn render<'a>(
     gw: [u8; 4],
     dns: [u8; 4],
     boots: u32,
+    lang: &str,
 ) -> Result<&'a str, &'static str> {
+    let lang = if lang_ok(lang) { lang } else { "en" };
     fmtbuf::render(
         buf,
         format_args!(
-            "hostname=afrisovera\nip={}.{}.{}.{}\ngw={}.{}.{}.{}\ndns={}.{}.{}.{}\nboots={}\n",
+            "hostname=afrisovera\nip={}.{}.{}.{}\ngw={}.{}.{}.{}\ndns={}.{}.{}.{}\nboots={}\nlang={}\n",
             ip[0], ip[1], ip[2], ip[3],
             gw[0], gw[1], gw[2], gw[3],
             dns[0], dns[1], dns[2], dns[3],
-            boots
+            boots, lang
         ),
     )
 }
@@ -73,7 +100,7 @@ pub fn render<'a>(
 /// Allocation-free end to end: [`render`] fills a stack buffer and `vfs::write` copies
 /// into a static table. A full heap can no longer cost the boot here, because this path
 /// no longer asks the heap for anything.
-fn persist(boots: u32) -> Result<(), &'static str> {
+fn persist(boots: u32, lang: &str) -> Result<(), &'static str> {
     let mut buf = [0u8; CONF_MAX];
     let conf = render(
         &mut buf,
@@ -81,6 +108,7 @@ fn persist(boots: u32) -> Result<(), &'static str> {
         crate::virtio::dhcp_gw(),
         crate::virtio::dhcp_dns(),
         boots,
+        lang,
     )?;
     // Checked rather than dropped: `vfs::write` has always returned whether it took the
     // file, and a config that was never written is exactly the state the next boot would
@@ -106,7 +134,7 @@ pub fn boot_apply() {
     // The refusal costs the config write, not the boot (2.736). Reported and stepped
     // over: an operator who cannot see why the boot count stopped moving has a machine
     // that quietly forgets every reboot.
-    if let Err(why) = persist(boots) {
+    if let Err(why) = persist(boots, lang()) {
         crate::kprintln!("[cfg] NOT saved — {}; booting on without persisting", why);
         return;
     }
@@ -166,14 +194,14 @@ pub fn selftest() {
     const GW: [u8; 4] = [10, 0, 2, 2];
     const DNS: [u8; 4] = [10, 0, 2, 3];
     const EXPECT: &str =
-        "hostname=afrisovera\nip=10.0.2.15\ngw=10.0.2.2\ndns=10.0.2.3\nboots=7\n";
+        "hostname=afrisovera\nip=10.0.2.15\ngw=10.0.2.2\ndns=10.0.2.3\nboots=7\nlang=en\n";
 
     crate::kprintln!("config: allocation-free render against synthetic buffers");
 
     let mut buf = [0u8; CONF_MAX];
     // The baseline: the fixed buffer produces exactly the bytes `format!` used to.
     // Byte-for-byte, because the next boot re-reads and parses this text.
-    let exact = match render(&mut buf, IP, GW, DNS, 7) {
+    let exact = match render(&mut buf, IP, GW, DNS, 7, "en") {
         Ok(s) => {
             let n = s.len();
             case_ok(&mut pass, &mut total, s == EXPECT,
@@ -190,16 +218,16 @@ pub fn selftest() {
     // The boundary, on both sides — the whole reason the check is a refusal and not a
     // truncation. One byte short must lose the WHOLE write, not the last character:
     // "boots=7\n" cut to "boots=" parses on the next boot, and lies.
-    let fits = matches!(render(&mut buf[..exact], IP, GW, DNS, 7), Ok(s) if s == EXPECT);
+    let fits = matches!(render(&mut buf[..exact], IP, GW, DNS, 7, "en"), Ok(s) if s == EXPECT);
     case_ok(&mut pass, &mut total, exact > 0 && fits,
         "a buffer of exactly the rendered length is served, to the last byte");
     case_ok(&mut pass, &mut total,
-        exact > 0 && render(&mut buf[..exact - 1], IP, GW, DNS, 7) == Err(fmtbuf::BOUND_BUF),
+        exact > 0 && render(&mut buf[..exact - 1], IP, GW, DNS, 7, "en") == Err(fmtbuf::BOUND_BUF),
         "one byte short is REFUSED by name — never written short, never half a key=value");
     // ...and every smaller buffer likewise: no length below the fit may report success.
     let mut all_refuse = exact > 0;
     for n in 0..exact {
-        all_refuse &= render(&mut buf[..n], IP, GW, DNS, 7).is_err();
+        all_refuse &= render(&mut buf[..n], IP, GW, DNS, 7, "en").is_err();
     }
     case_ok(&mut pass, &mut total, all_refuse,
         "EVERY buffer below the fit refuses; none reports a partial render as a success");
@@ -209,11 +237,11 @@ pub fn selftest() {
     // still fits the buffer with room to spare. If this case ever fails, the boot path
     // has acquired a bound it can actually hit.
     let mut wide = [0u8; CONF_MAX];
-    let widest = render(&mut wide, [255; 4], [255; 4], [255; 4], u32::MAX)
+    let widest = render(&mut wide, [255; 4], [255; 4], [255; 4], u32::MAX, "abcdefgh")
         .map(|s| s.len())
         .unwrap_or(usize::MAX);
     case_ok(&mut pass, &mut total, widest <= CONF_MAX,
-        "the WIDEST config the kernel can produce (255.255.255.255 x3, u32::MAX boots) fits");
+        "the WIDEST config the kernel can produce (255.255.255.255 x3, u32::MAX boots, an 8-letter language) fits");
     // And what fits the buffer fits the file: `vfs::write` silently truncates past its
     // own per-file limit, so the buffer must not be the larger of the two.
     case_ok(&mut pass, &mut total, CONF_MAX <= crate::vfs::MAX_FILE_BYTES,
@@ -242,7 +270,7 @@ pub fn selftest() {
 
 /// Shell `config save`: persist the current state (keeping the boot count).
 pub fn save() {
-    if let Err(why) = persist(saved_boots()) {
+    if let Err(why) = persist(saved_boots(), lang()) {
         crate::kprintln!("[cfg] NOT saved to {} — {}", CONF, why);
         return;
     }
@@ -251,4 +279,14 @@ pub fn save() {
     } else {
         crate::kprintln!("[cfg] saved to {} (RAM only; no virtio-blk to persist)", CONF);
     }
+}
+
+/// The desk's language changed (Settings, `desk lang <code>`): keep it, with the boot count as it is, through the
+/// same allocation-free path as the boot. With a disk it is synced and survives a reboot; without one it lasts
+/// until power off. Refused by name, never half written.
+pub fn set_lang(code: &str) -> Result<(), &'static str> {
+    if !lang_ok(code) {
+        return Err("not a language code (2 to 8 lowercase letters)");
+    }
+    persist(saved_boots(), code)
 }

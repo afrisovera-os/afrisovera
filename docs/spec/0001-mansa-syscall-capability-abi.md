@@ -263,6 +263,7 @@ Return values are signed. `0 ≤ r < 2^63` is success; `r ∈ [-4095, -1]` is an
 | -7 | `E_WOULDBLOCK` | non-blocking variant would have blocked |
 | -8 | `E_PEERCLOSED` | the other end of a channel is gone |
 | -9 | `E_TOOBIG` | message exceeds the channel limits |
+| -10 | `E_CANCELED` | the wait was ended by a close request on the caller's window (v0.5, §7.6) |
 
 Message payloads are delivered through user buffers, never through the return register, so a payload
 can no longer collide with an error.
@@ -320,6 +321,109 @@ syscall is defined in v1.
   sizes are written to the first 8 bytes of `bytes_ptr` (u32 bytes, u32 handles, little-endian).
 - A channel queue holds at most 64 messages; a write to a full queue returns `E_WOULDBLOCK`.
 - Message bodies are AfriIDL-encoded (AFR-0004 §5).
+
+### 7.6 v0.5: the Dira subset (Designed, being built, 14 Nov 2026)
+
+The calls Dira needs to leave the kernel (Dira M3, DIRA_M3_PLAN.md; the architect's verdict, ARCHITECT_REVIEWS 14 Nov
+"Dira M3"), taken from v1 ahead of the rest of it, so that v1 replaces the kernel side and nothing in a program built
+on them changes. PC first (ring 3, `pc/proc.rs`); ARM with its own plan.
+
+**Entry and errors.** The v0 entry (§4.1, §4.2: `int 0x80`, `rax`, `rdi rsi rdx rcx r8 r9`). The calls below return
+the v1 errors of §7.2 (signed; `-4095..=-1`), never v0's `EPERM`. The v0 calls keep v0's single error.
+
+**Handles.** v0.5 widens the v0 capability record (§6.1) to a handle table of 8 entries per process, each entry an
+object kind (`ENDPOINT`, `VMO`, `CELL`, `NET`, `CONN`) and v1 rights (§7.4). Handle numbers stay table indexes;
+`handle_close` (8) is in the subset. Only the kernel grants a handle at spawn, as in v0, apart from those a call
+below returns (a `VMO`, a `CONN`). v1 adds `handle_dup`, transfer and channels on the same table.
+
+**What each program is given at spawn.** Only the kernel grants, at spawn; no call asks for a handle. A program not in
+this table is spawned as today's userland, with neither CELL nor NET.
+
+| Program | Spawned by | Handles | Rights | NET class bits |
+|---|---|---|---|---|
+| Dira (`userland/dira`) | the kernel's `dira` shell command only | CELL, NET | CELL: READ, WRITE, WAIT; NET: SEND, RECV, WAIT | 0, 1, 2 (public, private networks, link-local); bit 3 (127/8) only when the kernel is started with the test rig's flag |
+| rustapp, niavm and every other user program today | their shell commands, as in v0 | their v0 endpoints only | v0 SEND/RECV | none (no NET handle) |
+
+A process can create a VMO (`vmo_create`) and a connection (`tcp_dial`, from a NET handle it holds); it can never
+create CELL or NET.
+
+**Memory (S1, built by the browser engineer, reviewed by the performance engineer):**
+
+| # | Name | Arguments | Result | Errors |
+|---|---|---|---|---|
+| 32 | `vmo_create` | size (bytes, a multiple of 4 KiB, at least 4 KiB) | `VMO` handle (READ, WRITE, MAP) | `E_INVAL` size; `E_NOMEM` past the caps below or no frames |
+| 33 | `vmo_map` | vmo h, offset (0), len (the whole object), prot (READ\|WRITE) | user address | `E_BADHANDLE`; `E_PERM` without MAP, or prot with EXECUTE; `E_INVAL` offset, len or prot; `E_NOMEM` no room in the map area |
+| 34 | `vmo_unmap` | addr, len (as mapped) | 0 | `E_INVAL` not a whole mapping |
+| 8 | `handle_close` | h | 0 | `E_BADHANDLE` |
+
+Requirements (the architect's conditions on S1):
+- every page is zeroed before it is mapped, and is never executable (NX set; a test jumps into one and must trap);
+- one mapping of the whole object per `vmo_map` in v0.5 (offset 0, the whole length), in the **map area**: from
+  `USER_BASE + 0x4000_0000` (`0x0000_0100_4000_0000`) up to, not including, `USER_BASE + 0x4400_0000` (64 MiB).
+  That is 1 GiB above the code, data and stack of §6.3 (which end at `USER_BASE + 0x4_0000`). Mappings are placed
+  first fit with one unmapped 4 KiB guard page after each. `vmo_map` never maps over code, data, stack or another
+  mapping; when no gap fits, it returns `E_NOMEM`;
+- the kernel's user-pointer check (`user_range`) accepts a buffer inside one of the caller's own mappings, as it
+  accepts one between `USER_BASE` and the stack top today; a buffer that crosses a guard page is `E_FAULT`;
+- per process at most 32 MiB in all objects, and at most 128 MiB for all processes together; past either cap
+  `vmo_create` returns `E_NOMEM` and nothing is half made;
+- the frames go back to the frame pool when the last handle closes or the process ends, and on every failed spawn;
+- `ps` shows each process's object memory.
+
+**The cell window (S2), the service calls of v0.5.** In v1 the cell window is a channel protocol to the desk
+(Tonga) service; until then these five calls carry the same arguments and results as Nia's (afriui.md §25,
+`cell_abi.rs`) and take the `CELL` handle the process was given at spawn. In v1 each becomes a message with the same
+fields, its number is retired (§9: `E_NOSYS` forever), and the user library Dira calls (`afri_rt::cell`) changes
+transport, not its function names.
+
+| # | Name | Arguments | Result | Errors |
+|---|---|---|---|---|
+| 64 | `cell_open` | cell h, min_cols, min_rows | 0 (the window is the handle's) | `E_PERM` no CELL right; `E_INVAL` negative; `E_WOULDBLOCK` another owner holds it; `E_PEERCLOSED` the desk is not showing |
+| 65 | `cell_put` | cell h, col, row, cells_ptr, len (bytes, even) | cells written | `E_FAULT` the buffer is not the caller's; `E_INVAL`; `E_PEERCLOSED` closed |
+| 66 | `cell_cursor` | cell h, col, row, shape (0..=3) | 0 | `E_INVAL`; `E_PEERCLOSED` |
+| 67 | `cell_size` | cell h | cols << 14 \| rows | `E_PEERCLOSED` |
+| 68 | `cell_event` | cell h, timeout_ms (negative: no limit) | an event as `cell_abi::event` packs it; 0 for none in time | `E_PEERCLOSED` (then every call says so) |
+
+The pointer in `cell_put` is checked against the caller's own mappings (as `mem_range` does for Nia). The title, its
+marks and "Close anyway" are the desk's; the title of a process spawned by the `dira` command is "Dira (built-in)",
+set by the kernel from the spawn, never by the process.
+
+**The network (S3), service calls of v0.5.** In v1 a network service owns these over a channel; same rule as above.
+A `NET` handle carries the classes it may reach: bit 0 public, bit 1 private networks, bit 2 link-local, bit 3 this
+machine (127/8). No handle reaches 0/8, 224/3 or 255.255.255.255, whatever its bits.
+
+| # | Name | Arguments | Result | Errors |
+|---|---|---|---|---|
+| 72 | `tcp_dial` | net h, IPv4 (u32, big-endian), port, timeout_ms | `CONN` handle | `E_PERM` the class is not on the handle, or never allowed; `E_WOULDBLOCK` the process has a connection open (one at a time); `E_PEERCLOSED` refused or no answer in time |
+| 73 | `tcp_send` | conn h, ptr, len (at most 512) | bytes sent | `E_FAULT`; `E_INVAL`; `E_PEERCLOSED` |
+| 74 | `tcp_recv` | conn h, ptr, cap, timeout_ms | bytes received; 0 = the peer closed | `E_FAULT`; `E_WOULDBLOCK` nothing in time; `E_TOOBIG` past 4 MiB on this connection (it is then closed) |
+| 75 | `tcp_close` | conn h | 0 | `E_BADHANDLE` |
+| 76 | `dns_a` | net h, name_ptr, name_len, timeout_ms | the IPv4 address (u32, big-endian, as a non-negative value) | `E_FAULT`; `E_INVAL` not a name; `E_PEERCLOSED` no checked answer (pc/dnscheck.rs) |
+
+**The stop rule (the kernel's job now that Dira is a process).** A close request on the process's window (the close
+box, Alt+F4, Ctrl+\\ on the serial line), or the window closing, ends a blocked `tcp_dial`, `tcp_recv` or `dns_a`
+within 100 ms. The call returns **`E_CANCELED` (-10)**, a new error added to §7.2's list for v0.5 and v1, and the
+connection is reset at once, as at exit. The close request stays queued, so the next `cell_event` returns it
+(kind 3), and the program answers it as Nia apps do. A blocked `cell_event` itself returns the close request as an
+event, and after "Close anyway" kind 4 (`EV_CLOSED`) at once.
+
+Every `tcp_dial` prints one `[net]` line with the process, the destination and the class. The kernel keeps TCP, the
+route (M1b `route_open`), the DNS checks and the stop rules: when the process ends or its window closes, its
+connection is reset at once. Nothing gives a process raw frames or a listening port. The rule that a public page may
+not redirect into the home network stays in Dira (url.rs), which alone knows which page asked.
+
+**What stays for v1:** `SYSCALL`/`SYSRET`, channels and handle transfer, `process_spawn` from a memory image, and the
+window, AI, voice, cell and network services over channels (when they move, calls 64 to 76 are retired).
+
+**Test vectors (with each step):** S1: create, map, write and read back; refused EXECUTE; the jump into a mapped page
+traps; the caps (`E_NOMEM`, nothing leaked: the frame pool's free count is the same before and after); exit frees;
+map until the area is full (`E_NOMEM`), then check every mapping lies inside the area, none overlaps another or the
+code, data and stack, and each is followed by its guard page; a buffer across a guard page is `E_FAULT`.
+S2: a process without CELL is refused; a bad pointer is `E_FAULT`; the dira suite's window, against the process.
+S3: the classes (refused 0/8, 224/3, 127/8 without bit 3, private without bit 1), one connection, the 4 MiB cap,
+reset on exit, the `[net]` line; a close request while `tcp_recv` waits on a server that never answers: `E_CANCELED`
+within 100 ms and the connection reset (in the capture); the same for `tcp_dial` and `dns_a`; pc-dira-net and dira
+against the process.
 
 ## 8. Security considerations
 

@@ -4,7 +4,9 @@
 # runs and survives a reboot; upper-case hash accepted; n cancels; a wrong, malformed or swapped hash, a non-module,
 # a too-big file, a 404, a bundled name, a bad name, no Content-Length and no server are each refused with one line
 # and nothing written; bytes past Content-Length are ignored; a sideloaded app that calls net is denied; a reinstall
-# replaces the bytes. No panic; the shell answers at the end. Needs python3.
+# replaces the bytes. An app with an afri.permissions section (claude/nia-perms): an unknown permission is refused
+# before install; the consent screen lists what it asks for and what it will not get, and the run withholds it.
+# No panic; the shell answers at the end. Needs python3.
 set -uo pipefail
 
 BIN="target/aarch64-unknown-none/debug/mansa-kernel"
@@ -61,6 +63,9 @@ B1="$(boot 4776 \
     "nia extra.wasm" \
     "$G netapp.wasm ${H[netapp.wasm]}" ":y" \
     "nia netapp.wasm" \
+    "$G permbad.wasm ${H[permbad.wasm]}" \
+    "$G permnet.wasm ${H[permnet.wasm]}" ":y" \
+    "nia permnet.wasm" \
     "$G re.wasm ${H[big.wasm]}" ":y" \
     "$G re.wasm ${H[v2.wasm]}" ":y" \
     "nia re.wasm" \
@@ -84,6 +89,9 @@ has "no complete answer from the server" "no server, no clear line"
 has "appget: installed extra.wasm (3000 bytes)" "bytes past Content-Length broke the install"
 has "it will NOT get: net" "the consent screen did not list the withheld capability"
 has "DENIED: app called host 'net'" "the withheld capability was not denied"
+has "permbad.wasm is not a Nia app (unknown permission); nothing written" "an unknown permission was not refused before install"
+has "  it asks for: print, net" "the consent screen did not list what the app asks for"
+has "permissions withheld: net" "the run did not withhold the asked-for net"
 has "replaces the existing re.wasm (3000 bytes)" "the reinstall did not say it replaces"
 has "print(77)" "the reinstalled app did not run its new code"
 LS="$(echo "$B1" | tr -d '\r' | grep -aE '^ *[0-9]+  [A-Za-z0-9._-]+$')"

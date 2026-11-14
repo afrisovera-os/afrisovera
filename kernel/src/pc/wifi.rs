@@ -14,155 +14,19 @@
 
 // PCI configuration space (read only here) through the shared pc/pci.rs (review R1-8).
 use crate::pci::cfg_read32 as cfg32;
-
-/// The Linux driver family a Wi-Fi chip needs, and what that means for AfriSovera.
-#[derive(Clone, Copy)]
-enum Fam {
-    Iwl,
-    Rtw88,
-    Rtw89,
-    Rtlwifi,
-    Mt76,
-    Ath9k,
-    Ath10k,
-    Ath11k,
-    Brcm,
-}
-
-fn fam_line(f: Fam) -> &'static str {
-    match f {
-        Fam::Iwl => "Linux driver iwlwifi; needs Intel's closed firmware file loaded first",
-        Fam::Rtw88 => "Linux driver rtw88; needs Realtek's firmware file loaded first",
-        Fam::Rtw89 => "Linux driver rtw89; needs Realtek's firmware file loaded first",
-        Fam::Rtlwifi => "Linux driver rtlwifi; needs Realtek's firmware file loaded first",
-        Fam::Mt76 => "Linux driver mt76 (mt7921e); needs MediaTek's firmware files loaded first",
-        Fam::Ath9k => "Linux driver ath9k; needs NO firmware file; the easiest chip to write a first Wi-Fi driver for",
-        Fam::Ath10k => "Linux driver ath10k; needs Qualcomm's firmware files loaded first",
-        Fam::Ath11k => "Linux driver ath11k; needs Qualcomm's firmware files loaded first",
-        Fam::Brcm => "Broadcom; needs Broadcom's firmware (often only a closed driver exists)",
-    }
-}
-
-/// Known Wi-Fi chips: (vendor, device, name, family).
-const CHIPS: &[(u16, u16, &str, Fam)] = &[
-    // Intel (0x8086): plug-in cards, then the CNVi Wi-Fi built into the chipset (its RF part is a CRF module)
-    (0x8086, 0x272B, "Intel Wi-Fi 7 BE200", Fam::Iwl),
-    (0x8086, 0x2725, "Intel Wi-Fi 6E AX210/AX211/AX411", Fam::Iwl),
-    (0x8086, 0x2723, "Intel Wi-Fi 6 AX200", Fam::Iwl),
-    (0x8086, 0x2526, "Intel Wireless-AC 9260", Fam::Iwl),
-    (0x8086, 0x24FD, "Intel Wireless 8265", Fam::Iwl),
-    (0x8086, 0x24F3, "Intel Wireless 8260", Fam::Iwl),
-    (0x8086, 0x24FB, "Intel Wireless 3168", Fam::Iwl),
-    (0x8086, 0x3165, "Intel Wireless 3165", Fam::Iwl),
-    (0x8086, 0x3166, "Intel Wireless 3165", Fam::Iwl),
-    (0x8086, 0x095A, "Intel Wireless 7265", Fam::Iwl),
-    (0x8086, 0x095B, "Intel Wireless 7265", Fam::Iwl),
-    (0x8086, 0x08B1, "Intel Wireless 7260", Fam::Iwl),
-    (0x8086, 0x08B2, "Intel Wireless 7260", Fam::Iwl),
-    (0x8086, 0x9DF0, "Intel CNVi Wi-Fi (Cannon Point-LP: 9560/9461/9462)", Fam::Iwl),
-    (0x8086, 0xA370, "Intel CNVi Wi-Fi (Cannon Point-H: 9560)", Fam::Iwl),
-    (0x8086, 0x31DC, "Intel CNVi Wi-Fi (Gemini Lake: 9560/9461/9462)", Fam::Iwl),
-    (0x8086, 0x02F0, "Intel CNVi Wi-Fi (Comet Lake-LP: AX201/9560)", Fam::Iwl),
-    (0x8086, 0x06F0, "Intel CNVi Wi-Fi (Comet Lake-H: AX201/9560)", Fam::Iwl),
-    (0x8086, 0x34F0, "Intel CNVi Wi-Fi (Ice Lake: AX201/9560)", Fam::Iwl),
-    (0x8086, 0x4DF0, "Intel CNVi Wi-Fi (Jasper Lake: AX201/9560)", Fam::Iwl),
-    (0x8086, 0xA0F0, "Intel CNVi Wi-Fi (Tiger Lake: AX201)", Fam::Iwl),
-    (0x8086, 0x43F0, "Intel CNVi Wi-Fi (Tiger Lake-H: AX201)", Fam::Iwl),
-    (0x8086, 0x51F0, "Intel CNVi Wi-Fi (Alder Lake-P: AX211/AX201)", Fam::Iwl),
-    (0x8086, 0x51F1, "Intel CNVi Wi-Fi (Alder Lake-P: AX211/AX201)", Fam::Iwl),
-    (0x8086, 0x54F0, "Intel CNVi Wi-Fi (Alder Lake-N: AX211/AX201)", Fam::Iwl),
-    (0x8086, 0x7A70, "Intel CNVi Wi-Fi (Alder Lake-S: AX211/AX201)", Fam::Iwl),
-    (0x8086, 0x7AF0, "Intel CNVi Wi-Fi (Raptor Lake-S: AX211/AX201)", Fam::Iwl),
-    (0x8086, 0x7E40, "Intel CNVi Wi-Fi (Meteor Lake: BE201/AX211)", Fam::Iwl),
-    // Realtek (0x10EC)
-    (0x10EC, 0xC821, "Realtek RTL8821CE", Fam::Rtw88),
-    (0x10EC, 0xC822, "Realtek RTL8822CE", Fam::Rtw88),
-    (0x10EC, 0xB822, "Realtek RTL8822BE", Fam::Rtw88),
-    (0x10EC, 0xD723, "Realtek RTL8723DE", Fam::Rtw88),
-    (0x10EC, 0x8852, "Realtek RTL8852AE", Fam::Rtw89),
-    (0x10EC, 0xB852, "Realtek RTL8852BE", Fam::Rtw89),
-    (0x10EC, 0xC852, "Realtek RTL8852CE", Fam::Rtw89),
-    (0x10EC, 0xB723, "Realtek RTL8723BE", Fam::Rtlwifi),
-    (0x10EC, 0x8179, "Realtek RTL8188EE", Fam::Rtlwifi),
-    (0x10EC, 0x8821, "Realtek RTL8821AE", Fam::Rtlwifi),
-    // MediaTek (0x14C3)
-    (0x14C3, 0x7961, "MediaTek MT7921 (Wi-Fi 6)", Fam::Mt76),
-    (0x14C3, 0x0608, "MediaTek MT7921K / RZ608 (Wi-Fi 6E)", Fam::Mt76),
-    (0x14C3, 0x0616, "MediaTek MT7922 / RZ616 (Wi-Fi 6E)", Fam::Mt76),
-    // Qualcomm Atheros (0x168C) and Qualcomm (0x17CB)
-    (0x168C, 0x0032, "Qualcomm Atheros AR9485", Fam::Ath9k),
-    (0x168C, 0x0034, "Qualcomm Atheros AR9462", Fam::Ath9k),
-    (0x168C, 0x0036, "Qualcomm Atheros QCA9565 / AR9565", Fam::Ath9k),
-    (0x168C, 0x002B, "Qualcomm Atheros AR9285", Fam::Ath9k),
-    (0x168C, 0x0030, "Qualcomm Atheros AR93xx", Fam::Ath9k),
-    (0x168C, 0x003E, "Qualcomm Atheros QCA6174", Fam::Ath10k),
-    (0x168C, 0x0042, "Qualcomm Atheros QCA9377", Fam::Ath10k),
-    (0x17CB, 0x1101, "Qualcomm QCA6390", Fam::Ath11k),
-    (0x17CB, 0x1103, "Qualcomm WCN6855 / QCNFA765", Fam::Ath11k),
-    // Broadcom (0x14E4)
-    (0x14E4, 0x43A0, "Broadcom BCM4360", Fam::Brcm),
-    (0x14E4, 0x43B1, "Broadcom BCM4352", Fam::Brcm),
-    (0x14E4, 0x43A3, "Broadcom BCM4350", Fam::Brcm),
-    (0x14E4, 0x4365, "Broadcom BCM43142", Fam::Brcm),
-];
-
-/// Linux driver families of USB Wi-Fi sticks.
-#[derive(Clone, Copy)]
-enum UFam {
-    AthHtc,
-    Rt2800,
-    Mt7601,
-    Mt76u,
-    Rtl8xxxu,
-    Rtw88u,
-}
-
-fn ufam_line(f: UFam) -> &'static str {
-    match f {
-        UFam::AthHtc => "Linux driver ath9k_htc; its firmware file is OPEN source (free to ship); the easiest USB stick to write a first Wi-Fi driver for",
-        UFam::Rt2800 => "Linux driver rt2800usb; needs Ralink's firmware file (free to redistribute)",
-        UFam::Mt7601 => "Linux driver mt7601u; needs MediaTek's firmware file loaded first",
-        UFam::Mt76u => "Linux driver mt76 (USB); needs MediaTek's firmware files loaded first",
-        UFam::Rtl8xxxu => "Linux driver rtl8xxxu; needs Realtek's firmware file loaded first",
-        UFam::Rtw88u => "Linux driver rtw88 (USB); needs Realtek's firmware file loaded first",
-    }
-}
-
-/// Known USB Wi-Fi sticks: (vendor, product, name, family).
-const STICKS: &[(u16, u16, &str, UFam)] = &[
-    (0x0CF3, 0x9271, "Qualcomm Atheros AR9271 (e.g. TP-Link TL-WN722N v1, Alfa AWUS036NHA)", UFam::AthHtc),
-    (0x0CF3, 0x7015, "Qualcomm Atheros AR7010 (e.g. TP-Link TL-WN821N v3)", UFam::AthHtc),
-    (0x0846, 0x9030, "Qualcomm Atheros AR9271 (Netgear WNA1100)", UFam::AthHtc),
-    (0x148F, 0x5370, "Ralink RT5370", UFam::Rt2800),
-    (0x148F, 0x3070, "Ralink RT3070", UFam::Rt2800),
-    (0x148F, 0x7601, "MediaTek MT7601U", UFam::Mt7601),
-    (0x0E8D, 0x7612, "MediaTek MT7612U", UFam::Mt76u),
-    (0x0E8D, 0x7961, "MediaTek MT7921AU (Wi-Fi 6)", UFam::Mt76u),
-    (0x0BDA, 0x8179, "Realtek RTL8188EUS", UFam::Rtl8xxxu),
-    (0x0BDA, 0x8176, "Realtek RTL8188CUS", UFam::Rtl8xxxu),
-    (0x0BDA, 0x818B, "Realtek RTL8192EU", UFam::Rtl8xxxu),
-    (0x2357, 0x010C, "Realtek RTL8188EUS (TP-Link TL-WN722N v2/v3)", UFam::Rtl8xxxu),
-    (0x2357, 0x0109, "Realtek RTL8192EU (TP-Link TL-WN823N v2)", UFam::Rtl8xxxu),
-    (0x0BDA, 0xC811, "Realtek RTL8811CU", UFam::Rtw88u),
-    (0x0BDA, 0xB812, "Realtek RTL88x2BU", UFam::Rtw88u),
-];
-
-fn stick(v: u16, p: u16) -> Option<(&'static str, UFam)> {
-    STICKS.iter().find(|c| c.0 == v && c.1 == p).map(|c| (c.2, c.3))
-}
-
-fn chip(v: u16, d: u16) -> Option<(&'static str, Fam)> {
-    CHIPS.iter().find(|c| c.0 == v && c.1 == d).map(|c| (c.2, c.3))
-}
+// The chip and stick tables and their family lines live in pc/hwdb.rs since 12 Nov 2026 (hwscan reads them
+// too); this file prints exactly what it printed before.
+use crate::hwdb::{chip, fam_line, stick, ufam_line};
 
 /// A wired chip AfriSovera drives: the Intel e1000/e1000e/igb parts (e1000.rs), the Realtek
 /// r8169 family and RTL8139C+ (rtl8169.rs), or virtio-net.
 fn driven(v: u16, d: u16) -> Option<&'static str> {
-    if v == 0x8086 {
-        return crate::e1000::PARTS.iter().find(|p| p.0 == d).map(|p| p.1);
+    // the drivers' own match tables (Asili v0 BINDS), by id alone
+    if let Some(p) = crate::hwdb::id_part(crate::e1000::BINDS, v, d) {
+        return Some(p.name);
     }
-    if let Some(p) = crate::rtl8169::PARTS.iter().find(|p| p.0 == v && p.1 == d) {
-        return Some(p.2);
+    if let Some(p) = crate::hwdb::id_part(crate::rtl8169::BINDS, v, d) {
+        return Some(p.name);
     }
     if v == 0x1AF4 && (d == 0x1000 || d == 0x1041) {
         return Some("virtio-net");
@@ -241,7 +105,45 @@ pub fn show() {
     crate::kprintln!("{}", OWNER);
 }
 
-fn hex4(s: &str) -> Option<u16> {
+/// `wifi selftest` (W1, 14 Nov 2026): every published test vector of the Wi-Fi crypto (kernel/src/wlan/crypto_kat.rs,
+/// parsed from the RFCs and IEEE 802.11 annexes by scripts/wifi-kat-fetch.sh), one line per family with its time.
+/// Wi-Fi may make keys only after this has passed in this boot (`wlan::crypto::kat_passed`). Nothing is sent.
+pub fn selftest() {
+    use crate::wlan::crypto::{run_kind, set_kat_result, Kind, KINDS};
+    crate::kprintln!("wifi selftest: the Wi-Fi crypto against its published test vectors (nothing is sent or changed)");
+    let hz = crate::timer::hz().max(1);
+    let (mut total, mut bad) = (0usize, 0usize);
+    for k in KINDS {
+        if matches!(k, Kind::Pbkdf2Sha1 | Kind::Psk) {
+            crate::kprintln!("  {}: making keys (a few seconds)", k.name());
+        }
+        let t0 = crate::timer::cycles();
+        let r = run_kind(k);
+        let ms = crate::timer::cycles().wrapping_sub(t0).saturating_mul(1000) / hz;
+        match r {
+            Ok(n) => {
+                total += n;
+                if k == Kind::Psk && n > 0 {
+                    crate::kprintln!("  {}: {} of {} PASS in {} ms ({} ms for one passphrase)", k.name(), n, n, ms, ms / n as u64);
+                } else {
+                    crate::kprintln!("  {}: {} of {} PASS in {} ms", k.name(), n, n, ms);
+                }
+            }
+            Err(i) => {
+                bad += 1;
+                crate::kprintln!("  {}: vector {} FAILED", k.name(), i + 1);
+            }
+        }
+    }
+    set_kat_result(bad == 0);
+    if bad == 0 {
+        crate::kprintln!("wifi selftest: {} of {} vectors PASS; Wi-Fi may make keys", total, total);
+    } else {
+        crate::kprintln!("wifi selftest: FAILED in {} famil{}; Wi-Fi will not make keys this boot", bad, if bad == 1 { "y" } else { "ies" });
+    }
+}
+
+pub(crate) fn hex4(s: &str) -> Option<u16> {
     let h = s.get(..4)?;
     if h.bytes().all(|c| c.is_ascii_hexdigit()) {
         u16::from_str_radix(h, 16).ok()
@@ -252,7 +154,7 @@ fn hex4(s: &str) -> Option<u16> {
 
 /// The (vendor, device) in `8086:2723`, Device Manager's `PCI\VEN_8086&DEV_2723&SUBSYS_...` or
 /// `USB\VID_0BDA&PID_8179&REV_0000`, and which form: Some(false) PCI, Some(true) USB, None plain.
-fn parse(s: &str) -> Option<(u16, u16, Option<bool>)> {
+pub(crate) fn parse(s: &str) -> Option<(u16, u16, Option<bool>)> {
     let mut up = [0u8; 96];
     let n = s.len().min(up.len());
     for (o, c) in up.iter_mut().zip(s.bytes().take(n)) {

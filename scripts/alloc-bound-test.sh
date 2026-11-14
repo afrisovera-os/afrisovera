@@ -113,7 +113,8 @@ cfg, fmtb, heap, main = (code(x) for x in (cfg, fmtb, heap, main))
 if "format!" in nostr(cfg) or "use alloc::" in nostr(cfg):
     fail("config.rs still builds its text with format! — the boot path is back to dying "
          "of a full arena for a 90-byte string")
-if "fn persist(boots: u32) -> Result<(), &'static str>" not in cfg:
+# (13 Nov 2026: persist also takes the desk's language, LANGUAGES_PLAN.md; the bound is unchanged)
+if "fn persist(boots: u32, lang: &str) -> Result<(), &'static str>" not in cfg:
     fail("config::persist does not return its bound — a refusal nobody is handed is a "
          "config that silently was not written")
 if not re.search(r"if !crate::vfs::write\(CONF, conf\.as_bytes\(\)\)", cfg):
@@ -166,7 +167,7 @@ for phrase in (
         "one byte short is REFUSED by name — never written short, never half a key=value",
         "EVERY buffer below the fit refuses; none reports a partial render as a success",
         # The claim that keeps the refusal theoretical rather than a new failure mode.
-        "the WIDEST config the kernel can produce (255.255.255.255 x3, u32::MAX boots) fits",
+        "the WIDEST config the kernel can produce (255.255.255.255 x3, u32::MAX boots, an 8-letter language) fits",
         "the buffer is no larger than the VFS file limit, so nothing rendered is truncated",
         "a lossy render stops on a CHAR boundary, keeping the prefix and counting the rest",
         "a zero-length buffer writes nothing and overruns nothing, rather than faulting",

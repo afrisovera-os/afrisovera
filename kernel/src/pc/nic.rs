@@ -1,6 +1,6 @@
 //! The PC's wired network card behind the emulated virtio-net device (virtio_pci.rs):
 //! an Intel e1000/e1000e/igb on the PCI bus, a Realtek RTL8111/8168 family chip (rtl8169.rs),
-//! or else a USB Ethernet adapter (CDC-ECM, or RNDIS: a phone's USB tethering) on the xHCI (xhci.rs). The shared TCP/IP stack sees the same virtio-net device either way.
+//! or else a USB Ethernet adapter (CDC-NCM or RNDIS: a phone's USB tethering; CDC-ECM) on the xHCI (xhci.rs). The shared TCP/IP stack sees the same virtio-net device either way.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -31,6 +31,7 @@ pub fn describe() -> &'static str {
     match WHICH.load(Ordering::Relaxed) {
         INTEL => "the Intel NIC (e1000)",
         REALTEK => "the Realtek NIC (rtl)",
+        USB if crate::xhci::net_ncm() => "the USB Ethernet adapter (CDC-NCM)",
         USB if crate::xhci::net_rndis() => "the USB Ethernet adapter (RNDIS)",
         USB => "the USB Ethernet adapter (CDC-ECM)",
         _ => "nothing",
@@ -42,6 +43,7 @@ pub fn short() -> &'static str {
     match WHICH.load(Ordering::Relaxed) {
         INTEL => "e1000",
         REALTEK => "rtl",
+        USB if crate::xhci::net_ncm() => "usb-ncm",
         USB if crate::xhci::net_rndis() => "usb-rndis",
         USB => "usb-ecm",
         _ => "-",

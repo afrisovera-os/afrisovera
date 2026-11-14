@@ -295,7 +295,7 @@ pub fn init() -> bool {
     let mut found = false;
     // the first audio device (class 04:03) that brings up; a failed one leaves the walk going
     pci::find_by(8, |b, d, f, id| {
-        if pci::cfg_read32(b, d, f, 8) >> 16 != 0x0403 {
+        if crate::hwdb::pci_part(BINDS, b, d, f, id).is_none() {
             return false;
         }
         found = true;
@@ -1004,6 +1004,15 @@ pub fn mic_cmd(rest: &str) {
 pub fn present() -> bool {
     // SAFETY: scalar read of boot-time state.
     unsafe { READY }
+}
+
+/// Asili v0 BINDS (pc/hwdb.rs): `init` decides from this table.
+pub(crate) const BINDS: &[crate::hwdb::Part] = &[crate::hwdb::pci_class(0x04_03_00, 0xFF_FF_00, "HD Audio controller")];
+
+/// The PCI function this driver took, for `hwscan`.
+pub fn at() -> Option<(u8, u8, u8)> {
+    // SAFETY: scalar reads of boot-time state.
+    unsafe { (READY).then_some(PCI_AT) }
 }
 
 /// Bytes the DMA engine has read from the ring since the stream began.

@@ -69,6 +69,32 @@ pub fn get(i: usize) -> Option<Device>;
   `usb-ethernet`, `intel-hda`, `gop-display`.
 - **Defect (v0):** a 17th registration is silently dropped. v0.1 SHOULD log it.
 
+**Match tables (`BINDS`, added 12 Nov 2026; the maker-facing rules are in `docs/driver-standard.md`):**
+
+```rust
+pub enum Bind {                                    // plain data: the v1 manifest's `binds` (section 5.1)
+    PciId { vendor: u16, device: u16, mask: u16, min_rev: u8 },
+    PciClass { class: u32, mask: u32 },            // 24-bit class code
+    UsbClass { class: u8, sub: u8, proto: u8, mask: u8 },
+    UsbId { vendor: u16, product: u16 },
+    Acpi(&'static str),                            // _HID or _CID
+}
+pub struct Part { pub bind: Bind, pub name: &'static str }
+pub(crate) const BINDS: &[Part];                   // one per bus driver (kernel/src/pc/hwdb.rs)
+```
+
+- In `PciId`, `mask` picks the device-id bits that must be equal (`0xFFFF` matches one device id; `0xFF80` with
+  device `0x1000` matches `0x1000` to `0x107F`), and `min_rev` is the lowest PCI revision ID (configuration offset
+  0x08) the driver takes, 0 meaning any. In `UsbClass`, `mask` says which fields are compared: bit 0 the class, bit 1
+  the subclass, bit 2 the protocol (`0b111` all three, `0b001` the class alone).
+- Every bus driver MUST export `BINDS`, and its probe MUST decide from it (`hwdb::pci_part`) and from no other
+  list; a finer check after the match (a capability, a revision quirk not expressible in `Bind`) MAY remain.
+- Every registered name MUST have a row in `hwdb::DRIVERS` (`Pci(BINDS)`, `UsbWalk` or `Platform`). `hwscan`
+  reads the same tables, so its `driven` and `class` verdicts follow what the drivers really match; suite
+  `pc-hwscan` fails if a registered driver has no row.
+- USB function drivers still decide inside the xHCI descriptor walk (`UsbWalk`) until they move onto
+  `UsbClass`/`UsbId` tables.
+
 ### 4.2 Lifecycle functions
 
 Every driver module exposes:

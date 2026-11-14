@@ -32,6 +32,11 @@ static mut BODY_CUT: bool = false;
 /// While set, console output goes into the report body (a probe's answer), not the log.
 static CAPTURE: AtomicBool = AtomicBool::new(false);
 
+/// True while a probe of the field report runs: its output goes to the network (uvc.rs refuses `camera on` then).
+pub fn capturing() -> bool {
+    CAPTURE.load(Ordering::Relaxed)
+}
+
 /// Every console print, from uart.rs (under its print lock, interrupts off): keep it.
 pub fn feed(s: &str) {
     // SAFETY: called only under uart.rs's PRINT_LOCK, so one writer at a time.
@@ -120,7 +125,7 @@ fn parse(arg: &str) -> Option<([u8; 4], u16)> {
 const PROBES: &[&str] = &[
     "date", "fwinfo", "screeninfo", "cpuinfo", "acpiinfo", "mem", "uptime", "ifconfig",
     "devices", "lsvirtio", "lsusb", "lsps2", "lsnvme", "lsahci", "lside", "lse1000", "lsrtl", "lssd",
-    "lshda", "wifi",
+    "lshda", "wifi", "hwscan", "usbaddr", "camera", "bt",
 ];
 
 /// Lines of the console log that look like trouble.
@@ -163,7 +168,33 @@ fn contains(hay: &[u8], needle: &str) -> bool {
 }
 
 /// Build the whole report into `BODY`. Returns its length.
-fn build(ip: [u8; 4], port: u16) -> usize {
+/// Every MAC address in `b` (six pairs of hex digits joined by ':' or '-') cut to its maker half,
+/// `3c:52:82:--:--:--` (the hwscan rule, ARCHITECT_REVIEWS 13 Nov night: the device half adds nothing for
+/// debugging, and reports sit where every session reads them).
+fn mask_macs(b: &mut [u8]) {
+    let hex = |c: u8| c.is_ascii_hexdigit();
+    let mut i = 0;
+    while i + 17 <= b.len() {
+        let sep = b[i + 2];
+        let is_mac = (sep == b':' || sep == b'-')
+            && (0..6).all(|k| hex(b[i + 3 * k]) && hex(b[i + 3 * k + 1]))
+            && (1..6).all(|k| b[i + 3 * k - 1] == sep)
+            && (i == 0 || !(hex(b[i - 1]) || b[i - 1] == sep))
+            && (i + 17 == b.len() || !(hex(b[i + 17]) || b[i + 17] == sep));
+        if is_mac {
+            for k in 3..6 {
+                b[i + 3 * k] = b'-';
+                b[i + 3 * k + 1] = b'-';
+            }
+            i += 17;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// The report, built into BODY for `to` (an address and port, or None: saved to the USB stick); its length.
+fn build(to: Option<([u8; 4], u16)>) -> usize {
     // SAFETY: kernel context; the report statics are touched only here and in `feed`.
     unsafe {
         BODY_LEN = 0;
@@ -174,13 +205,29 @@ fn build(ip: [u8; 4], port: u16) -> usize {
             Body,
             "AFRISOVERA FIELD REPORT 1\n\
              commit: {} ({})\n\
-             build: {} x86_64 UEFI (mansa-pc)\n\
-             from: {}.{}.{}.{} mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({})\n\
-             to: {}.{}.{}.{}:{}\n\
-             cores: {} (ACPI)   memory: {} MiB\n",
-            commit(), commit_date(), profile(),
-            me[0], me[1], me[2], me[3], mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-            crate::nic::short(), ip[0], ip[1], ip[2], ip[3], port,
+             build: {} x86_64 UEFI (mansa-pc)\n",
+            commit(), commit_date(), profile()
+        );
+        if crate::virtio_core::net_present() {
+            let _ = write!(
+                Body,
+                "from: {}.{}.{}.{} mac {:02x}:{:02x}:{:02x}:--:--:-- ({})\n",
+                me[0], me[1], me[2], me[3], mac[0], mac[1], mac[2], crate::nic::short()
+            );
+        } else {
+            let _ = write!(Body, "from: no wired network card\n");
+        }
+        match to {
+            Some((ip, port)) => {
+                let _ = write!(Body, "to: {}.{}.{}.{}:{}\n", ip[0], ip[1], ip[2], ip[3], port);
+            }
+            None => {
+                let _ = write!(Body, "to: the USB stick AfriSovera started from (report save)\n");
+            }
+        }
+        let _ = write!(
+            Body,
+            "cores: {} (ACPI)   memory: {} MiB\n",
             crate::acpi::cores(), crate::frame::total_frames() * 4 / 1024
         );
         for p in PROBES {
@@ -225,6 +272,8 @@ fn build(ip: [u8; 4], port: u16) -> usize {
             BODY_LEN = BODY_CAP - 64;
             let _ = write!(Body, "\n[report cut at {} KiB]\n", BODY_CAP / 1024);
         }
+        // no full MAC anywhere: the probes and the boot log print them
+        mask_macs(&mut (&mut *addr_of_mut!(BODY))[..BODY_LEN]);
         let n = BODY_LEN;
         let _ = write!(Body, "\n== end of report ({} bytes before this line) ==\n", n);
         BODY_LEN
@@ -234,14 +283,28 @@ fn build(ip: [u8; 4], port: u16) -> usize {
 /// The shell command.
 pub fn command(arg: &str) {
     let arg = arg.trim();
+    if arg == "save" {
+        crate::kprintln!("[report] collecting this PC's details ...");
+        let len = build(None);
+        // SAFETY: the body is finished; nothing writes it while it is saved.
+        let body = unsafe { &(&*addr_of!(BODY))[..len] };
+        crate::kprintln!("[report] {} bytes ready, saving to the USB stick AfriSovera started from", len);
+        crate::esp::report_save(body);
+        return;
+    }
     let (ip, port) = match parse(arg) {
         Some(d) if !arg.is_empty() => d,
         _ => {
-            crate::kprintln!("report: send this PC's details to your main PC over the home network.");
-            crate::kprintln!("  1. on the main PC run tools/report-receiver.py; it shows its address");
-            crate::kprintln!("  2. here type   report <that address>   e.g.  report 192.168.1.20");
-            crate::kprintln!("     (port {} unless you add one: report 192.168.1.20:7701)", PORT);
-            crate::kprintln!("  nothing is sent anywhere else, and nothing comes back in");
+            crate::kprintln!("report: give this PC's details to your main PC, one of two ways.");
+            crate::kprintln!("  With a network cable to the home router:");
+            crate::kprintln!("    1. on the main PC run tools/report-receiver.py; it shows its address");
+            crate::kprintln!("    2. here type   report <that address>   e.g.  report 192.168.1.20");
+            crate::kprintln!("       (port {} unless you add one: report 192.168.1.20:7701)", PORT);
+            crate::kprintln!("  Without one (a phone's tethering cannot reach the main PC):");
+            crate::kprintln!("    1. here type   report save   (written to the USB stick AfriSovera started from)");
+            crate::kprintln!("    2. plug the stick into the main PC and run tools/report-from-stick.bat");
+            crate::kprintln!("  nothing is sent anywhere else, and nothing comes back in.");
+            crate::kprintln!("  The report includes the last screen of text: don't send or save it right after typing anything private.");
             return;
         }
     };
@@ -254,7 +317,7 @@ pub fn command(arg: &str) {
         return;
     }
     crate::kprintln!("[report] collecting this PC's details ...");
-    let len = build(ip, port);
+    let len = build(Some((ip, port)));
     // SAFETY: the body is finished; nothing writes it while it is being sent.
     let body = unsafe { &(&*addr_of!(BODY))[..len] };
     crate::kprintln!("[report] {} bytes ready, sending to {}.{}.{}.{}:{}", len, ip[0], ip[1], ip[2], ip[3], port);

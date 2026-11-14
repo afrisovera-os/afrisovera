@@ -66,6 +66,8 @@ struct Arm;
 
 impl Platform for Arm {
     const STRONG: &'static [&'static str] = &["rndr", "virtio-rng"];
+    /// 4 bits per byte for both (F3 step 2a: the same claim as before, now per source).
+    const H64: &'static [u32] = &[crate::drbg::H64_DEFAULT, crate::drbg::H64_DEFAULT];
     const ARCH: &'static [u8] = b"arm64";
 
     fn strong(idx: usize, buf: &mut [u8]) -> usize {

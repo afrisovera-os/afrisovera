@@ -5,6 +5,15 @@
 Cargo.lock
 # the workspace lock IS published (ADR 0007: the kernel's pinned crypto crates); sub-crates keep theirs ignored
 !/Cargo.lock
+# F2 (ADR 0007): the five sub-crate locks are committed too, and vendor/ is kept byte for byte (cargo checks
+# every vendored file against its .cargo-checksum.json, so nothing under it may be ignored)
+!/mesh-crypto/Cargo.lock
+!/mesh-noise/Cargo.lock
+!/mesh-hpke/Cargo.lock
+!/mesh-link/Cargo.lock
+!/drbg-host/Cargo.lock
+!/wlan-crypto/Cargo.lock
+!/vendor/**
 
 # QEMU run artefacts
 /serial.log

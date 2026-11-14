@@ -16,7 +16,8 @@
 //! Phase 0 limits, stated plainly: bucket 0 (256 bytes) only, because the serve loop sends one segment of at
 //! most 512 bytes per exchange (architect review, "size limit"); one link at a time; the identity key lives in
 //! RAM for this boot only (the keystore, review R2-6, is a prerequisite for anything longer); the bundle's
-//! `expires` is checked against its own `created`, not against a trusted clock.
+//! `expires` is checked against its own `created` and against this machine's clock (F5a: a bundle with
+//! `expires + CLOCK_SKEW <= now` is refused as `Expired`). The clock is the board RTC, not a trusted one.
 //!
 //! Secrets (F1, review S2): the identity key, ephemerals and every DH output, contact root and HPKE key are
 //! wiped when they go out of use (`Secret` here, `Drop` on mesh-noise's handshake and transport states, the
@@ -82,6 +83,26 @@ pub enum MeshError {
     Open,
     Tag,
     Unexpected,
+    /// F5a: the bundle's `expires` is at or before this machine's clock (allowing `CLOCK_SKEW`).
+    Expired,
+}
+
+/// F5a: how far this machine's clock may run ahead of the sender's before a bundle counts as expired.
+pub const CLOCK_SKEW: u64 = 300;
+/// AFR-0009 section 6, opening step 3: `expires - created` is at most 72 hours.
+pub const MAX_LIFETIME: u64 = 72 * 3600;
+
+/// F5a: a bundle's lifetime against its own `created` and against `now`. Refuses `expires <= created` (as before)
+/// and `expires - created > MAX_LIFETIME` (AFR-0009 section 6 step 3) as `Tag`, and `expires + CLOCK_SKEW <= now`
+/// as `Expired`. `now` = 0 means no clock (raspi): only the checks against `created`.
+fn check_expiry(created: u64, expires: u64, now: u64) -> Result<(), MeshError> {
+    if expires <= created || expires - created > MAX_LIFETIME {
+        return Err(MeshError::Tag);
+    }
+    if expires.saturating_add(CLOCK_SKEW) <= now {
+        return Err(MeshError::Expired);
+    }
+    Ok(())
 }
 
 /// 32 secret bytes from the hardened DRBG, or an error. Never all-zero (review S4).
@@ -259,6 +280,17 @@ fn seal_to(sk: &[u8; 32], pk: &[u8; 32], peer: &[u8; 32], text: &[u8]) -> Result
 
 /// Open a bundle addressed to this node from `peer`, checking the recipient tag for the bundle's own period.
 fn open_from(sk: &[u8; 32], pk: &[u8; 32], peer: &[u8; 32], bundle: &[u8]) -> Result<(u8, u64, Vec<u8>), MeshError> {
+    open_from_at(sk, pk, peer, bundle, now_unix())
+}
+
+/// `open_from` with the clock given (the selftest opens one bundle at several times).
+fn open_from_at(
+    sk: &[u8; 32],
+    pk: &[u8; 32],
+    peer: &[u8; 32],
+    bundle: &[u8],
+    now: u64,
+) -> Result<(u8, u64, Vec<u8>), MeshError> {
     let (mtype, created, body) = mesh_hpke::bundle_open(bundle, sk, peer).ok_or(MeshError::Open)?;
     // AFR-0009 section 6 step 3 (caller's part): the tag must be the one this contact pair derives for the
     // bundle's period. The header is authenticated as AAD, so a tag that matches here was sealed by `peer`.
@@ -270,9 +302,7 @@ fn open_from(sk: &[u8; 32], pk: &[u8; 32], peer: &[u8; 32], bundle: &[u8]) -> Re
         return Err(MeshError::Tag);
     }
     let expires = u64::from_le_bytes(bundle[36..44].try_into().map_err(|_| MeshError::Frame)?);
-    if expires <= created {
-        return Err(MeshError::Tag);
-    }
+    check_expiry(created, expires, now)?;
     Ok((mtype, created, body))
 }
 
@@ -629,6 +659,33 @@ pub fn selftest() -> bool {
     check("bundle-seal-open", rt.as_deref() == Some(&b"Habari kutoka AfriSovera"[..]), &mut pass, &mut total);
     check("bundle-tamper-rejected", tamper, &mut pass, &mut total);
     check("bundle-wrong-sender-rejected", wrong, &mut pass, &mut total);
+    // F5a: the same sealed bundle (expires = created + 24 h) opened at chosen times: inside the skew it opens,
+    // at expires + CLOCK_SKEW it is Expired; and the pure check's edges: no clock, `expires <= created`, the 72 h
+    // lifetime, and no overflow at the top of the range.
+    let (in_skew, expired) = match &sealed {
+        Ok(bun) => {
+            let exp = u64::from_le_bytes(bun[36..44].try_into().unwrap_or([0; 8]));
+            (
+                open_from_at(&b, &pb, &pa, bun, exp + CLOCK_SKEW - 1).is_ok(),
+                open_from_at(&b, &pb, &pa, bun, exp + CLOCK_SKEW).err() == Some(MeshError::Expired),
+            )
+        }
+        Err(_) => (false, false),
+    };
+    check("bundle-open-within-clock-skew", in_skew, &mut pass, &mut total);
+    check("bundle-expired-rejected", expired, &mut pass, &mut total);
+    check(
+        "bundle-expiry-edges",
+        check_expiry(1000, 2000, 0).is_ok()
+            && check_expiry(1000, 2000, 2000 + CLOCK_SKEW - 1).is_ok()
+            && check_expiry(1000, 2000, 2000 + CLOCK_SKEW) == Err(MeshError::Expired)
+            && check_expiry(2000, 2000, 0) == Err(MeshError::Tag)
+            && check_expiry(1000, 1000 + MAX_LIFETIME, 0).is_ok()
+            && check_expiry(1000, 1000 + MAX_LIFETIME + 1, 0) == Err(MeshError::Tag)
+            && check_expiry(u64::MAX - 10, u64::MAX, u64::MAX - 1).is_ok(),
+        &mut pass,
+        &mut total,
+    );
     check(
         "bundle-is-bucket-0",
         sealed.as_ref().map(|v| v.len() == mesh_crypto::BUCKETS[0]).unwrap_or(false),

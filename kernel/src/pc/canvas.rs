@@ -151,6 +151,56 @@ pub fn fill_rect(x0: usize, y0: usize, w: usize, h: usize, rgb: u32) {
     }
 }
 
+/// Text coverage mixed into the canvas (afriui.md section 26), clipped to it. Mainline only.
+pub fn blend(x0: usize, y0: usize, w: usize, h: usize, a: &[u8], astride: usize, rgb: u32, gamma: &[u8; 256]) {
+    let (cw, ch) = (width(), height());
+    let (w, h) = (w.min(cw.saturating_sub(x0)), h.min(ch.saturating_sub(y0)));
+    if w == 0 || h == 0 {
+        return;
+    }
+    add_span(y0, y0 + h);
+    // SAFETY: the canvas is a static array; single writer (mainline).
+    let buf = unsafe { &mut (*addr_of_mut!(BUF)).0 };
+    crate::framebuffer::blend_into(buf, cw, x0, y0, w, h, a, astride, rgb, gamma);
+}
+
+/// Black at alphas over the canvas (soft shadows, afriui.md section 30), clipped to it. Mainline only.
+pub fn shade(x0: usize, y0: usize, w: usize, h: usize, a: &[u8], astride: usize) {
+    let (cw, ch) = (width(), height());
+    let (w, h) = (w.min(cw.saturating_sub(x0)), h.min(ch.saturating_sub(y0)));
+    if w == 0 || h == 0 {
+        return;
+    }
+    add_span(y0, y0 + h);
+    // SAFETY: the canvas is a static array; single writer (mainline).
+    let buf = unsafe { &mut (*addr_of_mut!(BUF)).0 };
+    crate::framebuffer::shade_into(buf, cw, x0, y0, w, h, a, astride);
+}
+
+/// Black at one alpha over a block of the canvas, clipped to it. Mainline only.
+pub fn shade_const(x0: usize, y0: usize, w: usize, h: usize, al: u32) {
+    let (cw, ch) = (width(), height());
+    let (w, h) = (w.min(cw.saturating_sub(x0)), h.min(ch.saturating_sub(y0)));
+    if w == 0 || h == 0 {
+        return;
+    }
+    add_span(y0, y0 + h);
+    // SAFETY: the canvas is a static array; single writer (mainline).
+    let buf = unsafe { &mut (*addr_of_mut!(BUF)).0 };
+    crate::framebuffer::shade_const_into(buf, cw, x0, y0, w, h, al);
+}
+
+/// One edge pixel mixed into the canvas. Mainline only.
+pub fn mix(x: usize, y: usize, rgb: u32, al: u32) {
+    let (cw, ch) = (width(), height());
+    if x < cw && y < ch {
+        add_span(y, y + 1);
+        // SAFETY: as above.
+        let buf = unsafe { &mut (*addr_of_mut!(BUF)).0 };
+        crate::framebuffer::mix_into(buf, y * cw + x, rgb, al);
+    }
+}
+
 // The desktop's whole boundary to the screen (docs/design/afriui-phone-plan.md, step P1): the
 // Sovereign model and paint call only `crate::canvas::*`, so the phone can give them its own
 // canvas (P2) without either naming a PC module.

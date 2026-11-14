@@ -26,6 +26,11 @@ fn main() {
     // Scoped to the ARM kernel binary: `mansa-pc` (the x86-64 UEFI kernel) is linked
     // by the UEFI target's own PE linker and takes no linker script.
     println!("cargo:rustc-link-arg-bin=mansa-kernel=-T{}", script.display());
+    // The PC kernel, a repeatable link (docs/design-pc-repro-link.md): /Brepro puts a hash of the output where
+    // lld writes a timestamp, and /DEBUG:NONE drops the PDB, whose object names and temp paths change every build
+    // and would otherwise move that hash. pc-boot fails if a CodeView (PDB) entry comes back.
+    println!("cargo:rustc-link-arg-bin=mansa-pc=/Brepro");
+    println!("cargo:rustc-link-arg-bin=mansa-pc=/DEBUG:NONE");
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-changed=linker-raspi.ld");
     println!("cargo:rerun-if-changed=linker-rpi4.ld");
@@ -55,7 +60,11 @@ fn stamp_commit() {
     if let Some(c) = commit {
         println!("cargo:rustc-env=AFRI_COMMIT={}", c);
     }
-    if let Some(d) = git(&["log", "-1", "--format=%cI"]) {
+    // AFRI_COMMIT_DATE in the environment wins too, so a build with no git (a the cloud runner job) can stamp the same
+    // date as a git checkout of that commit, and the two PC images can be compared byte for byte.
+    println!("cargo:rerun-if-env-changed=AFRI_COMMIT_DATE");
+    let date = std::env::var("AFRI_COMMIT_DATE").ok().or_else(|| git(&["log", "-1", "--format=%cI"]));
+    if let Some(d) = date {
         println!("cargo:rustc-env=AFRI_COMMIT_DATE={}", d);
     }
     for p in ["HEAD", "logs/HEAD", "index"] {

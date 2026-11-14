@@ -110,7 +110,7 @@ afrisovera> desk verify
 afrisovera> desk motion hold 1 circle
 [desk] launcher open
 [desk] motion: grow circle held at 1/3
-afrisovera> desk tap 342 305
+afrisovera> desk tap 400 286
 [desk] open settings
 afrisovera> desk motion
 [desk] motion on; 4 motion(s) run
@@ -118,7 +118,7 @@ afrisovera> desk motion
 [desk] motion before: grow circle ticks 1460 0 0 early
 afrisovera> desk verify
 [desk] verify: 0 of 480 rows differ after a full redraw (9 partial frame(s) drawn before it)
-afrisovera> desk tap 425 230
+afrisovera> desk tap 425 250
 [desk] settings: motion off
 afrisovera> desk close about
 [desk] close about
@@ -209,8 +209,8 @@ boot() { # boot <serial port> <qmp port> <log> <png> <command>...
 }
 boot 5976 5977 "$W/serial1.log" "$W/shot1.png" \
     "screen ui" "gui" "desk motion" "desk open about" "desk motion" "desk verify" \
-    "desk motion hold 1 files" "desk verify" "desk motion hold 1 circle" "desk tap 342 305" "desk motion" \
-    "desk verify" "desk tap 425 230" "desk close about" "desk open about" "desk motion" "desk motion on" \
+    "desk motion hold 1 files" "desk verify" "desk motion hold 1 circle" "desk tap 400 286" "desk motion" \
+    "desk verify" "desk tap 425 250" "desk close about" "desk open about" "desk motion" "desk motion on" \
     "desk verify" "desk perf"
 boot 5978 5979 "$W/serial2.log" "$W/shot2.png" "gui" "desk open about" "desk motion hold 1 files"
 python3 scripts/lib/png-px.py "$W/shot1.png" --desk 1 20,250 > "$W/pixels1.txt" 2>&1

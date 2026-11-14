@@ -303,8 +303,7 @@ pub fn init() {
                     }
                     continue;
                 }
-                let class = cfg32(b, d, f, 8) >> 16;
-                if class == 0x0805 && n < found.len() {
+                if crate::hwdb::pci_part(BINDS, b, d, f, id).is_some() && n < found.len() {
                     found[n] = (b, d, f, id);
                     n += 1;
                 }
@@ -1219,6 +1218,15 @@ pub fn claim() -> bool {
 pub fn present() -> bool {
     // SAFETY: scalar read.
     unsafe { USED }
+}
+
+/// Asili v0 BINDS (pc/hwdb.rs): `init` decides from this table.
+pub(crate) const BINDS: &[crate::hwdb::Part] = &[crate::hwdb::pci_class(0x08_05_00, 0xFF_FF_00, "SD host controller (SDHCI)")];
+
+/// The PCI function this driver took, for `hwscan`.
+pub fn at() -> Option<(u8, u8, u8)> {
+    // SAFETY: scalar reads of boot-time state.
+    unsafe { (USED).then_some(PCI_AT) }
 }
 
 /// The VFS is on the built-in eMMC (whole disk or AfriSovera's partition): an internal disk, so

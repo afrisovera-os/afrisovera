@@ -334,6 +334,93 @@ pub fn list() {
     }
 }
 
+/// One Boot#### as read: its description (ASCII, `?` for anything else) and the file path its first device path
+/// names (lower-case ASCII).
+struct Entry {
+    desc: [u8; 64],
+    dn: usize,
+    file: [u8; 64],
+    file_n: usize,
+}
+
+/// Whose a Boot#### is: AfriSovera's main entry, its trial entry (safe updates, AFR-0010: the description is
+/// exactly "AfriSovera trial"), or not ours. A trial entry is never taken for the main one; a hand-made entry with
+/// another description stays as before.
+#[derive(PartialEq, Clone, Copy)]
+enum Kind {
+    Main,
+    Trial,
+    Other,
+}
+
+impl Entry {
+    fn kind(&self) -> Kind {
+        let low = self.desc.map(|c| c.to_ascii_lowercase());
+        if low[..self.dn] == *b"afrisovera trial" {
+            Kind::Trial
+        } else if low[..self.dn].starts_with(b"afrisovera") || self.file[..self.file_n].windows(12).any(|w| w == b"\\afrisovera\\") {
+            Kind::Main
+        } else {
+            Kind::Other
+        }
+    }
+}
+
+/// An EFI_LOAD_OPTION's description and file path; None when it is too short to hold them.
+fn parse(d: &[u8]) -> Option<Entry> {
+    if d.len() < 6 {
+        return None;
+    }
+    let fpl = u16le(d, 4) as usize;
+    let mut e = Entry { desc: [0; 64], dn: 0, file: [0; 64], file_n: 0 };
+    let mut i = 6;
+    while i + 1 < d.len() {
+        let c = u16le(d, i);
+        i += 2;
+        if c == 0 {
+            break;
+        }
+        if e.dn < e.desc.len() {
+            e.desc[e.dn] = if (0x20..0x7F).contains(&c) { c as u8 } else { b'?' };
+            e.dn += 1;
+        }
+    }
+    if i + fpl <= d.len() {
+        path(&mut Line::new(), &d[i..i + fpl], &mut e.file, &mut e.file_n);
+    }
+    Some(e)
+}
+
+/// For `updatestage` (safe updates U3): AfriSovera's main entry and the file its device path names (lower-case,
+/// such as `\efi\afrisovera\afrisovera.efi`), as read at power-on or after the last change; None if there is none.
+#[allow(dead_code)] // its caller, updatestage, is the next change (architect: this refactor merges first)
+pub(crate) fn main_file() -> Option<(u16, [u8; 64], usize)> {
+    find(Kind::Main).map(|(n, e)| (n, e.file, e.file_n))
+}
+
+/// For `updatestage`: AfriSovera's trial entry, if there is one.
+#[allow(dead_code)] // as main_file
+pub(crate) fn trial_number() -> Option<u16> {
+    find(Kind::Trial).map(|(n, _)| n)
+}
+
+/// The last Boot#### of this kind, as `numbers` picks AfriSovera's own.
+fn find(kind: Kind) -> Option<(u16, Entry)> {
+    let bv = uefi::boot_vars();
+    if !bv.read {
+        return None;
+    }
+    let mut found = None;
+    for k in 0..bv.n {
+        if let Some(e) = parse(&bv.data[k][..bv.len[k]]) {
+            if e.kind() == kind {
+                found = Some((bv.num[k], e));
+            }
+        }
+    }
+    found
+}
+
 /// For `bootplan`: (the next free Boot number, AfriSovera's own entry if it has one, the
 /// first entry of BootOrder and its name), worked out as `list` does, printing nothing.
 pub fn numbers() -> Option<(Option<u16>, Option<u16>, Option<(u16, [u8; 64], usize)>)> {
@@ -350,30 +437,11 @@ pub fn numbers() -> Option<(Option<u16>, Option<u16>, Option<(u16, [u8; 64], usi
         if num < 0x100 {
             used[num as usize] = true;
         }
-        if d.len() < 6 {
-            continue;
-        }
-        let fpl = u16le(d, 4) as usize;
-        let (mut i, mut desc, mut dn) = (6, [0u8; 64], 0);
-        while i + 1 < d.len() {
-            let c = u16le(d, i);
-            i += 2;
-            if c == 0 {
-                break;
-            }
-            if dn < desc.len() {
-                desc[dn] = if (0x20..0x7F).contains(&c) { c as u8 } else { b'?' };
-                dn += 1;
-            }
-        }
-        let (mut file, mut file_n) = ([0u8; 64], 0);
-        if i + fpl <= d.len() {
-            path(&mut Line::new(), &d[i..i + fpl], &mut file, &mut file_n);
-        }
-        let low = desc.map(|c| c.to_ascii_lowercase());
-        if low[..dn].starts_with(b"afrisovera") || file[..file_n].windows(12).any(|w| w == b"\\afrisovera\\") {
+        let Some(e) = parse(d) else { continue };
+        if e.kind() == Kind::Main {
             ours = Some(num);
         }
+        let (desc, dn) = (e.desc, e.dn);
         // what the PC really starts first: the earliest in BootOrder that is active, not hidden
         // and a boot option (the firmware skips hidden ones and apps such as its own setup screen)
         let attr = u32le(d, 0);
@@ -555,16 +623,23 @@ pub fn name(n: u16) -> [u8; 8] {
 // way back: BootOrder without it, the Boot#### deleted.
 
 const DESC: &str = "AfriSovera";
-const PATH_LEN: usize = 42 + 66 + 4;
-const OPT_LEN: usize = 6 + 2 * 11 + PATH_LEN;
+/// The trial entry's description (safe updates, AFR-0010): told apart from the main entry by this exact text.
+#[allow(dead_code)] // its user, updatestage, is the next change
+pub(crate) const TRIAL_DESC: &str = "AfriSovera trial";
+/// Room for the longest option: a 16-character description and a 40-character file path.
+const OPT_CAP: usize = 6 + 2 * (16 + 1) + 42 + 4 + 2 * (40 + 1) + 4;
 
-/// The EFI_LOAD_OPTION: active, "AfriSovera", HD(entry, start, size, GPT, guid)/File(FILE)/End.
-fn option(ent: u64, start: u64, size: u64, guid: &[u8; 16]) -> [u8; OPT_LEN] {
-    let mut o = [0u8; OPT_LEN];
+/// The EFI_LOAD_OPTION: active, `desc`, HD(entry, start, size, GPT, guid)/File(`file`)/End, and its length.
+/// For the main entry ("AfriSovera", esp::FILE) these are the same 140 bytes as before safe updates.
+fn option(desc: &str, file: &str, ent: u64, start: u64, size: u64, guid: &[u8; 16]) -> ([u8; OPT_CAP], usize) {
+    assert!(desc.len() <= 16 && file.len() <= 40);
+    let file_node = 4 + 2 * (file.len() + 1);
+    let path_len = 42 + file_node + 4;
+    let mut o = [0u8; OPT_CAP];
     o[0..4].copy_from_slice(&1u32.to_le_bytes()); // LOAD_OPTION_ACTIVE
-    o[4..6].copy_from_slice(&(PATH_LEN as u16).to_le_bytes());
+    o[4..6].copy_from_slice(&(path_len as u16).to_le_bytes());
     let mut i = 6;
-    for c in DESC.bytes() {
+    for c in desc.bytes() {
         o[i] = c;
         i += 2;
     }
@@ -578,16 +653,17 @@ fn option(ent: u64, start: u64, size: u64, guid: &[u8; 16]) -> [u8; OPT_LEN] {
     o[i + 40] = 2; // GPT
     o[i + 41] = 2; // the signature is a GUID
     i += 42;
-    // File: media path, file path, UTF-16 with its NUL (30 characters + NUL = 62 bytes)
-    o[i..i + 4].copy_from_slice(&[4, 4, 66, 0]);
+    // File: media path, file path, UTF-16 with its NUL
+    o[i..i + 2].copy_from_slice(&[4, 4]);
+    o[i + 2..i + 4].copy_from_slice(&(file_node as u16).to_le_bytes());
     let mut k = i + 4;
-    for c in crate::esp::FILE.bytes() {
+    for c in file.bytes() {
         o[k] = c;
         k += 2;
     }
-    i += 66;
+    i += file_node;
     o[i..i + 4].copy_from_slice(&[0x7F, 0xFF, 4, 0]);
-    o
+    (o, i + 4)
 }
 
 /// BootOrder as the firmware has it now: (numbers, count), or why it cannot be used.
@@ -702,7 +778,8 @@ pub fn add(given: Option<&str>) {
         crate::kprintln!("bootentry: BootOrder is full or already names {}; nothing written", nms);
         return;
     }
-    let opt = option(ent, start, size, &guid);
+    let (opt, ol) = option(DESC, crate::esp::FILE, ent, start, size, &guid);
+    let opt = &opt[..ol];
     let mut ob = [0u8; uefi::ORDER_MAX * 2];
     let olen = order_bytes(&order[..n], &mut ob);
     let mut new = order;
@@ -732,15 +809,15 @@ pub fn add(given: Option<&str>) {
         ),
         None => crate::kprintln!("  the PC keeps its first choice; AfriSovera is picked from the firmware's boot menu"),
     }
-    if !agreed("bootentry", given, code(b"bootentry", num, &opt, &ob[..olen])) {
+    if !agreed("bootentry", given, code(b"bootentry", num, opt, &ob[..olen])) {
         return;
     }
-    let st = uefi::set_global(&nm, &opt);
+    let st = uefi::set_global(&nm, opt);
     if st != uefi::SUCCESS {
         crate::kprintln!("bootentry: the firmware refused to write {} (status {:#x}); nothing changed", nms, st);
         return;
     }
-    if !reads_back(&nm, &opt) {
+    if !reads_back(&nm, opt) {
         let back = uefi::set_global(&nm, &[]);
         crate::kprintln!(
             "bootentry: {} did not read back as written, so it was taken out again ({}); BootOrder not changed",

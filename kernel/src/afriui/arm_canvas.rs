@@ -31,6 +31,26 @@ pub fn fill_rect(x0: usize, y0: usize, w: usize, h: usize, rgb: u32) {
     crate::framebuffer::fill_rect(x0, y0, w, h, rgb);
 }
 
+/// Text coverage mixed into the framebuffer (afriui.md section 26).
+pub fn blend(x0: usize, y0: usize, w: usize, h: usize, a: &[u8], astride: usize, rgb: u32, gamma: &[u8; 256]) {
+    crate::framebuffer::blend(x0, y0, w, h, a, astride, rgb, gamma);
+}
+
+/// Black at alphas over the framebuffer (soft shadows, afriui.md section 30).
+pub fn shade(x0: usize, y0: usize, w: usize, h: usize, a: &[u8], astride: usize) {
+    crate::framebuffer::shade(x0, y0, w, h, a, astride);
+}
+
+/// Black at one alpha over a block of the framebuffer.
+pub fn shade_const(x0: usize, y0: usize, w: usize, h: usize, al: u32) {
+    crate::framebuffer::shade_const(x0, y0, w, h, al);
+}
+
+/// One edge pixel mixed into the framebuffer.
+pub fn mix(x: usize, y: usize, rgb: u32, al: u32) {
+    crate::framebuffer::mix(x, y, rgb, al);
+}
+
 /// Something was drawn: ramfb shows it as it is (nothing to copy).
 pub fn mark() {}
 

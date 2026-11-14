@@ -25,8 +25,17 @@ pub fn public_key(secret: &[u8; 32]) -> [u8; 32] {
     PublicKey::from(&StaticSecret::from(*secret)).to_bytes()
 }
 
-fn dh(secret: &[u8; 32], peer: &[u8; 32]) -> [u8; 32] {
-    StaticSecret::from(*secret).diffie_hellman(&PublicKey::from(*peer)).to_bytes()
+/// X25519, refusing an all-zero result (security finding M1, 13 Nov 2026). A low-order peer key (32 zero bytes,
+/// for example) gives zero whatever our secret is, so a stranger with no private key could otherwise finish a
+/// handshake whose keys are made of public bytes. RFC 7748 section 6.1 suggests this check and the Noise spec
+/// allows it for 25519; mesh-hpke makes the same check (`was_contributory`, constant time).
+fn dh(secret: &[u8; 32], peer: &[u8; 32]) -> Result<[u8; 32], ()> {
+    let shared = StaticSecret::from(*secret).diffie_hellman(&PublicKey::from(*peer));
+    if shared.was_contributory() {
+        Ok(shared.to_bytes())
+    } else {
+        Err(())
+    }
 }
 
 fn sha(parts: &[&[u8]]) -> [u8; 32] {
@@ -199,22 +208,22 @@ impl Handshake {
 
     fn mix_token(&mut self, t: Tok) -> Result<(), ()> {
         let mut d = match t {
-            Tok::Ee => dh(&self.e_priv, &self.re.ok_or(())?),
+            Tok::Ee => dh(&self.e_priv, &self.re.ok_or(())?)?,
             Tok::Es => {
                 if self.initiator {
-                    dh(&self.e_priv, &self.rs.ok_or(())?)
+                    dh(&self.e_priv, &self.rs.ok_or(())?)?
                 } else {
-                    dh(&self.s_priv, &self.re.ok_or(())?)
+                    dh(&self.s_priv, &self.re.ok_or(())?)?
                 }
             }
             Tok::Se => {
                 if self.initiator {
-                    dh(&self.s_priv, &self.re.ok_or(())?)
+                    dh(&self.s_priv, &self.re.ok_or(())?)?
                 } else {
-                    dh(&self.e_priv, &self.rs.ok_or(())?)
+                    dh(&self.e_priv, &self.rs.ok_or(())?)?
                 }
             }
-            Tok::Ss => dh(&self.s_priv, &self.rs.ok_or(())?),
+            Tok::Ss => dh(&self.s_priv, &self.rs.ok_or(())?)?,
             _ => return Err(()),
         };
         self.mixkey(&d);
@@ -228,9 +237,12 @@ impl Handshake {
         if self.failed {
             return Err(());
         }
+        let start = out.len();
         let r = self.try_write(payload, out);
         if r.is_err() {
             self.failed = true;
+            // nothing of a failed message leaves (M1: the e already appended before a refused DH)
+            out.truncate(start);
         }
         r
     }
@@ -665,5 +677,97 @@ mod tests {
         // SAFETY: as above.
         unsafe { core::ptr::drop_in_place(&mut *cs) };
         assert_eq!(cs.k, [0u8; 32]);
+    }
+
+    // Security finding M1 (13 Nov 2026): a stranger with no private key sends 32 zero bytes as its ephemeral.
+    // XX m1 is only "e", so reading it does no DH; the responder's ee (and es) come when it writes m2. That
+    // write must fail, leave no m2 bytes (so the responder's static key is never sent) and poison the handshake.
+    #[test]
+    fn m1_zero_ephemeral_is_refused_by_the_responder() {
+        let b = arr32(XB);
+        let mut r = Handshake::xx_responder(b, [0x55u8; 32], &pro());
+        let m1 = [0u8; 32];
+        let mut pl = Vec::new();
+        r.read_message(&m1, &mut pl).unwrap();
+        let mut m2 = Vec::new();
+        assert!(r.write_message(&[], &mut m2).is_err(), "the responder answers a zero ephemeral");
+        assert!(m2.is_empty(), "m2 bytes left the responder");
+        assert!(r.write_message(&[], &mut m2).is_err(), "not poisoned");
+        assert!(r.read_message(&m1, &mut pl).is_err(), "not poisoned for reads");
+    }
+
+    // M1, the other low-order points too: each of the seven low-order X25519 u-coordinates in RFC 7748's
+    // neighbourhood (libsodium's list), with and without the ignored top bit, is refused when the responder
+    // answers it.
+    #[test]
+    fn m1_every_low_order_ephemeral_is_refused() {
+        let b = arr32(XB);
+        let low_order = [
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0100000000000000000000000000000000000000000000000000000000000000",
+            "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+            "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        ];
+        for (n, h) in low_order.iter().enumerate() {
+            for top in [0u8, 0x80] {
+                let mut e = arr32(h);
+                e[31] |= top;
+                let mut r = Handshake::xx_responder(b, [0x55u8; 32], &pro());
+                let (mut pl, mut m2) = (Vec::new(), Vec::new());
+                r.read_message(&e, &mut pl).unwrap();
+                assert!(r.write_message(&[], &mut m2).is_err(), "low-order point {} (top bit {:#x}) accepted", n, top);
+                assert!(m2.is_empty());
+            }
+        }
+    }
+
+    // M1 from the initiator's side (`mesh connect` against a fake responder): an m2 whose ephemeral is zero is
+    // refused before anything in it is decrypted, and the initiator writes no m3.
+    #[test]
+    fn m1_zero_ephemeral_in_m2_is_refused_by_the_initiator() {
+        let a = arr32(XA);
+        let mut i = Handshake::xx_initiator(a, [0x44u8; 32], &pro());
+        let mut m1 = Vec::new();
+        i.write_message(&[], &mut m1).unwrap();
+        let mut m2 = vec![0u8; 32];
+        m2.extend_from_slice(&[0u8; 48 + 16]);
+        let mut pl = Vec::new();
+        assert!(i.read_message(&m2, &mut pl).is_err(), "m2 with a zero ephemeral is read");
+        assert!(pl.is_empty());
+        let mut m3 = Vec::new();
+        assert!(i.write_message(&[], &mut m3).is_err(), "the initiator writes m3 after a zero ephemeral");
+    }
+
+    // M1, the static half: a real ephemeral but a zero static in m3 makes se zero for the responder. The
+    // stranger cannot normally encrypt m3 (it needs ee and es), so this drives a real initiator whose static key
+    // is replaced after m2 by one whose public half is zero: se = DH(e_r, 0) must be refused.
+    #[test]
+    fn m1_zero_static_in_m3_is_refused_by_the_responder() {
+        let a = arr32(XA);
+        let b = arr32(XB);
+        let mut i = Handshake::xx_initiator(a, [0x44u8; 32], &pro());
+        let mut r = Handshake::xx_responder(b, [0x55u8; 32], &pro());
+        let (mut m1, mut m2, mut m3, mut pl) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        i.write_message(&[], &mut m1).unwrap();
+        r.read_message(&m1, &mut pl).unwrap();
+        r.write_message(&[], &mut m2).unwrap();
+        i.read_message(&m2, &mut pl).unwrap();
+        i.s_pub = [0u8; 32];
+        // The initiator's own se uses its real secret, so it writes m3; the responder's se = DH(e_r, 0) = 0.
+        i.write_message(&[], &mut m3).unwrap();
+        assert!(r.read_message(&m3, &mut pl).is_err(), "m3 with a zero static is accepted");
+        assert!(!r.is_finished());
+    }
+
+    // KK with a zero peer static configured: ss and the static DH are zero, so the first message is refused.
+    #[test]
+    fn m1_kk_zero_peer_static_is_refused() {
+        let a = arr32(XA);
+        let mut init = Handshake::kk_initiator(a, [0x66u8; 32], [0u8; 32], &pro());
+        let mut m1 = Vec::new();
+        assert!(init.write_message(&[], &mut m1).is_err(), "KK initiator writes to a zero static");
     }
 }

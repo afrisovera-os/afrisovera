@@ -41,8 +41,8 @@ grade() { # grade <boot1> <boot2>
     [ -n "$PB" ] || _f "boot 2: the second press of the power button was never seen"
     has "$PA" '^\[vfs\] synced [0-9]+ files to disk$' || _f "boot 1: the files were not synced after the press"
     has "$PA" '^\[pc\] power button: files saved to the disk$' || _f "boot 1: the press did not say the files were saved"
-    has "$PA" '^\[pc\] powering off \(UEFI ResetSystem: shutdown\)$' || _f "boot 1: the firmware was not asked to switch off"
-    has "$PB" '^\[pc\] powering off \(UEFI ResetSystem: shutdown\)$' || _f "boot 2: the firmware was not asked to switch off"
+    has "$PA" "^\[pc\] switching off \(the firmware's ResetSystem\)$" || _f "boot 1: the firmware was not asked to switch off"
+    has "$PB" "^\[pc\] switching off \(the firmware's ResetSystem\)$" || _f "boot 2: the firmware was not asked to switch off"
     has "$A" '^== power-button: qemu exited on its own after [0-9]+ s ==$' || _f "boot 1: the machine did not switch off after the press"
     has "$B" '^== power-button: qemu exited on its own after [0-9]+ s ==$' || _f "boot 2: the machine did not switch off after the press"
     has "$B" '^PWRBTN-7NOV$' || _f "boot 2: notes.txt did not come back from the drive"
@@ -66,7 +66,7 @@ afrisovera> write notes.txt PWRBTN-7NOV
 afrisovera> [pc] power button pressed: saving AfriSovera'"'"'s files, then switching off
 [vfs] synced 18 files to disk
 [pc] power button: files saved to the disk
-[pc] powering off (UEFI ResetSystem: shutdown)
+[pc] switching off (the firmware'"'"'s ResetSystem)
 
 == power-button: qemu exited on its own after 1 s =='
 S2='[pc] power button: ready; a press saves the files and switches off (PM1a 0x600, ACPI mode switched on)
@@ -75,7 +75,7 @@ PWRBTN-7NOV
 afrisovera> [pc] power button pressed: saving AfriSovera'"'"'s files, then switching off
 [vfs] synced 18 files to disk
 [pc] power button: files saved to the disk
-[pc] powering off (UEFI ResetSystem: shutdown)
+[pc] switching off (the firmware'"'"'s ResetSystem)
 
 == power-button: qemu exited on its own after 1 s =='
 
@@ -98,9 +98,9 @@ selftest() {
     arm not-armed red "$(printf '%s\n' "$S1" | sed "1s/.*/$(printf '%s' "$NOTARMED" | sed 's/[\/&]/\\&/g')/")" "$S2"
     arm acpiinfo-off red "$(printf '%s\n' "$S1" | sed 's/ACPI mode on, presses 0/ACPI mode off, presses 0/')" "$S2"
     arm not-claimed red "$(printf '%s\n' "$S1" | grep -v '^claimdisk:')" "$S2"
-    arm press-unseen red "$(printf '%s\n' "$S1" | grep -v 'power button pressed\|files saved\|powering off')" "$S2"
+    arm press-unseen red "$(printf '%s\n' "$S1" | grep -v 'power button pressed\|files saved\|switching off (the')" "$S2"
     arm no-sync-after-press red "$(printf '%s\n' "$S1" | sed '/power button pressed/,$ { /^\[vfs\] synced/d }')" "$S2"
-    arm hard-off red "$(printf '%s\n' "$S1" | grep -v '^\[pc\] powering off')" "$S2"
+    arm hard-off red "$(printf '%s\n' "$S1" | grep -v '^\[pc\] switching off (the')" "$S2"
     arm still-running red "$(printf '%s\n' "$S1" | sed 's/^== power-button: qemu exited.*/== power-button: qemu still running after 60 s ==/')" "$S2"
     arm boot2-still-running red "$S1" "$(printf '%s\n' "$S2" | sed 's/^== power-button: qemu exited.*/== power-button: qemu still running after 60 s ==/')"
     arm not-persisted red "$S1" "$(printf '%s\n' "$S2" | grep -v '^PWRBTN')"

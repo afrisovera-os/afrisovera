@@ -172,6 +172,14 @@ if ! cargo build -p mansa-kernel --bin mansa-pc --features pc --target x86_64-un
 fi
 EFI="target/x86_64-unknown-uefi/debug/mansa-pc.efi"
 [ -r "$EFI" ] || { echo "PC BOOT TEST FAILED (harness: $EFI was not built)"; exit 1; }
+# The PC link is repeatable (docs/design-pc-repro-link.md): the same commit gives the same md5. Print it for the
+# walk's record, and fail if the image has a CodeView (PDB) entry or no REPRO entry, so a toolchain or build.rs
+# change that brings back /DEBUG shows up here as a red, not as a quiet md5 drift.
+echo "PC md5: $(md5sum "$EFI" | cut -d' ' -f1)  $EFI"
+REPRO="$(python3 scripts/lib/pe-diff.py --check-repro "$EFI" 2>&1)"; RRC=$?
+printf '%s\n' "$REPRO" | sed 's/^/  /'
+[ "$RRC" -eq 0 ] ||
+    { echo "PC BOOT TEST FAILED (the PC image is no longer a repeatable link: see the pe-repro lines above)"; exit 1; }
 
 W="$(mktemp -d "$T/pc-boot.XXXXXX")"
 mkdir -p "$W/esp/EFI/BOOT"

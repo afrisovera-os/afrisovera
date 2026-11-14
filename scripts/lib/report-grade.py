@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Grade one `report` boot for scripts/pc-report-test.sh (docs/design/field-report.md).
 
-    report-grade.py <serial log> <receiver log> <reports dir> <card> <port> <closed port>
+    report-grade.py <serial log> <receiver log> <reports dir> <card> <port> <closed port> [serials]
     report-grade.py --selftest
 
-<card> is e1000 or rtl: the probe section and boot line that must name the card.
+<card> is e1000, rtl or usb-ecm: the probe section and boot line that must name the card.
+[serials]: comma-separated serial numbers the boot's devices carry; none may appear in the report, and
+no full MAC address may either (report home, ARCHITECT_REVIEWS 13 Nov night).
 Exit 0 = green. Every failure is printed as "  FAIL: ...".
 """
 import os
@@ -13,23 +15,25 @@ import sys
 
 SECTIONS = ["date", "fwinfo", "screeninfo", "cpuinfo", "acpiinfo", "mem", "uptime", "ifconfig",
             "devices", "lsvirtio", "lsusb", "lsps2", "lsnvme", "lsahci", "lse1000", "lsrtl", "lssd",
-            "lshda", "wifi"]
+            "lshda", "wifi", "hwscan", "usbaddr", "camera"]
 CARD = {
     "e1000": ("lse1000", "82574L", "[e1000] 82574L"),
     "rtl": ("lsrtl", "RTL8139C+", "[rtl] RTL8139C+"),
+    "usb-ecm": ("lsvirtio", "usb-ecm", "USB Ethernet adapter 0525:a4a2 (CDC-ECM"),
 }
+FULL_MAC = re.compile(r"(?<![0-9A-Fa-f:-])([0-9A-Fa-f]{2}([:-])){1}[0-9A-Fa-f]{2}(\2[0-9A-Fa-f]{2}){4}(?![0-9A-Fa-f:-])")
 
 
 def clean(t):
     return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", t.replace("\r", ""))
 
 
-def grade(serial, recv, report, card, port, closed):
+def grade(serial, recv, report, card, port, closed, serials=()):
     """serial/recv: text; report: bytes or None. Returns a list of failures."""
     bad = []
     s = clean(serial)
     has = lambda pat: re.search(pat, s, re.M)
-    if not has(r"^report: send this PC's details to your main PC"):
+    if not has(r"^report: give this PC's details to your main PC, one of two ways\.$"):
         bad.append("bare `report` did not explain itself")
     # QEMU's user network answers a closed host port with RST on some hosts and with silence
     # on others (Windows); either way the guest must give up in plain words
@@ -62,7 +66,7 @@ def grade(serial, recv, report, card, port, closed):
         bad.append("no commit line")
     if not re.search(r"^build: (debug|release) x86_64 UEFI \(mansa-pc\)$", t, re.M):
         bad.append("no build line")
-    if not re.search(r"^from: 10\.0\.2\.15 mac ([0-9a-f]{2}:){5}[0-9a-f]{2} \(%s\)$" % card, t, re.M):
+    if not re.search(r"^from: 10\.0\.2\.15 mac ([0-9a-f]{2}:){3}--:--:-- \(%s\)$" % card, t, re.M):
         bad.append("no 'from' line naming the %s card" % card)
     cm = re.search(r"^cores: (\d+) \(ACPI\)   memory: (\d+) MiB$", t, re.M)
     if not cm or int(cm.group(1)) < 1 or int(cm.group(2)) < 16:
@@ -83,6 +87,12 @@ def grade(serial, recv, report, card, port, closed):
         bad.append("no boot log section")
     elif bootline not in t[bm.end():bm.end() + int(bm.group(1))]:
         bad.append("the boot log does not hold the card's own boot line")
+    fm = FULL_MAC.search(t)
+    if fm:
+        bad.append("a full MAC address is in the report: %s" % fm.group(0))
+    for sn in serials:
+        if sn and sn in t:
+            bad.append("a device serial number is in the report: %s" % sn)
     em = re.search(r"\n== end of report \((\d+) bytes before this line\) ==\n\Z", t)
     if not em:
         bad.append("the report does not end with its end line (cut short?)")
@@ -101,9 +111,9 @@ def load(serial, recv, rdir):
 
 def fixture(card):
     sect, word, bootline = CARD[card]
-    boot = ("[pc] AfriSovera boot\n%s (8139cp) at 00:02.0, MAC 52:54:00:12:34:56, link up\n" % bootline) * 40
+    boot = ("[pc] AfriSovera boot\n%s (8139cp) at 00:02.0, MAC 52:54:00:--:--:--, link up\n" % bootline) * 40
     parts = ["AFRISOVERA FIELD REPORT 1\ncommit: 3a94a94c (2026-11-08T20:00:00+00:00)\n"
-             "build: debug x86_64 UEFI (mansa-pc)\nfrom: 10.0.2.15 mac 52:54:00:12:34:56 (%s)\n"
+             "build: debug x86_64 UEFI (mansa-pc)\nfrom: 10.0.2.15 mac 52:54:00:--:--:-- (%s)\n"
              "to: 10.0.2.2:7700\ncores: 1 (ACPI)   memory: 255 MiB\n" % card]
     for n in SECTIONS:
         parts.append("\n== %s ==\n%s\n" % (n, word + " at 00:02.0" if n == sect else n + " output"))
@@ -112,7 +122,7 @@ def fixture(card):
     body = "".join(parts).encode()
     n = len(body)
     report = body + b"\n== end of report (%d bytes before this line) ==\n" % n
-    serial = ("afrisovera> report\nreport: send this PC's details to your main PC over the home network.\n"
+    serial = ("afrisovera> report\nreport: give this PC's details to your main PC, one of two ways.\n"
               "afrisovera> report 10.0.2.2:9\n"
               "report: NOT SENT: 10.0.2.2 is there but nothing listens on port 9; start tools/report-receiver.py first\n"
               "afrisovera> report 10.0.2.2:5000\n"
@@ -129,23 +139,30 @@ def selftest():
 
     def arm(name, expect, serial, recv, report, card="e1000"):
         nonlocal ok, bad
-        got = "green" if not grade(serial, recv, report, card, 5000, 9) else "red"
+        got = "green" if not grade(serial, recv, report, card, 5000, 9, ("AFRSER0001",)) else "red"
         if got == expect:
             ok += 1
             print("    arm %s: %s (expected %s) OK" % (name, got, expect))
         else:
             bad += 1
             print("    arm %s: %s but expected %s  <-- GRADER BUG" % (name, got, expect))
-            for f in grade(serial, recv, report, card, 5000, 9):
+            for f in grade(serial, recv, report, card, 5000, 9, ("AFRSER0001",)):
                 print("      " + f)
 
     s, r, rep = fixture("e1000")
     arm("green-e1000", "green", s, r, rep)
     s2, r2, rep2 = fixture("rtl")
     arm("green-rtl", "green", s2, r2, rep2, "rtl")
+    s3, r3, rep3 = fixture("usb-ecm")
+    arm("green-usb-ecm", "green", s3, r3, rep3, "usb-ecm")
+    arm("full-mac", "red", s, r, rep.replace(b"52:54:00:--:--:--, link up", b"52:54:00:12:34:56, link up", 1))
+    arm("full-mac-dashes", "red", s, r, rep.replace(b"52:54:00:--:--:--, link up", b"52-54-00-12-34-56, link up", 1))
+    arm("serial-leak", "red", s, r, rep.replace(b"lsnvme output", b"lsnvme serial AFRSER0001", 1))
+    arm("old-usage", "red", s.replace("give this PC's details to your main PC, one of two ways.",
+        "send this PC's details to your main PC over the home network."), r, rep)
     arm("crlf-serial", "green", s.replace("\n", "\r\n"), r, rep)
     arm("wrong-card", "red", s, r, rep, "rtl")
-    arm("no-usage", "red", s.replace("report: send this PC", "x"), r, rep)
+    arm("no-usage", "red", s.replace("report: give this PC", "x"), r, rep)
     arm("not-refused", "red", s.replace("NOT SENT", "SENT"), r, rep)
     arm("closed-silent", "green", s.replace("is there but nothing listens on port 9; start tools/report-receiver.py first",
         "never answered; its firewall may block Python (allow it on private networks)"), r, rep)
@@ -165,15 +182,16 @@ def selftest():
     arm("few-segments", "red", s.replace(" in %d segments" % (len(rep) // 512 + 1), " in 3 segments"), r, rep)
     arm("empty", "red", "", "", None)
     print("  grader selftest: %d ok / %d FAIL" % (ok, bad))
-    return bad == 0 and ok == 20
+    return bad == 0 and ok == 25
 
 
 def main():
     if sys.argv[1:] == ["--selftest"]:
         return 0 if selftest() else 1
     serial, recv, rdir, card, port, closed = sys.argv[1:7]
+    serials = tuple(x for x in (sys.argv[7] if len(sys.argv) > 7 else "").split(",") if x)
     s, r, rep = load(serial, recv, rdir)
-    fails = grade(s, r, rep, card, int(port), int(closed))
+    fails = grade(s, r, rep, card, int(port), int(closed), serials)
     for f in fails:
         print("  FAIL: " + f)
     if rep is not None and not fails:

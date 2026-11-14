@@ -196,6 +196,10 @@ pub fn bring_up() {
         return;
     };
     cpu::send_init_sipi(page, dest);
+    let stuck = cpu::ICR_STUCK.load(Ordering::Relaxed);
+    if stuck != 0 {
+        crate::kprintln!("[pc] SMP: {} start-up IPI(s) were still pending after 10 ms", stuck);
+    }
     let t0 = crate::timer::cycles();
     let hz = crate::timer::hz().max(1);
     while !UP.load(Ordering::Acquire) && (crate::timer::cycles() - t0) < hz / 5 {

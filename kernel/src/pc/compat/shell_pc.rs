@@ -187,6 +187,8 @@ pub fn intercept(line: &str) -> bool {
         "lsnvme" => crate::nvme::list(),
         // reset the NVMe controller by hand (the path a command with no answer takes), then read block 0
         "nvmereset" => crate::nvme::reset_cmd(),
+        // NVMe queue test switches: an odd-block read into a buffer at a page offset (PRP list), or a lost completion
+        "nvmetest" => crate::nvme::test_cmd(_rest),
         // reset a USB controller by hand and find its devices again; `xhcireset fault` tests the automatic path
         "xhcireset" => crate::xhci::reset_cmd(_rest),
         "lsparts" => crate::gpt::list(0),
@@ -206,12 +208,26 @@ pub fn intercept(line: &str) -> bool {
         "wifi" => {
             if _rest.is_empty() {
                 crate::wifi::show()
+            } else if _rest == "selftest" {
+                // the Wi-Fi crypto known-answer tests (W1): published vectors only, nothing sent or changed
+                crate::wifi::selftest()
             } else {
                 crate::wifi::lookup(_rest)
             }
         }
+        // every PCI, USB and ACPI device, each marked driven, class, missing or none needed; or one by its id (reads only)
+        "hwscan" => crate::hwscan::command(_rest),
+        // a CDC-NCM adapter's block counters; `usbnettest ncm`: the NCM block parser's selftest (reads only)
+        "usbnettest" => crate::xhci::ncm_command(_rest),
         // where AfriSovera's boot file and boot entry would go next to Windows (reads only)
         "bootplan" => crate::esp::plan(),
+        // device firmware files: each listed file, there and right or why not; `firmware test`: the loader's cases
+        // (reads only)
+        "firmware" => crate::fwdb::command(_rest),
+        // a USB webcam: `camera` lists it, `camera on|off` (local keyboard or serial only), `camera stats|test`
+        "camera" => crate::uvc::command(_rest),
+        // Bluetooth slice 1: the controller, and a scan the owner types (bt.rs)
+        "bt" => crate::bt::command(_rest),
         // the boot file copied into the EFI partition Windows starts from, on the owner's code (no boot entry yet); and out again
         "bootcopy" => {
             let mut w = _rest.split_whitespace();
@@ -243,6 +259,8 @@ pub fn intercept(line: &str) -> bool {
                 _ => crate::kprintln!("bootnext: type bootnext: it shows what would change and the code; nothing is written without the code"),
             }
         }
+        // the update file update.afu on a USB stick, checked whole: signature, machine, version, boot file (reads only)
+        "updatecheck" => crate::update::command(),
         "installplan" => match if _rest.is_empty() { Ok(1024) } else { _rest.parse::<u64>() } {
             // where AfriSovera's own partition would go on each internal disk (reads only)
             Ok(m) if (1..=1 << 20).contains(&m) => crate::gpt::list(m),
@@ -293,16 +311,30 @@ pub fn intercept(line: &str) -> bool {
         }
         // this PC's details sent ONCE to the owner's main PC (tools/report-receiver.py); one-way
         "report" => crate::report::command(_rest),
+        // switching off and restarting (14 Nov 2026, the owner's HP): the friendly names too, and the files saved
+        // first, as the power button does
+        "shutdown" | "poweroff" => {
+            crate::acpi::save_files("shutdown");
+            crate::psci::poweroff();
+        }
+        "restart" | "reboot" => {
+            crate::acpi::save_files("restart");
+            crate::psci::reboot();
+        }
         "lse1000" => crate::e1000::list(),
         "lsrtl" => crate::rtl8169::list(),
         "lsusb" if _rest == "late" => crate::xhci::late_check(),
         "lsusb" if _rest == "late0" => crate::xhci::late0_check(),
+        "lsusb" if _rest == "stall0" => crate::xhci::stall0_check(),
+        "lsusb" if _rest == "stallhub" => crate::xhci::stallhub_check(),
         "lsusb" => crate::xhci::list(),
         "lsps2" if _rest == "late" => crate::ps2::late_check(),
         "lsps2" if _rest == "cfg" => crate::ps2::cfg_check(),
         "lsps2" => crate::ps2::list(),
         "accel" => crate::ps2::accel_cmd(_rest),
         "usbaddr" => crate::xhci::addr_cmd(_rest),
+        // the firmware's DSDT, SSDTs and FACP to the boot stick (AML rung C2; never MSDM or any other table)
+        "acpisave" => crate::hwscan::acpi_save(),
         // F7 (HP ENVY field report): `help <word>` / `help <page>` show part of the shared list,
         // plain `help` ends with how to; the shared `help` prints it (helpview.rs filters)
         "help" => {
@@ -379,7 +411,24 @@ pub fn intercept(line: &str) -> bool {
             crate::screen::set_desktop(false);
             return false; // the shared `clear` still runs
         }
+        // ADR 0008 step 1 (PC only, diagnostics): `rng sources` and `rng jitter dump <n>`. Plain `rng` and
+        // `rng secret` still run the shared code.
+        "rng" if _rest == "sources" => crate::rng::cmd_sources(),
+        // F3 step 3: `rng secret <n>` prints ok or refused and the counters, never a byte (bare `rng secret` is shared and prints none).
+        "rng" if _rest.starts_with("secret ") => match _rest[7..].trim().parse::<usize>() {
+            Ok(n) if (1..=64).contains(&n) => crate::rng::cmd_secret(n),
+            _ => crate::kprintln!("rng secret: type rng secret <n>, n from 1 to 64 (e.g. rng secret 32)"),
+        },
+        "rng" if _rest.starts_with("jitter") => {
+            let mut w = _rest.split_whitespace().skip(1);
+            match (w.next(), w.next().map(|s| s.parse::<u64>()), w.next()) {
+                (Some("dump"), Some(Ok(n)), None) if (1..=100_000_000).contains(&n) => crate::rng::cmd_jitter_dump(n),
+                _ => crate::kprintln!("rng jitter: type rng jitter dump <n>, n from 1 to 100000000 (e.g. rng jitter dump 1000000)"),
+            }
+        }
         "cpuinfo" => cpuinfo(),
+        // the battery, AC adapter, lid and embedded controller the firmware describes, read only; `battery selftest`
+        "battery" => crate::battery::cmd(_rest),
         "rtcinfo" => {
             crate::kprintln!("rtcinfo: CMOS RTC (MC146818) @ I/O port 0x70");
             crate::kprintln!("rtcinfo: present {}  status-B 0x{:02x}", crate::cmos::present(), crate::cmos::status_b());

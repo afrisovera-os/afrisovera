@@ -49,6 +49,8 @@ mod sha256;
 #[allow(dead_code)]
 #[path = "../drbg.rs"]
 mod drbg;
+#[path = "../drbg_apt.rs"]
+mod drbg_apt;
 #[allow(dead_code)]
 #[path = "../drbg_kat.rs"]
 mod drbg_kat;
@@ -90,6 +92,10 @@ mod integrity;
 mod nia;
 #[path = "../appget.rs"]
 mod appget;
+#[path = "dnscheck.rs"] // DNS answers believed only from the name server, with our id, port and question (Dira M1b)
+mod dnscheck;
+#[path = "../dira/mod.rs"] // the web browser, milestone M1 (BROWSER_PLAN.md)
+mod dira;
 #[allow(dead_code)]
 #[path = "../store.rs"]
 mod store;
@@ -140,6 +146,7 @@ mod shell_pc;
 #[path = "compat/timer.rs"]
 mod timer;
 // the ARM driver itself; its transport underneath is PCI (virtio.rs -> pc/virtio_pci.rs)
+#[path = "../netparse.rs"] mod netparse; // received-frame readers on slices (gap G1)
 #[path = "../virtio.rs"]
 mod virtio_core;
 // `crate::virtio` = virtio_core, its disk calls widened to the PC's SATA disks (disk.rs)
@@ -160,14 +167,30 @@ mod conback;
 mod helpview;
 mod font_lower;
 mod acpi;
+mod tpm; // F3 step 3: the TPM's RNG as a counted source (TIS only)
+mod tpm_wire;
+mod tpm_tis; // the TIS protocol and its rules, generic over the bus (host-tested: drbg-host/tests/tpm_tis.rs)
 mod gpt;
 mod bootent;
+mod update;
 mod esp;
 mod fwinfo;
 mod wifi;
+// Our own Wi-Fi stack (WIFI_PLAN.md, architect 14 Nov 2026); PC only, so the ARM image does not change.
+#[path = "../wlan/mod.rs"]
+mod wlan;
+mod cdcncm;
+mod uvc;
+mod btparse;
+mod bt;
+mod fwdb;
+mod hwdb;
+mod hwscan;
 mod hda;
 mod sdhci;
 mod report;
+mod aml; // the pure part of the read-only AML subset (fuzz-host target aml_eval)
+mod battery; // battery: the battery, AC adapter, lid and EC the firmware describes (structural AML read, read only)
 
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
@@ -178,6 +201,47 @@ static RUNTIME_SERVICES: AtomicUsize = AtomicUsize::new(0);
 /// The RAM the firmware's memory map reported as usable, in MiB (field item F11): the
 /// machine's real memory, not the kernel's fixed frame pool. Shown by the desktop and `mem`.
 static RAM_MIB: AtomicUsize = AtomicUsize::new(0);
+
+/// Boot steps and the kernel time each took (performance plan, 13 Nov 2026): one boot line, read by the perf
+/// suites (scripts/perf-bench.py), so the slowest step of a PC boot is a measured number, not a guess. Shell-less
+/// mainline only (one core, before the shell), hence the plain statics.
+const NSTEP: usize = 32;
+static mut STEPS: [(&str, u64); NSTEP] = [("", 0); NSTEP];
+static mut NSTEPS: usize = 0;
+static mut STEP_AT: u64 = 0;
+
+/// Close the step that ran since the last mark (or since the clock started) under `name`.
+fn boot_step(name: &'static str) {
+    let now = timer::cycles();
+    // SAFETY: boot mainline on the boot core, before the shell and before any second core runs kernel code.
+    unsafe {
+        if *core::ptr::addr_of!(NSTEPS) < NSTEP {
+            let d = now.wrapping_sub(STEP_AT);
+            (*core::ptr::addr_of_mut!(STEPS))[NSTEPS] = (name, d);
+            NSTEPS += 1;
+        }
+        STEP_AT = now;
+    }
+}
+
+/// `[pc] boot steps (ms): total T; name ms, ...` (steps of 1 ms or more, slowest first).
+fn boot_steps_report() {
+    let hz = timer::hz().max(1);
+    // SAFETY: as boot_step.
+    let (steps, n) = unsafe { (*core::ptr::addr_of!(STEPS), NSTEPS) };
+    let mut v = steps;
+    let v = &mut v[..n];
+    v.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    let total: u64 = v.iter().map(|s| s.1).sum();
+    kprint!("[pc] boot steps (ms): total {}", total * 1000 / hz);
+    for (name, c) in v.iter() {
+        let ms = *c * 1000 / hz;
+        if ms > 0 {
+            kprint!("; {} {}", name, ms);
+        }
+    }
+    kprintln!();
+}
 
 /// The machine's RAM in MiB (the `crate::ram_mib` the shared desktop and `mem` print). On a
 /// PC this is what the firmware reported; 0 until the memory map has been read.
@@ -191,6 +255,12 @@ pub fn runtime_services() -> *const uefi::RuntimeServices {
 
 /// Cores running kernel code (the ARM `cores_online` the shell prints): the PC kernel does
 /// not start the application processors yet.
+/// Cores the machine has, as its firmware lists them (ACPI's MADT), at least the one running (14 Nov: the owner's
+/// HP showed "1 core(s)" for its two).
+pub fn cores_found() -> u32 {
+    (crate::acpi::cores() as u32).max(cores_online())
+}
+
 pub fn cores_online() -> u32 {
     1
 }
@@ -424,6 +494,8 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     // the firmware's Secure Boot state and version, for fwinfo (read only)
     // SAFETY: the system table the firmware passed in, before exit_boot_services.
     unsafe { fwinfo::keep(st) };
+    // which release this is, and whether it trusts a demo update key (AFR-0010)
+    update::boot_line();
     match &scr {
         Some(s) => {
             kprintln!(
@@ -449,6 +521,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     for d in map.entries() {
         n += 1;
         stackinfo::note_region(d.phys_start, d.pages, d.ty);
+        hwscan::note_region(d.phys_start, d.pages, d.ty);
         if uefi::usable_after_exit(d.ty) {
             usable += d.pages * 4096;
             // the highest free page below 1 MiB: where a second core's start-up code goes.
@@ -504,6 +577,8 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     // The TSC's frequency, measured against the PIT now that the firmware no longer uses it;
     // the shell's clock (`uptime`, `sleep`, `bench`) counts from here.
     timer::init();
+    // SAFETY: boot mainline, one core (boot_step).
+    unsafe { STEP_AT = timer::cycles() };
     // The frame pool lives inside the image (see mansa_pc_frame_pool), not in RAM the firmware
     // used: that RAM still holds the page tables CR3 points at until the PC has its own.
     let pool_at = core::ptr::addr_of!(mansa_pc_frame_pool) as usize;
@@ -610,7 +685,13 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     }
 
     // Shared kernel code, the same source files as the ARM kernel.
-    let (a, b, c) = (sha256::self_test(), sha512::self_test(), ed25519::self_test());
+    boot_step("cpu-memory-timer");
+    let a = sha256::self_test();
+    boot_step("sha256-test");
+    let b = sha512::self_test();
+    boot_step("sha512-test");
+    let c = ed25519::self_test();
+    boot_step("ed25519-test");
     let ok = |v: bool| if v { "ok" } else { "FAILED" };
     kprintln!(
         "[pc] shared code: SHA-256 {}, SHA-512 {}, Ed25519 {} (the same files as the ARM kernel)",
@@ -633,6 +714,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     // Ring 3: three tiny programs at the CPU's lowest privilege (see user.rs). One uses the
     // system calls and exits; one tries to read kernel memory; one tries a privileged
     // instruction. The last two must be stopped by the kernel, which carries on.
+    boot_step("heap-test");
     let ring3_ok = if user::init() {
         let calls0 = user::SYSCALLS.load(Ordering::Relaxed);
         let rc = user::run(user::Prog::Hello, 0);
@@ -667,6 +749,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     // Processes (see proc.rs): two programs in separate address spaces that may talk only
     // through capabilities: one may SEND on endpoint 0, the other may RECV. Each also tries
     // what its capabilities do not allow, and must be refused.
+    boot_step("ring3-test");
     let ipc_ok = match (
         proc::spawn(proc::code(proc::Prog::Recv), &[(0, proc::RIGHT_RECV)], false),
         proc::spawn(proc::code(proc::Prog::Send), &[(0, proc::RIGHT_SEND)], false),
@@ -690,6 +773,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     };
 
     // The scheduler: two workers that never give the CPU up; only the timer can switch them.
+    boot_step("ipc-test");
     let sched_ok = match (
         proc::spawn(proc::code(proc::Prog::Worker), &[], true),
         proc::spawn(proc::code(proc::Prog::Worker), &[], true),
@@ -718,6 +802,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     // receiver would hand P0 the wrong value. P4's only capability names an endpoint past
     // the last one: it is left empty, so its RECV is refused. Graded by pc-ipc from the
     // values each prints: P0 0xa1, P1 0xb2.
+    boot_step("sched-test");
     let ep_ok = {
         let spawned = [
             proc::spawn(proc::code(proc::Prog::EpRecv), &[(1, proc::RIGHT_RECV)], false),
@@ -762,6 +847,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     if let Some(sc) = &scr {
         screen::attach(sc.base as u64, sc.w, sc.h, sc.stride, sc.bgr);
     }
+    boot_step("endpoints-test");
     start_shell();
 }
 
@@ -775,6 +861,9 @@ fn start_shell() -> ! {
 }
 
 extern "sysv64" fn shell_on_kernel_stack() -> ! {
+    // F3 step 3: is there a TPM to count? One `[tpm]` line; no TPM table means no MMIO access at all.
+    tpm::init();
+    boot_step("tpm");
     asili::register("16550-uart", asili::Class::Console, board::UART_BASE as u64, true);
     asili::register("fw-cfg", asili::Class::Firmware, board::FWCFG_BASE as u64, qemu::fw_cfg_read(0, &mut [0u8; 4]));
     asili::register("local-apic", asili::Class::Interrupt, 0, true);
@@ -786,19 +875,28 @@ extern "sysv64" fn shell_on_kernel_stack() -> ! {
     screen::present();
     // USB first: a USB Ethernet adapter can be the network (nic.rs)
     xhci::init();
+    boot_step("xhci");
     // virtio devices (PCI on a PC), then DHCP when there is a network, as the ARM boot does
     virtio::init();
+    boot_step("virtio");
     nvme::init();
+    boot_step("nvme");
     ahci::init();
+    boot_step("ahci");
     // a SATA disk whose firmware is set to IDE (compatibility) mode, or an old IDE disk
     ide::init();
+    boot_step("ide");
     // an SD card in the PC's card reader (SDHCI)
     sdhci::init();
+    boot_step("sdhci");
     ps2::init();
+    boot_step("ps2");
     // Intel HD Audio: the PC's own sound chip (used when there is no virtio-sound device)
     hda::init();
+    boot_step("hda");
     // the PC's power button: a press saves the files and switches off (ACPI fixed feature)
     acpi::power_button_init();
+    boot_step("acpi");
     // the PC's own drivers in the shared device registry (the Tonga device manager, `devices`)
     if nvme::present() {
         asili::register("nvme", asili::Class::Storage, 0, true);
@@ -861,12 +959,12 @@ extern "sysv64" fn shell_on_kernel_stack() -> ! {
         }
     }
     // a second core, when the machine has one (the ARM boot's bring_up_secondary)
+    boot_step("devices-dhcp");
     smp::bring_up();
+    boot_step("smp");
     screen::pat_check(); // D1c: WC only when every running core's PAT has it
     vfs::seed();
-    for (name, bytes) in nia::BUNDLED {
-        vfs::write(name, bytes()); // the bundled apps, from the one table the manifest also uses
-    }
+    nia::seed_bundled(); // the bundled apps the VFS can hold, as files (A7: bigger ones stay built in)
     vfs::write("sample.webapp", web::sample());
     vfs::write("sample.apkmeta", daraja::sample());
     asili::register("ramfs", asili::Class::Storage, 0, true);
@@ -880,6 +978,9 @@ extern "sysv64" fn shell_on_kernel_stack() -> ! {
     for (name, bytes) in nia::BUNDLED {
         integrity::record(name, bytes());
     }
+    nia::check_bundled(); // every bundled app is in the manifest (A7)
+    boot_step("files-apps");
+    boot_steps_report();
     kprintln!(
         "[pc] starting the AfriSh shell on COM1 (TSC {} MHz, clock {})",
         timer::hz() / 1_000_000,

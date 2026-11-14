@@ -60,10 +60,7 @@ const MAX: usize = 16;
 static mut NAMES: [&str; MAX] = [""; MAX];
 static mut HASHES: [[u8; 32]; MAX] = [[0; 32]; MAX];
 static mut COUNT: usize = 0;
-
-// Scratch used only to demonstrate tamper detection (hash a modified copy).
-const TCAP: usize = 8192;
-static mut TBUF: [u8; TCAP] = [0; TCAP];
+static mut REFUSED: usize = 0;
 
 /// Record `name`'s expected digest (its bytes as installed).
 pub fn record(name: &'static str, data: &[u8]) {
@@ -73,8 +70,18 @@ pub fn record(name: &'static str, data: &[u8]) {
             NAMES[COUNT] = name;
             HASHES[COUNT] = sha256::digest(data);
             COUNT += 1;
+        } else {
+            // Never a silent drop (the architect's A7 change 3): the app would run unverified.
+            REFUSED += 1;
+            crate::kprintln!("[integrity] manifest full ({} entries): {} not recorded", MAX, name);
         }
     }
+}
+
+/// How many `record` calls the full manifest refused.
+pub fn refused() -> usize {
+    // SAFETY: a scalar read of data written at boot.
+    unsafe { REFUSED }
 }
 
 /// Result of an integrity check at app-launch time.
@@ -115,16 +122,11 @@ pub fn expected(name: &str) -> Option<[u8; 32]> {
 /// Digest of a *tampered* copy of `data` (first byte flipped) — for the `verify
 /// <app> tamper` demo, showing the manifest catches a single changed byte.
 pub fn hash_tampered(data: &[u8]) -> [u8; 32] {
-    // SAFETY: single-threaded; TBUF accessed via raw pointer to avoid a &mut static.
-    unsafe {
-        let p = core::ptr::addr_of_mut!(TBUF) as *mut u8;
-        let n = data.len().min(TCAP);
-        for i in 0..n {
-            *p.add(i) = data[i];
-        }
-        if n > 0 {
-            *p.add(0) ^= 0xff; // flip one byte
-        }
-        sha256::digest(core::slice::from_raw_parts(p, n))
+    // Streamed, so an app of any size is hashed whole (A7: a bundled app may be over 16 KiB) with no copy.
+    let mut h = sha256::Sha256::new();
+    if let Some((&first, rest)) = data.split_first() {
+        h.update(&[first ^ 0xff]); // flip one byte
+        h.update(rest);
     }
+    h.finish()
 }

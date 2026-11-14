@@ -43,6 +43,9 @@ Bad / accepted costs:
   be copied into the platform; Linux is used as a *reference* for hardware behaviour, never copied.
 - Every public file needs a clean provenance; the release engineer's public copy must pass a secrets and
   provenance audit before each push.
+- Fonts (data, not code) may also be under the SIL Open Font License 1.1, and keep that licence in the tree:
+  the desk's outline font from Noto Sans (13 Nov 2026, the architect; docs/policy/THIRD_PARTY.md, Fonts). OFL-1.1
+  is never allowed for code.
 
 ## Evidence in the tree
 

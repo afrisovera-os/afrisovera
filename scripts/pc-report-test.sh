@@ -2,9 +2,11 @@
 # The field report (8 Nov 2026, docs/design/field-report.md): `report <ip>[:port]` sends this
 # PC's details ONCE to tools/report-receiver.py on the owner's main PC.
 #
-# Two boots of the PC kernel (q35 + UEFI), each with ONLY a real-card model on user-mode
-# networking: an Intel 82574L (`e1000e`, pc/e1000.rs) and a Realtek RTL8139C+ (`rtl8139`,
-# pc/rtl8169.rs). In each, the REAL receiver (tools/report-receiver.py --once) listens on the
+# Three boots of the PC kernel (q35 + UEFI), each with ONLY one network card on user-mode
+# networking: an Intel 82574L (`e1000e`, pc/e1000.rs), a Realtek RTL8139C+ (`rtl8139`,
+# pc/rtl8169.rs) and a USB Ethernet adapter (`usb-net` on the xHCI, CDC-ECM; report home, 14 Nov
+# 2026). Each boot also has an NVMe disk with a known serial number: neither it nor any full MAC
+# address may appear in the report. In each, the REAL receiver (tools/report-receiver.py --once) listens on the
 # host, and the guest types:
 #   report                     -> the plain-words usage
 #   report 10.0.2.2:<closed>   -> refused in plain words (nothing listens there)
@@ -48,10 +50,13 @@ closed_port() {
 
 fail=0
 W="$(mktemp -d "$T/pc-report.XXXXXX")"
-for card in e1000 rtl; do
+SERIAL=AFRSER0001
+: > "$W/nv.img" && truncate -s 1M "$W/nv.img"
+for card in e1000 rtl usb-ecm; do
     case "$card" in
-        e1000) DEV=e1000e ;;
-        rtl) DEV=rtl8139 ;;
+        e1000) DEV=(-device e1000e,netdev=n0) ;;
+        rtl) DEV=(-device rtl8139,netdev=n0) ;;
+        usb-ecm) DEV=(-device qemu-xhci,id=xhci -device usb-net,netdev=n0,bus=xhci.0) ;;
     esac
     D="$W/$card"
     mkdir -p "$D/reports"
@@ -69,7 +74,8 @@ for card in e1000 rtl; do
     echo "  [$card] receiver on 127.0.0.1:$PORT (10.0.2.2:$PORT from the guest); closed port $CLOSED"
 
     qemu-system-aarch64 -M virt -m 256M -display none \
-        -netdev user,id=n0 -device "$DEV",netdev=n0 \
+        -netdev user,id=n0 "${DEV[@]}" \
+        -drive "if=none,id=nv,format=raw,file=$W/nv.img" -device "nvme,serial=$SERIAL,drive=nv" \
         -serial "tcp:127.0.0.1:5146,server,nowait" -qmp "tcp:127.0.0.1:5147,server,nowait" &
     QPID=$!
     AFRISH_BOOT_GRACE="${AFRISH_BOOT_GRACE:-10}" python3 scripts/shell-demo.py 5146 5147 "$D/shot.png" \
@@ -82,7 +88,7 @@ for card in e1000 rtl; do
     tr -d '\r' < "$D/serial.log" | grep -aE '^\[report\]|^report: (NOT|send)|DHCP: IP|PANIC|EXCEPTION' | sed 's/^/  | /'
     sed 's/^/  receiver| /' "$D/receiver.log" | grep -v '^  receiver|     report '
     echo "  --- grading ($card) ---"
-    if ! python3 scripts/lib/report-grade.py "$D/serial.log" "$D/receiver.log" "$D/reports" "$card" "$PORT" "$CLOSED"; then
+    if ! python3 scripts/lib/report-grade.py "$D/serial.log" "$D/receiver.log" "$D/reports" "$card" "$PORT" "$CLOSED" "$SERIAL"; then
         fail=1
     fi
 done

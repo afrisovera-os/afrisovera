@@ -136,6 +136,17 @@ const RESET_COLD: u32 = 0;
 // become undefined behaviour here; the callers then fall back to the hardware's own resets.
 type ResetSystemFn = extern "efiapi" fn(u32, Status, usize, *const u8);
 
+/// The firmware's ResetSystem, which comes back if the firmware does not act (the caller then uses ACPI and the
+/// chipset): `off` true for EfiResetShutdown, else EfiResetCold.
+pub fn try_reset(rt: *const RuntimeServices, off: bool) {
+    if rt.is_null() {
+        return;
+    }
+    // SAFETY: as `shutdown`.
+    let f: ResetSystemFn = unsafe { core::mem::transmute((*rt).f[RESET_SYSTEM]) };
+    f(if off { RESET_SHUTDOWN } else { RESET_COLD }, SUCCESS, 0, core::ptr::null());
+}
+
 /// Power the machine off through the firmware (EfiResetShutdown).
 pub fn shutdown(rt: *const RuntimeServices) -> ! {
     // SAFETY: slot RESET_SYSTEM has this signature per the UEFI spec; `rt` is the
@@ -149,9 +160,8 @@ pub fn shutdown(rt: *const RuntimeServices) -> ! {
 
 /// Restart the machine through the firmware (EfiResetCold): the PC shell's `reboot`.
 pub fn reset_cold(rt: *const RuntimeServices) -> ! {
-    // SAFETY: as `shutdown`.
-    let f: ResetSystemFn = unsafe { core::mem::transmute((*rt).f[RESET_SYSTEM]) };
-    f(RESET_COLD, SUCCESS, 0, core::ptr::null());
+    // a null table: the firmware is skipped (psci.rs has tried it already)
+    try_reset(rt, false);
     // the firmware did not reset: the chipset's reset control (0xCF9: full reset), then
     // the keyboard controller's reset line, the two ways every PC can be restarted
     // SAFETY: port writes whose only effect is a machine reset.
@@ -241,6 +251,73 @@ type HandleProtocolFn = extern "efiapi" fn(Handle, *const Guid, *mut *mut core::
 
 const LOADED_IMAGE_GUID: Guid = Guid(0x5b1b31a1, 0x9562, 0x11d2, [0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b]);
 const SIMPLE_FS_GUID: Guid = Guid(0x964e5b22, 0x6459, 0x11d2, [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b]);
+const DEVICE_PATH_GUID: Guid = Guid(0x09576e91, 0x6d3f, 0x11d2, [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b]);
+
+/// What AfriSovera was started from, by the boot device's device path (report home, 13 Nov 2026): `report save`
+/// writes only to a USB stick it started from, never to an internal disk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Medium {
+    /// The device path was not read.
+    Unknown,
+    /// A USB mass-storage device (a USB node in the path).
+    Usb,
+    /// Anything else: the name of the first messaging node ("SATA", "NVMe", "eMMC" ...).
+    Other(&'static str),
+}
+
+static mut BOOT_MEDIUM: Medium = Medium::Unknown;
+/// The boot file's path on its volume (ASCII, '?' for others), as the firmware loaded it.
+static mut OWN_PATH: ([u8; 128], usize) = ([0; 128], 0);
+
+/// What the kernel was started from.
+pub fn boot_medium() -> Medium {
+    // SAFETY: written once before exit_boot_services.
+    unsafe { BOOT_MEDIUM }
+}
+
+/// The boot file's path on the boot volume (for example \EFI\BOOT\BOOTX64.EFI); empty if not kept.
+pub fn own_path() -> &'static str {
+    // SAFETY: written once before exit_boot_services.
+    unsafe {
+        let p = &*core::ptr::addr_of!(OWN_PATH);
+        core::str::from_utf8(&p.0[..p.1]).unwrap_or("")
+    }
+}
+
+/// The medium a device path names: USB if any node is a USB one (Messaging 3: USB 5, USB class 15, USB WWID 16),
+/// else the first messaging node's kind. Walks at most 32 nodes of at most `max` bytes in all.
+/// SAFETY: `p` points at a device path the firmware gave, readable for `max` bytes or up to its end node.
+unsafe fn medium_of(mut p: *const u8, max: usize) -> Medium {
+    let mut other: Option<&'static str> = None;
+    let mut walked = 0usize;
+    for _ in 0..32 {
+        let (ty, sub) = (*p, *p.add(1));
+        let len = u16::from_le_bytes([*p.add(2), *p.add(3)]) as usize;
+        if ty == 0x7F || len < 4 || walked + len > max {
+            break;
+        }
+        if ty == 3 {
+            match sub {
+                5 | 15 | 16 => return Medium::Usb,
+                _ if other.is_none() => {
+                    other = Some(match sub {
+                        1 => "ATAPI or IDE",
+                        2 => "SCSI",
+                        18 => "SATA",
+                        23 => "NVMe",
+                        26 => "SD card",
+                        29 => "eMMC",
+                        _ => "an internal device",
+                    })
+                }
+                _ => {}
+            }
+        }
+        walked += len;
+        p = p.add(len);
+    }
+    Medium::Other(other.unwrap_or("a device that is not USB"))
+}
 
 #[repr(C)]
 struct LoadedImage {
@@ -297,6 +374,12 @@ impl Uefi {
                 return;
             }
             let li = &*(li as *const LoadedImage);
+            if !li.device.is_null() {
+                let mut dp: *mut core::ffi::c_void = core::ptr::null_mut();
+                if hp(li.device, &DEVICE_PATH_GUID, &mut dp) == SUCCESS && !dp.is_null() {
+                    BOOT_MEDIUM = medium_of(dp as *const u8, 1024);
+                }
+            }
             let mut fs: *mut core::ffi::c_void = core::ptr::null_mut();
             if li.device.is_null() || hp(li.device, &SIMPLE_FS_GUID, &mut fs) != SUCCESS || fs.is_null() {
                 crate::kprintln!("[pc] own boot file: the boot device has no file system the firmware reads; installdisk will not be possible");
@@ -386,6 +469,14 @@ impl Uefi {
                 return;
             }
             OWN = (at, got);
+            {
+                let op = &mut *core::ptr::addr_of_mut!(OWN_PATH);
+                let k = n.min(op.0.len());
+                for i in 0..k {
+                    op.0[i] = if path[i] < 0x80 { path[i] as u8 } else { b'?' };
+                }
+                op.1 = k;
+            }
             let mut shown = [0u8; 64];
             let k = n.min(shown.len());
             for i in 0..k {

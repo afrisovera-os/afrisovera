@@ -17,7 +17,7 @@ reopen it).
 | [0004](0004-capability-security.md) | Capability security, no ambient authority | Accepted (partly realised) | 2026-08-05 |
 | [0005](0005-apache-2-license.md) | Apache-2.0 for the platform code | Accepted | 2026-08-05, public copy 2026-11-08 |
 | [0006](0006-pc-track.md) | x86-64 PCs and laptops are a full target | Accepted | 2026-11-03 |
-| 0007 | Kernel crates.io dependencies for crypto only (cited in the tree; file not yet written) | Accepted | 2026-11-10 |
+| [0007](0007-crypto-crate-dependencies.md) | Third-party crates only for cryptographic primitives, pinned, vendored and audited | Accepted | 2026-11-10, written 2026-11-13 |
 | [0008](0008-pc-entropy-without-rdrand.md) | Counted entropy on PCs without RDSEED or RDRAND | Proposed (step 1 accepted) | 2026-11-10 |
 
 Status words: **Proposed**, **Accepted**, **Superseded by NNNN**, **Deprecated**. "Partly realised" means

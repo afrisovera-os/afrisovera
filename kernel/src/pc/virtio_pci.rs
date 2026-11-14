@@ -30,7 +30,6 @@ use super::{R_QUEUE_NUM_MAX, R_QUEUE_READY, R_QUEUE_SEL, R_STATUS, R_VERSION};
 use super::{DEV_BLK, DEV_NET, DEV_RNG, DEV_SOUND};
 use core::ptr::{read_volatile, write_volatile};
 
-const VENDOR_VIRTIO: u16 = 0x1AF4;
 const MAX_DEVS: usize = 8;
 
 // virtio_pci_common_cfg field offsets (VIRTIO 1.x, 4.1.4.3)
@@ -92,7 +91,8 @@ fn bar_addr(b: u8, d: u8, f: u8, bar: u8) -> u64 {
 /// Look at one PCI function; if it is a modern-capable virtio device, record it.
 fn probe(b: u8, d: u8, f: u8) {
     let vd = cfg32(b, d, f, 0);
-    if vd as u16 != VENDOR_VIRTIO {
+    // Asili v0 BINDS: the table is crate::hwdb::VIRTIO_BINDS (this file is a private module of the shared virtio.rs)
+    if crate::hwdb::pci_part(crate::hwdb::VIRTIO_BINDS, b, d, f, vd).is_none() {
         return;
     }
     let pid = (vd >> 16) as u16;
@@ -153,6 +153,7 @@ fn probe(b: u8, d: u8, f: u8) {
         let key = if devcfg != 0 { devcfg } else { common } - R_CONFIG;
         DEVS[NDEVS] = Dev { base: key, id, common, notify, mult, bdf: (b, d, f) };
         NDEVS += 1;
+        crate::hwdb::virtio_took(b, d, f);
     }
 }
 
@@ -431,10 +432,15 @@ pub(super) unsafe fn w(base: u64, off: u64, v: u32) {
         R_STATUS => {
             wr8(c + C_STATUS, v);
             if v == 0 {
-                // a reset completes when the status reads back 0 (4.1.4.3.2)
-                let mut n = 0;
-                while rd8(c + C_STATUS) != 0 && n < 1_000_000 {
-                    n += 1;
+                // a reset completes when the status reads back 0 (4.1.4.3.2). Waited by the
+                // clock (1 s), not by a count of polls (before 12 Nov: a million reads, so how
+                // long a device had depended on the CPU and on how slow its register reads were)
+                let (t0, hz) = (crate::timer::cycles(), crate::timer::hz().max(1));
+                while rd8(c + C_STATUS) != 0 {
+                    if crate::timer::cycles().wrapping_sub(t0) > hz {
+                        crate::kprintln!("[virtio] {} did not finish its reset within 1 s", dev_name(d.id));
+                        break;
+                    }
                     core::hint::spin_loop();
                 }
             }

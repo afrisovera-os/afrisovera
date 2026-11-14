@@ -11,6 +11,9 @@ Steps (in order):  type:<text>   keys on the USB keyboard, then Enter
                    down / up     left mouse button
                    wheel:up / wheel:down  roll the mouse wheel one notch (pc-usbwheel)
                    hold:<key>,<ms>  hold one key down that long (key repeat)
+                   burst:<key>,<n>,<ms>  n key-down events <ms> apart, then one key-up: what a keyboard's own
+                                 repeat sends while a key is held (pc-power: the PS/2 repeat filter)
+                   off           the guest switches itself off: from here the serial capture only ends
                    keys:<qcode>+<qcode>  press one chord, e.g. keys:alt+tab (desktop shortcuts)
                    plug:<driver>,<id>[,<xhci id>[,<port>]] / unplug:<id>  hot-plug a USB device (QMP device_add/del)
                    wait:<s>      let the guest catch up
@@ -136,6 +139,18 @@ def main():
         elif kind == "unplug":  # unplug:<id>
             qmp("device_del", {"id": arg})
             drain(3)
+        elif kind == "burst":
+            key, n, ms = arg.split(",")
+            ev = lambda down: {"type": "key", "data": {"down": down, "key": {"type": "qcode", "data": key}}}
+            for _ in range(int(n)):
+                qmp("input-send-event", {"events": [ev(True)]})
+                time.sleep(int(ms) / 1000)
+            qmp("input-send-event", {"events": [ev(False)]})
+            drain(0.5)
+        elif kind == "off":
+            drain(30)
+            open(out, "wb").write(bytes(cap))
+            return
         elif kind == "wait":
             drain(float(arg))
         else:

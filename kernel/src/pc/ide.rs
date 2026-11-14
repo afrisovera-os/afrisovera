@@ -591,9 +591,9 @@ pub fn init() {
     // every IDE controller (class 01:01, any programming interface), at most two
     // SAFETY: init runs once at boot, single core, before any reader.
     unsafe {
-        pci::find_by(8, |b, d, f, _| {
+        pci::find_by(8, |b, d, f, id| {
             let c = pci::cfg_read32(b, d, f, 8);
-            if c >> 16 == 0x0101 && N_CTRL < 2 {
+            if crate::hwdb::pci_part(BINDS, b, d, f, id).is_some() && N_CTRL < 2 {
                 CTRLS[N_CTRL] = (b, d, f, (c >> 8) as u8);
                 N_CTRL += 1;
             }
@@ -657,6 +657,21 @@ pub fn claim() -> bool {
 pub fn present() -> bool {
     // SAFETY: scalar read.
     unsafe { (*addr_of!(DISK)).is_some() }
+}
+
+/// Asili v0 BINDS (pc/hwdb.rs): `init` decides from this table.
+pub(crate) const BINDS: &[crate::hwdb::Part] = &[crate::hwdb::pci_class(0x01_01_00, 0xFF_FF_00, "IDE controller")];
+
+/// The IDE controllers this driver took (at most two), for `hwscan`.
+pub fn controllers() -> ([(u8, u8, u8); 2], usize) {
+    // SAFETY: plain copies of boot-time state.
+    unsafe {
+        let mut out = [(0, 0, 0); 2];
+        for (o, c) in out.iter_mut().zip((*addr_of!(CTRLS)).iter()) {
+            *o = (c.0, c.1, c.2);
+        }
+        (out, N_CTRL)
+    }
 }
 
 pub fn capacity() -> u64 {

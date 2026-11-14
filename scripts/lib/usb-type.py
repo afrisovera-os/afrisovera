@@ -77,7 +77,14 @@ def main():
         if text.startswith("@wait "):  # "@wait N": type nothing, read the console for N seconds
             drain(float(text.split()[1]))
             continue
-        for ch in text + "\n":
+        if text.startswith("@key "):  # "@key QCODE": press one key (caps_lock, say), no Enter
+            key(text.split()[1])
+            drain(0.5)
+            continue
+        end = "\n"
+        if text.startswith("@raw "):  # "@raw TEXT": type TEXT with no Enter after it
+            text, end = text[5:], ""
+        for ch in text + end:
             if ch in SHIFTED:
                 key("shift", SHIFTED[ch])
             elif ch.isalpha() and ch.isupper():
@@ -85,7 +92,7 @@ def main():
             else:
                 key(QCODE.get(ch, ch))
             drain(0.15)
-        drain(4)
+        drain(4 if end else 0.3)
     drain(3)
     shot = os.environ.get("USB_TYPE_SHOT")  # optional: a screenshot of the guest's screen at the end
     if shot:

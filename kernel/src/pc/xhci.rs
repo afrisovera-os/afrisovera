@@ -78,7 +78,7 @@ const NCTL: usize = 4;
 static mut CMD: [Ring<NCMD>; NCTL] = [const { Ring([TRB0; NCMD]) }; NCTL];
 static mut EVT: [Ring<NEV>; NCTL] = [const { Ring([TRB0; NEV]) }; NCTL];
 /// Devices a slot is kept for: one keyboard, one mouse.
-const NDEV: usize = 7; // a keyboard, a mouse, a USB Ethernet adapter, a hub, a USB stick, a headset, a serial cable
+const NDEV: usize = 9; // a keyboard, a mouse, a USB Ethernet adapter, a hub, a USB stick, a headset, a serial cable, a camera, Bluetooth
 static mut EP0: [Ring<NXFER>; NDEV] = [const { Ring([TRB0; NXFER]) }; NDEV];
 static mut EPIN: [Ring<NXFER>; NDEV] = [const { Ring([TRB0; NXFER]) }; NDEV];
 static mut ERST: [Erst; NCTL] = [const { Erst([0; 2]) }; NCTL];
@@ -170,6 +170,8 @@ const KIND_MSC: u8 = 5;
 const KIND_TABLET: u8 = 6;
 const KIND_AUDIO: u8 = 7;
 const KIND_SERIAL: u8 = 8;
+const KIND_CAM: u8 = 9;
+const KIND_BT: u8 = 10;
 
 // --- an absolute pointer: a USB touchscreen, graphics tablet or a remote console's (KVM/BMC)
 // mouse. Not a boot device, so its reports are laid out by its HID report descriptor
@@ -418,11 +420,42 @@ static mut MSC_STALE: u64 = 0; // transfer events for an older TRB, set aside by
 static mut CTL_STALE: u64 = 0; // endpoint 0 events for an older request, set aside by wait_control
 static mut CTL_TOOK: u64 = 0; // the TRB whose event ended the last control transfer (lsusb late0)
 static mut CTL_WANT: u64 = 0; // the status TRB of the last control transfer queued
+static mut CTL_RESETS: u64 = 0; // endpoint 0 found halted after a failed request and reset
+static mut CTL_QUIET: bool = false; // lsusb stall0: its refused request is not reported
 static mut MSC_TAG: u32 = 1;
 static mut MSC_BLOCKS: u64 = 0;
 static mut MSC_BS: u32 = 512;
 static mut MSC_USABLE: bool = false;
+/// The stick answers sector reads and writes (its block size is one we use, block 0 reads, and it needs no 16-byte
+/// commands): esp.rs may read and write its FAT32 (the boot stick: firmware files, `report save`). MSC_USABLE is
+/// the narrower "holds the VFS or is blank" (14 Nov 2026: a FAT32 boot stick is never MSC_USABLE, so the FAT
+/// code needs this one).
+static mut MSC_RAW: bool = false;
 static mut MSC_NAME: [u8; 24] = [b' '; 24];
+/// Room for 8 KiB DMA buffers that each start on an 8 KiB line, so none crosses a 64 KiB line (one TRB each,
+/// xHCI 4.11.7.1). `align(8192)` is not enough: the UEFI loader puts the image only on a 4 KiB line, so a buffer
+/// aligned to 8 KiB when linked can sit 4 KiB off it when run (13 Nov 2026: with the fonts merge every such
+/// buffer moved 4 KiB off, and the debug build's alignment check stopped the kernel at the camera's). The room is
+/// 4 KiB longer than its buffers; they start at its first 8 KiB line (`at8k`). Never read as a typed reference.
+#[repr(C, align(4096))]
+struct Room8k<const N: usize>([u8; N]);
+/// The bytes of a room for `n` buffers of 8 KiB.
+const fn room8k(n: usize) -> usize {
+    n * 8192 + 4096
+}
+/// Buffer `i` of the room at `p`: on an 8 KiB line, inside the room.
+fn at8k(p: *const u8, i: usize) -> *mut u8 {
+    let a = p as usize;
+    (((a + 0x1FFF) & !0x1FFF) + i * 8192) as *mut u8
+}
+/// The stick's read-ahead and write-behind buffers (MSC_RA_BYTES each).
+unsafe fn msc_ra() -> *mut u8 {
+    at8k(addr_of!(MSC_RA) as *const u8, 0)
+}
+unsafe fn msc_wb() -> *mut u8 {
+    at8k(addr_of!(MSC_WB) as *const u8, 0)
+}
+
 // Multi-block commands (9 Nov 2026): one READ(10) or WRITE(10) of up to 8 KiB (16 sectors of
 // 512 B) instead of one command per device block. Reads: the blocks of the last such read are
 // kept from MSC_RA_AT (MSC_RA_N valid) and the next reads served from them. Writes: the VFS
@@ -431,12 +464,10 @@ static mut MSC_NAME: [u8; 24] = [b' '; 24];
 // sectors changed in place) and sent when it ends (its last sector, a gap, 8 KiB) or before
 // any read. Each way is checked once against one block at a time before it is trusted.
 const MSC_RA_BYTES: usize = 8192;
-#[repr(C, align(8192))]
-struct Ahead([u8; MSC_RA_BYTES]);
-static mut MSC_RA: Ahead = Ahead([0; MSC_RA_BYTES]);
+static mut MSC_RA: Room8k<{ room8k(1) }> = Room8k([0; room8k(1)]);
 static mut MSC_RA_AT: u64 = 0;
 static mut MSC_RA_N: u32 = 0;
-static mut MSC_WB: Ahead = Ahead([0; MSC_RA_BYTES]);
+static mut MSC_WB: Room8k<{ room8k(1) }> = Room8k([0; room8k(1)]);
 static mut MSC_WB_AT: u64 = 0;
 static mut MSC_WB_N: u32 = 0;
 /// 0 = not checked, 1 = on, 2 = off; reads and writes apart.
@@ -505,6 +536,55 @@ unsafe fn note_other() {
         NOTHERS = n + 1;
     }
 }
+/// The devices in use now, for `hwscan`: (vendor, product, what this driver does with it), and how many.
+pub(crate) fn used() -> ([(u16, u16, &'static str); NDEV], usize) {
+    let mut out = [(0, 0, ""); NDEV];
+    let mut n = 0;
+    // SAFETY: single core, shell context; plain copies of the device table.
+    unsafe {
+        for dv in (*addr_of!(DEVS)).iter() {
+            if dv.slot == 0 {
+                continue;
+            }
+            let what = match dv.kind {
+                KIND_KBD => "keyboard (usb-keyboard)",
+                KIND_MOUSE => "mouse (usb-mouse)",
+                KIND_NET => "network adapter (usb-ethernet)",
+                KIND_HUB => "hub (the USB host driver)",
+                KIND_MSC => "storage (usb-storage)",
+                KIND_TABLET => "touchscreen or absolute pointer (usb-tablet)",
+                KIND_AUDIO => "headset or speaker (usb-audio)",
+                KIND_SERIAL => "serial cable (usb-serial)",
+                KIND_CAM => "camera (usb-video)",
+                KIND_BT => "Bluetooth controller (bt)",
+                _ => continue, // being set up, or not used
+            };
+            out[n] = (dv.vid, dv.pid, what);
+            n += 1;
+        }
+    }
+    (out, n)
+}
+
+/// The controllers this driver runs, for `hwscan`.
+pub(crate) fn controllers() -> ([(u8, u8, u8); NCTL], usize) {
+    let mut out = [(0, 0, 0); NCTL];
+    // SAFETY: single core, shell context; `list` reads the controllers the same way.
+    unsafe {
+        if OP == 0 {
+            return (out, 0);
+        }
+        let Some(home) = on(CUR) else { return (out, 0) };
+        let n = NRUN.max(1).min(NCTL);
+        for (c, o) in out.iter_mut().enumerate().take(n) {
+            select(c);
+            *o = *addr_of!(PCI_AT);
+        }
+        select(home);
+        (out, n)
+    }
+}
+
 /// (a USB controller was set up, the devices it found and does not use, how many).
 pub(crate) fn others() -> (bool, [(u16, u16, u8, u8); 8], usize) {
     // SAFETY: single core, shell context; plain copies of boot/hot-plug bookkeeping.
@@ -512,7 +592,7 @@ pub(crate) fn others() -> (bool, [(u16, u16, u8, u8); 8], usize) {
 }
 static mut HUB_PORTS: u32 = 0;
 
-// --- USB Ethernet (CDC-ECM or RNDIS): one adapter, bulk IN and OUT ---
+// --- USB Ethernet (CDC-NCM, CDC-ECM or RNDIS): one adapter, bulk IN and OUT ---
 const NRXB: usize = 4; // receive transfers kept queued on the bulk-IN ring
 const NTXB: usize = 8; // transmit buffers, used round robin
 const NRXQ: usize = 16; // received frames waiting for the network stack
@@ -541,6 +621,34 @@ static mut NET_RXDROP: u64 = 0;
 static mut NET_RNDIS: bool = false; // RNDIS (a phone's USB tethering): each frame in a 44-byte PACKET_MSG
 static mut NET_MPSO: u32 = 64; // the bulk-OUT packet size (an RNDIS message never ends on a multiple of it)
 const RNDIS_HDR: usize = 44;
+/// CDC-NCM (13 Nov 2026): the received blocks can each carry many frames, so NCM has its own receive buffers,
+/// 8 KiB each (up to 5 full-size frames per block). A buffer's address is its DMA address (identity mapped, as
+/// every xHCI buffer here); each starts on an 8 KiB line (Room8k), so it never crosses a 64 KiB boundary (one TRB
+/// each, xHCI 4.11.7.1).
+const NCM_IN: usize = 8192;
+static mut NCMRX: Room8k<{ room8k(NRXB) }> = Room8k([0; room8k(NRXB)]);
+/// NCM receive buffer `b` (NCM_IN bytes).
+unsafe fn ncm_rx(b: usize) -> *mut u8 {
+    at8k(addr_of!(NCMRX) as *const u8, b)
+}
+/// Set when the adapter speaks NCM: the device's checked block parameters and the receive block size asked for.
+static mut NET_NCM: Option<(crate::cdcncm::Params, usize)> = None;
+static mut NCM_SEQ: u16 = 0;
+#[derive(Clone, Copy)]
+struct NcmStats {
+    blocks: u64,    // blocks received
+    most: usize,    // most frames in one block
+    bad: u64,       // blocks dropped whole (cdcncm::Bad)
+    last_bad: Option<crate::cdcncm::Bad>,
+    skipped: u64,   // table entries skipped
+    dropped: u64,   // frames the receive queue had no room for
+    stopped: u32,   // receive buffers taken out after an error completion (never handed back to the controller)
+    sent: u64,      // blocks sent
+}
+impl NcmStats {
+    const ZERO: NcmStats = NcmStats { blocks: 0, most: 0, bad: 0, last_bad: None, skipped: 0, dropped: 0, stopped: 0, sent: 0 };
+}
+static mut NCM_STATS: NcmStats = NcmStats::ZERO;
 /// One enumerated HID boot device: its slot, interrupt-IN DCI and kind.
 #[derive(Clone, Copy)]
 struct Dev {
@@ -550,8 +658,10 @@ struct Dev {
     port: u32, // the root port it hangs off (directly or behind a hub)
     ctl: usize, // the controller it is on (slot and port numbers are that controller's)
     route: u32, // its route string behind hubs (0 on a root port)
+    vid: u16, // its vendor and product ids, from the device descriptor (for `hwscan`)
+    pid: u16,
 }
-const NO_DEV: Dev = Dev { slot: 0, dci: 0, kind: 0, port: 0, ctl: 0, route: 0 };
+const NO_DEV: Dev = Dev { slot: 0, dci: 0, kind: 0, port: 0, ctl: 0, route: 0, vid: 0, pid: 0 };
 static mut DEVS: [Dev; NDEV] = [NO_DEV; NDEV];
 /// Root ports whose connection changed (port-status-change events), for `service`, per controller.
 static mut PENDING: [u32; NCTL] = [0; NCTL];
@@ -649,6 +759,16 @@ fn free_dev() -> Option<usize> {
 static mut NDEVS: usize = 0;
 static mut KBD_SLOT: u32 = 0;
 static mut KBD_PORT: u32 = 0;
+/// Caps Lock (13 Nov 2026): a USB keyboard's Caps Lock key used to do nothing. It now turns
+/// letters to capitals (Shift then gives small letters, as on other systems), and the keyboard's
+/// own Caps Lock light is set with a HID SET_REPORT on its interface. The keyboard's lights are
+/// the host's to set; the request is sent from `service` (the idle loop), never from the timer
+/// interrupt. Counters for `lsusb`: lights set and requests the keyboard refused.
+static mut KBD_IFACE: u16 = 0;
+static mut CAPS_LOCK: bool = false;
+static mut LED_WANT: bool = false;
+static mut LED_SETS: u32 = 0;
+static mut LED_FAILS: u32 = 0;
 static mut MOUSE_SLOT: u32 = 0;
 static mut MOUSE_PORT: u32 = 0;
 static mut READY: bool = false;
@@ -790,10 +910,17 @@ unsafe fn release(at: *mut Trb) {
 /// The next event, if the controller has written one (and the dequeue pointer moved on).
 unsafe fn next_event() -> Option<Trb> {
     let ev = addr_of!(EVT[CUR].0) as *const Trb;
-    let t = read_volatile(ev.add(EV_IDX));
-    if t.control & 1 != EV_CYCLE {
+    // The cycle bit first, then the rest (14 Nov 2026, the release build's lost stick answer): the controller
+    // writes an event's parameter and status before its control word, so reading the whole TRB in one go could take
+    // a new control word (the cycle bit says "new") with the previous lap's parameter. wait_xfer then saw an event
+    // naming another TRB, dropped it as stale, and waited 30 s for an answer that had come.
+    let p = ev.add(EV_IDX);
+    let control = read_volatile(addr_of!((*p).control));
+    if control & 1 != EV_CYCLE {
         return None;
     }
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+    let t = Trb { param: read_volatile(addr_of!((*p).param)), status: read_volatile(addr_of!((*p).status)), control };
     EV_IDX += 1;
     if EV_IDX == NEV {
         EV_IDX = 0;
@@ -906,16 +1033,39 @@ unsafe fn control(d: usize, rtype: u8, req: u8, value: u16, index: u16, len: u16
     match wait_control(slot, [first as u64, data, status]) {
         Some(ev) if matches!(ev.status >> 24, CC_SUCCESS | CC_SHORT) => true,
         Some(ev) => {
-            crate::kprintln!("[xhci] control request {:#04x} failed (completion code {})", req, ev.status >> 24);
+            if !CTL_QUIET {
+                crate::kprintln!("[xhci] control request {:#04x} failed (completion code {})", req, ev.status >> 24);
+            }
             LAST_CC = ev.status >> 24;
+            ep0_recover(d);
             false
         }
         None => {
             crate::kprintln!("[xhci] control request {:#04x} timed out", req);
             LAST_CC = 0;
+            ep0_recover(d);
             false
         }
     }
+}
+
+/// After a failed control request: an endpoint 0 the controller halted (a STALL, babble or a
+/// transaction error, xHCI 4.10.2.1) takes no more requests until it is reset. Reset Endpoint,
+/// then its dequeue pointer is moved past the failed request to where the next one will be
+/// queued (Set TR Dequeue Pointer, xHCI 4.6.10); the device itself clears a control STALL at the
+/// next SETUP (USB 2.0 8.5.3.4). Before, every later request to the device timed out, so one
+/// refused class or vendor request cost the whole device. A running endpoint 0 (a request that
+/// timed out) is left as it is: its late answer is set aside by wait_control.
+unsafe fn ep0_recover(d: usize) {
+    let slot = DEVS[d].slot;
+    if read_volatile(ctx(addr_of_mut!(OUTCTX[d].0) as *mut u8, 1)) & 7 != 2 {
+        return;
+    }
+    CTL_RESETS += 1;
+    command(0, T_RESET_EP << 10 | slot << 24 | 1 << 16);
+    let p = *addr_of!(PEP0[d]);
+    let deq = addr_of!(EP0[d].0) as u64 + 16 * p.idx as u64;
+    command(deq | p.cycle as u64, T_SET_TR_DEQ << 10 | slot << 24 | 1 << 16);
 }
 
 fn ctx(base: *mut u8, i: usize) -> *mut u32 {
@@ -923,13 +1073,17 @@ fn ctx(base: *mut u8, i: usize) -> *mut u32 {
     unsafe { base.add(i * CSZ) as *mut u32 }
 }
 
-/// Every PCI function of class `class` (24 bits: class, subclass, programming interface) on
-/// buses 0-7, in bus order, with its vendor:device id; at most 4.
-fn pci_find(class: u32) -> ([(u8, u8, u8, u32); 4], usize) {
+/// Asili v0 BINDS (pc/hwdb.rs): `init` takes the controllers this table matches.
+pub(crate) const BINDS: &[crate::hwdb::Part] = &[crate::hwdb::pci_class(0x0C_03_30, 0xFF_FF_FF, "xHCI USB controller")];
+/// The older USB 2 controllers (EHCI): not driven, only looked for by `intel_switch` (port routing).
+const EHCI: &[crate::hwdb::Part] = &[crate::hwdb::pci_class(0x0C_03_20, 0xFF_FF_FF, "EHCI USB 2 controller")];
+
+/// Every PCI function `parts` matches on buses 0-7, in bus order, with its vendor:device id; at most 4.
+fn pci_find(parts: &'static [crate::hwdb::Part]) -> ([(u8, u8, u8, u32); 4], usize) {
     let mut out = [(0, 0, 0, 0); 4];
     let mut n = 0;
     pci::find_by(8, |b, d, f, id| {
-        if cfg32(b, d, f, 8) >> 8 == class && n < 4 {
+        if crate::hwdb::pci_part(parts, b, d, f, id).is_some() && n < 4 {
             out[n] = (b, d, f, id);
             n += 1;
         }
@@ -1128,7 +1282,7 @@ fn intel_switch(b: u8, d: u8, f: u8, say: bool) {
     if cfg32(b, d, f, 0) & 0xFFFF != 0x8086 || cfg32(b, d, f, 0x2C) == 0x90A8_104D {
         return;
     }
-    let (ehci, n) = pci_find(0x0C_03_20);
+    let (ehci, n) = pci_find(EHCI);
     if !ehci[..n].iter().any(|e| e.3 & 0xFFFF == 0x8086) {
         return;
     }
@@ -1200,7 +1354,7 @@ fn probe(b: u8, d: u8, f: u8) -> u32 {
 /// with nothing in it at power-on runs too, so a device plugged into ANY port later is seen
 /// (hot-plug on every controller, as Linux does).
 pub fn init() {
-    let (all, n) = pci_find(0x0C_03_30);
+    let (all, n) = pci_find(BINDS);
     if n == 0 {
         return;
     }
@@ -1429,7 +1583,7 @@ unsafe fn hid(d: usize, port: u32, speed: u32) -> bool {
         None => return false,
     };
     let slot = ev.control >> 24;
-    DEVS[d] = Dev { slot, dci: 0, kind: 0, port, ctl: CUR, route: PATH.0 };
+    DEVS[d] = Dev { slot, dci: 0, kind: 0, port, ctl: CUR, route: PATH.0, vid: 0, pid: 0 };
     let ok = enumerate(d, port, speed);
     if !ok {
         command(0, T_DISABLE_SLOT << 10 | slot << 24);
@@ -1527,6 +1681,7 @@ unsafe fn enumerate(d: usize, port: u32, speed: u32) -> bool {
     }
     let (vid, pid) = (u16::from_le_bytes([DBUF.0[8], DBUF.0[9]]), u16::from_le_bytes([DBUF.0[10], DBUF.0[11]]));
     let num_configs = DBUF.0[17];
+    (DEVS[d].vid, DEVS[d].pid) = (vid, pid);
     LAST_OTHER = (vid, pid, DBUF.0[4], 0);
     if DBUF.0[4] == 9 {
         let protocol = DBUF.0[6]; // 2 = a high-speed hub with one TT per port (multi-TT)
@@ -1610,7 +1765,9 @@ unsafe fn enumerate(d: usize, port: u32, speed: u32) -> bool {
     }
     let Some((epn, mps, binterval)) = ep else {
         // not a boot keyboard or mouse: perhaps a USB Ethernet adapter
-        return (SER_SLOT == 0 && serial_setup(d, port, speed, vid, pid))
+        return (BT_SLOT == 0 && bt_setup(d, port, speed, vid, pid))
+            || (SER_SLOT == 0 && serial_setup(d, port, speed, vid, pid))
+            || (CAM_SLOT == 0 && video_setup(d, port, speed, vid, pid))
             || (AUD_SLOT == 0 && audio_setup(d, port, speed, vid, pid))
             || (NET_SLOT == 0 && net_setup(d, port, speed, num_configs, vid, pid))
             || (MSC_SLOT == 0 && msc_setup(d, port, speed, vid, pid));
@@ -1663,6 +1820,8 @@ unsafe fn enumerate(d: usize, port: u32, speed: u32) -> bool {
     if kind == KIND_KBD {
         KBD_SLOT = slot;
         KBD_PORT = port;
+        KBD_IFACE = iface as u16;
+        LED_WANT = CAPS_LOCK; // a keyboard plugged in while Caps Lock is on gets its light too
     } else if kind == KIND_TABLET {
         TABLET_SLOT = slot;
         TABLET_PORT = port;
@@ -1830,6 +1989,14 @@ unsafe fn handle(ev: Trb) {
         ser_event(d, &ev, cc);
         return;
     }
+    if DEVS[d].kind == KIND_CAM {
+        cam_event(&ev, cc);
+        return;
+    }
+    if DEVS[d].kind == KIND_BT {
+        bt_event(d, &ev, cc);
+        return;
+    }
     if DEVS[d].kind == KIND_AUDIO {
         // one isochronous packet played (or missed); ring under/overrun events name no packet
         if cc != 14 && cc != 15 {
@@ -1894,7 +2061,14 @@ unsafe fn handle(ev: Trb) {
                     crate::uart::console_page(k == 0x4b); // Shift+PgUp/PgDn: scrollback (conback.rs)
                     continue;
                 }
-                if let Some(c) = ascii(k, shift) {
+                if k == 0x39 {
+                    CAPS_LOCK = !CAPS_LOCK; // Caps Lock: its light is set by `service`
+                    LED_WANT = true;
+                    continue;
+                }
+                // Caps Lock turns letters only; Shift with it gives small letters
+                let up = if (0x04..=0x1D).contains(&k) { shift ^ CAPS_LOCK } else { shift };
+                if let Some(c) = ascii(k, up) {
                     crate::uart::inject(c);
                     KEYS += 1;
                     // the newest key pressed is the one that repeats while held
@@ -1927,8 +2101,8 @@ unsafe fn other_name(c: u8) -> &'static str {
     }
 }
 
-/// A USB class code in words, for the boot log.
-fn class_name(c: u8) -> &'static str {
+/// A USB class code in words, for the boot log and `hwscan`.
+pub(crate) fn class_name(c: u8) -> &'static str {
     match c {
         0x01 => "audio",
         0x02 | 0x0A => "communications",
@@ -1958,7 +2132,8 @@ pub fn service() {
             || BUSY
             || ((*addr_of!(PENDING)).iter().all(|&p| p == 0)
                 && (*addr_of!(HUBCHG)).iter().all(|&h| h == 0)
-                && (*addr_of!(DEAD)).iter().all(|&s| s == 0))
+                && (*addr_of!(DEAD)).iter().all(|&s| s == 0)
+                && !LED_WANT)
         {
             return;
         }
@@ -2004,6 +2179,22 @@ pub fn service() {
                 }
             }
         }
+        if LED_WANT {
+            LED_WANT = false;
+            let kbd = (0..NDEVS).find(|&d| DEVS[d].kind == KIND_KBD && DEVS[d].slot == KBD_SLOT && KBD_SLOT != 0);
+            if let Some(d) = kbd {
+                select(DEVS[d].ctl);
+                // SET_REPORT (output report 0): bit 1 is the Caps Lock light, the others off
+                (*addr_of_mut!(DBUF)).0[0] = (CAPS_LOCK as u8) << 1;
+                CTL_QUIET = true; // a keyboard without lights may refuse; that is counted, not logged
+                if control(d, 0x21, 0x09, 0x0200, KBD_IFACE, 1) {
+                    LED_SETS += 1;
+                } else {
+                    LED_FAILS += 1;
+                }
+                CTL_QUIET = false;
+            }
+        }
         select(home);
         BUSY = false;
     }
@@ -2031,13 +2222,25 @@ unsafe fn forget(d: usize, c: usize) {
         KIND_TABLET => TABLET_SLOT = 0,
         KIND_NET => NET_SLOT = 0,
         KIND_AUDIO => AUD_SLOT = 0,
+        KIND_CAM => {
+            if CAM_RUN {
+                (CAM_RUN, CAM_STOPPING, CAM_STOP_SAID) = (false, false, false);
+                crate::uvc::stopped(); // the stream is gone with the device: frames zeroed, mark off
+                crate::kprintln!("[camera] the camera went while on: stopped (the mark is off, the frames are cleared)");
+            }
+            (CAM_SLOT, CAM) = (0, None);
+        }
+        KIND_BT => {
+            BT_SLOT = 0;
+            crate::bt::gone();
+        }
         KIND_SERIAL => {
             SER_SLOT = 0;
             SER_INFLIGHT = false;
         }
         KIND_MSC => {
             MSC_SLOT = 0;
-            MSC_USABLE = false;
+            (MSC_USABLE, MSC_RAW) = (false, false);
             (MSC_UAS, UAS_STREAMS) = (false, false);
             (MSC_RA_N, MSC_WB_N) = (0, 0); // gathered writes are lost with the device
         }
@@ -2455,8 +2658,11 @@ unsafe fn dma_check() -> (u32, u32, &'static str) {
     for i in 0..6 {
         chk(&mut st, "UAS stream ring", addr_of!(UAS_SR[i]) as u64, size_of::<Ring<NXFER>>(), K64);
     }
-    chk(&mut st, "stick read-ahead", addr_of!(MSC_RA) as u64, MSC_RA_BYTES, K64);
-    chk(&mut st, "stick write-behind", addr_of!(MSC_WB) as u64, MSC_RA_BYTES, K64);
+    chk(&mut st, "stick read-ahead", msc_ra() as u64, MSC_RA_BYTES, K64);
+    chk(&mut st, "stick write-behind", msc_wb() as u64, MSC_RA_BYTES, K64);
+    for i in 0..NRXB {
+        chk(&mut st, "NCM receive buffer", ncm_rx(i) as u64, NCM_IN, K64);
+    }
     chk(&mut st, "network ring", addr_of!(EPOUT) as u64, size_of::<Ring<NXFER>>(), K64);
     for i in 0..NRXB {
         chk(&mut st, "network receive buffer", addr_of!(NETRX[i]) as u64, FRAME, K64);
@@ -2466,6 +2672,11 @@ unsafe fn dma_check() -> (u32, u32, &'static str) {
     }
     chk(&mut st, "serial ring", addr_of!(SER_RING) as u64, size_of::<Ring<NXFER>>(), K64);
     chk(&mut st, "serial buffer", addr_of!(SER_TXBUF) as u64, 4096, K64);
+    chk(&mut st, "camera ring", addr_of!(CAM_RING) as u64, size_of::<Ring<NCAM>>(), K64);
+    for i in 0..NCAM - 1 {
+        chk(&mut st, "camera packet", addr_of!(CAMBUF[i]) as u64, CAM_PKT, K64);
+    }
+    chk(&mut st, "camera configuration", cam_cfg() as u64, CAM_CFG, K64);
     chk(&mut st, "sound ring", addr_of!(AUD_RING) as u64, size_of::<Ring<NAUD>>(), K64);
     for i in 0..NAUD {
         chk(&mut st, "sound packet", addr_of!(AUDBUF[i]) as u64, AUD_PKT, K64);
@@ -2950,13 +3161,20 @@ unsafe fn msc_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bool
             { MSC_BLOCKS }
         );
     }
-    let usable = matches!(MSC_BS, 512 | 1024 | 2048 | 4096) && msc_io(0, false) && {
+    let raw = matches!(MSC_BS, 512 | 1024 | 2048 | 4096) && msc_io(0, false);
+    let usable = raw && {
         let s0 = &mscbuf()[..512];
         &s0[..8] == b"AFRIVFS1" || s0.iter().all(|&x| x == 0)
     };
     MSC_USABLE = usable;
+    // a stick past what 10-byte commands reach is only written after the 16-byte check, which runs for a VFS
+    // stick; a FAT32 one that large is left alone
+    MSC_RAW = raw && !MSC_LONG;
     if usable && MSC_LONG {
         msc_long_check();
+        // a VFS stick past 2 TiB that passed the 16-byte check is read and written as before (14 Nov 2026:
+        // report home's MSC_RAW left it off, so msc_read/msc_write refused it and pc-usbbig's VFS was lost)
+        MSC_RAW = MSC_USABLE;
     }
     let name = core::str::from_utf8(&*addr_of!(MSC_NAME)).unwrap_or("?");
     crate::kprintln!(
@@ -2983,7 +3201,7 @@ unsafe fn msc_multi_check() {
         MSC_MULTI = 2;
         return;
     }
-    let ra = addr_of_mut!(MSC_RA.0) as *mut u8;
+    let ra = msc_ra();
     core::ptr::write_bytes(ra, 0xA5, MSC_RA_BYTES);
     let mut same = msc_rw(0, k, false, ra as u64);
     let read_ok = same;
@@ -3067,7 +3285,7 @@ unsafe fn msc_long_check() {
         let why = if !saved { "the last block could not be read" } else if !back { "the last block did not read back as written" }
             else if !apart { "the write landed on a 32-bit wrapped block too" } else { "the last block could not be put back" };
         crate::kprintln!("[xhci] USB storage: 16-byte command check did not pass ({}): disk left alone", why);
-        MSC_USABLE = false;
+        (MSC_USABLE, MSC_RAW) = (false, false);
     }
 }
 
@@ -3078,7 +3296,7 @@ unsafe fn msc_fetch(b: u64) -> bool {
     let bs = MSC_BS as usize;
     if b >= MSC_RA_AT && b < MSC_RA_AT + MSC_RA_N as u64 {
         let off = (b - MSC_RA_AT) as usize * bs;
-        mscbuf()[..bs].copy_from_slice(&(&*addr_of!(MSC_RA.0))[off..off + bs]);
+        mscbuf()[..bs].copy_from_slice(&core::slice::from_raw_parts(msc_ra(), MSC_RA_BYTES)[off..off + bs]);
         MSC_RSTATS.1 += 1;
         return true;
     }
@@ -3086,9 +3304,9 @@ unsafe fn msc_fetch(b: u64) -> bool {
         let k = (MSC_RA_BYTES as u64 / MSC_BS as u64).min(MSC_BLOCKS - b) as u32;
         if k > 1 {
             MSC_RA_N = 0;
-            if msc_rw(b, k, false, addr_of!(MSC_RA.0) as u64) {
+            if msc_rw(b, k, false, msc_ra() as u64) {
                 (MSC_RA_AT, MSC_RA_N) = (b, k);
-                mscbuf()[..bs].copy_from_slice(&(&*addr_of!(MSC_RA.0))[..bs]);
+                mscbuf()[..bs].copy_from_slice(&core::slice::from_raw_parts(msc_ra(), MSC_RA_BYTES)[..bs]);
                 MSC_RSTATS.2 += 1;
                 return true;
             }
@@ -3097,7 +3315,11 @@ unsafe fn msc_fetch(b: u64) -> bool {
         }
     }
     MSC_RSTATS.3 += 1;
-    msc_io(b, false)
+    let ok = msc_io(b, false);
+    if !ok {
+        msc_note("read", b);
+    }
+    ok
 }
 
 /// Device block `b` was written from `data` (or the write failed): keep the read-ahead true.
@@ -3105,7 +3327,7 @@ unsafe fn msc_ra_update(b: u64, data: &[u8], ok: bool) {
     if b >= MSC_RA_AT && b < MSC_RA_AT + MSC_RA_N as u64 {
         if ok {
             let off = (b - MSC_RA_AT) as usize * MSC_BS as usize;
-            (&mut (*addr_of_mut!(MSC_RA)).0)[off..off + data.len()].copy_from_slice(data);
+            core::slice::from_raw_parts_mut(msc_ra(), MSC_RA_BYTES)[off..off + data.len()].copy_from_slice(data);
         } else {
             MSC_RA_N = 0; // the device's copy is unknown now
         }
@@ -3121,7 +3343,7 @@ unsafe fn msc_flush() -> bool {
         return true;
     }
     MSC_WB_N = 0;
-    let wb = addr_of!(MSC_WB.0) as *const u8;
+    let wb = msc_wb() as *const u8;
     let bs = MSC_BS as usize;
     let mut done = false;
     if k > 1 && MSC_MULTI == 1 && MSC_MULTIW != 2 {
@@ -3199,9 +3421,36 @@ unsafe fn bot_at(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
     ok
 }
 
+/// Why the last stick command failed, and the sense data the stick gave for it (key, ASC, ASCQ): every failed
+/// read or write says so in one line (`msc_note`), so a failure is never silent (reliability engineer, 14 Nov).
+static mut MSC_WHY: &str = "";
+static mut MSC_SENSE: Option<(u8, u8, u8)> = None;
+static mut MSC_FAILS: u64 = 0;
+
+/// `op` ("read", "written") of device block `b` did not succeed: a line for the first three and every 64th after.
+/// The line avoids the words the storage suites treat as a fault ("failed", "timed out"): it is a note, and a
+/// suite that injects faults on purpose may see it.
+unsafe fn msc_note(op: &str, b: u64) {
+    MSC_FAILS += 1;
+    if MSC_FAILS <= 3 || MSC_FAILS % 64 == 0 {
+        match MSC_SENSE {
+            Some((k, a, q)) => crate::kprintln!(
+                "[xhci] USB storage: block {} could not be {}: {} (sense key {:#x}, ASC {:#04x}/{:#04x}); {} such time(s) so far",
+                b, op, MSC_WHY, k, a, q, { MSC_FAILS }
+            ),
+            None => crate::kprintln!("[xhci] USB storage: block {} could not be {}: {}; {} such time(s) so far", b, op, MSC_WHY, { MSC_FAILS }),
+        }
+    }
+}
+
 unsafe fn bot_inner(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
+    MSC_SENSE = None;
     if MSC_UAS {
-        return uas_cmd(cdb, len, dir_in, buf);
+        let ok = uas_cmd(cdb, len, dir_in, buf);
+        if !ok {
+            MSC_WHY = "the UAS command did not complete";
+        }
+        return ok;
     }
     let w = &mut (*addr_of_mut!(CBW)).0;
     w.fill(0);
@@ -3217,6 +3466,7 @@ unsafe fn bot_inner(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
     let good = |c: Option<u32>| matches!(c, Some(CC_SUCCESS) | Some(CC_SHORT));
     // the command block wrapper
     if !good(cc_of(msc_xfer(false, addr_of!(CBW) as u64, 31))) {
+        MSC_WHY = "the stick did not take the command (it was reset)";
         bot_reset(); // the device would not even take the command: start over
         return false;
     }
@@ -3226,6 +3476,7 @@ unsafe fn bot_inner(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
         if c == Some(CC_STALL) {
             unwedge(dir_in);
         } else if !good(c) {
+            MSC_WHY = if c.is_none() { "the data stage got no answer (the stick was reset)" } else { "the data stage got an error (the stick was reset)" };
             bot_reset();
             return false;
         }
@@ -3240,6 +3491,7 @@ unsafe fn bot_inner(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
     let valid = good(c) && u32::from_le_bytes([cs[0], cs[1], cs[2], cs[3]]) == 0x5342_5355
         && u32::from_le_bytes([cs[4], cs[5], cs[6], cs[7]]) == tag;
     if !valid || cs[12] == 2 {
+        MSC_WHY = if c.is_none() { "no status came back (the stick was reset)" } else { "a status that could not be trusted (the stick was reset)" };
         bot_reset(); // phase error, or a status we cannot trust: Bulk-Only reset recovery
         return false;
     }
@@ -3249,8 +3501,12 @@ unsafe fn bot_inner(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
     if status != 0 && cdb[0] != 0x03 {
         // a failed command: read its sense data, or many sticks refuse the next one
         let saved = *mscbuf();
-        bot_inner(&[0x03, 0, 0, 0, 18, 0], 18, true, addr_of!(MSCBUF) as u64);
+        let got = bot_inner(&[0x03, 0, 0, 0, 18, 0], 18, true, addr_of!(MSCBUF) as u64);
+        let s = &mscbuf()[..18];
+        let sense = if got && s[0] & 0x7E == 0x70 { Some((s[2] & 0xF, s[12], s[13])) } else { None };
         *mscbuf() = saved;
+        MSC_WHY = "the stick refused the command";
+        MSC_SENSE = sense;
     }
     status == 0
 }
@@ -3591,6 +3847,92 @@ pub fn late0_check() {
     }
 }
 
+/// `lsusb stall0`: a test switch for endpoint 0. On the stick (or the first device), asks for a
+/// descriptor of a type no device has (0x7F), which the device refuses with a STALL that halts
+/// endpoint 0 in the controller, then reads the device descriptor. Right only if the refusal was
+/// a STALL, endpoint 0 was reset once and the read passed; the old control() left endpoint 0
+/// halted, so the read (and every later request to the device) timed out. Interrupts off.
+pub fn stall0_check() {
+    // SAFETY: mainline; BUSY and interrupts off keep the timer poll off the event ring.
+    unsafe {
+        let d = if msc_present() { MSC_D } else { match (0..NDEV).find(|&d| DEVS[d].slot != 0) { Some(d) => d, None => {
+            crate::kprintln!("lsusb stall0: no USB device");
+            return;
+        } } };
+        let Some(home) = on(DEVS[d].ctl) else { return };
+        crate::cpu::cli();
+        let was_busy = BUSY;
+        BUSY = true;
+        let r0 = CTL_RESETS;
+        CTL_QUIET = true;
+        let refused = !control(d, 0x80, 6, 0x7F00, 0, 18);
+        CTL_QUIET = false;
+        let cc = if refused { LAST_CC } else { CC_SUCCESS };
+        (&mut (*addr_of_mut!(DBUF)).0)[..18].fill(0);
+        let ok = control(d, 0x80, 6, 0x0100, 0, 18);
+        let (len, ty) = (DBUF.0[0], DBUF.0[1]);
+        let resets = CTL_RESETS - r0;
+        BUSY = was_busy;
+        crate::cpu::sti();
+        select(home);
+        let good = refused && cc == CC_STALL && resets == 1 && ok && len == 18 && ty == 1;
+        crate::kprintln!(
+            "lsusb stall0: a request the device refuses was {} (completion code {}); endpoint 0 was reset {} time(s); the next request {} (descriptor of {} bytes, type {}): {}",
+            if refused { "refused" } else { "ANSWERED" },
+            cc,
+            resets,
+            if ok { "passed" } else { "FAILED" },
+            len,
+            ty,
+            if good { "OK" } else { "WRONG" }
+        );
+    }
+}
+
+/// `lsusb stallhub`: `stall0_check`'s request, but aimed at a HUB's own endpoint 0 (not a child
+/// device's), then a real hub operation (GET_PORT_STATUS on port 1) to prove the hub still
+/// manages its ports after recovery. `control()` and `ep0_recover()` are the same code
+/// `hub_status`/`hub_port`/`service_hub` already call for every port request, so this needed no
+/// new recovery path -- only a check that it also covers the hub's own control endpoint.
+pub fn stallhub_check() {
+    // SAFETY: mainline; BUSY and interrupts off keep the timer poll off the event ring.
+    unsafe {
+        let Some(d) = (0..NDEV).find(|&d| DEVS[d].slot != 0 && DEVS[d].kind == KIND_HUB) else {
+            crate::kprintln!("lsusb stallhub: no USB hub in use");
+            return;
+        };
+        let Some(home) = on(DEVS[d].ctl) else { return };
+        crate::cpu::cli();
+        let was_busy = BUSY;
+        BUSY = true;
+        let r0 = CTL_RESETS;
+        CTL_QUIET = true;
+        let refused = !control(d, 0x80, 6, 0x7F00, 0, 18);
+        CTL_QUIET = false;
+        let cc = if refused { LAST_CC } else { CC_SUCCESS };
+        (&mut (*addr_of_mut!(DBUF)).0)[..18].fill(0);
+        let ok = control(d, 0x80, 6, 0x0100, 0, 18);
+        let (len, ty) = (DBUF.0[0], DBUF.0[1]);
+        let port_ok = hub_status(d, 1).is_some();
+        let resets = CTL_RESETS - r0;
+        BUSY = was_busy;
+        crate::cpu::sti();
+        select(home);
+        let good = refused && cc == CC_STALL && resets == 1 && ok && len == 18 && ty == 1 && port_ok;
+        crate::kprintln!(
+            "lsusb stallhub: a request the hub refuses was {} (completion code {}); its endpoint 0 was reset {} time(s); the next request {} (descriptor of {} bytes, type {}); its port 1 status {}: {}",
+            if refused { "refused" } else { "ANSWERED" },
+            cc,
+            resets,
+            if ok { "passed" } else { "FAILED" },
+            len,
+            ty,
+            if port_ok { "read" } else { "FAILED" },
+            if good { "OK" } else { "WRONG" }
+        );
+    }
+}
+
 /// READ(10) / WRITE(10) (or the 16-byte forms) of one device block at `lba` through MSCBUF.
 unsafe fn msc_io(lba: u64, write: bool) -> bool {
     let (cdb, n) = msc_cdb(lba, 1, write);
@@ -3608,21 +3950,78 @@ pub fn msc_present() -> bool {
     unsafe { MSC_SLOT != 0 && MSC_USABLE }
 }
 
+/// True when the stick answers sector reads and writes, whatever it holds (esp.rs: its FAT32). The VFS asks
+/// msc_present.
+pub fn msc_attached() -> bool {
+    // SAFETY: scalar reads.
+    unsafe { MSC_SLOT != 0 && MSC_RAW }
+}
+
+/// The stick's own block size in bytes (512 or 4096), for reading its partition table (esp.rs firmware files).
+pub fn msc_block_size() -> u64 {
+    // SAFETY: scalar read.
+    (unsafe { MSC_BS } as u64).max(512)
+}
+
 /// Capacity in 512-byte sectors.
 pub fn msc_capacity() -> u64 {
     // SAFETY: scalar read.
     (unsafe { MSC_BLOCKS }) * msc_per()
 }
 
+/// One 512-byte sector of the stick. The VFS (disk.rs) and the table backup (gpt.rs) check msc_present first;
+/// esp.rs's FAT32 reader checks msc_attached.
 pub fn msc_read(n: u64, out: &mut [u8; 512]) -> bool {
-    if !msc_present() || n >= msc_capacity() {
+    if !msc_attached() || n >= msc_capacity() {
         return false;
     }
     // SAFETY: mainline (the VFS); bot() keeps the timer poll off the event ring meanwhile.
     unsafe {
-        let Some(home) = on(DEVS[MSC_D].ctl) else { return false };
+        let Some(home) = on(DEVS[MSC_D].ctl) else {
+            (MSC_WHY, MSC_SENSE) = ("the USB controller was being switched (try again)", None);
+            msc_note("read", n / msc_per());
+            return false;
+        };
         // writes still gathered go to the device before anything is read
         let ok = msc_flush() && msc_fetch(n / msc_per());
+        select(home);
+        if !ok {
+            return false;
+        }
+        let off = (n % msc_per()) as usize * 512;
+        out.copy_from_slice(&mscbuf()[off..off + 512]);
+    }
+    true
+}
+
+/// READ ONLY, for `updatecheck` (AFR-0010, 13 Nov 2026): a USB stick that holds other data (a FAT32 stick
+/// with an update file on it) is left alone for storage, so `msc_present` says no; it may still be READ.
+/// There is deliberately no matching write. This door cannot write by construction: it refuses while any
+/// write is gathered and never calls `msc_flush` (architect, 14 Nov 2026), so it does not lean on what
+/// `msc_write` accepts. Capacity in 512-byte sectors, or 0 when no stick reported a block size we can read.
+pub fn msc_read_only_capacity() -> u64 {
+    // SAFETY: scalar reads.
+    unsafe {
+        if MSC_SLOT == 0 || !matches!(MSC_BS, 512 | 1024 | 2048 | 4096) {
+            return 0;
+        }
+    }
+    msc_capacity()
+}
+
+/// One 512-byte sector of any attached stick, ours or not (see `msc_read_only_capacity`). Reads only:
+/// no path from here issues a WRITE command.
+pub fn msc_read_only(n: u64, out: &mut [u8; 512]) -> bool {
+    if n >= msc_read_only_capacity() {
+        return false;
+    }
+    // SAFETY: as msc_read, but with no flush: while any write is gathered it refuses instead.
+    unsafe {
+        if MSC_WB_N != 0 {
+            return false;
+        }
+        let Some(home) = on(DEVS[MSC_D].ctl) else { return false };
+        let ok = msc_fetch(n / msc_per());
         select(home);
         if !ok {
             return false;
@@ -3645,13 +4044,36 @@ unsafe fn on(c: usize) -> Option<usize> {
     Some(home)
 }
 
-pub fn msc_write(n: u64, data: &[u8; 512]) -> bool {
-    if !msc_present() || n >= msc_capacity() {
+/// Every write still gathered for the stick sent to it now (report save: what was written is on the stick).
+pub fn msc_settle() -> bool {
+    if !msc_attached() {
         return false;
     }
     // SAFETY: as msc_read.
     unsafe {
         let Some(home) = on(DEVS[MSC_D].ctl) else { return false };
+        let ok = msc_flush();
+        select(home);
+        ok
+    }
+}
+
+/// One 512-byte sector onto the stick. Its callers, and no others (architect, 14 Nov: a person's FAT32 stick is
+/// written only by `report save`; scripts/pc-reportsave-test.sh greps this list):
+/// - disk.rs, the VFS, after `msc_present` (a VFS or blank stick);
+/// - gpt.rs, the partition-table backup, after `msc_present`;
+/// - esp.rs, `BootStick`, made only in `report_save` after the boot-medium and boot-file checks.
+pub fn msc_write(n: u64, data: &[u8; 512]) -> bool {
+    if !msc_attached() || n >= msc_capacity() {
+        return false;
+    }
+    // SAFETY: as msc_read.
+    unsafe {
+        let Some(home) = on(DEVS[MSC_D].ctl) else {
+            (MSC_WHY, MSC_SENSE) = ("the USB controller was being switched (try again)", None);
+            msc_note("written", n / msc_per());
+            return false;
+        };
         // the VFS saves its sectors in order, so a run of device blocks is gathered in MSC_WB
         // (up to 8 KiB; one block while multi-block writes are off). A block bigger than a
         // sector (1, 2 or 4 KiB) is read once when the run reaches it and its sectors changed
@@ -3671,7 +4093,7 @@ pub fn msc_write(n: u64, data: &[u8; 512]) -> bool {
         // kept equal to every block flushed, or the device)
         let got = !new || per == 1 || msc_fetch(b);
         if got {
-            let wb = &mut (*addr_of_mut!(MSC_WB)).0;
+            let wb = core::slice::from_raw_parts_mut(msc_wb(), MSC_RA_BYTES);
             if MSC_WB_N == 0 {
                 MSC_WB_AT = b;
             }
@@ -3691,26 +4113,35 @@ pub fn msc_write(n: u64, data: &[u8; 512]) -> bool {
             }
         }
         let ok = ok && got;
+        if !ok {
+            msc_note("written", n / msc_per());
+        }
         select(home);
         ok
     }
 }
 
-/// A USB Ethernet adapter: CDC-ECM (most USB Ethernet dongles and docks) or RNDIS (an Android
-/// phone's "USB tethering", and older dongles made for Windows). Find a configuration with a
-/// communication interface of either kind and a data interface (class 0x0A) with a bulk IN and
-/// a bulk OUT endpoint (ECM: in an alternate setting >= 1; RNDIS: in setting 0). ECM is taken
-/// when a device offers both, as Linux does (QEMU's usb-net offers both; the test rig asks for
-/// RNDIS through fw_cfg `opt/afrisovera/usbnet-rndis`). ECM: the MAC is the string its Ethernet
-/// functional descriptor names; SET_INTERFACE selects the data endpoints; the packet filter is
-/// opened with SET_ETHERNET_PACKET_FILTER. RNDIS: INITIALIZE, a query of the permanent MAC and
-/// a SET of the packet filter go as encapsulated control messages (RNDIS 1.0). Then both
-/// endpoints are configured and receive buffers queued.
+/// A USB Ethernet adapter: CDC-NCM (newer phones' USB tethering, 2.5G dongles), CDC-ECM (most
+/// USB Ethernet dongles and docks) or RNDIS (older Android tethering, dongles made for Windows).
+/// Find a configuration with a communication interface of the kind tried and its data interface
+/// (class 0x0A, named by the Union descriptor when there is one) with a bulk IN and a bulk OUT
+/// endpoint (NCM and ECM: in an alternate setting >= 1; RNDIS: in setting 0). Tried in the order
+/// NCM, ECM, RNDIS (architect's N1, 13 Nov 2026; Linux binds cdc_ncm first too): if any NCM step
+/// fails (block parameters out of range, a refused SET_NTB_INPUT_SIZE, an alignment that does not
+/// fit), one line, and the same device is set up as ECM or RNDIS, without a replug. QEMU's usb-net
+/// offers RNDIS and ECM (with the CI's test patch and ncm=on: NCM and ECM); the test rig asks for
+/// RNDIS first through fw_cfg `opt/afrisovera/usbnet-rndis`. NCM and ECM: the MAC is the string the Ethernet functional descriptor names;
+/// NCM then reads and sets its transfer block sizes (cdcncm.rs); SET_INTERFACE selects the data
+/// endpoints; SET_ETHERNET_PACKET_FILTER opens the filter. RNDIS: INITIALIZE, a query of the
+/// permanent MAC and a SET of the packet filter go as encapsulated control messages (RNDIS 1.0).
+/// Then both endpoints are configured and receive buffers queued.
 unsafe fn net_setup(d: usize, port: u32, speed: u32, ncfg: u8, vid: u16, pid: u16) -> bool {
     let slot = DEVS[d].slot;
     let want_rndis = crate::qemu::fw_cfg_file(b"opt/afrisovera/usbnet-rndis");
-    for pass in 0..2 {
-        let rndis = (pass == 0) == want_rndis;
+    let order = if want_rndis { [NetKind::Rndis, NetKind::Ncm, NetKind::Ecm] } else { [NetKind::Ncm, NetKind::Ecm, NetKind::Rndis] };
+    for kind in order {
+        let rndis = kind == NetKind::Rndis;
+        let ncm = kind == NetKind::Ncm;
         for ci in 0..ncfg.clamp(1, 4) {
             if !control(d, 0x80, 6, 0x0200 | ci as u16, 0, 9) {
                 continue;
@@ -3720,7 +4151,7 @@ unsafe fn net_setup(d: usize, port: u32, speed: u32, ncfg: u8, vid: u16, pid: u1
             if !control(d, 0x80, 6, 0x0200 | ci as u16, 0, total as u16) {
                 continue;
             }
-            let (mut i, mut comm, mut mac_idx) = (0usize, None, 0u8);
+            let (mut i, mut comm, mut mac_idx, mut ncm_caps, mut union) = (0usize, None, 0u8, 0u8, None);
             let (mut cur_if, mut cur_alt, mut cur_class) = (0u8, 0u8, (0u8, 0u8, 0u8));
             let (mut data_if, mut data_alt, mut ein, mut eout) = (0u8, 0u8, None, None);
             while i + 2 <= total {
@@ -3735,21 +4166,32 @@ unsafe fn net_setup(d: usize, port: u32, speed: u32, ncfg: u8, vid: u16, pid: u1
                         cur_class = (DBUF.0[i + 5], DBUF.0[i + 6], DBUF.0[i + 7]);
                         // RNDIS: CDC ACM with vendor protocol 0xFF (Windows-class dongles), wireless
                         // controller 0xE0/1/3 (Android), or miscellaneous 0xEF/4/1
-                        let is_comm = if rndis {
-                            matches!(cur_class, (2, 2, 0xFF) | (0xE0, 1, 3) | (0xEF, 4, 1))
-                        } else {
-                            (cur_class.0, cur_class.1) == (2, 6)
+                        let is_comm = match kind {
+                            NetKind::Rndis => matches!(cur_class, (2, 2, 0xFF) | (0xE0, 1, 3) | (0xEF, 4, 1)),
+                            NetKind::Ecm => (cur_class.0, cur_class.1) == (2, 6),
+                            NetKind::Ncm => (cur_class.0, cur_class.1) == (2, 0x0D),
                         };
                         if is_comm && comm.is_none() {
                             comm = Some(cur_if);
                         }
                     }
-                    // CS_INTERFACE, Ethernet Networking functional descriptor: iMACAddress
-                    0x24 if i + 4 <= total && DBUF.0[i + 2] == 0x0F && comm == Some(cur_if) => mac_idx = DBUF.0[i + 3],
-                    5 if i + 7 <= total && cur_class.0 == 0x0A && (if rndis { cur_alt == 0 } else { cur_alt >= 1 }) => {
+                    // CS_INTERFACE descriptors of the communication interface taken
+                    0x24 if i + 4 <= total && comm == Some(cur_if) && cur_alt == 0 => match DBUF.0[i + 2] {
+                        0x0F => mac_idx = DBUF.0[i + 3], // Ethernet Networking: iMACAddress
+                        0x06 if i + 5 <= total && union.is_none() => union = Some(DBUF.0[i + 4]), // Union: its data interface
+                        0x1A if i + 6 <= total => ncm_caps = DBUF.0[i + 5], // NCM: bmNetworkCapabilities
+                        _ => {}
+                    },
+                    5 if i + 7 <= total
+                        && cur_class.0 == 0x0A
+                        && comm.is_some()
+                        && union.map_or(true, |u| u == cur_if)
+                        && (if rndis { cur_alt == 0 } else { cur_alt >= 1 }) =>
+                    {
                         let (addr, attr) = (DBUF.0[i + 2], DBUF.0[i + 3]);
                         let mps = u16::from_le_bytes([DBUF.0[i + 4], DBUF.0[i + 5]]) as u32 & 0x7FF;
-                        if attr & 3 == 2 {
+                        // both bulk endpoints from one interface setting: the first one that has any
+                        if attr & 3 == 2 && ((ein.is_none() && eout.is_none()) || (cur_if, cur_alt) == (data_if, data_alt)) {
                             data_if = cur_if;
                             data_alt = cur_alt;
                             if addr & 0x80 != 0 {
@@ -3765,6 +4207,7 @@ unsafe fn net_setup(d: usize, port: u32, speed: u32, ncfg: u8, vid: u16, pid: u1
             }
             let (Some(comm_if), Some((epi, mpsi)), Some((epo, mpso))) = (comm, ein, eout) else { continue };
             let mut mac = [0u8; 6];
+            let mut ncm_p = None;
             if rndis {
                 if !control(d, 0x00, 9, cval as u16, 0, 0) {
                     return false; // SET_CONFIGURATION
@@ -3791,6 +4234,15 @@ unsafe fn net_setup(d: usize, port: u32, speed: u32, ncfg: u8, vid: u16, pid: u1
                 }
                 if !control(d, 0x00, 9, cval as u16, 0, 0) {
                     return false; // SET_CONFIGURATION
+                }
+                if ncm {
+                    match ncm_blocks(d, comm_if, ncm_caps) {
+                        Ok(p) => ncm_p = Some(p),
+                        Err(why) => {
+                            crate::kprintln!("[xhci] port {}: CDC-NCM not used: {}; trying the device as CDC-ECM or RNDIS", port, why);
+                            continue;
+                        }
+                    }
                 }
                 control(d, 0x01, 11, data_alt as u16, data_if as u16, 0); // SET_INTERFACE: the data endpoints
                 control(d, 0x21, 0x43, 0x0E, comm_if as u16, 0); // SET_ETHERNET_PACKET_FILTER: directed, broadcast, all multicast
@@ -3825,7 +4277,9 @@ unsafe fn net_setup(d: usize, port: u32, speed: u32, ncfg: u8, vid: u16, pid: u1
             NET_DOUT = dout;
             NET_MAC = mac;
             NET_RNDIS = rndis;
+            NET_NCM = ncm_p;
             NET_MPSO = mpso.max(8);
+            NCM_STATS = NcmStats::ZERO;
             for b in 0..NRXB {
                 queue_rx(b);
             }
@@ -3834,10 +4288,16 @@ unsafe fn net_setup(d: usize, port: u32, speed: u32, ncfg: u8, vid: u16, pid: u1
             READY = true;
             crate::kprintln!(
                 "[xhci] port {}: USB Ethernet adapter {:04x}:{:04x} ({}, {} speed), slot {}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                port, vid, pid, if rndis { "RNDIS" } else { "CDC-ECM" },
+                port, vid, pid, kind.name(),
                 speed_name(speed), slot,
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
             );
+            if let Some((p, insz)) = ncm_p {
+                crate::kprintln!(
+                    "[xhci] NCM: blocks up to {} KiB in (the device offers {} KiB), {} KiB out, table alignment {}, frame divisor {} remainder {}, 16-bit blocks",
+                    insz / 1024, p.in_max / 1024, p.out_max / 1024, p.out_align, p.out_div, p.out_rem
+                );
+            }
             if rndis {
                 let (per, max) = RNDIS_INFO;
                 crate::kprintln!(
@@ -3849,6 +4309,46 @@ unsafe fn net_setup(d: usize, port: u32, speed: u32, ncfg: u8, vid: u16, pid: u1
         }
     }
     false
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetKind {
+    Ncm,
+    Ecm,
+    Rndis,
+}
+
+impl NetKind {
+    fn name(self) -> &'static str {
+        match self {
+            NetKind::Ncm => "CDC-NCM",
+            NetKind::Ecm => "CDC-ECM",
+            NetKind::Rndis => "RNDIS",
+        }
+    }
+}
+
+/// NCM's transfer blocks, while the data interface is still in setting 0 (NCM 1.0 6.2): read the
+/// device's NTB parameters and check them (cdcncm::params), ask for 16-bit blocks when it also
+/// offers 32-bit ones, and set the largest block it may send us to our receive buffer. Any refusal
+/// is the reason the caller prints before it tries the device as ECM or RNDIS.
+unsafe fn ncm_blocks(d: usize, comm: u8, caps: u8) -> Result<(crate::cdcncm::Params, usize), &'static str> {
+    if !control(d, 0xA1, 0x80, 0, comm as u16, 28) {
+        return Err("GET_NTB_PARAMETERS was refused");
+    }
+    let p = crate::cdcncm::params(&DBUF.0[..28], FRAME)?;
+    if p.formats & 2 != 0 && !control(d, 0x21, 0x84, 0, comm as u16, 0) {
+        return Err("SET_NTB_FORMAT (16-bit) was refused");
+    }
+    let insz = p.in_max.min(NCM_IN);
+    DBUF.0[..8].fill(0);
+    DBUF.0[..4].copy_from_slice(&(insz as u32).to_le_bytes());
+    // bmNetworkCapabilities bit 5: the request carries 8 bytes (size, then most datagrams, 0 = any)
+    let n = if caps & 1 << 5 != 0 { 8 } else { 4 };
+    if !control(d, 0x21, 0x86, 0, comm as u16, n) {
+        return Err("SET_NTB_INPUT_SIZE was refused");
+    }
+    Ok((p, insz))
 }
 
 /// What the RNDIS device said in INITIALIZE_CMPLT: packets and bytes per transfer at most.
@@ -3932,12 +4432,16 @@ unsafe fn rndis_filter(d: usize, comm: u8) -> bool {
 /// Queue receive buffer `b` on the adapter's bulk-IN ring.
 unsafe fn queue_rx(b: usize) {
     let d = NET_D;
+    let (buf, len) = match NET_NCM {
+        Some((_, insz)) => (ncm_rx(b) as u64, insz as u32),
+        None => (addr_of!(NETRX[b]) as u64, FRAME as u32),
+    };
     let at = push_held(
         addr_of_mut!(EPIN[d].0) as *mut Trb,
         NXFER,
         &mut (*addr_of_mut!(PEPIN))[d],
-        addr_of!(NETRX[b]) as u64,
-        FRAME as u32,
+        buf,
+        len,
         T_NORMAL << 10 | 1 << 5 | 1 << 2, // IOC, ISP: one event per frame, short ones too
         false,
     );
@@ -3957,6 +4461,33 @@ unsafe fn net_event(ev: &Trb, cc: u32) {
         return;
     }
     let Some(b) = (0..NRXB).find(|&b| RXMAP[b] == ev.param) else { return };
+    if let Some((_, insz)) = NET_NCM {
+        // architect's condition 4: this buffer's transfer has completed, so it is ours again. After an error
+        // completion (a stall, babble, a transaction error) the endpoint is halted: the buffer is not handed
+        // back to it; receiving stops with one line (a replug sets the adapter up again with all buffers).
+        if cc != CC_SUCCESS && cc != CC_SHORT {
+            RXMAP[b] = 0;
+            NCM_STATS.stopped += 1;
+            if NCM_STATS.stopped == 1 {
+                crate::kprintln!("[xhci] NCM: a receive ended with completion code {}: that buffer is not reused (replug to receive again)", cc);
+            }
+            return;
+        }
+        let n = insz.saturating_sub((ev.status & 0xFF_FFFF) as usize);
+        let blk = core::slice::from_raw_parts(ncm_rx(b) as *const u8, n.min(NCM_IN));
+        let g = crate::cdcncm::parse(blk, |f| rxq_put(f.as_ptr(), f.len()));
+        let st = &mut *addr_of_mut!(NCM_STATS);
+        st.blocks += 1;
+        st.most = st.most.max(g.frames + g.dropped);
+        st.skipped += g.skipped as u64;
+        st.dropped += g.dropped as u64;
+        if g.bad.is_some() {
+            st.bad += 1;
+            st.last_bad = g.bad;
+        }
+        queue_rx(b);
+        return;
+    }
     if cc == CC_SUCCESS || cc == CC_SHORT {
         let n = FRAME.saturating_sub((ev.status & 0xFF_FFFF) as usize);
         let buf = addr_of!(NETRX[b]) as *const u8;
@@ -3987,8 +4518,8 @@ unsafe fn net_event(ev: &Trb, cc: u32) {
     queue_rx(b);
 }
 
-/// One received Ethernet frame into the queue for the network stack (dropped if full).
-unsafe fn rxq_put(src: *const u8, n: usize) {
+/// One received Ethernet frame into the queue for the network stack (dropped if full); true if taken.
+unsafe fn rxq_put(src: *const u8, n: usize) -> bool {
     let next = (RXQ_TAIL + 1) % NRXQ;
     if (14..=FRAME).contains(&n) && next != RXQ_HEAD {
         core::ptr::copy_nonoverlapping(src, addr_of_mut!(RXQ[RXQ_TAIL]) as *mut u8, n);
@@ -3996,8 +4527,10 @@ unsafe fn rxq_put(src: *const u8, n: usize) {
         core::sync::atomic::fence(Ordering::SeqCst);
         RXQ_TAIL = next;
         NET_RXN += 1;
+        true
     } else {
         NET_RXDROP += 1;
+        false
     }
 }
 
@@ -4010,6 +4543,38 @@ pub fn net_present() -> bool {
 pub fn net_mac() -> [u8; 6] {
     // SAFETY: scalar read of boot-time state.
     unsafe { NET_MAC }
+}
+
+/// True when the adapter speaks CDC-NCM (newer phones' USB tethering, 2.5G dongles).
+pub fn net_ncm() -> bool {
+    // SAFETY: scalar read of enumeration-time state.
+    unsafe { (*addr_of!(NET_NCM)).is_some() }
+}
+
+/// `usbnettest`: the NCM counters (blocks, frames per block, bad blocks), or `usbnettest ncm`: the block
+/// parser's selftest (cdcncm.rs).
+pub fn ncm_command(arg: &str) {
+    if arg.trim() == "ncm" {
+        crate::cdcncm::selftest();
+        return;
+    }
+    // SAFETY: scalar reads of counters the timer interrupt updates; a torn value is only a stale count.
+    let (on, st) = unsafe { ((*addr_of!(NET_NCM)).is_some(), *addr_of!(NCM_STATS)) };
+    if !on {
+        crate::kprintln!("usbnettest: no CDC-NCM adapter (`usbnettest ncm` runs the block parser's selftest)");
+        return;
+    }
+    crate::kprintln!(
+        "usbnettest: NCM {} block(s) in, most frames in one block {}, {} block(s) out, bad blocks {} (last: {}), skipped entries {}, frames with no room {}, receive buffers stopped {}",
+        st.blocks,
+        st.most,
+        st.sent,
+        st.bad,
+        st.last_bad.map_or("none", |b| b.name()),
+        st.skipped,
+        st.dropped,
+        st.stopped
+    );
 }
 
 /// True when the adapter speaks RNDIS (a phone's USB tethering) rather than CDC-ECM.
@@ -4028,6 +4593,22 @@ pub fn net_send(frame: &[u8]) -> bool {
         let hdr = if NET_RNDIS { RNDIS_HDR } else { 0 };
         if NET_SLOT == 0 || hdr + frame.len() + 1 > FRAME || NET_TXN - NET_TXDONE >= NTXB as u64 {
             return false;
+        }
+        if let Some((p, _)) = NET_NCM {
+            let Some(home) = on(DEVS[NET_D].ctl) else { return false };
+            let b = (NET_TXN % NTXB as u64) as usize;
+            let tx = &mut (*addr_of_mut!(NETTX[b])).0;
+            let Some(n) = crate::cdcncm::build(frame, NCM_SEQ, &p, NET_MPSO as usize, tx) else {
+                select(home);
+                return false;
+            };
+            NCM_SEQ = NCM_SEQ.wrapping_add(1);
+            NCM_STATS.sent += 1;
+            push(addr_of_mut!(EPOUT.0) as *mut Trb, NXFER, &mut *addr_of_mut!(PEPOUT), tx.as_ptr() as u64, n as u32, T_NORMAL << 10 | 1 << 5);
+            NET_TXN += 1;
+            doorbell(NET_SLOT, NET_DOUT);
+            select(home);
+            return true;
         }
         let Some(home) = on(DEVS[NET_D].ctl) else { return false };
         let b = (NET_TXN % NTXB as u64) as usize;
@@ -4742,9 +5323,7 @@ unsafe fn mouse_rel_report(m: Rel, r: &[u8]) {
     let z = signed(r, m.wheel).clamp(-127, 127);
     if z != 0 {
         MWHEEL += z.unsigned_abs() as u64;
-        if !crate::desk::shown() {
-            crate::uart::console_wheel(-z);
-        }
+        crate::uart::console_wheel(-z); // the console, or the desk's Terminal while the desk shows
     }
     let (dx, dy) = mouse_accel(signed(r, m.x), signed(r, m.y));
     mouse_report(buttons, dx, dy);
@@ -4908,6 +5487,9 @@ pub fn list() {
         if CTL_STALE > 0 {
             crate::kprintln!("  control: {} late endpoint 0 answer(s) set aside, not taken as a later request's", { CTL_STALE });
         }
+        if CTL_RESETS > 0 {
+            crate::kprintln!("  control: endpoint 0 reset {} time(s) after the controller halted it", { CTL_RESETS });
+        }
         if PLUGS + UNPLUGS > 0 {
             crate::kprintln!("  hot-plug: {} plugged in, {} unplugged since boot", { PLUGS }, { UNPLUGS });
         }
@@ -4951,6 +5533,10 @@ pub fn list() {
         if KBD_SLOT != 0 {
             crate::kprintln!("  keyboard: slot {}, {} reports, {} keys typed", { KBD_SLOT }, { REPORTS }, { KEYS });
             crate::kprintln!("  keyboard: {} repeats while a key was held", { REPEATS });
+            crate::kprintln!(
+                "  keyboard: caps lock {}, its light set {} times, {} refused",
+                if CAPS_LOCK { "on" } else { "off" }, { LED_SETS }, { LED_FAILS }
+            );
         }
         if MOUSE_SLOT != 0 {
             crate::kprintln!(
@@ -5022,5 +5608,637 @@ pub fn pointer() -> Option<(usize, usize)> {
         } else {
             None
         }
+    }
+}
+
+// --- USB video: webcams (USB Video Class 1.0 to 1.5), slice 1 (13 Nov 2026, uvc.rs, UVC_PLAN.md) ---
+// Every laptop's built-in camera is a UVC device on an internal USB port. The device is configured when it
+// comes, but nothing streams until `camera on` (uvc.rs: typed at the local keyboard or serial console only).
+// Then: the probe and commit controls, the endpoint, the alternate setting that carries the camera's packet
+// size, and a ring of isochronous IN packets, each handed to uvc::packet before its TRB is given back.
+
+/// The isochronous IN ring: 39 packets and the link. Every packet asks for an event (its length is needed), so
+/// at most 39 camera events wait at once, which leaves room in the 64-entry event ring for the other devices.
+const NCAM: usize = 40;
+/// The most one service interval brings (high speed: 3 x 1024).
+const CAM_PKT: usize = 3072;
+/// Each packet buffer on its own 4 KiB, so none crosses a 64 KiB block (the architect's N3 rule).
+#[repr(C, align(4096))]
+struct CamPkt([u8; 4096]);
+const _: () = assert!(CAM_PKT <= core::mem::size_of::<CamPkt>() && core::mem::align_of::<CamPkt>() >= core::mem::size_of::<CamPkt>());
+/// The camera's whole configuration descriptor (cameras' run past the 512 bytes of DBUF): 8 KiB on an 8 KiB line.
+const CAM_CFG: usize = 8192;
+static mut CAM_RING: Ring<NCAM> = Ring([TRB0; NCAM]);
+static mut PCAM: Prod = Prod { idx: 0, cycle: 1 };
+static mut CAMBUF: [CamPkt; NCAM - 1] = [const { CamPkt([0; 4096]) }; NCAM - 1];
+static mut CAMCFG: Room8k<{ room8k(1) }> = Room8k([0; room8k(1)]);
+unsafe fn cam_cfg() -> *mut u8 {
+    at8k(addr_of!(CAMCFG) as *const u8, 0)
+}
+static mut CAM: Option<crate::uvc::Cam> = None;
+static mut CAM_D: usize = usize::MAX;
+static mut CAM_SLOT: u32 = 0;
+static mut CAM_PORT: u32 = 0;
+static mut CAM_SPEED: u32 = 0;
+static mut CAM_ID: (u16, u16) = (0, 0);
+static mut CAM_DCI: u32 = 0;
+static mut CAM_REQ: u32 = 0; // bytes asked for in each packet
+static mut CAM_TLBPC: u32 = 0; // high speed: the transactions in each packet, less one
+static mut CAM_RUN: bool = false;
+static mut CAM_HALT: bool = false; // an error ended the stream: no packet is given back until it is stopped
+static mut CAM_NEXT: usize = 0; // the ring slot whose completion comes next
+/// `camera off` (or an error) has begun but the stream is not yet known to have stopped: its events are ignored,
+/// the mark stays, and the idle loop tries again (ARCHITECT_REVIEWS 13 Nov night, fix 1).
+static mut CAM_STOPPING: bool = false;
+static mut CAM_STOP_SAID: bool = false;
+/// (events, packets taken, ring-empty events, packets lost by the controller, bad packets)
+static mut CAM_ST: (u64, u64, u64, u64, u64) = (0, 0, 0, 0, 0);
+/// The AfriSovera test camera (scripts/ci/qemu-uvc-test.patch): its frames carry a frame number and are summed.
+const TEST_CAM: (u16, u16) = (0x46F4, 0xAF01);
+
+/// A control transfer with its data stage in `buf` (a DMA buffer inside one 64 KiB block), returning the bytes
+/// moved. The data stage asks for a Short Packet event (ISP), so a short IN answer says how much came back.
+unsafe fn control_buf(d: usize, rtype: u8, req: u8, value: u16, index: u16, len: u16, buf: u64) -> Option<usize> {
+    let slot = DEVS[d].slot;
+    let ring = addr_of_mut!(EP0[d].0) as *mut Trb;
+    let p = &mut (*addr_of_mut!(PEP0))[d];
+    let input = rtype & 0x80 != 0;
+    let setup = rtype as u64 | (req as u64) << 8 | (value as u64) << 16 | (index as u64) << 32 | (len as u64) << 48;
+    let trt = if len == 0 { 0 } else if input { 3 } else { 2 };
+    let first = push_held(ring, NXFER, p, setup, 8, T_SETUP << 10 | 1 << 6 | trt << 16, true);
+    let mut data = 0;
+    if len > 0 {
+        data = push_held(ring, NXFER, p, buf, len as u32, T_DATA << 10 | (input as u32) << 16 | 1 << 2, false) as u64;
+    }
+    let status_in = len == 0 || !input;
+    let status = push_held(ring, NXFER, p, 0, 0, T_STATUS << 10 | 1 << 5 | (status_in as u32) << 16, false) as u64;
+    release(first);
+    doorbell(slot, 1);
+    CTL_WANT = status;
+    let mut got = len as usize;
+    for _ in 0..2 {
+        match wait_control(slot, [first as u64, data, status]) {
+            Some(ev) if ev.status >> 24 == CC_SHORT && data != 0 && ev.param & !0xF == data => {
+                got = (len as u32).saturating_sub(ev.status & 0xFF_FFFF) as usize;
+                // the status stage's own event follows
+            }
+            Some(ev) if matches!(ev.status >> 24, CC_SUCCESS | CC_SHORT) => return Some(got),
+            Some(ev) => {
+                crate::kprintln!("[xhci] control request {:#04x} failed (completion code {})", req, ev.status >> 24);
+                LAST_CC = ev.status >> 24;
+                ep0_recover(d);
+                return None;
+            }
+            None => {
+                crate::kprintln!("[xhci] control request {:#04x} timed out", req);
+                LAST_CC = 0;
+                ep0_recover(d);
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// A USB camera: its whole configuration read and walked (uvc::descriptors), the device configured. Nothing
+/// streams until `camera on`. A camera with no YUY2 size up to 640x480 (MJPEG only) is named and left alone.
+unsafe fn video_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bool {
+    let slot = DEVS[d].slot;
+    if !control(d, 0x80, 6, 0x0200, 0, 9) {
+        return false;
+    }
+    let total = u16::from_le_bytes([DBUF.0[2], DBUF.0[3]]) as usize;
+    let cval = DBUF.0[5];
+    let room = CAM_CFG;
+    if total < 9 || total > room {
+        if total > room {
+            crate::kprintln!("[xhci] port {}: device {:04x}:{:04x}: its configuration ({} bytes) is larger than the camera driver reads", port, vid, pid, total);
+        }
+        return false;
+    }
+    let Some(got) = control_buf(d, 0x80, 6, 0x0200, 0, total as u16, cam_cfg() as u64) else { return false };
+    let cfg = &core::slice::from_raw_parts(cam_cfg() as *const u8, CAM_CFG)[..got.min(total)];
+    let cam = match crate::uvc::descriptors(cfg) {
+        Ok(c) => c,
+        Err(crate::uvc::Bad::NoVideo) => return false,
+        Err(e) => {
+            crate::kprintln!("[xhci] port {}: USB camera {:04x}:{:04x} refused: {}", port, vid, pid, e);
+            return false;
+        }
+    };
+    let Some(s) = crate::uvc::pick(&cam) else {
+        crate::kprintln!(
+            "[xhci] port {}: USB camera {:04x}:{:04x}: no YUY2 picture up to 640x480 ({}): not driven yet",
+            port, vid, pid, if cam.mjpeg { "MJPEG only, slice 2" } else { "other formats" }
+        );
+        return false;
+    };
+    if cam.nalts == 0 {
+        crate::kprintln!("[xhci] port {}: USB camera {:04x}:{:04x}: no isochronous endpoint (a bulk camera, slice 3): not driven yet", port, vid, pid);
+        return false;
+    }
+    if !control(d, 0x00, 9, cval as u16, 0, 0) {
+        return false; // SET_CONFIGURATION
+    }
+    DEVS[d].kind = KIND_CAM;
+    DEVS[d].dci = 0;
+    NDEVS = NDEVS.max(d + 1);
+    (CAM, CAM_D, CAM_SLOT, CAM_PORT, CAM_SPEED, CAM_ID) = (Some(cam), d, slot, port, speed, (vid, pid));
+    (CAM_RUN, CAM_HALT) = (false, false);
+    READY = true;
+    crate::kprintln!(
+        "[xhci] port {}: USB camera {:04x}:{:04x} ({} speed), slot {}, UVC {:x}.{:02x}, {} YUY2 size(s){}: {}x{} at {} a second; off until `camera on`",
+        port, vid, pid, speed_name(speed), slot, cam.uvc >> 8, cam.uvc & 0xFF, cam.nsizes,
+        if cam.mjpeg { ", MJPEG too (slice 2)" } else { "" },
+        s.w, s.h, if s.interval > 0 { 10_000_000 / s.interval } else { 0 }
+    );
+    true
+}
+
+/// `camera`: the camera, its sizes and what is shown.
+pub fn cam_list() {
+    // SAFETY: shell context; plain copies of enumeration-time state.
+    unsafe {
+        let Some(c) = CAM.filter(|_| CAM_SLOT != 0) else {
+            crate::kprintln!("camera: no USB camera (video class, YUY2) is plugged in");
+            return;
+        };
+        let (vid, pid) = CAM_ID;
+        crate::kprintln!(
+            "camera: {:04x}:{:04x} on port {}, UVC {:x}.{:02x}, video interfaces {} and {}, {} format(s){}",
+            vid, pid, CAM_PORT, c.uvc >> 8, c.uvc & 0xFF, c.vc_if, c.vs_if, c.formats,
+            if c.mjpeg { ", MJPEG not shown until slice 2" } else { "" }
+        );
+        crate::kprint!("camera: YUY2 sizes:");
+        for z in &c.sizes[..c.nsizes] {
+            crate::kprint!(" {}x{}", z.w, z.h);
+        }
+        crate::kprintln!();
+        if let Some(s) = crate::uvc::pick(&c) {
+            crate::kprintln!(
+                "camera: shows {}x{} at {} a second; {}",
+                s.w, s.h, if s.interval > 0 { 10_000_000 / s.interval } else { 0 },
+                if CAM_RUN { "on" } else { "off (type `camera on` at this keyboard)" }
+            );
+        }
+    }
+}
+
+/// True while the driver is in the middle of an operation (enumeration, a control transfer): the idle loop waits.
+pub fn busy() -> bool {
+    // SAFETY: scalar read.
+    unsafe { BUSY }
+}
+
+/// True while the camera streams (from `camera on` until it has been stopped).
+pub fn cam_running() -> bool {
+    // SAFETY: scalar read.
+    unsafe { CAM_RUN }
+}
+
+/// True for the AfriSovera test camera of pc-usbcam, whose frames are summed for the grader.
+pub fn cam_is_test() -> bool {
+    // SAFETY: scalar reads.
+    unsafe { CAM_SLOT != 0 && CAM_ID == TEST_CAM }
+}
+
+/// `camera stats`, the ring's line.
+pub fn cam_ring_stats() {
+    // SAFETY: counters the interrupt updates; a torn read only skews a count.
+    let (ev, taken, empty, lost, bad) = unsafe { CAM_ST };
+    crate::kprintln!(
+        "camera ring: {} events, {} packets taken, {} ring-empty events, {} packets lost by the controller, {} bad packets",
+        ev, taken, empty, lost, bad
+    );
+}
+
+/// `camera on` (uvc.rs has already checked that it was typed at the local console).
+pub fn cam_start() -> Result<(), &'static str> {
+    // SAFETY: shell context; BUSY keeps the timer poll off the event ring while the controls and commands run.
+    unsafe {
+        if CAM_SLOT == 0 || CAM_D >= NDEV {
+            return Err("no USB camera is plugged in");
+        }
+        if CAM_STOPPING {
+            return Err("the camera is still stopping; the mark stays until it has");
+        }
+        if CAM_RUN {
+            return Err("already on");
+        }
+        let Some(cam) = CAM else { return Err("no USB camera is plugged in") };
+        let Some(s) = crate::uvc::pick(&cam) else { return Err("the camera has no YUY2 picture up to 640x480") };
+        let Some(home) = on(DEVS[CAM_D].ctl) else { return Err("the USB controller is busy; try again") };
+        let was = BUSY;
+        BUSY = true;
+        let r = cam_open(CAM_D, &cam, s);
+        BUSY = was;
+        select(home);
+        r
+    }
+}
+
+/// Device `d`'s route string and TT hub fields, as enumerate gave them, read back from its output context.
+unsafe fn slot_path(d: usize) -> (u32, u32) {
+    let o = addr_of_mut!(OUTCTX[d].0) as *mut u8;
+    (read_volatile(ctx(o, 0)) & 0xF_FFFF, read_volatile(ctx(o, 0).add(2)) & 0xFFFF)
+}
+
+/// Probe and commit `s`, then the endpoint, the alternate setting and the packets.
+unsafe fn cam_open(d: usize, cam: &crate::uvc::Cam, s: crate::uvc::Size) -> Result<(), &'static str> {
+    let slot = DEVS[d].slot;
+    let vs = cam.vs_if as u16;
+    // the probe control's length: 26 bytes for UVC 1.0, 34 for 1.1, 48 for 1.5
+    let plen: u16 = if cam.uvc < 0x0110 { 26 } else if cam.uvc < 0x0150 { 34 } else { 48 };
+    let dbuf = addr_of!(DBUF) as u64;
+    {
+        let b = &mut (*addr_of_mut!(DBUF)).0;
+        b[..48].fill(0);
+        b[0] = 1; // bmHint: keep the frame interval
+        (b[2], b[3]) = (s.format, s.frame);
+        b[4..8].copy_from_slice(&s.interval.to_le_bytes());
+    }
+    // VS_PROBE_CONTROL (selector 1): SET_CUR, then GET_CUR for what the camera makes of it
+    if control_buf(d, 0x21, 0x01, 0x0100, vs, plen, dbuf).is_none() {
+        return Err("the camera refused the probe");
+    }
+    let got = control_buf(d, 0xA1, 0x81, 0x0100, vs, plen, dbuf).ok_or("the camera did not answer the probe")?;
+    // the answer's length is checked before any field of it is read
+    if got < 26 {
+        return Err("the camera's probe answer is shorter than 26 bytes");
+    }
+    let b = (*addr_of!(DBUF)).0;
+    if (b[2], b[3]) != (s.format, s.frame) {
+        return Err("the camera chose another format or size than asked");
+    }
+    let frame = u32::from_le_bytes([b[18], b[19], b[20], b[21]]);
+    let payload = u32::from_le_bytes([b[22], b[23], b[24], b[25]]);
+    if frame != s.bytes {
+        return Err("the camera's frame size is not width x height x 2");
+    }
+    if payload == 0 {
+        return Err("the camera asks for no packet size");
+    }
+    let Some(alt) = crate::uvc::alt_for(cam, payload) else { return Err("no alternate setting carries the camera's packet size") };
+    if alt.bytes() as usize > CAM_PKT {
+        return Err("the camera's packets are larger than 3072 bytes");
+    }
+    // VS_COMMIT_CONTROL (selector 2): what the probe gave back
+    if control_buf(d, 0x21, 0x01, 0x0200, vs, got as u16, dbuf).is_none() {
+        return Err("the camera refused the commit");
+    }
+    // the isochronous IN endpoint: DCI = 2 x number + 1
+    let dci = 2 * (alt.ep & 0xF) as u32 + 1;
+    let interval = if CAM_SPEED >= 3 { (alt.interval as u32).clamp(1, 16) - 1 } else { (alt.interval as u32).clamp(1, 16) + 2 };
+    *addr_of_mut!(PCAM) = Prod { idx: 0, cycle: 1 };
+    core::ptr::write_bytes(addr_of_mut!(CAM_RING) as *mut u8, 0, core::mem::size_of::<Ring<NCAM>>());
+    let (route, tt) = slot_path(d);
+    let inb = addr_of_mut!(INCTX.0) as *mut u8;
+    core::ptr::write_bytes(inb, 0, 4096);
+    *ctx(inb, 0).add(1) = 1 | 1 << dci;
+    let sl = ctx(inb, 1);
+    *sl = CAM_SPEED << 20 | dci << 27 | route;
+    *sl.add(1) = CAM_PORT << 16;
+    *sl.add(2) = tt;
+    let ec = ctx(inb, 1 + dci as usize);
+    *ec = interval << 16;
+    // CErr 0 (isochronous), isochronous IN (5), Max Burst = transactions - 1 at high speed, the packet size
+    let burst = if CAM_SPEED == 3 { alt.mult as u32 - 1 } else { 0 };
+    *ec.add(1) = 5 << 3 | burst << 8 | (alt.mps as u32) << 16;
+    let tr = addr_of!(CAM_RING) as u64;
+    *ec.add(2) = tr as u32 | 1;
+    *ec.add(3) = (tr >> 32) as u32;
+    *ec.add(4) = alt.bytes() | alt.bytes() << 16; // average TRB length, max ESIT payload
+    if command(inb as u64, T_CONFIGURE_EP << 10 | slot << 24).is_none() {
+        return Err("the USB controller refused the camera's endpoint");
+    }
+    if !control(d, 0x01, 11, alt.alt as u16, vs, 0) {
+        cam_drop(d, dci);
+        return Err("the camera refused its alternate setting");
+    }
+    DEVS[d].dci = dci;
+    (CAM_DCI, CAM_REQ, CAM_NEXT) = (dci, alt.bytes(), 0);
+    // high speed: the packet's transactions less one (TLBPC, as Linux sets it; TBC stays 0)
+    CAM_TLBPC = if CAM_SPEED == 3 { alt.bytes().div_ceil(alt.mps as u32).max(1) - 1 } else { 0 };
+    CAM_ST = (0, 0, 0, 0, 0);
+    crate::uvc::begin(s.w as usize, s.h as usize);
+    (CAM_RUN, CAM_HALT, CAM_STOPPING, CAM_STOP_SAID) = (true, false, false, false);
+    for k in 0..NCAM - 1 {
+        cam_queue(k);
+    }
+    doorbell(slot, dci);
+    crate::kprintln!(
+        "[camera] on: {}x{} YUY2 at {} a second, alternate setting {} ({} bytes every {} us), endpoint {:#04x}; the CAMERA ON mark shows until it stops",
+        s.w, s.h, if s.interval > 0 { 10_000_000 / s.interval } else { 0 }, alt.alt, alt.bytes(), 125u32 << interval, alt.ep
+    );
+    Ok(())
+}
+
+/// Packet buffer `k` onto the ring: one Isoch TRB, started as soon as possible (SIA), an event for every packet
+/// (IOC, and ISP for a short one).
+unsafe fn cam_queue(k: usize) {
+    push(
+        addr_of_mut!(CAM_RING.0) as *mut Trb,
+        NCAM,
+        &mut *addr_of_mut!(PCAM),
+        addr_of!(CAMBUF[k]) as u64,
+        CAM_REQ,
+        1 << 31 | CAM_TLBPC << 16 | T_ISOCH << 10 | 1 << 5 | 1 << 2,
+    );
+}
+
+/// Take the endpoint away again (its bandwidth back to the controller): Configure Endpoint with its drop flag.
+/// True when the controller took it.
+unsafe fn cam_drop(d: usize, dci: u32) -> bool {
+    let (route, tt) = slot_path(d);
+    let inb = addr_of_mut!(INCTX.0) as *mut u8;
+    core::ptr::write_bytes(inb, 0, 4096);
+    *ctx(inb, 0) = 1 << dci; // drop
+    *ctx(inb, 0).add(1) = 1; // the slot context
+    let sl = ctx(inb, 1);
+    *sl = CAM_SPEED << 20 | 1 << 27 | route;
+    *sl.add(1) = CAM_PORT << 16;
+    *sl.add(2) = tt;
+    let ok = command(inb as u64, T_CONFIGURE_EP << 10 | DEVS[d].slot << 24).is_some();
+    if ok {
+        DEVS[d].dci = 0;
+    }
+    ok
+}
+
+/// One camera event (timer interrupt, or a wait in the shell): the packet it names handed to uvc.rs, then its
+/// TRB given back. The bytes are the length asked for less the residue, never more than the buffer; a residue
+/// larger than the request is a bad packet. Missed service and the like count as lost packets, not as errors (a
+/// real camera gets them); only a halt or a transaction error ends the stream.
+/// A real controller may skip packets without an event for each, and may send Missed Service with no packet
+/// named: an event for a slot ahead of CAM_NEXT gives the slots in between back as lost (uvc::slot), and a Missed
+/// Service with no pointer only counts. Only a slot already given back is a fault.
+unsafe fn cam_event(ev: &Trb, cc: u32) {
+    if !CAM_RUN || CAM_HALT || CAM_STOPPING || (ev.control >> 16) & 0x1F != CAM_DCI {
+        return;
+    }
+    CAM_ST.0 += 1;
+    if cc == 14 || cc == 15 {
+        // ring underrun/overrun: the ring ran empty (no packet named); the doorbell starts it again
+        CAM_ST.2 += 1;
+        doorbell(CAM_SLOT, CAM_DCI);
+        return;
+    }
+    let base = addr_of!(CAM_RING) as u64;
+    let at = ev.param & !0xF;
+    if cc == 23 && at == 0 {
+        // missed service with no packet named: the packets it skipped are given back when the next event names a
+        // later slot
+        crate::uvc::lost_packet();
+        return;
+    }
+    if at < base || at >= base + 16 * (NCAM as u64 - 1) {
+        CAM_ST.4 += 1;
+        return;
+    }
+    let k = ((at - base) / 16) as usize;
+    match crate::uvc::slot(CAM_NEXT, k, NCAM - 1) {
+        crate::uvc::Slot::Next => {}
+        crate::uvc::Slot::Ahead(gap) => {
+            // the controller passed these packets without an event: lost, given back in ring order
+            for _ in 0..gap {
+                let j = CAM_NEXT;
+                CAM_ST.3 += 1;
+                crate::uvc::lost_packet();
+                CAM_NEXT = (j + 1) % (NCAM - 1);
+                cam_queue(j);
+            }
+        }
+        crate::uvc::Slot::Behind => {
+            CAM_HALT = true;
+            crate::uvc::fail("a packet's event named a packet already given back");
+            return;
+        }
+    }
+    match cc {
+        CC_SUCCESS | CC_SHORT => {
+            let res = ev.status & 0xFF_FFFF;
+            if res > CAM_REQ {
+                CAM_ST.4 += 1; // more left over than was asked for: a bad packet, not an underflow
+                crate::uvc::lost_packet();
+            } else {
+                let n = ((CAM_REQ - res) as usize).min(CAM_PKT);
+                CAM_ST.1 += 1;
+                crate::uvc::packet(&(&*addr_of!(CAMBUF[k])).0[..n]);
+            }
+        }
+        4 | 6 => {
+            CAM_HALT = true;
+            crate::uvc::fail(if cc == 4 { "a USB transaction error" } else { "the endpoint halted" });
+            return;
+        }
+        23 => {
+            CAM_ST.3 += 1; // missed service: the controller could not serve this interval
+            crate::uvc::lost_packet();
+        }
+        _ => {
+            CAM_ST.4 += 1;
+            crate::uvc::lost_packet();
+        }
+    }
+    CAM_NEXT = (k + 1) % (NCAM - 1);
+    cam_queue(k);
+    doorbell(CAM_SLOT, CAM_DCI);
+}
+
+/// `camera off`, a stream error, or the end: Stop Endpoint, the alternate setting back to 0 (no bandwidth), the
+/// endpoint dropped. The frames are zeroed and the mark taken off (uvc::stopped) only when the stream has really
+/// stopped: Stop Endpoint succeeded, or the drop did (a halted endpoint cannot take Stop Endpoint), or the camera
+/// is gone. Otherwise the mark stays, events are ignored, and the idle loop tries again. True when stopped.
+pub fn cam_stop() -> bool {
+    // SAFETY: shell context (the idle loop or a command); BUSY keeps the timer poll off the event ring.
+    unsafe {
+        if !CAM_RUN {
+            return true;
+        }
+        CAM_STOPPING = true;
+        let d = CAM_D;
+        let mut done = CAM_SLOT == 0 || d >= NDEV;
+        if !done {
+            if let Some(home) = on(DEVS[d].ctl) {
+                let was = BUSY;
+                BUSY = true;
+                let stopped = command(0, T_STOP_EP << 10 | CAM_SLOT << 24 | CAM_DCI << 16).is_some();
+                if let Some(c) = CAM {
+                    CTL_QUIET = true;
+                    control(d, 0x01, 11, 0, c.vs_if as u16, 0);
+                    CTL_QUIET = false;
+                }
+                let dropped = cam_drop(d, CAM_DCI);
+                BUSY = was;
+                select(home);
+                done = stopped || dropped;
+            }
+        }
+        if !done {
+            if !CAM_STOP_SAID {
+                CAM_STOP_SAID = true;
+                crate::kprintln!("[camera] could not stop the camera yet; the mark stays (trying again)");
+            }
+            return false;
+        }
+        (CAM_RUN, CAM_HALT, CAM_STOPPING, CAM_STOP_SAID) = (false, false, false, false);
+        crate::uvc::stopped();
+        true
+    }
+}
+
+/// True while a stop has begun but the stream is not yet known to have stopped (the mark stays).
+pub fn cam_stopping() -> bool {
+    // SAFETY: scalar read.
+    unsafe { CAM_STOPPING }
+}
+
+// --- Bluetooth over USB, slice 1 (14 Nov 2026, bt.rs, BLUETOOTH_PLAN.md) ---
+// A laptop's Bluetooth is a USB device of class E0/01/01 on an internal port. Its first interface carries HCI:
+// commands go out as class control requests (bmRequestType 0x20, bRequest 0, wIndex 0), events come in on an
+// interrupt-IN endpoint, one packet of at most its wMaxPacketSize at a time (bt.rs puts them together). The bulk
+// endpoints (ACL data) and the isochronous interface (voice) are not used in slice 1. Nothing is sent at boot.
+
+static mut BT_SLOT: u32 = 0;
+static mut BT_D: usize = usize::MAX;
+static mut BT_ID: (u16, u16) = (0, 0);
+static mut BT_DCI: u32 = 0;
+static mut BT_MPS: u32 = 16;
+static mut BT_ERR: u64 = 0;
+
+/// A Bluetooth controller: interface 0 of class E0/01/01 (alternate setting 0) with an interrupt-IN endpoint.
+unsafe fn bt_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bool {
+    let slot = DEVS[d].slot;
+    if !control(d, 0x80, 6, 0x0200, 0, 9) {
+        return false;
+    }
+    let total = (u16::from_le_bytes([DBUF.0[2], DBUF.0[3]]) as usize).min(512);
+    let cval = DBUF.0[5];
+    if !control(d, 0x80, 6, 0x0200, 0, total as u16) {
+        return false;
+    }
+    let (mut i, mut in_hci, mut ep) = (0usize, false, None);
+    while i + 2 <= total {
+        let len = DBUF.0[i] as usize;
+        if len < 2 || i + len > total {
+            break;
+        }
+        match DBUF.0[i + 1] {
+            4 if len >= 9 => {
+                let class = (DBUF.0[i + 5], DBUF.0[i + 6], DBUF.0[i + 7]);
+                in_hci = class == (0xE0, 0x01, 0x01) && DBUF.0[i + 3] == 0 && ep.is_none();
+            }
+            5 if in_hci && len >= 7 && DBUF.0[i + 3] & 3 == 3 && DBUF.0[i + 2] & 0x80 != 0 => {
+                let mps = u16::from_le_bytes([DBUF.0[i + 4], DBUF.0[i + 5]]) as u32 & 0x7FF;
+                ep = ep.or(Some((DBUF.0[i + 2] & 0xF, mps, DBUF.0[i + 6])));
+            }
+            _ => {}
+        }
+        i += len;
+    }
+    let Some((epn, mps, binterval)) = ep else { return false };
+    if mps == 0 {
+        return false;
+    }
+    if !control(d, 0x00, 9, cval as u16, 0, 0) {
+        return false; // SET_CONFIGURATION
+    }
+    let dci = 2 * epn as u32 + 1;
+    let interval = if speed >= 3 {
+        (binterval as u32).clamp(1, 16) - 1
+    } else {
+        ((binterval as u32).max(1) * 8).ilog2().clamp(3, 10)
+    };
+    let inb = addr_of_mut!(INCTX.0) as *mut u8;
+    core::ptr::write_bytes(inb, 0, 4096);
+    *ctx(inb, 0).add(1) = 1 | 1 << dci;
+    let sl = ctx(inb, 1);
+    *sl = speed << 20 | dci << 27 | PATH.0;
+    *sl.add(1) = port << 16;
+    *sl.add(2) = PATH.1 | PATH.2 << 8;
+    let ec = ctx(inb, 1 + dci as usize);
+    *ec = interval << 16;
+    *ec.add(1) = 3 << 1 | 7 << 3 | mps << 16; // CErr 3, interrupt IN
+    let tr = addr_of!(EPIN[d]) as u64;
+    *ec.add(2) = tr as u32 | 1;
+    *ec.add(3) = (tr >> 32) as u32;
+    *ec.add(4) = mps | mps << 16; // average TRB length, max ESIT payload
+    if command(inb as u64, T_CONFIGURE_EP << 10 | slot << 24).is_none() {
+        return false;
+    }
+    DEVS[d].dci = dci;
+    DEVS[d].kind = KIND_BT;
+    NDEVS = NDEVS.max(d + 1);
+    (BT_D, BT_ID, BT_DCI, BT_MPS, BT_ERR) = (d, (vid, pid), dci, mps.clamp(8, 512), 0);
+    BT_SLOT = slot;
+    bt_queue(d);
+    crate::kprintln!(
+        "[xhci] port {}: Bluetooth controller {:04x}:{:04x} ({} speed), slot {}, events on endpoint {}; nothing is sent until `bt`",
+        port, vid, pid, speed_name(speed), slot, epn
+    );
+    true
+}
+
+/// One event packet asked for on the interrupt-IN ring.
+unsafe fn bt_queue(d: usize) {
+    push(
+        addr_of_mut!(EPIN[d].0) as *mut Trb,
+        NXFER,
+        &mut (*addr_of_mut!(PEPIN))[d],
+        addr_of!(REPORT[d]) as u64,
+        BT_MPS,
+        T_NORMAL << 10 | 1 << 5 | 1 << 2, // IOC, ISP
+    );
+    doorbell(DEVS[d].slot, BT_DCI);
+}
+
+/// An event packet (timer interrupt, or a wait in the shell): to bt.rs, then the next one asked for.
+unsafe fn bt_event(d: usize, ev: &Trb, cc: u32) {
+    if (ev.control >> 16) & 0x1F != BT_DCI {
+        return;
+    }
+    if cc == CC_SUCCESS || cc == CC_SHORT {
+        let got = (BT_MPS as usize).saturating_sub((ev.status & 0xFF_FFFF) as usize).min(512);
+        crate::bt::packet(&(&*addr_of!(REPORT[d])).0[..got]);
+    } else {
+        BT_ERR += 1;
+        if BT_ERR > 16 {
+            return; // a halted endpoint: no more asking (unplugging resets it)
+        }
+    }
+    bt_queue(d);
+}
+
+/// True while a Bluetooth controller is plugged in.
+pub fn bt_present() -> bool {
+    // SAFETY: scalar read.
+    unsafe { BT_SLOT != 0 }
+}
+
+/// The controller's USB vendor and product id.
+pub fn bt_id() -> (u16, u16) {
+    // SAFETY: scalar read.
+    unsafe { BT_ID }
+}
+
+/// One HCI command packet (opcode, length, parameters) to the controller: a class request on endpoint 0.
+pub fn bt_command(pkt: &[u8]) -> bool {
+    if pkt.len() > 258 {
+        return false;
+    }
+    // SAFETY: shell context; BUSY keeps the timer poll off the event ring while the request runs.
+    unsafe {
+        if BT_SLOT == 0 || BT_D >= NDEV {
+            return false;
+        }
+        let d = BT_D;
+        let Some(home) = on(DEVS[d].ctl) else { return false };
+        let was = BUSY;
+        BUSY = true;
+        (&mut (*addr_of_mut!(DBUF)).0)[..pkt.len()].copy_from_slice(pkt);
+        let ok = control(d, 0x20, 0, 0, 0, pkt.len() as u16);
+        BUSY = was;
+        select(home);
+        ok
     }
 }

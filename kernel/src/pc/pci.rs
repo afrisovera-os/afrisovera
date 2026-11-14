@@ -61,6 +61,7 @@ pub fn find_by(buses: u8, mut hit: impl FnMut(u8, u8, u8, u32) -> bool) -> Optio
     None
 }
 
+#[allow(dead_code)] // the drivers now decide from their BINDS (pc/hwdb.rs); kept for tools and tests
 /// The first function on buses `0..buses` whose class code (base:sub:interface, 24 bits) is
 /// `class`. Same walk the drivers used.
 pub fn find_class(class: u32, buses: u8) -> Option<(u8, u8, u8)> {

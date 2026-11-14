@@ -25,11 +25,55 @@ pub fn run() -> ! {
     }
 }
 
+/// The shell waits at its own prompt with nothing typed (afriui.md section 32). Only then may the Circle start an app,
+/// and only this prompt's read takes its line: a command's own key wait (`cpu_getc`, the pager, appget's y) never
+/// does, so the desk never answers a question the person did not see (the architect, 14 Nov).
+static AT_PROMPT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The shell is idle at its prompt, with nothing typed.
+pub fn at_prompt() -> bool {
+    AT_PROMPT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The prompt's key wait: a key, or the line a Circle tile asked for (only while nothing is typed). A key typed after
+/// a tile was clicked wins, and the tile's line is dropped.
+fn prompt_getc(len: usize) -> Result<u8, &'static str> {
+    use core::sync::atomic::Ordering::Relaxed;
+    end_catch();
+    AT_PROMPT.store(len == 0, Relaxed);
+    loop {
+        if let Some(c) = crate::uart::getc() {
+            AT_PROMPT.store(false, Relaxed);
+            crate::desk::launch_drop();
+            return Ok(c);
+        }
+        crate::desk::idle(); // the desktop's input events and redraws (desk.rs): a tile is clicked here
+        if len == 0 {
+            if let Some(line) = crate::desk::launch_take() {
+                AT_PROMPT.store(false, Relaxed);
+                return Err(line);
+            }
+        }
+        crate::uart::note_idle_wfi();
+        crate::cpu::wfi();
+    }
+}
+
 /// Read a line, echoing characters. Handles backspace and CR/LF.
 fn read_line(buf: &mut [u8; MAX_LINE]) -> &str {
     let mut len = 0;
     loop {
-        match cpu_getc() {
+        let c = match prompt_getc(len) {
+            Ok(c) => c,
+            Err(line) => {
+                // a Circle tile's line, shown as typed so the person sees what ran
+                let n = line.len().min(MAX_LINE - 1);
+                buf[..n].copy_from_slice(&line.as_bytes()[..n]);
+                crate::kprintln!("{}", &line[..n]);
+                return core::str::from_utf8(&buf[..n]).unwrap_or("");
+            }
+        };
+        match c {
             b'\r' | b'\n' => {
                 crate::kprintln!();
                 break;
@@ -62,7 +106,210 @@ fn read_line(buf: &mut [u8; MAX_LINE]) -> &str {
 /// a wake within 10 ms regardless (so `uptime` keeps advancing and we never sleep
 /// forever). The RX ISR drains the hardware FIFO into the ring, so idling on `wfi`
 /// no longer risks dropping bursty input.
+// ---------------------------------------------------------------------------------------------------------------
+// A pager and output to a file (afriui.md section 28): `more <cmd>`, `<cmd> | more`, `<cmd> > name`. The command
+// runs as usual; what it prints is caught at uart::_print (both kernels) into CAP, then paged or written.
+// ---------------------------------------------------------------------------------------------------------------
+const CAP_LEN: usize = 32 * 1024;
+static mut CAP: [u8; CAP_LEN] = [0; CAP_LEN];
+static mut CAP_N: usize = 0;
+static mut CAP_CUT: bool = false;
+static CAPTURING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The pager is showing a page: its lines go straight to the screen, past `help`'s own page filter on the PC (which
+/// holds a line until it ends, and so held the "More:" prompt back).
+static PAGING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn paging() -> bool {
+    PAGING.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Commands that wait for a key (a prompt, an app's input, "any key to return"): they cannot run inside a catch,
+/// since the person would never see the question (the architect, 14 Nov). Add each new one here as it lands; the
+/// shell's key wait ends a catch anyway (`end_catch`), so a missed name shows its output instead of hanging.
+const ASKS_KEY: [&str; 9] = ["appget", "store", "edit", "web", "dira", "nia", "wm", "rustapp", "niavm"];
+
+/// A catch ended early by a key wait: the command's output already went to the screen, so it is not paged or saved.
+static CAP_BROKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// A command is waiting for a key: end an active catch first, showing what was caught, so the person sees the
+/// question (`cpu_getc`, store.rs `getkey`). Nothing when no catch is on.
+pub fn end_catch() {
+    if !capturing() {
+        return;
+    }
+    CAPTURING.store(false, core::sync::atomic::Ordering::Relaxed);
+    CAP_BROKEN.store(true, core::sync::atomic::Ordering::Relaxed);
+    // SAFETY: the catch is off; nothing else writes CAP.
+    let out = unsafe { &(&*core::ptr::addr_of!(CAP))[..CAP_N] };
+    crate::kprint!("{}", core::str::from_utf8(out).unwrap_or(""));
+    crate::kprintln!("[more] this command asks for a key, so its output goes to the screen");
+}
+
+/// Output is being caught (uart::_print asks, with its print lock held).
+pub fn capturing() -> bool {
+    CAPTURING.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+struct Catch;
+impl core::fmt::Write for Catch {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        // SAFETY: only uart::_print calls this, with its print lock held.
+        unsafe {
+            let buf = &mut *core::ptr::addr_of_mut!(CAP);
+            for &b in s.as_bytes() {
+                if CAP_N < CAP_LEN {
+                    buf[CAP_N] = b;
+                    CAP_N += 1;
+                } else {
+                    CAP_CUT = true;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Catch one print (uart::_print, print lock held).
+pub fn capture(args: core::fmt::Arguments) {
+    let _ = core::fmt::Write::write_fmt(&mut Catch, args);
+}
+
+/// Run `cmd` with its output caught; returns the bytes caught (valid until the next catch) and whether any were cut.
+fn caught(cmd: &str) -> (&'static [u8], bool) {
+    // SAFETY: mainline; the catch is off until `CAPTURING` is set below.
+    unsafe {
+        CAP_N = 0;
+        CAP_CUT = false;
+    }
+    CAP_BROKEN.store(false, core::sync::atomic::Ordering::Relaxed);
+    CAPTURING.store(true, core::sync::atomic::Ordering::Relaxed);
+    exec(cmd);
+    CAPTURING.store(false, core::sync::atomic::Ordering::Relaxed);
+    // SAFETY: the catch is off; nothing else writes CAP.
+    unsafe { (&(&*core::ptr::addr_of!(CAP))[..CAP_N], CAP_CUT) }
+}
+
+/// The three forms; true if `line` was one of them (and has run).
+fn paged(line: &str) -> bool {
+    let t = line.trim();
+    if capturing() {
+        return false; // a command inside a caught one runs plainly
+    }
+    let (cmd, to_file) = if let Some(rest) = t.strip_prefix("more ") {
+        (rest.trim(), None)
+    } else if let Some(rest) = t.strip_suffix("| more") {
+        (rest.trim(), None)
+    } else if let Some(i) = t.rfind(" > ") {
+        let name = t[i + 3..].trim();
+        if name.is_empty() || name.contains(' ') {
+            return false;
+        }
+        (t[..i].trim(), Some(name))
+    } else {
+        return false;
+    };
+    if cmd.is_empty() {
+        crate::kprintln!("more: more <command>, <command> | more, or <command> > <file>");
+        return true;
+    }
+    if cmd.starts_with("more ") || cmd == "more" || cmd.ends_with("| more") || cmd.contains(" > ") {
+        crate::kprintln!("more: one more or > at a time");
+        return true;
+    }
+    let word = cmd.split_whitespace().next().unwrap_or("");
+    if ASKS_KEY.contains(&word) {
+        crate::kprintln!("more: '{}' asks for a key, so it cannot run inside more or >", word);
+        return true;
+    }
+    if let Some(name) = to_file {
+        // never the system's files: the config, a bundled app, anything the integrity manifest or appget owns
+        if name == "afrisovera.conf" || crate::nia::BUNDLED.iter().any(|(n, _)| *n == name) || crate::integrity::expected(name).is_some() {
+            crate::kprintln!("[shell] {} is the system's file; not replaced", name);
+            return true;
+        }
+        // and never a file that is there already (an explicit overwrite can come later; the safe default first)
+        if crate::vfs::read_raw(name).is_some() {
+            crate::kprintln!("[shell] {} exists; not replaced (choose another name)", name);
+            return true;
+        }
+    }
+    let (out, cut) = caught(cmd);
+    if CAP_BROKEN.load(core::sync::atomic::Ordering::Relaxed) {
+        crate::kprintln!("[more] nothing {}: the command asked for a key", if to_file.is_some() { "saved" } else { "paged" });
+        return true;
+    }
+    match to_file {
+        Some(name) => {
+            // a cut file ends with a line that says so (the architect, 14 Nov)
+            const CUT_NOTE: &[u8] = b"\n[cut: the output was longer than this file can hold]\n";
+            let max = crate::vfs::MAX_BIG_FILE_BYTES;
+            let longer = cut || out.len() > max;
+            let saved = if longer {
+                let n = max - CUT_NOTE.len();
+                // SAFETY: mainline; CAP is not written again until the next catch, and n + CUT_NOTE fits in CAP.
+                unsafe {
+                    let buf = &mut *core::ptr::addr_of_mut!(CAP);
+                    buf[n..n + CUT_NOTE.len()].copy_from_slice(CUT_NOTE);
+                    &buf[..n + CUT_NOTE.len()]
+                }
+            } else {
+                out
+            };
+            if crate::vfs::write_full(name, saved) {
+                crate::kprintln!("[shell] {} bytes of '{}' saved to {}{}", saved.len(), cmd, name, if longer { " (cut: the output was longer)" } else { "" });
+            } else {
+                crate::kprintln!("[shell] could not save to {} (no room for another file?)", name);
+            }
+        }
+        None => {
+            PAGING.store(true, core::sync::atomic::Ordering::Relaxed);
+            page(out, cut);
+            PAGING.store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    true
+}
+
+/// Show caught output a screenful at a time: the Terminal's rows with the desk showing, else the console's.
+fn page(out: &[u8], cut: bool) {
+    let rows = if crate::desk::shown() { crate::desk::term_rows() } else { 46 }.max(3);
+    let per = rows - 1; // the last row holds the prompt
+    const PROMPT: &str = "More: Space next page, Enter next line, q quit";
+    let mut lines = out.split(|&b| b == b'\n').peekable();
+    let mut left = per;
+    let mut shown = 0usize;
+    while let Some(l) = lines.next() {
+        if lines.peek().is_none() && l.is_empty() {
+            break; // the newline that ends the output
+        }
+        crate::kprintln!("{}", core::str::from_utf8(l).unwrap_or("?"));
+        shown += 1;
+        left -= 1;
+        if left == 0 && lines.peek().is_some() {
+            crate::kprint!("{}", PROMPT);
+            let k = cpu_getc();
+            // take the prompt off again (both the console and the Terminal take a backspace)
+            for _ in 0..PROMPT.len() {
+                crate::kprint!("\x08 \x08");
+            }
+            match k {
+                b'q' | b'Q' | 0x03 | 0x1B => {
+                    crate::kprintln!("[more] stopped after {} line(s)", shown);
+                    return;
+                }
+                b'\r' | b'\n' => left = 1,
+                _ => left = per,
+            }
+        }
+    }
+    if cut {
+        crate::kprintln!("[more] (the output was longer than {} KiB; the rest was not kept)", CAP_LEN / 1024);
+    }
+}
+
 fn cpu_getc() -> u8 {
+    end_catch(); // a command waiting for a key inside more or > shows its question instead of hanging
     loop {
         if let Some(c) = crate::uart::getc() {
             return c;
@@ -209,7 +456,7 @@ fn parse_dest(tok: &str) -> Dest<'_> {
     }
 }
 
-pub(crate) fn exec(line: &str) { pc_intercept!(line);
+pub(crate) fn exec(line: &str) { if paged(line) { return; } pc_intercept!(line);
     let line = line.trim();
     if line.is_empty() {
         return;
@@ -253,6 +500,11 @@ pub(crate) fn exec(line: &str) { pc_intercept!(line);
             crate::kprintln!("[faultdemo] spawning an EL0 process that will deliberately fault...");
             crate::process::run_fault_demo();
             crate::kprintln!("[faultdemo] the offending process was killed; the OS is still running.");
+        }
+        "el0-ptr" => {
+            // Gap G2 probe: an EL0 program passes kernel addresses to SYS_AI and SYS_SPEAK (scripts/el0-ptr-test.sh).
+            crate::kprintln!("[el0-ptr] an EL0 program hands the kernel its own addresses...");
+            crate::process::run_el0_ptr_probe();
         }
         "sgi-el0" => {
             // 2.991 falsify-first probe: is an SGI taken at EL0 delivered, or
@@ -6960,11 +7212,14 @@ pub(crate) fn exec(line: &str) { pc_intercept!(line);
             // Install a Nia app from the network: appget <ip> <port> <name> <sha256> (appget.rs).
             crate::appget::run(rest, cpu_getc);
         }
+        "dira" => crate::dira::run(rest), // the web browser: dira <address> (dira/mod.rs)
         "nia" => {
             // Nia WASM runtime. `nia` runs the built-in demos; `nia <file.wasm>`
             // loads and runs a WebAssembly module from the filesystem.
             if rest.is_empty() {
                 crate::nia::run_demo();
+            } else if rest == "--stackprobe" {
+                crate::nia::stack_probe_on(); // a test switch (desk-cell-app), until the next boot
             } else {
                 crate::nia::run_file(rest);
             }
@@ -7402,6 +7657,10 @@ pub(crate) fn exec(line: &str) { pc_intercept!(line);
         "wasmfuzz" => {
             // Feed malformed modules to the WASM parser; the kernel must survive.
             crate::nia::fuzz();
+        }
+        "wasmbench" => {
+            // Time the Nia bench apps the old way and the new way (claude/nia-fast).
+            crate::nia::bench();
         }
         "wasmops" => {
             // Run a WASM module exercising the shift/rotate opcodes.

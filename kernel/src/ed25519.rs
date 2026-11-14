@@ -9,6 +9,18 @@
 //! their private key; the device only ever verifies.
 //!
 //! Validated against RFC 8032 Ed25519 Test 1 (see `self_test`).
+//!
+//! **Strict checks (G7 step 1, docs/security-model.md).** TweetNaCl's own verify is permissive; `verify` here first
+//! refuses, as ed25519-dalek's `verify_strict` does:
+//! - `S >= L`: otherwise `S + L` also verifies, and anyone can make a second valid signature (malleability);
+//! - a public key A that is not canonically encoded (y >= p, or x = 0 with the sign bit set);
+//! - A or R of small order (`[8]P` is the identity), or an R that does not decompress: under such a key one
+//!   signature can verify many messages.
+//!
+//! A non-canonical R is refused by the final byte compare. The equation stays cofactorless. **Mixed-order keys**
+//! (a large-order point plus a small torsion part) are still accepted, as `verify_strict` accepts them: the
+//! small-order check does not cover them. Whether a key must be of prime order is for the trust list (a later G7
+//! step) to decide when a key is added. The inputs are public, so none of these checks needs to be constant time.
 
 use crate::sha512;
 use alloc::vec::Vec;
@@ -295,12 +307,67 @@ fn reduce(h: &[u8; 64]) -> [u8; 32] {
     r
 }
 
-/// Verify an Ed25519 signature `sig` (R‖S) over `msg` under `pubkey`.
+/// L, the order of the base point, as 32 little-endian bytes (from `L` above).
+const L_BYTES: [u8; 32] = {
+    let mut b = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        b[i] = L[i] as u8;
+        i += 1;
+    }
+    b
+};
+
+/// True iff the little-endian scalar `s` is strictly below L (compared from byte 31 down).
+fn scalar_canonical(s: &[u8]) -> bool {
+    for i in (0..32).rev() {
+        if s[i] != L_BYTES[i] {
+            return s[i] < L_BYTES[i];
+        }
+    }
+    false // equal to L
+}
+
+/// True iff `[8]P` is the identity, i.e. P has order 1, 2, 4 or 8.
+fn small_order(p: &Point) -> bool {
+    let mut q = *p;
+    for _ in 0..3 {
+        let c = q;
+        point_add(&mut q, &c); // double
+    }
+    let mut id = [0u8; 32];
+    id[0] = 1;
+    pack_point(&q) == id
+}
+
+/// Verify an Ed25519 signature `sig` (R‖S) over `msg` under `pubkey`, strictly (see the top of the file).
 pub fn verify(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
+    // S < L, before any curve work.
+    if !scalar_canonical(&sig[32..64]) {
+        return false;
+    }
     let neg_a = match unpackneg(pubkey) {
         Some(p) => p,
         None => return false,
     };
+    // A canonical: undo the negation (x -> -x, t = x*y), repack, and require the very same 32 bytes. This one rule
+    // refuses y >= p and x = 0 with the sign bit set (where -A = A, so comparing -A with a flipped bit would pass).
+    let mut a = neg_a;
+    a[0] = fe_z(&GF0, &a[0]);
+    a[3] = fe_m(&a[0], &a[1]);
+    if pack_point(&a) != *pubkey {
+        return false;
+    }
+    let mut r_bytes = [0u8; 32];
+    r_bytes.copy_from_slice(&sig[0..32]);
+    // R must decompress, and neither A nor R may be of small order (the order of -P is the order of P).
+    let neg_r = match unpackneg(&r_bytes) {
+        Some(p) => p,
+        None => return false,
+    };
+    if small_order(&neg_a) || small_order(&neg_r) {
+        return false;
+    }
 
     // k = SHA-512(R || A || M) mod L
     let mut buf = Vec::with_capacity(64 + msg.len());
@@ -316,7 +383,7 @@ pub fn verify(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
     point_add(&mut r, &p); // [S]B + [k](-A) = [S]B - [k]A
     let check = pack_point(&r);
 
-    // Valid iff the recomputed point equals R.
+    // Valid iff the recomputed point equals R, byte for byte (so a non-canonical R never matches).
     check[..] == sig[0..32]
 }
 
@@ -337,5 +404,34 @@ pub fn self_test() -> bool {
     let mut bad_sig = sig;
     bad_sig[0] ^= 0x01;
     let bad = verify(&pk, b"", &bad_sig);
-    good && !bad
+    good && !bad && strict_cases(&pk, &sig)
+}
+
+/// G7 step 1: the three strict refusals, each on a case the permissive check accepted or that only its rule refuses.
+fn strict_cases(pk: &[u8; 32], sig: &[u8; 64]) -> bool {
+    // 1. S + L: the same signature, malleated (TweetNaCl's verify accepted it).
+    #[rustfmt::skip]
+    const S_PLUS_L: [u8; 32] = [
+        0x4c, 0x8c, 0x78, 0x72, 0xaa, 0x06, 0x4e, 0x04, 0x9d, 0xbb, 0x30, 0x13, 0xfb, 0xf2, 0x93, 0x80,
+        0xd2, 0x5b, 0xf5, 0xf0, 0x59, 0x5b, 0xbe, 0x24, 0x65, 0x51, 0x41, 0x43, 0x8e, 0x7a, 0x10, 0x1b,
+    ];
+    let mut malleated = *sig;
+    malleated[32..].copy_from_slice(&S_PLUS_L);
+    // 2. The identity as the key, R = B and S = 1: [1]B - [k]0 = B for every message, so the permissive check
+    //    accepted this one signature for any message at all.
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    let mut any = [0u8; 64];
+    any[..32].copy_from_slice(&[0x66; 32]); // B's encoding: 0x58, then 31 bytes of 0x66
+    any[0] = 0x58;
+    any[32] = 1; // S = 1
+    // 3. y = p + 3: not canonical, and y = 3 is a point of LARGE order, so only the canonical rule refuses it.
+    let mut noncanon = [0xff; 32];
+    noncanon[0] = 0xf0;
+    noncanon[31] = 0x7f;
+    let large = match unpackneg(&noncanon) {
+        Some(p) => !small_order(&p),
+        None => false,
+    };
+    !verify(pk, b"", &malleated) && !verify(&identity, b"any message", &any) && large && !verify(&noncanon, b"", sig)
 }

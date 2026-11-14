@@ -32,6 +32,9 @@ concurrency:
   group: full-walk-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CARGO_NET_OFFLINE: "true"   # F2: every build uses vendor/ (.cargo/config.toml); a crate missing from it fails here
+
 jobs:
   plan:
     name: Plan the shards
@@ -50,6 +53,11 @@ jobs:
           import fnmatch, json, os, re
           src = open("scripts/run-all-tests.sh", encoding="utf-8").read()
           suites = re.search(r"^SUITES=\((.*)\)$", src, re.M).group(1).split()
+          # a suite whose script stays private (fuzz-host) is registered but not in this tree: skip it, and say so
+          gone = [s for s in suites if not os.path.exists(f"scripts/{s}-test.sh")]
+          suites = [s for s in suites if s not in gone]
+          if gone:
+              print("private-only suites, not run here: " + ", ".join(gone))
           arm_only = set()
           for line in open("scripts/lib/pc-arch/arm-only.txt", encoding="utf-8"):
               line = line.strip()
@@ -111,6 +119,9 @@ jobs:
           # The team's ARM baseline: md5 of the ARM image as built here. The debug image embeds the build path,
           # so compare it only with other walks of this public repo (same runner path), never with a PC build.
           if [ "$ARCH" = arm ]; then md5sum target/mansa-kernel.img target/aarch64-unknown-none/debug/mansa-kernel 2> /dev/null | sed 's/^/ARM md5: /' || true; fi
+          # The PC kernel's md5, next to it: a repeatable link (/Brepro, no PDB; docs/design-pc-repro-link.md), so the
+          # same commit gives the same value in every shard that built it.
+          md5sum target/x86_64-unknown-uefi/debug/mansa-pc.efi 2> /dev/null | sed 's/^/PC md5: /' || true
           want=$(tr ',' '\n' <<< "$SUITES" | grep -c .)
           ran=$(wc -l < results.tsv 2>/dev/null || echo 0)
           bad=$(awk -F'\t' '$2 != "PASS"' results.tsv 2>/dev/null | wc -l)

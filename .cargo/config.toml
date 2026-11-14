@@ -8,3 +8,24 @@ target = "aarch64-unknown-none"
 # your terminal, so the kernel's banner prints right here.
 [target.aarch64-unknown-none]
 runner = "qemu-system-aarch64 -M virt -cpu cortex-a72 -smp 1 -m 256M -nographic -kernel"
+
+# F2 (ADR 0007 point 3, architect 11 Nov 2026): every cargo command in this repository takes crates from vendor/,
+# never from crates.io, so a build works with no network. vendor/ holds the crates of all nine lockfiles (the root
+# workspace and the excluded mesh-crypto, mesh-noise, mesh-hpke, mesh-link, drbg-host, fuzz-host, fuzz-host/fuzz and
+# wlan-crypto). Refresh it with:
+#   cargo vendor --locked -s mesh-crypto/Cargo.toml -s mesh-noise/Cargo.toml -s mesh-hpke/Cargo.toml \
+#     -s mesh-link/Cargo.toml -s drbg-host/Cargo.toml -s fuzz-host/Cargo.toml -s fuzz-host/fuzz/Cargo.toml \
+#     -s wlan-crypto/Cargo.toml vendor
+
+# The PC kernel (x86_64-unknown-uefi) saves no SIMD state, so RustCrypto's `aes` must use its portable software
+# backend there, never AES-NI (ADR 0007 row "Wi-Fi primitives", architect 14 Nov 2026). wlan-crypto refuses to build
+# for UEFI without this cfg; scripts/wifi-crypto-test.sh disassembles the image to prove it. A RUSTFLAGS environment
+# variable replaces these flags, so never set one for a PC build (wlan-crypto's compile_error then stops it).
+[target.x86_64-unknown-uefi]
+rustflags = ["--cfg", "aes_force_soft"]
+
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

@@ -8765,14 +8765,14 @@ fn cmd_titlef(line: &str, cmd: &str, rest: &str) {
 #[allow(unused_variables)]
 fn cmd_rng(line: &str, cmd: &str, rest: &str) {
     // The generator's state: HMAC_DRBG boot KAT, strong sources and their health, reseeds, and
-    // `rng secret` = one fail-closed draw (what the mesh uses for keys and ephemerals).
+    // `rng secret` = one fail-closed draw (what the mesh uses for keys and ephemerals). It prints ok or
+    // refused and never a byte of the secret (architect's TPM merge follow-up 1, 13 Nov 2026).
     if rest.trim() == "secret" {
         let mut b = [0u8; 16];
-        match crate::rng::fill_secret(&mut b) {
-            Ok(()) => crate::kprintln!(
-                "[rng] secret OK {:02x}{:02x}{:02x}{:02x}...",
-                b[0], b[1], b[2], b[3]
-            ),
+        let r = crate::rng::fill_secret(&mut b);
+        b.fill(0);
+        match r {
+            Ok(()) => crate::kprintln!("[rng] secret OK, 16 bytes, not shown"),
             Err(e) => crate::kprintln!("[rng] secret REFUSED: {:?}", e),
         }
     }
@@ -8798,6 +8798,18 @@ fn cmd_rng(line: &str, cmd: &str, rest: &str) {
                 "FAILED-health"
             },
             s.samples[i]
+        );
+    }
+    // F3 step 2a: per-source entropy claims and the cutoffs they give (added lines; the two above are unchanged).
+    crate::kprintln!("[rng] counted bits={} of {} at the last (re)seed", s.last_bits, crate::drbg::SEED_BITS);
+    for (i, name) in crate::rng::source_names().iter().enumerate() {
+        crate::kprintln!(
+            "[rng] source {} claim: H={}/64 bit per byte, rct_cutoff={} apt_cutoff={}/{}",
+            name,
+            s.h64[i],
+            s.rct_cutoff[i],
+            s.apt_cutoff[i],
+            crate::drbg::APT_WINDOW
         );
     }
 }
@@ -8980,7 +8992,8 @@ fn cmd_verify(line: &str, cmd: &str, rest: &str) {
     let mut parts = rest.split_whitespace();
     let name = parts.next().unwrap_or("");
     let tamper = parts.next() == Some("tamper");
-    match vfs::read_full(name) {
+    // A bundled name is checked on the bytes that run: the kernel's own copy (A7).
+    match crate::nia::bundled(name).or_else(|| vfs::read_full(name)) {
         Some(data) => match crate::integrity::expected(name) {
             Some(exp) => {
                 let got = if tamper {
@@ -10676,9 +10689,19 @@ fn cmd_ls(line: &str, cmd: &str, rest: &str) {
                         vfs::size_of(i), name
                     );
                 }
+            } else if crate::nia::is_big_bundled(name) {
+                // A7 change 1: the person's file is kept, but the built-in app of that name is what `nia` runs.
+                crate::kprintln!("{:>6}  {}  (a file of yours; the built-in app is what runs)", vfs::size_of(i), name);
             } else {
                 crate::kprintln!("{:>6}  {}", vfs::size_of(i), name);
             }
+            n += 1;
+        }
+    }
+    // A7: a bundled app too big for the VFS exists only in the kernel image; it is listed so `nia NAME` is found.
+    for (name, _) in crate::nia::BUNDLED {
+        if let Some(b) = crate::nia::built_in_only(name) {
+            crate::kprintln!("{:>6}  {}  (built in)", b.len(), name);
             n += 1;
         }
     }

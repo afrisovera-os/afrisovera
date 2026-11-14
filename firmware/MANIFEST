@@ -1,0 +1,14 @@
+# Device firmware files AfriSovera may send to a device (FIRMWARE_PLAN.md, architect's verdict of 13 Nov 2026).
+# One row per file: name size sha256 licence vendor version source
+#   name     the file's name in \EFI\afrisovera\firmware\ (a plain name, no folder)
+#   size     bytes; sha256 of the whole file, lower-case hex
+#   licence  its licence text, whole, in firmware/licences/ (redistribution in binary form, unchanged, only)
+#   source   the https address of the pinned file (linux-firmware: the commit id in the address), or gen:<name> for
+#            AfriSovera's own test file, made by scripts/fw/fwtool.py
+# Every row here is also a row of kernel/src/pc/fwdb.rs's FIRMWARE table (scripts/fw/fwtool.py check). Adding or
+# changing a row, with its licence, needs the chief architect's verdict before the merge, and the release engineer's
+# licence check before a public sync.
+fwtest.bin 70000 738d796683b53552914356087ff339feb1be5d8b796cff59925bbaf9e7320fa8 LICENCE.fwtest AfriSovera 1 gen:fwtest
+ibt-hw-37.8.10-fw-1.1.1.2c.13.bseq 120 3e0d0db38c76db7491137442176a40d53e66184bdf4a73430a6f025fa0a3bc3d LICENCE.fwtest AfriSovera 1 gen:btpatch1
+ibt-hw-37.8.10-fw-1.1.2.2c.13.bseq 120 14f39d19030c5be4630030e300997db261a6ddd56dfc0a73f39e2f9ef1929fab LICENCE.fwtest AfriSovera 1 gen:btpatch2
+ibt-hw-37.8.10-fw-1.1.4.2c.13.bseq 120 d6b5018633ca5a188f5db1e54d13db103900c2a4bd870632dc53cb024d22f143 LICENCE.fwtest AfriSovera 1 gen:btpatch4

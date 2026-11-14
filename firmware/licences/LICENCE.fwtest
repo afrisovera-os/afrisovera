@@ -1,0 +1,5 @@
+fwtest.bin is AfriSovera's own test file, not any device's firmware. It is 70000 bytes made by
+scripts/fw/fwtool.py (SHA-256 blocks of a counter) and exists only so the firmware loader can be tested.
+
+Copyright 2026 AfriSovera. Licensed under the Apache License, Version 2.0, as the rest of AfriSovera
+(docs/adr/0005-apache-2-license.md). It may be copied and given out in binary form without changes.

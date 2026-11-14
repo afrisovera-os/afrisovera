@@ -9,6 +9,33 @@ use super::*;
 #[path = "face.rs"]
 mod face; // the Sovereign face (afriui.md section 16)
 
+#[path = "look.rs"]
+pub(super) mod look; // the premium look, step 2: corners, soft shadows, see-through panels (afriui.md section 30)
+
+#[path = "vector.rs"]
+pub(super) mod vector; // smooth text that scales (afriui.md section 26)
+
+#[path = "shape_data.rs"]
+pub(super) mod shape_data; // the shaper's generated tables (SHAPING_PLAN.md C1)
+
+#[path = "bidi.rs"]
+pub(super) mod bidi; // right to left and mixed lines (UAX 9)
+
+#[path = "gsub.rs"]
+pub(super) mod gsub; // the font's substitution and mark lookups, compiled offline
+
+#[path = "shape.rs"]
+pub(super) mod shape; // Arabic shaped by the font's lookups, laid out by bidi
+
+/// Which face the desk's proportional text uses: the outline font (true, the default) or the Sovereign bitmap face
+/// (`desk font bitmap`, kept as the fallback until premium step 5). The Terminal and cell windows keep the bitmap
+/// face either way until step 3.
+pub(super) static VECTOR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+fn vector_on() -> bool {
+    VECTOR.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 const NIGHT: u32 = 0x10_0C_0A; // the Spine: warm black, not grey
 
 const WALL_TOP: u32 = 0x1B_15_12; // soil gradient
@@ -61,7 +88,7 @@ const TERM_TEXT: u32 = 0xD8_CE_BE;
 const KENTE: [u32; 6] = [GOLD_DEEP, NIGHT, GREEN, GOLD_DEEP, RED, NIGHT];
 
 /// Each app's cloth (section 4): its focus mark, woven along the top of its lintel.
-const CLOTH: [[u32; 3]; 4] = [[OCHRE, NIGHT, GOLD], [GREEN, NIGHT, GOLD], [INDIGO, TEXT, GOLD], [GOLD, RED, GREEN]];
+const CLOTH: [[u32; 3]; 5] = [[OCHRE, NIGHT, GOLD], [GREEN, NIGHT, GOLD], [INDIGO, TEXT, GOLD], [GOLD, RED, GREEN], [CHARCOAL, GOLD, CHARCOAL]];
 
 /// While an app draws its body, everything it draws is clipped to its window, and the
 /// window's bottom-right cut corner stays cut: (x, y, w, h, cut). Mainline only.
@@ -110,24 +137,26 @@ fn rect(x: i32, y: i32, w: i32, h: i32, c: u32) {
 /// How far row j of a shape h rows high is inset on the left and on the right, for corners
 /// cut at 45 degrees: tl, tr, br, bl pixels (afriui.md section 3).
 fn cut_inset(j: i32, h: i32, tl: i32, tr: i32, br: i32, bl: i32) -> (i32, i32) {
-    let up = |c: i32| if j < c { c - j } else { 0 };
-    let down = |c: i32| if h - 1 - j < c { c - (h - 1 - j) } else { 0 };
-    (up(tl).max(down(bl)), up(tr).max(down(br)))
+    look::insets(j, h, tl, tr, br, bl)
 }
 
-/// A filled shape with cut corners.
+/// A filled shape with its corners in the current style (afriui.md sections 3 and 27): cut at 45 degrees (hard, as
+/// before, or smooth), or round.
 fn cut(x: i32, y: i32, w: i32, h: i32, tl: i32, tr: i32, br: i32, bl: i32, c: u32) {
-    let top = tl.max(tr).min(h);
-    let bot = (h - br.max(bl)).max(top);
-    for j in (0..top).chain(bot..h) {
-        let (l, r) = cut_inset(j, h, tl, tr, br, bl);
-        rect(x + l, y + j, w - l - r, 1, c);
-    }
-    rect(x, y + top, w, bot - top, c); // the straight middle in one fill
+    look::shape(x, y, w, h, tl, tr, br, bl, c, 255);
 }
 
-/// The one-pixel outline of a cut shape.
+/// The same shape at alpha a over what is there (the see-through panels).
+fn cut_a(x: i32, y: i32, w: i32, h: i32, tl: i32, tr: i32, br: i32, bl: i32, c: u32, a: u8) {
+    look::shape(x, y, w, h, tl, tr, br, bl, c, a);
+}
+
+/// The one-pixel outline of a shape. The hard style is drawn exactly as before step 2.
 fn cut_frame(x: i32, y: i32, w: i32, h: i32, tl: i32, tr: i32, br: i32, bl: i32, c: u32) {
+    if look::corners() != look::Corners::Hard {
+        look::frame(x, y, w, h, tl, tr, br, bl, c);
+        return;
+    }
     for j in 0..h {
         let (l, r) = cut_inset(j, h, tl, tr, br, bl);
         if j == 0 || j == h - 1 {
@@ -136,6 +165,18 @@ fn cut_frame(x: i32, y: i32, w: i32, h: i32, tl: i32, tr: i32, br: i32, bl: i32,
             rect(x + l, y + j, 1, 1, c);
             rect(x + w - r - 1, y + j, 1, 1, c);
         }
+    }
+}
+
+/// A shape's shadow: soft (step 2) or the hard relief copy 4 pixels down and right (before). None in touch mode.
+fn shadow(x: i32, y: i32, w: i32, h: i32, tl: i32, tr: i32, br: i32, bl: i32, hard: i32, reach: i32) {
+    if st().touch {
+        return;
+    }
+    if look::soft() {
+        look::shadow(x, y, w, h, tl, tr, br, bl, reach);
+    } else {
+        cut(x + hard, y + hard, w, h, tl, tr, br, bl, SHADOW);
     }
 }
 
@@ -213,15 +254,20 @@ fn glyph_at(x: i32, y: i32, rows: &[u8; 12], w: i32, c: u32, scale: i32) {
     }
 }
 
-/// Proportional text in the Sovereign face (afriui.md section 16): each glyph advances
-/// by its own width plus one pixel. (x0, y0) is the top of the capitals; descenders hang
-/// below the baseline (face::LINE_H rows in all). Returns the end x.
+/// Proportional text (afriui.md sections 16 and 26). (x0, y0) is the top of the capitals, which are face::CAP rows
+/// at `scale` 1; descenders hang below the baseline (face::LINE_H rows in all; marks above capitals rise a little
+/// above y0 in the outline face). Returns the end x. In the outline face `s` is UTF-8; in the bitmap face a byte
+/// outside ASCII draws as the face's box.
 fn text(x0: i32, y0: i32, s: &[u8], c: u32, scale: i32) -> i32 {
     // a line wholly above or below the box being redrawn: only its width is needed
     // SAFETY: mainline only.
     let (_, dy, _, dh) = unsafe { DCLIP };
-    if !s.is_empty() && (y0 >= dy + dh || y0 + face::LINE_H * scale <= dy) {
-        return x0 + text_w(s, scale) + scale;
+    let rise = if vector_on() { 4 * scale } else { 0 };
+    if !s.is_empty() && (y0 - rise >= dy + dh || y0 + face::LINE_H * scale + rise <= dy) {
+        return x0 + text_w(s, scale) + if vector_on() { 0 } else { scale };
+    }
+    if vector_on() {
+        return vtext(x0, y0, s, c, face::CAP * scale);
     }
     let mut x = x0;
     for &b in s {
@@ -233,8 +279,415 @@ fn text(x0: i32, y0: i32, s: &[u8], c: u32, scale: i32) -> i32 {
 }
 
 fn text_w(s: &[u8], scale: i32) -> i32 {
+    if vector_on() {
+        return vtext_w(s, face::CAP * scale);
+    }
     let w: i32 = s.iter().map(|&b| face::glyph(b).0 + 1).sum();
     ((w - 1) * scale).max(0)
+}
+
+/// The width of UTF-8 text in the outline face at a cap height, in whole pixels (rounded up).
+pub(super) fn vtext_w(s: &[u8], cap: i32) -> i32 {
+    if shape::needed(s) {
+        // the same decision as vtext, so a measured width always matches the drawn one
+        return (shape::layout(s, cap, None, &mut |_, _, _| {}) + 255) >> 8;
+    }
+    let mut pen = 0;
+    let mut i = 0;
+    while i < s.len() {
+        let cp = vector::next_char(s, &mut i);
+        pen += match vector::lookup_at(cp, cap) {
+            Some(g) => vector::advance(g, cap),
+            None => vector::box_size(cap).1 * 256,
+        };
+    }
+    (pen + 255) >> 8
+}
+
+/// UTF-8 text in the outline face, (x0, y0) the top of the capitals, `cap` the cap height in pixels. Each glyph is
+/// placed to a quarter pixel; a character the font does not have draws as a box. Returns the end x.
+pub(super) fn vtext(x0: i32, y0: i32, s: &[u8], c: u32, cap: i32) -> i32 {
+    let cap = vector::clamp_cap(cap);
+    if shape::needed(s) {
+        return vshaped(x0, y0, s, c, cap);
+    }
+    let base = y0 + cap;
+    let gamma = vector::gamma_for(c);
+    if let Some((l, t, w, h, off, adv)) = run(s, cap) {
+        // SAFETY: mainline only; the run's bytes are not touched until the next `run`.
+        let buf = unsafe { &(&*core::ptr::addr_of!(RUN_BUF))[off..off + w * h] };
+        cover(x0 + l, base + t, w, h, buf, c, gamma);
+        return x0 + ((adv + 255) >> 8);
+    }
+    let mut pen = x0 * 256;
+    let mut i = 0;
+    while i < s.len() {
+        let cp = vector::next_char(s, &mut i);
+        match vector::lookup_at(cp, cap) {
+            Some(g) => {
+                let px = pen >> 8;
+                vector::glyph(g, cap, (pen >> 6) & 3, &mut |l, t, w, h, cov| cover(px + l, base + t, w, h, cov, c, gamma));
+                pen += vector::advance(g, cap);
+            }
+            None => {
+                let (bw, adv) = vector::box_size(cap);
+                let bx = (pen >> 8) + (adv - bw) / 2;
+                rect(bx, y0, bw, 1, c);
+                rect(bx, base - 1, bw, 1, c);
+                rect(bx, y0, 1, cap, c);
+                rect(bx + bw - 1, y0, 1, cap, c);
+                pen += adv * 256;
+            }
+        }
+    }
+    (pen + 255) >> 8
+}
+
+/// A line that needs shaping (right to left, Arabic): shaped and ordered by shape::layout as one isolated paragraph,
+/// its direction from its own first strong character, so a call's text never reorders the text of another call (the
+/// architect's rule for titles: the app's name and the desk's own marks are separate calls). Returns the end x.
+fn vshaped(x0: i32, y0: i32, s: &[u8], c: u32, cap: i32) -> i32 {
+    let base = y0 + cap;
+    let gamma = vector::gamma_for(c);
+    let start = x0 * 256;
+    let w = shape::layout(s, cap, None, &mut |g, x, y| {
+        let p = start + x;
+        if g.boxed {
+            let (bw, adv) = vector::box_size(cap);
+            let bx = (p >> 8) + (adv - bw) / 2;
+            rect(bx, y0, bw, 1, c);
+            rect(bx, base - 1, bw, 1, c);
+            rect(bx, y0, 1, cap, c);
+            rect(bx + bw - 1, y0, 1, cap, c);
+        } else {
+            let px = p >> 8;
+            vector::glyph_in(g.face, g.g, cap, (p >> 6) & 3, &mut |l, t, w, h, cov| cover(px + l, base + y + t, w, h, cov, c, gamma));
+        }
+    });
+    (start + w + 255) >> 8
+}
+
+// ---- The text run cache (afriui.md section 30; the architect's follow-up 2 of step 1, and his conditions)
+
+/// Runs longer than this are drawn glyph by glyph and never cached.
+const RUN_MAX: usize = 120;
+const RUN_SLOTS: usize = 128;
+const RUN_ARENA: usize = 64 * 1024;
+#[derive(Clone, Copy)]
+struct Run {
+    hash: u32,
+    cap: i32,
+    len: usize,
+    bytes: [u8; RUN_MAX],
+    off: u32,
+    w: u16,
+    h: u16,
+    left: i16,
+    top: i16,
+    adv: i32,
+    used: bool,
+}
+const NO_RUN: Run = Run { hash: 0, cap: 0, len: 0, bytes: [0; RUN_MAX], off: 0, w: 0, h: 0, left: 0, top: 0, adv: 0, used: false };
+static mut RUNS: [Run; RUN_SLOTS] = [NO_RUN; RUN_SLOTS];
+static mut RUN_BUF: [u8; RUN_ARENA] = [0; RUN_ARENA];
+static mut RUN_USED: usize = 0;
+static mut RUN_N: usize = 0;
+/// (hits, runs made, times emptied), for the probe.
+pub(super) static mut RUN_STATS: (u64, u64, u64) = (0, 0, 0);
+/// The cache is on (`desk look runs on|off`), and a test switch that makes every key's hash collide (the
+/// architect's condition: a hit compares the whole string, the cap height and the start, never the hash alone).
+pub(super) static RUN_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+pub(super) static RUN_WEAK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn run_hash(s: &[u8], cap: i32) -> u32 {
+    let h = s.iter().fold(0x811c_9dc5u32, |h, &b| (h ^ b as u32).wrapping_mul(0x0100_0193)) ^ (cap as u32).wrapping_mul(0x9e37_79b9);
+    if RUN_WEAK.load(core::sync::atomic::Ordering::Relaxed) {
+        h & 1
+    } else {
+        h
+    }
+}
+
+/// Empty the run cache (before a new run when it is full, and from the probe). Nothing drawn from it is held.
+pub(super) fn run_reset() {
+    // SAFETY: mainline only.
+    unsafe {
+        for r in (&mut *core::ptr::addr_of_mut!(RUNS)).iter_mut() {
+            r.used = false;
+        }
+        RUN_N = 0;
+        RUN_USED = 0;
+        RUN_STATS.2 += 1;
+    }
+}
+
+/// The run for `s` at a cap height, from the cache or made now: (left, top, w, h, offset in RUN_BUF, advance in
+/// 1/256 pixel), the box relative to the pen's start and the baseline. None: not cached (too long, a character the
+/// font lacks, too big, or the cache is off); the caller draws glyph by glyph. The pen always starts on a whole pixel
+/// (callers pass whole x), so the quarter pixel of the start is always 0 and is not part of the key.
+fn run(s: &[u8], cap: i32) -> Option<(i32, i32, usize, usize, usize, i32)> {
+    if !RUN_ON.load(core::sync::atomic::Ordering::Relaxed) || s.is_empty() || s.len() > RUN_MAX {
+        return None;
+    }
+    let hash = run_hash(s, cap);
+    let mut i = (hash.wrapping_mul(2654435761) >> 25) as usize % RUN_SLOTS;
+    // SAFETY: mainline only; the slots and the arena are touched only here and in run_reset.
+    let runs = unsafe { &mut *core::ptr::addr_of_mut!(RUNS) };
+    for _ in 0..RUN_SLOTS {
+        let r = &runs[i];
+        if !r.used {
+            break;
+        }
+        // a hit compares the whole key: the hash first, then the cap height, the length and every byte
+        if r.hash == hash && r.cap == cap && r.len == s.len() && &r.bytes[..r.len] == s {
+            // SAFETY: as above.
+            unsafe { RUN_STATS.0 += 1 };
+            return Some((r.left as i32, r.top as i32, r.w as usize, r.h as usize, r.off as usize, r.adv));
+        }
+        i = (i + 1) % RUN_SLOTS;
+    }
+    // a miss: first the run's box, then its coverage, glyph by glyph as `vtext` places them
+    let (mut x0, mut y0, mut x1, mut y1, mut pen) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN, 0i32);
+    let mut k = 0;
+    while k < s.len() {
+        let g = vector::lookup_at(vector::next_char(s, &mut k), cap)?;
+        let px = pen >> 8;
+        vector::glyph(g, cap, (pen >> 6) & 3, &mut |l, t, w, h, _| {
+            if w > 0 && h > 0 {
+                x0 = x0.min(px + l);
+                y0 = y0.min(t);
+                x1 = x1.max(px + l + w as i32);
+                y1 = y1.max(t + h as i32);
+            }
+        });
+        pen += vector::advance(g, cap);
+    }
+    if x1 <= x0 || y1 <= y0 {
+        return None; // spaces only: nothing to cache
+    }
+    let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
+    if w * h > RUN_ARENA / 4 {
+        return None;
+    }
+    // SAFETY: mainline only.
+    unsafe {
+        if RUN_USED + w * h > RUN_ARENA || RUN_N * 4 >= RUN_SLOTS * 3 {
+            // empty it before any byte of the new run is written (as the glyph cache does)
+            for r in runs.iter_mut() {
+                r.used = false;
+            }
+            RUN_N = 0;
+            RUN_USED = 0;
+            RUN_STATS.2 += 1;
+        }
+        let off = RUN_USED;
+        let buf = &mut (&mut *core::ptr::addr_of_mut!(RUN_BUF))[off..off + w * h];
+        buf.fill(0);
+        let (mut pen, mut k) = (0i32, 0);
+        while k < s.len() {
+            let g = vector::lookup_at(vector::next_char(s, &mut k), cap)?;
+            let px = pen >> 8;
+            vector::glyph(g, cap, (pen >> 6) & 3, &mut |l, t, gw, gh, cov| {
+                for r in 0..gh {
+                    let row = (t + r as i32 - y0) as usize * w + (px + l - x0) as usize;
+                    for c in 0..gw {
+                        let d = &mut buf[row + c];
+                        *d = d.saturating_add(cov[r * gw + c]);
+                    }
+                }
+            });
+            pen += vector::advance(g, cap);
+        }
+        RUN_USED += w * h;
+        RUN_N += 1;
+        RUN_STATS.1 += 1;
+        // a free slot: the table is at most three quarters full, so the probe ends
+        let mut i = (hash.wrapping_mul(2654435761) >> 25) as usize % RUN_SLOTS;
+        while runs[i].used {
+            i = (i + 1) % RUN_SLOTS;
+        }
+        let mut bytes = [0u8; RUN_MAX];
+        bytes[..s.len()].copy_from_slice(s);
+        runs[i] = Run { hash, cap, len: s.len(), bytes, off: off as u32, w: w as u16, h: h as u16, left: x0 as i16, top: y0 as i16, adv: pen, used: true };
+        Some((x0, y0, w, h, off, pen))
+    }
+}
+
+/// Mix a glyph's coverage (w x h bytes) into the screen at (x, y), clipped as `rect` clips: to the box being
+/// redrawn, to the screen, and to an app's window with its bottom-right corner cut.
+fn cover(x: i32, y: i32, w: usize, h: usize, cov: &[u8], c: u32, gamma: &[u8; 256]) {
+    cover_stride(x, y, w, h, cov, w, c, gamma);
+}
+
+/// One pixel of colour c at alpha a (1 to 254), clipped as `rect` clips (the box redrawn, the screen, an app's window
+/// and its cut corner): the edge pixels of corners and outlines, without `cover`'s slices.
+fn mix1(x: i32, y: i32, a: u8, c: u32) {
+    // SAFETY: mainline only.
+    let (dx, dy, dw, dh) = unsafe { DCLIP };
+    if x < dx.max(0) || y < dy.max(0) || x >= (dx + dw).min(W()) || y >= (dy + dh).min(H()) {
+        return;
+    }
+    // SAFETY: mainline only.
+    if let Some((cx, cy, cw, ch, k)) = unsafe { CLIP } {
+        if x < cx || y < cy || x >= cx + cw || y >= cy + ch {
+            return;
+        }
+        let zone = cy + ch - k;
+        if k > 0 && y >= zone && x >= cx + cw - (y - zone) {
+            return;
+        }
+    }
+    crate::canvas::mix(x as usize, y as usize, c, a as u32);
+}
+
+/// `cover` with the coverage `stride` bytes a row; a stride of 0 reads the same row for every row (a flat alpha).
+fn cover_stride(x: i32, y: i32, w: usize, h: usize, cov: &[u8], stride: usize, c: u32, gamma: &[u8; 256]) {
+    let (w, h, st) = (w as i32, h as i32, stride as i32);
+    // SAFETY: mainline only.
+    let (dx, dy, dw, dh) = unsafe { DCLIP };
+    let (mut x0, mut y0) = (x.max(dx).max(0), y.max(dy).max(0));
+    let (mut x1, mut y1) = ((x + w).min(dx + dw).min(W()), (y + h).min(dy + dh).min(H()));
+    let mut cutk = None;
+    // SAFETY: mainline only.
+    if let Some((cx, cy, cw, ch, k)) = unsafe { CLIP } {
+        x0 = x0.max(cx);
+        y0 = y0.max(cy);
+        x1 = x1.min(cx + cw);
+        y1 = y1.min(cy + ch);
+        if k > 0 && y1 > cy + ch - k && x1 > cx + cw - k {
+            cutk = Some((cx + cw, cy + ch - k));
+        }
+    }
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let at = |xx: i32, yy: i32| ((yy - y) * st + (xx - x)) as usize;
+    // black with no gamma (the soft shadows) takes the darkening path: the same pixels, half the work
+    let dark = c == 0 && core::ptr::eq(gamma, &look::IDENT);
+    let put = |x: usize, y: usize, w: usize, h: usize, a: &[u8]| {
+        if dark {
+            crate::canvas::shade(x, y, w, h, a, stride);
+        } else {
+            crate::canvas::blend(x, y, w, h, a, stride, c, gamma);
+        }
+    };
+    match cutk {
+        None => put(x0 as usize, y0 as usize, (x1 - x0) as usize, (y1 - y0) as usize, &cov[at(x0, y0)..]),
+        Some((right, zone)) => {
+            // row j of the cut is inset by j + 1, as in `rect`
+            for yy in y0..y1 {
+                let r = if yy >= zone { x1.min(right - (yy - zone)) } else { x1 };
+                if r > x0 {
+                    put(x0 as usize, yy as usize, (r - x0) as usize, 1, &cov[at(x0, yy)..]);
+                }
+            }
+        }
+    }
+}
+
+/// The marks a person relies on are never see-through and never mixed (the architect, section 30): when a
+/// see-through panel (the Spine, a toast, the notifications list, the Circle) lies over the cell window's title, its
+/// file name, "unsigned" mark and Close anyway are drawn again over the panel, opaque, on the lintel's own ground.
+/// Not where a window above the cell window hides them. Within the box being redrawn only.
+fn marks_on_top() {
+    if !look::glass() {
+        return;
+    }
+    let s = st();
+    let c = App::Cell as usize;
+    if !s.wins[c].open || s.wins[c].min || cell_owner().is_none() {
+        return;
+    }
+    let (x, y, _, _) = win_rect(c);
+    let (_, _, ux, uw, ax, aw, _, _) = lintel_parts();
+    let nx = x + 12 + 12 + 8;
+    let right = (ux + uw).max(ax + aw);
+    let th = title_h();
+    let mb: Rect = (nx - 2, y + 6, right - nx + 4, th - 6);
+    if mb.2 <= 0 {
+        return;
+    }
+    let over = touches(dock_box(), mb)
+        || toast_box().is_some_and(|b| touches(b, mb))
+        || (s.notes_open && touches(panel_box(notes_box()), mb))
+        || (s.launcher && touches(panel_box(launcher_box()), mb));
+    if !over {
+        return;
+    }
+    if let Some(p) = (0..s.nz).position(|k| s.z[k] == c) {
+        if (p + 1..s.nz).any(|k| touches(win_rect(s.z[k]), mb)) {
+            return;
+        }
+    }
+    // SAFETY: mainline only; restored right after.
+    let keep = unsafe { DCLIP };
+    let (x0, y0) = (keep.0.max(mb.0), keep.1.max(mb.1));
+    let (x1, y1) = ((keep.0 + keep.2).min(mb.0 + mb.2), (keep.1 + keep.3).min(mb.1 + mb.3));
+    if x1 > x0 && y1 > y0 {
+        // SAFETY: as above.
+        unsafe { DCLIP = (x0, y0, x1 - x0, y1 - y0) };
+        window_whole(c);
+        // SAFETY: as above.
+        unsafe { DCLIP = keep };
+    }
+}
+
+/// Where the cell window's last drawn title put its parts: (window x, width, mark x, mark width, Close anyway x and
+/// width, buttons x, name cut), for `desk cell titlecheck`. Mainline only.
+static mut LINTEL: (i32, i32, i32, i32, i32, i32, i32, bool) = (0, 0, 0, 0, 0, 0, 0, false);
+
+pub(super) fn lintel_parts() -> (i32, i32, i32, i32, i32, i32, i32, bool) {
+    // SAFETY: mainline only.
+    unsafe { LINTEL }
+}
+
+/// The narrowest lintel that holds an app's title whole: the icon, a name cut to "..", the unsigned mark, Close
+/// anyway and the title buttons, with their gaps (afriui.md section 26, the architect's follow-up 1).
+pub(super) fn lintel_min_w() -> i32 {
+    lintel_min_w_in(lang::current())
+}
+
+/// The narrowest lintel in a given language: its words for the unsigned mark and Close anyway are measured, as the
+/// title drawing draws them (the architect's condition 3, 13 Nov), so no language's mark is ever cut.
+pub(super) fn lintel_min_w_in(l: lang::Lang) -> i32 {
+    let touch = st().touch;
+    let ts = if touch { 2 } else { 1 };
+    let isz = if touch { 16 } else { 12 };
+    let bw = if touch { 44 } else { 22 };
+    let uw = text_w(lang::text_in(l, lang::Msg::TitleUnsigned), ts) + 10 * ts;
+    let dots = text_w(b"..", ts) + ts;
+    let buttons = if touch { bw + 4 } else { 2 * bw + 8 };
+    12 + isz + 8 + dots + 8 * ts + uw + 6 * ts + anyway_w(l, ts) + 8 * ts + buttons
+}
+
+/// The width of the red Close anyway button: its word with 2 px a side at scale `ts`, and never narrower than the
+/// 84 px (x ts) it has always had, so the English title is the same as before.
+pub(super) fn anyway_w(l: lang::Lang, ts: i32) -> i32 {
+    (text_w(lang::text_in(l, lang::Msg::TitleAnyway), ts) + 4 * ts).max(84 * ts)
+}
+
+/// The longest start of `s` (whole characters) that fits in `room` pixels with ".." after it; (s, false) when all
+/// of `s` fits, and an empty start when not even ".." would.
+fn fit(s: &[u8], room: i32, ts: i32) -> (&[u8], bool) {
+    if text_w(s, ts) <= room {
+        return (s, false);
+    }
+    let dots = text_w(b"..", ts) + ts;
+    let (mut i, mut best) = (0, 0);
+    while i < s.len() {
+        let mut j = i;
+        if vector_on() {
+            vector::next_char(s, &mut j);
+        } else {
+            j += 1;
+        }
+        if text_w(&s[..j], ts) + dots > room {
+            break;
+        }
+        best = j;
+        i = j;
+    }
+    (&s[..best], true)
 }
 
 /// Monospace text (the Terminal, the file preview), clipped to `cols` cells of 6 px: every
@@ -269,6 +722,21 @@ fn monument(cx: i32, top: i32, h: i32, c_top: u32, c_bot: u32) {
     let pw = (300 * h / 288).max(6);
     let ph = (6 * h / 288).max(1);
     rect(cx - pw / 2, top + h, pw, ph, c_top);
+}
+
+/// Andika's tile (section 32): the editor's indigo cloth, three short lines of cells and a gold cursor block. Dim: the
+/// same drawing in the dark tones, while the shell is busy.
+fn andika_icon(x: i32, y: i32, s: i32, dim: bool) {
+    let u = |v: i32| v * s / 28;
+    let r = (s / 7).max(2);
+    let (ground, line, cursor) = if dim { (0x22_2A_40, 0x4A_50_60, 0x6A_5A_34) } else { (INDIGO, 0xB8_C0_E0, GOLD) };
+    chip(x, y, s, s, r, ground);
+    let t = u(2).max(1);
+    for (k, w) in [(0, 16), (1, 11), (2, 7)] {
+        rect(x + u(5), y + u(8) + k * u(5), u(w), t, line);
+    }
+    let ch = u(4).max(3);
+    rect(x + u(14), y + u(18) + t - ch, u(3).max(2), ch, cursor); // the cursor after the last line
 }
 
 fn icon(app: Option<App>, x: i32, y: i32, s: i32) {
@@ -312,6 +780,14 @@ fn icon(app: Option<App>, x: i32, y: i32, s: i32) {
                 let yy = y + u(7) + k * u(7);
                 rect(x + u(5), yy, u(18), u(1).max(1), 0xB8_C0_E0);
                 rect(x + u(5) + u(at), yy - u(2), u(3).max(2), u(5).max(3), GOLD);
+            }
+        }
+        Some(App::Cell) => {
+            // an app's cell window: a charcoal tile with three rows of cells, the middle one gold
+            chip(x, y, s, s, r, CHARCOAL);
+            for (k, c) in [(0, DIM), (1, GOLD), (2, DIM)] {
+                let yy = y + u(8) + k * u(5);
+                rect(x + u(5), yy, u(18 - 4 * (k % 2)), u(2).max(1), c);
             }
         }
         Some(App::About) => {
@@ -383,6 +859,8 @@ fn spine() {
         return bar();
     }
     let body = spine_w() - WEAVE;
+    // the Spine stays opaque: it is the desk's edge, the wallpaper is not drawn under it, so a see-through Spine
+    // would mix again over itself on every partial frame (found by desk verify on the first build)
     rect(0, 0, body, H(), NIGHT);
     weave_v(body, 0, H(), 2, &KENTE);
     // the Circle button
@@ -395,7 +873,7 @@ fn spine() {
     // the apps, each with a bead on the left edge: long and gold with focus, short when
     // open, a dot when minimised
     let foc = focused();
-    for i in 1..=NAPPS {
+    for i in 1..=NTILES {
         let (tx, ty, ts) = dock_tile(i);
         let a = i - 1;
         if foc == Some(a) {
@@ -418,11 +896,11 @@ fn spine() {
     let mut under = Line::new();
     if s.clock24 {
         l.two(hh).s(b":").two(mm);
-        under.s(b"UTC");
+        under.s(lang::t(lang::Msg::ClockUtc));
     } else {
         let h12 = if hh % 12 == 0 { 12 } else { hh % 12 };
         l.u(h12).s(b":").two(mm);
-        under.s(if hh < 12 { b"am" } else { b"pm" });
+        under.s(lang::t(if hh < 12 { lang::Msg::ClockAm } else { lang::Msg::ClockPm }));
     }
     rect(8, H() - 30, body - 16, 1, LINE);
     text(mid - text_w(l.get(), 1) / 2, H() - 23, l.get(), GOLD, 1);
@@ -442,6 +920,41 @@ fn spine() {
         text(gx + 20, gy + 3, num(s.unread as u64, &mut t), TEXT, 1);
     }
     power_net(mid - 11, H() - 78, mid - 10, H() - 100);
+    // the power button: a ring broken at the top with a bar through the gap
+    let (_, py, _, ph) = power_btn_box();
+    let (cx, cy) = (mid, py + ph / 2);
+    let c = if s.power > 0 { GOLD } else { DIM };
+    cut_frame(cx - 7, cy - 6, 14, 14, 4, 4, 4, 4, c);
+    rect(cx - 2, cy - 7, 4, 3, NIGHT); // the ring's gap
+    rect(cx - 1, cy - 9, 2, 8, c); // the bar
+}
+
+/// The power panel: the menu (Shut down, Restart) or its confirm, beside the Spine's foot.
+fn power_panel() {
+    let s = st();
+    let (x, y, w, h) = power_box();
+    shadow(x, y, w, h, CUT, 0, CUT, 0, 4, look::REACH); // soft, as every panel (opaque itself)
+    cut(x, y, w, h, CUT, 0, CUT, 0, 0x16_11_0E);
+    cut_frame(x, y, w, h, CUT, 0, CUT, 0, GOLD_DARK);
+    let (b1, b2) = power_buttons();
+    let button = |b: (i32, i32, i32, i32), label: &[u8], c: u32, tc: u32| {
+        chip(b.0, b.1, b.2, b.3, 3, c);
+        text(b.0 + (b.2 - text_w(label, 1)) / 2, b.1 + (b.3 - face::CAP) / 2, label, tc, 1);
+    };
+    match s.power {
+        1 => {
+            text(x + 14, y + 10, lang::t(lang::Msg::PowerTitle), GOLD, 1);
+            button(b1, lang::t(lang::Msg::PowerOff), SURFACE2, TEXT);
+            button(b2, lang::t(lang::Msg::PowerRestart), SURFACE2, TEXT);
+        }
+        _ => {
+            let off = s.power == 2;
+            text(x + 14, y + 10, lang::t(if off { lang::Msg::PowerOffAsk } else { lang::Msg::PowerRestartAsk }), GOLD, 1);
+            text(x + 14, y + 28, lang::t(lang::Msg::PowerUnsaved), DIM, 1);
+            button(b1, lang::t(if off { lang::Msg::PowerOff } else { lang::Msg::PowerRestart }), RED, TEXT);
+            button(b2, lang::t(lang::Msg::PowerCancel), SURFACE2, TEXT);
+        }
+    }
 }
 
 /// The Spine lying down as a bar along the bottom (a phone held upright, afriui-phone-plan.md
@@ -460,7 +973,7 @@ fn bar() {
     let (t1, _, _) = dock_tile(1);
     rect((tx + ts + t1) / 2, ty + 6, 1, ts - 12, LINE);
     let foc = focused();
-    for i in 1..=NAPPS {
+    for i in 1..=NTILES {
         let (tx, ty, ts) = dock_tile(i);
         let a = i - 1;
         if foc == Some(a) {
@@ -480,11 +993,11 @@ fn bar() {
     let (mut l, mut under) = (Line::new(), Line::new());
     if s.clock24 {
         l.two(hh).s(b":").two(mm);
-        under.s(b"UTC");
+        under.s(lang::t(lang::Msg::ClockUtc));
     } else {
         let h12 = if hh % 12 == 0 { 12 } else { hh % 12 };
         l.u(h12).s(b":").two(mm);
-        under.s(if hh < 12 { b"am" } else { b"pm" });
+        under.s(lang::t(if hh < 12 { lang::Msg::ClockAm } else { lang::Msg::ClockPm }));
     }
     let (cx, cy, cw, _) = clock_box();
     let mid = cx + cw / 2;
@@ -514,7 +1027,7 @@ fn power_net(px: i32, py: i32, nx: i32, ny: i32) {
     rect(px + 1, py, 1, 3, TEXT);
     rect(px + 5, py, 1, 3, TEXT);
     rect(px + 3, py + 9, 1, 3, TEXT);
-    text(px + 10, py + 2, b"AC", DIM, 1);
+    text(px + 10, py + 2, lang::t(lang::Msg::PowerAc), DIM, 1);
     // network: a link glyph, gold with a lease, dim without, crossed without a device
     let (present, ip) = (crate::virtio::net_present(), crate::virtio::dhcp_ip());
     let c = if !present {
@@ -564,22 +1077,59 @@ fn window_whole(a: usize) {
     let focus = focused() == Some(a);
     let k = win_cut();
     let ins = |j: i32| cut_inset(j, h, k, 0, k, 0);
-    if !s.touch {
-        // a hard relief shadow, down and right, as a carving's
-        cut(x + 4, y + 4, w, h, k, 0, k, 0, SHADOW);
-    }
+    // the shadow (soft, or the hard relief of a carving), then the window over it
+    // the focused window casts the full shadow; the others a short one (afriui.md section 30: they sink back, and
+    // their shadows were most of the ARM frame's cost)
+    shadow(x, y, w, h, k, 0, k, 0, 4, if focus { look::REACH } else { 3 });
     cut(x, y, w, h, k, 0, k, 0, if focus { SURFACE } else { SURFACE_OFF });
-    // the lintel (title bar)
+    // the lintel (title bar), with its corner's edge pixels in the lintel's colour
     for j in 0..th {
         let (l, r) = ins(j);
-        rect(x + l, y + j, w - l - r, 1, if focus { TITLE_ON } else { TITLE_OFF });
+        let c = if focus { TITLE_ON } else { TITLE_OFF };
+        rect(x + l, y + j, w - l - r, 1, c);
+        look::edges(x, y, w, h, j, k, 0, k, 0, c, 255);
     }
     rect(x, y + th, w, 1, LINE);
     let band = 6; // the cloth: three woven rows (4 px was too thin to read focus at a glance, review S1)
     let isz = if s.touch { 16 } else { 12 };
     icon(Some(APPS[a]), x + 12, y + band + (th - band - isz) / 2, isz);
     let ts = if s.touch { 2 } else { 1 };
-    text(x + 12 + isz + 8, y + band + (th - band - face::CAP * ts) / 2, APPS[a].name().as_bytes(), if focus { TEXT } else { DIM }, ts);
+    // an app's cell window wears its file name, and "unsigned" when it is not bundled or verified: the desk draws
+    // both, and the app cannot set or cover them (afriui.md section 25, security-model.md section 4)
+    let (name, signed) = match (APPS[a], cell_owner()) {
+        (App::Cell, Some(o)) => o,
+        _ => (APPS[a].name(), true),
+    };
+    let ty = y + band + (th - band - face::CAP * ts) / 2;
+    // the name gets what is left of the lintel after the "unsigned" mark, the Close anyway button and the title
+    // buttons: the mark always shows whole, and a name too long for the rest is cut with ".."
+    let nx = x + 12 + isz + 8;
+    let uw = if signed { 0 } else { text_w(lang::t(lang::Msg::TitleUnsigned), ts) + 10 * ts };
+    let (tcl, tmn) = title_buttons(a);
+    let right = if APPS[a] == App::Cell && cell_offer() { anyway_box(a).0 } else if s.touch { tcl.0 } else { tmn.0 };
+    let room = right - 6 * ts - nx - if signed { 0 } else { uw + 8 * ts };
+    let (shown, cut) = fit(name, room, ts);
+    let mut end = text(nx, ty, shown, if focus { TEXT } else { DIM }, ts);
+    if cut {
+        end = text(end + ts, ty, b"..", DIM, ts);
+    }
+    let mut ux = 0;
+    if !signed {
+        ux = if shown.is_empty() && !cut { nx } else { end + 8 * ts };
+        chip(ux, ty - 3 * ts, uw, (face::CAP + 6) * ts, 2, OCHRE);
+        text(ux + 5 * ts, ty, lang::t(lang::Msg::TitleUnsigned), TERM_BG, ts);
+    }
+    if APPS[a] == App::Cell {
+        let (ax, _, aw, _) = if cell_offer() { anyway_box(a) } else { (right, 0, 0, 0) };
+        // SAFETY: mainline only.
+        unsafe { LINTEL = (x, w, ux, uw, ax, aw, if s.touch { tcl.0 } else { tmn.0 }, cut) };
+    }
+    if APPS[a] == App::Cell && cell_offer() {
+        let (ax, ay, aw, ah) = anyway_box(a);
+        chip(ax, ay, aw, ah, 3, RED);
+        let ca = lang::t(lang::Msg::TitleAnyway);
+        text(ax + (aw - text_w(ca, ts)) / 2, ay + (ah - face::CAP * ts) / 2, ca, TEXT, ts);
+    }
     // buttons: minimise (pointer only) and close, cut-corner chips
     let (cl, mn) = title_buttons(a);
     let hot = s.hover_close == Some(a);
@@ -605,6 +1155,7 @@ fn window_whole(a: usize) {
         App::Terminal => terminal_app(bx, by, bw, bh),
         App::Settings => settings_app(a, bx, by, bw, bh),
         App::About => about_app(bx, by, bw, bh),
+        App::Cell => cell_app(bx, by, bw, bh),
     }
     // SAFETY: as above.
     unsafe { CLIP = None };
@@ -615,12 +1166,105 @@ fn window_whole(a: usize) {
     }
 }
 
+/// The 16 colour roles of a cell window (afriui.md section 24), in Andika's order: text, dim, keyword, string,
+/// comment, number, punct, gutter, gutter-current, selection, status, status-dim, cursor-line, error, ok,
+/// accent. As a background, role 0 is the body itself. The contrast review is stage 4.
+/// Every text role reads at 4.5:1 or more on the body (TERM_BG), the cursor line (12) and the selection (9): the
+/// architect's floor (section 32, 14 Nov), graded by desk-cell from `desk cell roles`. Dim, string, punct, gutter and
+/// error were lifted in lightness with their hues kept; the selection stays as it was (the native apps engineer's
+/// choice: it is the ground people steer by while editing).
+const CELL_ROLES: [u32; 16] = [
+    TERM_TEXT,   // 0 text
+    0xA3_98_8B,  // 1 dim (was 8A7E6E)
+    GOLD,        // 2 keyword
+    0x33_AE_75,  // 3 string, malachite lifted (was GREEN 2E9E6A)
+    DIM,         // 4 comment
+    OCHRE,       // 5 number
+    0xDC_81_5D,  // 6 punct, terracotta lifted (was C4562B)
+    0xA5_98_89,  // 7 gutter (was 6E6254)
+    GOLD_DEEP,   // 8 gutter-current
+    0x3A_2E_22,  // 9 selection
+    TEXT,        // 10 status
+    DIM,         // 11 status-dim
+    0x1C_16_12,  // 12 cursor-line
+    0xE8_79_6F,  // 13 error (was E04A3C)
+    0x4F_C0_8A,  // 14 ok
+    0x7A_9C_E0,  // 15 accent
+];
+
+/// `desk cell roles`: the colours the contrast grade reads (the body, the 16 roles, and the title's two marks on
+/// their own grounds).
+pub(super) fn cell_roles_report() {
+    crate::kprint!("[desk] cell roles: body {:06X};", TERM_BG);
+    for (i, c) in CELL_ROLES.iter().enumerate() {
+        crate::kprint!(" {}={:06X}", i, c);
+    }
+    crate::kprintln!("; unsigned {:06X} on {:06X}, close anyway {:06X} on {:06X}", TERM_BG, OCHRE, TEXT, RED);
+}
+
+/// A cell window's body: role 0 behind, then each row's cells (only the rows inside the box being redrawn),
+/// then the cursor in gold.
+fn cell_app(x: i32, y: i32, w: i32, h: i32) {
+    rect(x, y, w, h, TERM_BG);
+    let (cols, rows) = cell_grid();
+    let g = cell_cells();
+    let (cc, cr, shape) = cell_cursor_at();
+    // SAFETY: mainline only.
+    let (_, dy, _, dh) = unsafe { DCLIP };
+    for r in 0..rows {
+        let (_, top, _, _) = cell_box(0, r);
+        if top >= dy + dh || top + CELL_H <= dy {
+            continue; // a row outside the box being redrawn
+        }
+        for c in 0..cols {
+            let (cx, _, _, _) = cell_box(c, r);
+            let at = (r * CELL_COLS + c) * 2;
+            let (ch, attr) = (g[at], g[at + 1]);
+            let bg = (attr >> 4) as usize;
+            if bg != 0 {
+                rect(cx, top, CELL_W, CELL_H, CELL_ROLES[bg]);
+            }
+            let mut fg = CELL_ROLES[(attr & 15) as usize];
+            let here = c == cc && r == cr;
+            if here && shape == 2 {
+                rect(cx, top, CELL_W, CELL_H, GOLD);
+                fg = TERM_BG;
+            }
+            cell_glyph(cx, top + 1, ch, fg);
+            if here && shape == 1 {
+                rect(cx, top + 1, 1, face::CAP, GOLD);
+            } else if here && shape == 3 {
+                rect(cx, top + 1 + face::CAP + 1, CELL_W, 1, GOLD);
+            }
+        }
+    }
+}
+
+/// One cell's character: 33 to 126 from the face, centred in the 6 px cell as `mono` does; a space nothing;
+/// every other byte (0x80, the letter the font lacks, and the rest) a hollow box the size of a capital.
+fn cell_glyph(cx: i32, y: i32, ch: u8, c: u32) {
+    match ch {
+        b' ' => {}
+        33..=126 => {
+            let (w, rows) = face::glyph(ch);
+            glyph_at(cx + (5 - w) / 2, y, rows, w, c, 1);
+        }
+        _ => {
+            rect(cx, y, 5, 1, c);
+            rect(cx, y + face::CAP - 1, 5, 1, c);
+            rect(cx, y, 1, face::CAP, c);
+            rect(cx + 4, y, 1, face::CAP, c);
+        }
+    }
+}
+
 fn files_app(a: usize, x: i32, y: i32, w: i32, h: i32) {
     let s = st();
     let split = files_split(a);
     rect(x, y, split, 20, SURFACE2);
-    text(x + 10, y + 6, b"Name", DIM, 1);
-    text(x + split - 44, y + 6, b"Size", DIM, 1);
+    text(x + 10, y + 6, lang::t(lang::Msg::FilesName), DIM, 1);
+    let sz = lang::t(lang::Msg::FilesSize);
+    text(x + split - 10 - text_w(sz, 1).max(34), y + 6, sz, DIM, 1);
     rect(x + split, y, 1, h, LINE);
     let mut row = 0;
     for i in 0..crate::vfs::MAX_FILES {
@@ -653,7 +1297,7 @@ fn files_app(a: usize, x: i32, y: i32, w: i32, h: i32) {
         row += 1;
     }
     if row == 0 {
-        text(x + 10, y + 30, b"No files yet", DIM, 1);
+        text(x + 10, y + 30, lang::t(lang::Msg::FilesNone), DIM, 1);
     }
     // the preview pane
     let (px, pw) = (x + split + 1, w - split - 1);
@@ -662,14 +1306,14 @@ fn files_app(a: usize, x: i32, y: i32, w: i32, h: i32) {
             let name = crate::vfs::name_of(i);
             text(px + 10, y + 8, name.as_bytes(), GOLD, 1);
             let mut l = Line::new();
-            l.u(crate::vfs::size_of(i) as u64).s(b" bytes");
+            l.f(lang::Msg::FilesBytes, &[lang::Arg::N(crate::vfs::size_of(i) as u64)]);
             text(px + 10, y + 20, l.get(), DIM, 1);
             rect(px + 10, y + 32, pw - 20, 1, LINE);
             let data = crate::vfs::read_raw(name).unwrap_or(&[]);
             let printable = data.iter().take(512).all(|&c| c == b'\n' || c == b'\r' || c == b'\t' || (0x20..0x7f).contains(&c));
             if name.ends_with(".wasm") {
-                text(px + 10, y + 42, b"WebAssembly program", TEXT, 1);
-                text(px + 10, y + 56, b"Run it from Terminal:", DIM, 1);
+                text(px + 10, y + 42, lang::t(lang::Msg::FilesWasm), TEXT, 1);
+                text(px + 10, y + 56, lang::t(lang::Msg::FilesRunIt), DIM, 1);
                 let mut l = Line::new();
                 l.s(b"wasm ").s(name.as_bytes());
                 text(px + 10, y + 70, l.get(), GOLD_DEEP, 1);
@@ -700,11 +1344,11 @@ fn files_app(a: usize, x: i32, y: i32, w: i32, h: i32) {
                     }
                 }
             } else {
-                text(px + 10, y + 42, b"Binary data", TEXT, 1);
+                text(px + 10, y + 42, lang::t(lang::Msg::FilesBinary), TEXT, 1);
             }
         }
         _ => {
-            let m = b"Select a file";
+            let m = lang::t(lang::Msg::FilesSelect);
             text(px + (pw - text_w(m, 1)) / 2, y + h / 2 - 4, m, DIM, 1);
         }
     }
@@ -714,10 +1358,12 @@ fn terminal_app(x: i32, y: i32, w: i32, h: i32) {
     rect(x, y, w, h, TERM_BG);
     let cols = ((w - 16) / 6).max(1) as usize;
     let rows = ((h - 12) / 13).max(1) as usize;
-    // the newest lines that are not desktop log lines, bottom up
-    let mut shown = [0usize; TL];
+    // the newest lines that are not desktop log lines, bottom up, from the view (afriui.md section 28)
+    let view = term_view();
+    let mut shown = [0usize; 128];
+    let rows = rows.min(128);
     let mut n = 0;
-    let mut k = 0;
+    let mut k = view;
     while n < rows && k < TL {
         let l = term_line(k);
         if !l.starts_with(b"[desk]") {
@@ -736,11 +1382,24 @@ fn terminal_app(x: i32, y: i32, w: i32, h: i32) {
         } else {
             mono(x + 8, yy, line, TERM_TEXT, cols);
         }
-        if j == 0 {
+        if j == 0 && view == 0 {
             // the cursor after the line being typed
             let cx = x + 8 + (line.len().min(cols) as i32) * 6;
             rect(cx + 1, yy, 5, face::CAP, GOLD);
         }
+    }
+    if view > 0 {
+        // scrolled back: say how far, and how to come back, at the top right
+        let mut l = Line::new();
+        if view == 1 {
+            l.s(lang::t(lang::Msg::TermBackOne));
+        } else {
+            l.f(lang::Msg::TermBack, &[lang::Arg::N(view as u64)]);
+        }
+        let tw = text_w(l.get(), 1);
+        let (cx, cy) = (x + w - tw - 22, y + 4);
+        chip(cx, cy, tw + 14, face::CAP + 8, 3, GOLD_DEEP);
+        text(cx + 7, cy + 4, l.get(), NIGHT, 1);
     }
 }
 
@@ -758,55 +1417,81 @@ fn settings_app(a: usize, x: i32, y: i32, w: i32, _h: i32) {
         text(x + 14, yy, t, GOLD_DEEP, 1);
         rect(x + 14 + text_w(t, 1) + 6, yy + 4, w - 40 - text_w(t, 1), 1, LINE);
     };
-    head(y + 10, b"Display");
+    head(y + 10, lang::t(lang::Msg::SetDisplay));
     let rows = settings_rows();
     let mut l = Line::new();
-    l.u(W() as u64).s(b" x ").u(H() as u64).s(b" logical pixels");
+    l.f(lang::Msg::SetPixels, &[lang::Arg::N(W() as u64), lang::Arg::N(H() as u64)]);
     text(x + 14, y + 24, l.get(), DIM, 1);
     // input profile: a two-part switch
-    label(y + rows[0] + 5, b"Input");
+    // the language: its own name on a chip (a click moves to the next), and an ochre "draft" mark while any of its
+    // strings is a machine draft not yet checked by a fluent speaker (LANGUAGES_PLAN.md)
+    label(y + rows[4] + 5, lang::t(lang::Msg::SetLanguage));
+    let lx = x + settings_seg_x(a);
+    // one chip with the current language's own name and a down chevron; gold under the pointer or while its list
+    // is open; a click or Enter opens the list (the designer's spec, 14 Nov)
+    let cur = lang::current();
+    let hot = s.lang_hover || s.lang_list;
+    chip(lx, y + rows[4], 128, 20, 4, if hot { GOLD_DEEP } else { SURFACE2 });
+    let own = cur.own_name().as_bytes();
+    let (shown, cut_) = fit(own, 128 - 10 - 7 - 14, 1);
+    let end = text(lx + 10, y + rows[4] + 6, shown, if hot { NIGHT } else { TEXT }, 1);
+    if cut_ {
+        text(end + 1, y + rows[4] + 6, b"..", if hot { NIGHT } else { DIM }, 1);
+    }
+    let (vx, vy, vc) = (lx + 128 - 10 - 7, y + rows[4] + 8, if hot { NIGHT } else { DIM });
+    for k in 0..4 {
+        rect(vx + k, vy + k, 7 - 2 * k, 1, vc);
+    }
+    if lang::counts(cur).1 > 0 {
+        let d = lang::t(lang::Msg::SetDraft);
+        let dw = text_w(d, 1) + 10;
+        chip(lx - dw - 6, y + rows[4] + 3, dw, 14, 2, OCHRE);
+        text(lx - dw - 1, y + rows[4] + 6, d, TERM_BG, 1);
+    }
+    label(y + rows[0] + 5, lang::t(lang::Msg::SetInput));
     let sx = x + settings_seg_x(a);
     chip(sx, y + rows[0], 128, 20, 4, SURFACE2);
     let on = if s.touch { 64 } else { 0 };
     chip(sx + on + 2, y + rows[0] + 2, 60, 16, 3, GOLD_DEEP);
-    text(sx + 10, y + rows[0] + 6, b"Pointer", if s.touch { DIM } else { NIGHT }, 1);
-    text(sx + 64 + 14, y + rows[0] + 6, b"Touch", if s.touch { NIGHT } else { DIM }, 1);
+    text(sx + 10, y + rows[0] + 6, lang::t(lang::Msg::SetPointer), if s.touch { DIM } else { NIGHT }, 1);
+    text(sx + 64 + 14, y + rows[0] + 6, lang::t(lang::Msg::SetTouch), if s.touch { NIGHT } else { DIM }, 1);
 
-    head(y + 70, b"Desktop");
-    label(y + rows[1] + 3, b"Monument wallpaper");
+    head(y + 90, lang::t(lang::Msg::SetDesktop));
+    label(y + rows[1] + 3, lang::t(lang::Msg::SetWallpaper));
     switch(x + w - 50, y + rows[1], s.wallpaper);
-    label(y + rows[2] + 3, b"24-hour clock");
+    label(y + rows[2] + 3, lang::t(lang::Msg::SetClock24));
     switch(x + w - 50, y + rows[2], s.clock24);
-    label(y + rows[3] + 3, b"Motion");
+    label(y + rows[3] + 3, lang::t(lang::Msg::SetMotion));
     switch(x + w - 50, y + rows[3], s.motion);
 
-    head(y + 164, b"Network");
+    head(y + 182, lang::t(lang::Msg::SetNetwork));
     let ip = crate::virtio::dhcp_ip();
     let mut l = Line::new();
     if !crate::virtio::net_present() {
-        l.s(b"No network device");
+        l.s(lang::t(lang::Msg::SetNoDevice));
     } else if ip == [0u8; 4] {
-        l.s(b"Link up, no address yet");
+        l.s(lang::t(lang::Msg::SetNoAddress));
     } else {
-        rect(x + 14, y + 183, 5, 5, GREEN);
-        l.s(b"   Connected  ");
+        rect(x + 14, y + 201, 5, 5, GREEN);
+        let mut dotted = Line::new();
         for (k, o) in ip.iter().enumerate() {
             if k > 0 {
-                l.s(b".");
+                dotted.s(b".");
             }
-            l.u(*o as u64);
+            dotted.u(*o as u64);
         }
+        l.f(lang::Msg::SetConnected, &[lang::Arg::S(dotted.get())]);
     }
-    label(y + 180, l.get());
+    label(y + 198, l.get());
 
-    head(y + 204, b"System");
+    head(y + 220, lang::t(lang::Msg::SetSystem));
     let mut l = Line::new();
-    l.u(crate::cores_online() as u64).s(b" core(s), ").u(crate::ram_mib()).s(b" MiB memory");
-    label(y + 220, l.get());
+    l.f(lang::Msg::SetCores, &[lang::Arg::N(crate::cores_found() as u64), lang::Arg::N(crate::ram_mib())]);
+    label(y + 236, l.get());
     let mut l = Line::new();
-    l.s(b"Booted ").u(crate::config::boots() as u64).s(b" time(s), up ").u(now_ticks() / 100).s(b" s");
-    text(x + 14, y + 234, l.get(), DIM, 1);
-    note_uptime(a, y + 234);
+    l.f(lang::Msg::SetBooted, &[lang::Arg::N(crate::config::boots() as u64), lang::Arg::N(now_ticks() / 100)]);
+    text(x + 14, y + 250, l.get(), DIM, 1);
+    note_uptime(a, y + 250);
     let _ = (w, a);
 }
 
@@ -815,7 +1500,7 @@ fn settings_app(a: usize, x: i32, y: i32, w: i32, _h: i32) {
 /// Each app records where it last drew its uptime line, as rows below its window's top
 /// (architect's note N6: the place comes from the drawing, not a copy of its layout); -1 until
 /// the app has been drawn, and then the whole window is the line's box.
-static mut UPTIME_DY: [i32; NAPPS] = [-1; NAPPS];
+static mut UPTIME_DY: [i32; NWIN] = [-1; NWIN];
 
 fn note_uptime(a: usize, line_y: i32) {
     // SAFETY: mainline only.
@@ -839,27 +1524,146 @@ fn about_app(x: i32, y: i32, w: i32, h: i32) {
     let t = b"AfriSovera OS";
     text(x + (w - text_w(t, 2)) / 2, yy, t, GOLD, 2);
     yy += 22;
-    let sub = b"Own your device - own your future";
+    let sub = lang::t(lang::Msg::AboutMotto);
     text(x + (w - text_w(sub, 1)) / 2, yy, sub, GOLD_DEEP, 1);
     yy += 18;
     rect(x + 24, yy, w - 48, 1, LINE);
     yy += 10;
-    let arch: &[u8] = if cfg!(target_arch = "aarch64") { b"ARM64 (phone)" } else { b"x86-64 (PC)" };
-    let mut rows: [(&[u8], Line); 4] = [(b"Kernel", Line::new()), (b"Desktop", Line::new()), (b"Device", Line::new()), (b"Memory", Line::new())];
-    rows[0].1.s(b"Mansa microkernel, Rust");
-    rows[1].1.s(b"Tonga, Sovereign UI");
-    rows[2].1.s(arch).s(b", ").u(crate::cores_online() as u64).s(b" core(s)");
-    rows[3].1.u((crate::frame::total_frames() * 4 / 1024) as u64).s(b" MiB, up ").u(now_ticks() / 100).s(b" s");
-    for (k, v) in rows.iter() {
+    let arch = lang::t(if cfg!(target_arch = "aarch64") { lang::Msg::AboutArm } else { lang::Msg::AboutPc });
+    let mut rows: [(&[u8], Line); 4] = [
+        (lang::t(lang::Msg::AboutKernel), Line::new()),
+        (lang::t(lang::Msg::AboutDesktop), Line::new()),
+        (lang::t(lang::Msg::AboutDevice), Line::new()),
+        (lang::t(lang::Msg::AboutMemory), Line::new()),
+    ];
+    rows[0].1.s(lang::t(lang::Msg::AboutKernelIs));
+    rows[1].1.s(lang::t(lang::Msg::AboutDesktopIs));
+    rows[2].1.f(lang::Msg::AboutDeviceIs, &[lang::Arg::S(arch), lang::Arg::N(crate::cores_found() as u64)]);
+    // the machine's memory, as Settings shows it (it showed the kernel's 64 MiB page pool here; the owner's HP, 14 Nov)
+    rows[3].1.f(lang::Msg::AboutMemoryIs, &[lang::Arg::N(crate::ram_mib()), lang::Arg::N(now_ticks() / 100)]);
+    let vx = rows.iter().map(|(k, _)| 30 + text_w(k, 1) + 14).max().unwrap_or(100).max(100);
+    for (r, (k, v)) in rows.iter().enumerate() {
         if yy + face::LINE_H > y + h {
             break;
         }
         text(x + 30, yy, k, DIM, 1);
-        text(x + 100, yy, v.get(), TEXT, 1);
-        if *k == b"Memory" {
+        text(x + vx, yy, v.get(), TEXT, 1);
+        if r == 3 {
             note_uptime(App::About as usize, yy); // the uptime is on this row
         }
         yy += 14;
+    }
+}
+
+/// `desk lang fit` (LANGUAGES_PLAN.md stage 2): every string of language `l` measured against the room its place on
+/// the desk gives it, at the windows' home sizes and with the widest numbers it can show. Each string wider than its
+/// room goes to `bad(id, width, room)`. The rooms follow the drawing code above; a change there changes them here.
+pub(super) fn fit_report(l: lang::Lang, bad: &mut dyn FnMut(&str, i32, i32)) {
+    let name = |m: lang::Msg| lang::IDS[m as usize];
+    let w_of = |m: lang::Msg| text_w(lang::text_in(l, m), 1);
+    let filled = |m: lang::Msg, args: &[lang::Arg]| {
+        let mut line = Line::new();
+        lang::fill_text(lang::text_in(l, m), args, &mut |b: &[u8]| {
+            line.s(b);
+        });
+        text_w(line.get(), 1)
+    };
+    let mut check = |id: &str, w: i32, room: i32| {
+        if w > room {
+            bad(id, w, room);
+        }
+    };
+    // Settings (home width; the chip and the switches as settings_app draws them)
+    let sw = HOME[App::Settings as usize].2;
+    let seg = sw - 150;
+    let dw = w_of(lang::Msg::SetDraft) + 10;
+    check(name(lang::Msg::SetDraft), dw, 40);
+    check(name(lang::Msg::SetLanguage), w_of(lang::Msg::SetLanguage), seg - dw - 6 - 14 - 6);
+    check(name(lang::Msg::SetInput), w_of(lang::Msg::SetInput), seg - 14 - 6);
+    for m in [lang::Msg::SetWallpaper, lang::Msg::SetClock24, lang::Msg::SetMotion] {
+        check(name(m), w_of(m), sw - 50 - 14 - 6);
+    }
+    for m in [lang::Msg::SetPointer, lang::Msg::SetTouch] {
+        check(name(m), w_of(m), 60 - 12);
+    }
+    // the language list's rows: every language's own name whole beside the draft chip (200 - 14 - 8 - the chip); the
+    // closed chip cuts a long name with ".." beside its chevron, so it is not a fit error there
+    let dmark = text_w(lang::text_in(l, lang::Msg::SetDraft), 1) + 10;
+    for &o in lang::LANGS.iter() {
+        check(o.code(), text_w(o.own_name().as_bytes(), 1), 200 - 14 - 8 - dmark - 6);
+    }
+    for m in [lang::Msg::SetDisplay, lang::Msg::SetDesktop, lang::Msg::SetNetwork, lang::Msg::SetSystem] {
+        check(name(m), w_of(m), sw - 60);
+    }
+    for m in [lang::Msg::SetNoDevice, lang::Msg::SetNoAddress] {
+        check(name(m), w_of(m), sw - 28);
+    }
+    check(name(lang::Msg::SetPixels), filled(lang::Msg::SetPixels, &[lang::Arg::N(3840), lang::Arg::N(2160)]), sw - 28);
+    check(name(lang::Msg::SetConnected), filled(lang::Msg::SetConnected, &[lang::Arg::S(b"255.255.255.255")]), sw - 28);
+    check(name(lang::Msg::SetCores), filled(lang::Msg::SetCores, &[lang::Arg::N(64), lang::Arg::N(65536)]), sw - 28);
+    check(name(lang::Msg::SetBooted), filled(lang::Msg::SetBooted, &[lang::Arg::N(99999), lang::Arg::N(9999999)]), sw - 28);
+    // About
+    let aw = HOME[App::About as usize].2;
+    check(name(lang::Msg::AboutMotto), w_of(lang::Msg::AboutMotto), aw - 20);
+    let keys = [lang::Msg::AboutKernel, lang::Msg::AboutDesktop, lang::Msg::AboutDevice, lang::Msg::AboutMemory];
+    let vx = keys.iter().map(|&m| 30 + w_of(m) + 14).max().unwrap_or(100).max(100);
+    check(name(lang::Msg::AboutKernelIs), w_of(lang::Msg::AboutKernelIs), aw - vx - 10);
+    check(name(lang::Msg::AboutDesktopIs), w_of(lang::Msg::AboutDesktopIs), aw - vx - 10);
+    for arch in [lang::Msg::AboutArm, lang::Msg::AboutPc] {
+        let a = lang::text_in(l, arch);
+        check(name(lang::Msg::AboutDeviceIs), filled(lang::Msg::AboutDeviceIs, &[lang::Arg::S(a), lang::Arg::N(64)]), aw - vx - 10);
+    }
+    check(name(lang::Msg::AboutMemoryIs), filled(lang::Msg::AboutMemoryIs, &[lang::Arg::N(16384), lang::Arg::N(999999)]), aw - vx - 10);
+    // Files: the header and the preview pane
+    let fw = HOME[App::Files as usize].2;
+    let split = (fw * 46 / 100).max(150);
+    check(name(lang::Msg::FilesName), w_of(lang::Msg::FilesName), split - 10 - w_of(lang::Msg::FilesSize).max(34) - 10 - 6);
+    check(name(lang::Msg::FilesSize), w_of(lang::Msg::FilesSize), split - 60);
+    check(name(lang::Msg::FilesNone), w_of(lang::Msg::FilesNone), split - 14);
+    let pane = fw - split - 1 - 20;
+    for m in [lang::Msg::FilesWasm, lang::Msg::FilesRunIt, lang::Msg::FilesBinary, lang::Msg::FilesSelect] {
+        check(name(m), w_of(m), pane);
+    }
+    check(name(lang::Msg::FilesBytes), filled(lang::Msg::FilesBytes, &[lang::Arg::N(99999999)]), pane);
+    // the title bar's red button, the window names under the Circle's tiles and on the lintel
+    // the narrowest app title (icon, a cut name, the unsigned mark, Close anyway, the buttons) in this language fits
+    // the cell window's home width, so the window can always be made wide enough for the mark to stay whole
+    check(name(lang::Msg::TitleUnsigned), lintel_min_w_in(l), HOME[App::Cell as usize].2);
+    for m in [lang::Msg::AppFiles, lang::Msg::AppTerminal, lang::Msg::AppSettings, lang::Msg::AppAbout] {
+        check(name(m), w_of(m), 84);
+    }
+    // the clock's second line on the Spine
+    for m in [lang::Msg::ClockUtc, lang::Msg::ClockAm, lang::Msg::ClockPm] {
+        check(name(m), w_of(m), SPINE_P - 6);
+    }
+    // the Circle's information box (on the current screen)
+    let (_, _, iw, _) = circle_info_box();
+    let sum = filled(lang::Msg::CircleSummary, &[lang::Arg::S(b"192.168.10.200"), lang::Arg::N(16384), lang::Arg::N(64)]);
+    // the summary is cut with ".." when it is too wide (launcher), so only the label is a fit error here; the
+    // widest line is printed by `desk lang fit` as a note
+    let _ = sum;
+    check(name(lang::Msg::CircleDevice), w_of(lang::Msg::CircleDevice), iw - 28 - 60);
+    check(name(lang::Msg::CircleUp), filled(lang::Msg::CircleUp, &[lang::Arg::N(999999)]), iw - 28);
+    // the power panel (the designer's sizes, 14 Nov: power_box and power_buttons at UI scale 1): 240 px, text 14 px
+    // in, so 212 px a line; the menu's buttons are 212 px with the word centred; the confirm's two are 101 px
+    for m in [lang::Msg::PowerTitle, lang::Msg::PowerOffAsk, lang::Msg::PowerRestartAsk, lang::Msg::PowerUnsaved] {
+        check(name(m), w_of(m), 240 - 28);
+    }
+    for m in [lang::Msg::PowerOff, lang::Msg::PowerRestart] {
+        check(name(m), w_of(m), 240 - 28 - 8);
+    }
+    let pbw = (240 - 28 - 10) / 2;
+    for m in [lang::Msg::PowerOff, lang::Msg::PowerRestart, lang::Msg::PowerCancel] {
+        check(name(m), w_of(m), pbw - 8);
+    }
+    // the Terminal's scrolled-back chip (top right, sized to its text) within the body at its home width
+    let tw = HOME[App::Terminal as usize].2 - 120;
+    check(name(lang::Msg::TermBackOne), w_of(lang::Msg::TermBackOne) + 12, tw);
+    check(name(lang::Msg::TermBack), filled(lang::Msg::TermBack, &[lang::Arg::N(2048)]) + 12, tw);
+    // the notices panel
+    let nw = 280;
+    for m in [lang::Msg::NotesTitle, lang::Msg::NotesNone, lang::Msg::NoteWelcome] {
+        check(name(m), w_of(m), nw - 38);
     }
 }
 
@@ -879,8 +1683,8 @@ fn launcher() {
         return;
     }
     let k = lw * 29 / 100; // a regular octagon cuts about 29% off each corner
-    cut(lx + 4, ly + 4, lw, lh, k, k, k, k, SHADOW);
-    cut(lx, ly, lw, lh, k, k, k, k, 0x16_11_0E);
+    shadow(lx, ly, lw, lh, k, k, k, k, 4, look::REACH);
+    cut_a(lx, ly, lw, lh, k, k, k, k, 0x16_11_0E, if look::glass() { look::GLASS_ALPHA } else { 255 });
     cut_frame(lx, ly, lw, lh, k, k, k, k, GOLD_DARK);
     cut_frame(lx + 3, ly + 3, lw - 6, lh - 6, k - 1, k - 1, k - 1, k - 1, LINE);
     let (cx, cy) = (lx + lw / 2, ly + lh / 2 - 6);
@@ -893,15 +1697,23 @@ fn launcher() {
     monument(cx, cy - mh / 2 - 6, mh, GOLD_PALE, GOLD_DEEP);
     let word = b"AfriSovera";
     text(cx - text_w(word, 1) / 2, cy + mh / 2 + 6, word, GOLD, 1);
-    for i in 0..NAPPS {
+    let busy = circle_busy();
+    for i in 0..ntile() {
         let (tx, ty, ts) = launcher_tile(i);
         if i == s.sel {
             // the keyboard walk's choice: a gold cut frame round the tile (section 14)
             cut_frame(tx - 4, ty - 4, ts + 8, ts + 8, 6, 6, 6, 6, GOLD);
             cut_frame(tx - 3, ty - 3, ts + 6, ts + 6, 5, 5, 5, 5, GOLD);
         }
+        if let Some(k) = circle_app(i) {
+            // a bundled app's tile (section 32): dim while the shell is busy
+            andika_icon(tx, ty, ts, busy);
+            let n = CIRCLE_APPS[k].1;
+            text(tx + (ts - text_w(n, 1)) / 2, ty + ts + 6, n, if busy { DIM } else { TEXT }, 1);
+            continue;
+        }
         icon(Some(APPS[i]), tx, ty, ts);
-        let n = APPS[i].name().as_bytes();
+        let n = APPS[i].name();
         text(tx + (ts - text_w(n, 1)) / 2, ty + ts + 6, n, if s.wins[i].open { GOLD } else { TEXT }, 1);
     }
     // honest use of the space: what this device is doing now (review D2)
@@ -911,9 +1723,9 @@ fn launcher() {
     let ip = crate::virtio::dhcp_ip();
     let mut l = Line::new();
     if !crate::virtio::net_present() {
-        l.s(b"No network");
+        l.s(lang::t(lang::Msg::CircleNoNet));
     } else if ip == [0u8; 4] {
-        l.s(b"Link up, no address");
+        l.s(lang::t(lang::Msg::CircleNoAddress));
     } else {
         for (k, o) in ip.iter().enumerate() {
             if k > 0 {
@@ -922,31 +1734,99 @@ fn launcher() {
             l.u(*o as u64);
         }
     }
-    l.s(b",  ").u(crate::ram_mib()).s(b" MiB,  ");
-    l.u((0..crate::vfs::MAX_FILES).filter(|&i| crate::vfs::is_used(i)).count() as u64).s(b" files");
-    let x0 = text(ix + 14, iy + 10, b"This device", GOLD_DEEP, 1);
-    text(x0 + 10, iy + 10, l.get(), TEXT, 1);
+    let files = (0..crate::vfs::MAX_FILES).filter(|&i| crate::vfs::is_used(i)).count() as u64;
+    let mut sum = Line::new();
+    sum.f(lang::Msg::CircleSummary, &[lang::Arg::S(l.get()), lang::Arg::N(crate::ram_mib()), lang::Arg::N(files)]);
+    let l = sum;
+    let x0 = text(ix + 14, iy + 10, lang::t(lang::Msg::CircleDevice), GOLD_DEEP, 1);
+    // a long address and a big memory can be wider than the box on a small screen (desk lang fit found it in
+    // English at 640x480): then the line is cut with "..", never drawn past the box's edge
+    let (shown, cut) = fit(l.get(), ix + iw - 14 - (x0 + 10), 1);
+    let end = text(x0 + 10, iy + 10, shown, TEXT, 1);
+    if cut {
+        text(end + 1, iy + 10, b"..", DIM, 1);
+    }
     let mut l = Line::new();
-    l.s(b"Up ").u(now_ticks() / 100).s(b" s.  Super or Esc closes the Circle.");
+    l.f(lang::Msg::CircleUp, &[lang::Arg::N(now_ticks() / 100)]);
     text(ix + 14, iy + 26, l.get(), DIM, 1);
+}
+
+/// The language list (the designer's spec, 14 Nov): the notes panel's shape and shadow, a row a language in its own
+/// name, the current one on a gold chip, the keyboard's row in a gold outline, the ochre draft mark on a draft
+/// language's row, and a 2 px bar at the right edge when the list scrolls. Mirrored in a right-to-left language.
+fn lang_list() {
+    let s = st();
+    let (x, y, w, h) = lang_list_box();
+    shadow(x, y, w, h, CUT, 0, CUT, 0, 4, look::REACH); // soft, as every panel
+    cut(x, y, w, h, CUT, 0, CUT, 0, 0x16_11_0E);
+    cut_frame(x, y, w, h, CUT, 0, CUT, 0, GOLD_DARK);
+    let rtl = lang::current().dir() == lang::Dir::Rtl;
+    let cur = lang::current();
+    let (top, shown) = lang_list_rows();
+    let d = lang::t(lang::Msg::SetDraft);
+    let dw = text_w(d, 1) + 10;
+    for r in 0..shown {
+        let i = top + r;
+        let l = lang::LANGS[i];
+        let ry = y + 8 + r as i32 * 22;
+        if l == cur {
+            chip(x + 6, ry + 2, w - 12, 18, 3, GOLD_DEEP);
+        }
+        if i == s.lang_sel {
+            cut_frame(x + 6, ry + 2, w - 12, 18, 3, 3, 3, 3, GOLD);
+        }
+        let name = l.own_name().as_bytes();
+        let nx = if rtl { x + w - 14 - text_w(name, 1) } else { x + 14 };
+        text(nx, ry + 7, name, if l == cur { NIGHT } else { TEXT }, 1);
+        if lang::counts(l).1 > 0 {
+            // the designer's review (14 Nov): a NIGHT chip with OCHRE text on the current (gold) row, the ochre chip on
+            // the keyboard's row, and plain DIM text on the others, so the names read before the marks
+            let dx = if rtl { x + 8 } else { x + w - 8 - dw };
+            if l == cur {
+                chip(dx, ry + 4, dw, 14, 2, NIGHT);
+                text(dx + 5, ry + 7, d, OCHRE, 1);
+            } else if i == s.lang_sel {
+                chip(dx, ry + 4, dw, 14, 2, OCHRE);
+                text(dx + 5, ry + 7, d, TERM_BG, 1);
+            } else {
+                let tx = if rtl { x + 8 } else { x + w - 8 - text_w(d, 1) };
+                text(tx, ry + 7, d, DIM, 1);
+            }
+        }
+    }
+    let n = lang::LANGS.len();
+    if n > shown && n > 0 {
+        let track = h - 16;
+        let bx = if rtl { x + 2 } else { x + w - 4 };
+        rect(bx, y + 8 + track * top as i32 / n as i32, 2, (track * shown as i32 / n as i32).max(4), DIM);
+    }
 }
 
 fn notes_panel() {
     let s = st();
     let (nx, ny, nw, nh) = notes_box();
-    cut(nx + 4, ny + 4, nw, nh, CUT, 0, CUT, 0, SHADOW);
-    cut(nx, ny, nw, nh, CUT, 0, CUT, 0, 0x16_11_0E);
+    shadow(nx, ny, nw, nh, CUT, 0, CUT, 0, 4, look::REACH);
+    cut_a(nx, ny, nw, nh, CUT, 0, CUT, 0, 0x16_11_0E, if look::glass() { look::GLASS_ALPHA } else { 255 });
     cut_frame(nx, ny, nw, nh, CUT, 0, CUT, 0, GOLD_DARK);
-    text(nx + 14, ny + 10, b"Notifications", GOLD, 1);
+    text(nx + 14, ny + 10, lang::t(lang::Msg::NotesTitle), GOLD, 1);
     let total = s.nnotes.min(NNOTE);
     if total == 0 {
-        text(nx + 14, ny + 32, b"Nothing new", DIM, 1);
+        text(nx + 14, ny + 32, lang::t(lang::Msg::NotesNone), DIM, 1);
     }
     for k in 0..total {
         let i = (s.nnotes - 1 - k) % NNOTE;
         let yy = ny + 28 + k as i32 * 18;
         chip(nx + 14, yy + 2, 4, 4, 1, GOLD_DEEP);
         text(nx + 24, yy, &s.notes[i][..s.note_len[i]], TEXT, 1);
+    }
+}
+
+/// A panel's box with what its shadow can touch (the notifications list, the Circle).
+pub(super) fn panel_box(b: Rect) -> Rect {
+    if look::soft() && !st().touch {
+        look::shadow_box(b.0, b.1, b.2, b.3)
+    } else {
+        grow(b, 4)
     }
 }
 
@@ -961,6 +1841,12 @@ pub(super) fn toast_box() -> Option<Rect> {
 /// snapshot uses this, so a toast that expires between two snapshots still damages its box
 /// (a partial frame for something else could otherwise leave a strip of it on the screen).
 pub(super) fn toast_place() -> Option<Rect> {
+    let (x, y, w, h) = toast_rect()?;
+    Some(if look::soft() && !st().touch { look::shadow_box(x, y, w, h) } else { (x, y, w + 3, h + 3) })
+}
+
+/// The toast itself, without its shadow.
+fn toast_rect() -> Option<Rect> {
     let s = st();
     if s.nnotes == 0 || s.notes_open || s.toast_until == 0 {
         return None;
@@ -971,17 +1857,16 @@ pub(super) fn toast_place() -> Option<Rect> {
     // (design review D2)
     let sw = spine_w();
     let (x, y) = if s.touch { (sw + (W() - sw - w) / 2, H() - bar_h() - 46) } else { (W() - w - 10, TOP + 10) };
-    Some((x, y, w + 3, 28 + 3))
+    Some((x, y, w, 28))
 }
 
 fn toast() {
     let s = st();
-    let Some((x, y, w, _)) = toast_box() else { return };
-    let w = w - 3;
+    let Some((x, y, w, _)) = toast_rect() else { return };
     let i = (s.nnotes - 1) % NNOTE;
     let msg = &s.notes[i][..s.note_len[i]];
-    cut(x + 3, y + 3, w, 28, 6, 0, 6, 0, SHADOW);
-    cut(x, y, w, 28, 6, 0, 6, 0, SURFACE2);
+    shadow(x, y, w, 28, 6, 0, 6, 0, 3, look::REACH);
+    cut_a(x, y, w, 28, 6, 0, 6, 0, SURFACE2, if look::glass() { look::GLASS_ALPHA } else { 255 });
     cut_frame(x, y, w, 28, 6, 0, 6, 0, GOLD_DARK);
     chip(x + 12, y + 10, 8, 8, 2, GOLD);
     text(x + 28, y + 10, msg, TEXT, 1);
@@ -1003,6 +1888,14 @@ pub(super) fn draw() {
     if s.launcher {
         launcher();
     }
+    if s.lang_list {
+        lang_list();
+    }
+    // the power panel last, opaque: its words are never under glass (the architect, 14 Nov)
+    if s.power > 0 {
+        power_panel();
+    }
+    marks_on_top();
     s.frames += 1;
     let us = crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / crate::timer::hz().max(1);
     // SAFETY: mainline only.
@@ -1040,12 +1933,20 @@ pub(super) fn draw_damage(boxes: &[Rect]) {
         if toast_box().is_some_and(|b| touches(b, r)) {
             toast();
         }
-        if s.notes_open && touches(grow(notes_box(), 4), r) {
+        if s.notes_open && touches(panel_box(notes_box()), r) {
             notes_panel();
         }
-        if s.launcher && (touches(grow(launcher_box(), 4), r) || touches(grow(circle_info_box(), 4), r)) {
+        if s.launcher && (touches(panel_box(launcher_box()), r) || touches(grow(circle_info_box(), 4), r)) {
             launcher();
         }
+        if s.lang_list && touches(panel_box(lang_list_box()), r) {
+            lang_list();
+        }
+        // the power panel last, opaque: its words are never under glass (the architect, 14 Nov)
+        if s.power > 0 && touches(panel_box(power_box()), r) {
+            power_panel();
+        }
+        marks_on_top();
     }
     // SAFETY: as above.
     unsafe { DCLIP = (0, 0, i32::MAX / 2, i32::MAX / 2) };
@@ -1054,4 +1955,597 @@ pub(super) fn draw_damage(boxes: &[Rect]) {
     // SAFETY: mainline only.
     unsafe { PART_US = (us, PART_US.1.max(us), PART_US.2 + 1) };
     crate::canvas::mark();
+}
+
+/// FNV-1a over bytes, for the probe's hashes.
+fn fnv(h: u64, b: &[u8]) -> u64 {
+    b.iter().fold(h, |h, &x| (h ^ x as u64).wrapping_mul(0x100_0000_01b3))
+}
+
+/// A hash of the screen's pixels in (x, y, w, h), leaving out those `skip` says.
+fn screen_hash(x: i32, y: i32, w: i32, h: i32, skip: &dyn Fn(i32, i32) -> bool) -> u64 {
+    let (cw, ch) = (W(), H());
+    let p = crate::canvas::pixels();
+    let mut hsh = 0xcbf2_9ce4_8422_2325u64;
+    for yy in y.max(0)..(y + h).min(ch) {
+        for xx in x.max(0)..(x + w).min(cw) {
+            if !skip(xx, yy) {
+                // SAFETY: (xx, yy) is on the canvas, which is W() pixels a row.
+                let v = unsafe { *p.add(yy as usize * cw as usize + xx as usize) };
+                hsh = fnv(hsh, &v.to_le_bytes());
+            }
+        }
+    }
+    hsh
+}
+
+/// The visual order of a line as `desk shape hex` prints it (SHAPING_PLAN.md C1): characters after the explicit
+/// controls are dropped, the paragraph level, each character's level (x for a boundary-neutral one), the order left
+/// to right, the width at cap 9 and the oracle hash.
+pub(super) fn shape_report(b: &[u8]) {
+    let mut cps = [0u32; bidi::MAX];
+    let (mut n, mut i, mut dropped) = (0, 0, 0);
+    while i < b.len() {
+        let cp = vector::next_char(b, &mut i);
+        if bidi::is_explicit(cp) {
+            dropped += 1;
+        } else if n < bidi::MAX {
+            cps[n] = cp;
+            n += 1;
+        }
+    }
+    let mut levels = [0u8; bidi::MAX];
+    let para = bidi::resolve(&cps[..n], None, &mut levels[..n]);
+    let mut order = [0u16; bidi::MAX];
+    let m = bidi::reorder(&levels[..n], &mut order[..n]);
+    crate::kprint!("[desk] shape: {} chars, {} dropped, paragraph {}, levels", n, dropped, para);
+    for &lv in &levels[..n] {
+        if lv == bidi::REMOVED {
+            crate::kprint!(" x");
+        } else {
+            crate::kprint!(" {}", lv);
+        }
+    }
+    crate::kprint!(", order");
+    for &k in &order[..m] {
+        crate::kprint!(" {}", k);
+    }
+    crate::kprintln!(", width {}, needed {}", vtext_w(b, 9), if shape::needed(b) { "yes" } else { "no" });
+    crate::kprintln!("[desk] shape: oracle {:016x}", shape::oracle_hash(b));
+}
+
+/// `desk shape probe` (SHAPING_PLAN.md C1): the oracle hashes of every test string, the coverage hash of the sample
+/// line (the same on ARM and PC), widths drawn against measured, the limits, the fast test, and the speed. Draws
+/// over the desk, then redraws it whole.
+pub(super) fn shape_probe() {
+    let s = st();
+    let hz = crate::timer::hz().max(1);
+    let us = |t0: u64| crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / hz;
+    // SAFETY: mainline only; put back at the end.
+    let (keep_draw, keep_part, keep_frames) = unsafe { (DRAW_US, PART_US, s.frames) };
+    let was = vector_on();
+    VECTOR.store(true, core::sync::atomic::Ordering::Relaxed);
+    // 1. the oracle: every test string, hashed as tools/face/shape_expected.txt hashes HarfBuzz's answer
+    for (k, t) in shape_data::TESTS.iter().enumerate() {
+        crate::kprintln!("[desk] shape oracle {} {:016x}", k, shape::oracle_hash(t.as_bytes()));
+    }
+    // 2. the sample line's coverage at cap 9 and 18, hashed with each glyph's place: the same bytes on ARM and PC
+    let sample = "\u{627}\u{644}\u{633}\u{644}\u{627}\u{645} \u{639}\u{644}\u{64A}\u{643}\u{645} AfriSovera \u{662}\u{660}\u{662}\u{666}".as_bytes();
+    let mut hs = [0u64; 2];
+    for (k, cap) in [9, 18].into_iter().enumerate() {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        shape::layout(sample, cap, None, &mut |g, pen, y| {
+            h = fnv(h, &[g.face, g.boxed as u8]);
+            h = fnv(h, &g.g.to_le_bytes());
+            h = fnv(h, &pen.to_le_bytes());
+            h = fnv(h, &y.to_le_bytes());
+            if !g.boxed {
+                vector::glyph_in(g.face, g.g, cap, (pen >> 6) & 3, &mut |lf, tp, w, hh, cov| {
+                    h = fnv(fnv(h, &[lf as u8, tp as u8, w as u8, hh as u8]), cov);
+                });
+            }
+        });
+        hs[k] = h;
+    }
+    crate::kprintln!("[desk] shape: coverage hash cap 9 {:016x}, cap 18 {:016x}", hs[0], hs[1]);
+    // 3. drawn width against measured width, for Latin, Arabic, mixed, bad UTF-8 and explicit controls
+    let lines: [&[u8]; 8] = [
+        b"Settings: AfriSovera desk, a window title",
+        "\u{1EB9}\u{1ECD}\u{1E63} \u{25B}\u{254}".as_bytes(),
+        sample,
+        "\u{644}\u{627} \u{644}\u{623} (\u{628}\u{643}) [x] 12.5%".as_bytes(),
+        "abc \u{202E}\u{645}\u{631}\u{62D}\u{628}\u{627}\u{202C} def".as_bytes(),
+        &[0xD8, 0xA8, 0xD8, 0x20, 0xFF, 0xD9, 0x84, 0xD8],
+        "\u{5D0}\u{5D1} \u{200F}x\u{200E} \u{61C}".as_bytes(),
+        "\u{645}\u{64E}\u{631}\u{652}\u{62D}\u{64E}\u{628}\u{64B}\u{627}".as_bytes(),
+    ];
+    let mut same = 0;
+    for l in lines {
+        rect(10, 30, W() - 20, 40, SURFACE);
+        let end = vtext(14, 40, l, TEXT, 9);
+        same += (end - 14 == vtext_w(l, 9)) as usize;
+    }
+    crate::kprintln!("[desk] shape: widths: {} of {} drawn as measured", same, lines.len());
+    // 4. limits: a line of 300 characters (cut to 256, 44 counted), two explicit controls dropped
+    let mut long = [0u8; 600];
+    for p in long.chunks_mut(2) {
+        p.copy_from_slice(&[0xD8, 0xA8]);
+    }
+    shape::reset_cache(); // the lines above are cached; measure the cut and the drop on fresh shaping
+    // SAFETY: scalar reads.
+    let (d0, c0) = unsafe { (shape::STATS.0, shape::STATS.1) };
+    let lw = vtext_w(&long, 9);
+    let _ = vtext_w(lines[4], 9);
+    // SAFETY: scalar reads.
+    let (d1, c1) = unsafe { (shape::STATS.0, shape::STATS.1) };
+    crate::kprintln!("[desk] shape: limits: 300 characters gave {} cut and width {}, controls dropped {}", c1 - c0, lw, d1 - d0);
+    // 5. the fast test: Latin and Yoruba stay on the old path; Arabic, Hebrew and a lone control do not
+    let yn = |b: bool| if b { "yes" } else { "no" };
+    crate::kprintln!(
+        "[desk] shape: needed: latin {}, yoruba {}, arabic {}, hebrew {}, control {}",
+        yn(shape::needed(lines[0])),
+        yn(shape::needed(lines[1])),
+        yn(shape::needed(sample)),
+        yn(shape::needed(lines[6])),
+        yn(shape::needed("abc\u{202E}".as_bytes()))
+    );
+    // 6. speed: a 40-character Arabic line and the 40-character Latin title, cold, then warm (best and worst of 20)
+    let arabic40: &str = "\u{627}\u{644}\u{633}\u{644}\u{627}\u{645} \u{639}\u{644}\u{64A}\u{643}\u{645} \u{645}\u{631}\u{62D}\u{628}\u{627} \u{628}\u{643} \u{641}\u{64A} \u{627}\u{644}\u{625}\u{639}\u{62F}\u{627}\u{62F}\u{627}\u{62A} \u{627}\u{644}\u{645} \u{648}";
+    for (name, line) in [("arabic", arabic40.as_bytes()), ("latin", &lines[0][..40])] {
+        let mut t = [[0u64; 3]; 2];
+        for (si, scale) in [1, 2].into_iter().enumerate() {
+            rect(10, 30, W() - 20, 60, SURFACE);
+            vector::reset();
+            shape::reset_cache();
+            let t0 = crate::timer::cycles();
+            text(14, 40, line, TEXT, scale);
+            let cold = us(t0);
+            let (mut warm, mut worst) = (u64::MAX, 0);
+            for _ in 0..20 {
+                let t0 = crate::timer::cycles();
+                text(14, 40, line, TEXT, scale);
+                let t = us(t0);
+                warm = warm.min(t);
+                worst = worst.max(t);
+            }
+            t[si] = [cold, warm, worst];
+        }
+        crate::kprintln!(
+            "[desk] shape: {} {} characters: cap 9 cold {} us, warm {} us (worst of 20 {} us); cap 18 cold {} us, warm {} us (worst of 20 {} us)",
+            name,
+            core::str::from_utf8(line).map_or(0, |v| v.chars().count()),
+            t[0][0],
+            t[0][1],
+            t[0][2],
+            t[1][0],
+            t[1][1],
+            t[1][2]
+        );
+    }
+    // the Arabic line shaped every time (no line cache), warm glyphs: what a line costs the first frame it is seen
+    let mut every = [0u64; 2];
+    for (si, scale) in [1, 2].into_iter().enumerate() {
+        let mut best = u64::MAX;
+        for _ in 0..8 {
+            shape::reset_cache();
+            let t0 = crate::timer::cycles();
+            text(14, 40, arabic40.as_bytes(), TEXT, scale);
+            best = best.min(us(t0));
+        }
+        every[si] = best;
+    }
+    crate::kprintln!("[desk] shape: arabic 40 characters shaped every time: cap 9 {} us, cap 18 {} us", every[0], every[1]);
+    // SAFETY: scalar reads.
+    let cs = unsafe { shape::CSTATS };
+    crate::kprintln!("[desk] shape: line cache hits {}, misses {}, emptied {}", cs.0, cs.1, cs.2);
+    // SAFETY: scalar reads.
+    let st3 = unsafe { shape::STATS };
+    crate::kprintln!("[desk] shape: lines shaped {}, controls dropped {}, characters cut {}", st3.2, st3.0, st3.1);
+    VECTOR.store(was, core::sync::atomic::Ordering::Relaxed);
+    draw();
+    // SAFETY: mainline only.
+    unsafe {
+        DRAW_US = keep_draw;
+        PART_US = keep_part;
+    }
+    s.frames = keep_frames;
+}
+
+/// `desk font probe` (afriui.md section 26): the outline face's speed against the bitmap face's, and its checks.
+/// Draws over the desk, then redraws it whole; leaves the face as it was.
+pub(super) fn font_probe() {
+    let s = st();
+    let hz = crate::timer::hz().max(1);
+    let us = |t0: u64| crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / hz;
+    let was = vector_on();
+    // SAFETY: mainline only; put back at the end.
+    let (keep_draw, keep_part, keep_frames) = unsafe { (DRAW_US, PART_US, s.frames) };
+    let set = |v: bool| VECTOR.store(v, core::sync::atomic::Ordering::Relaxed);
+    let az: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let title: &[u8] = b"Settings: AfriSovera desk, a window title";
+    // 1. text speed: the bitmap face, then the outline face from an empty cache, then warm (fastest of 8)
+    for (name, line) in [("A to Z", az), ("40-character title", &title[..40])] {
+        let mut t = [[0u64; 4]; 2];
+        for (si, scale) in [1, 2].into_iter().enumerate() {
+            rect(10, 30, W() - 20, 40, SURFACE);
+            set(false);
+            let mut bm = u64::MAX;
+            for _ in 0..8 {
+                let t0 = crate::timer::cycles();
+                text(14, 40, line, TEXT, scale);
+                bm = bm.min(us(t0));
+            }
+            set(true);
+            vector::reset();
+            let t0 = crate::timer::cycles();
+            text(14, 40, line, TEXT, scale);
+            let cold = us(t0);
+            let (mut warm, mut worst) = (u64::MAX, 0);
+            for _ in 0..20 {
+                let t0 = crate::timer::cycles();
+                text(14, 40, line, TEXT, scale);
+                let t = us(t0);
+                warm = warm.min(t);
+                worst = worst.max(t);
+            }
+            t[si] = [bm, cold, warm, worst];
+        }
+        crate::kprintln!(
+            "[desk] font: {} at cap 9: bitmap {} us, outline cold {} us, warm {} us (worst of 20 {} us); at cap 18: bitmap {} us, outline cold {} us, warm {} us (worst of 20 {} us)",
+            name, t[0][0], t[0][1], t[0][2], t[0][3], t[1][0], t[1][1], t[1][2], t[1][3]
+        );
+    }
+    // 2. the coverage of a fixed word, hashed: the same bytes on ARM and PC
+    let word = "AfriSovera \u{25B}\u{254}\u{14B} \u{1EB9}\u{1ECD}\u{1E63} \u{14A}\u{190}\u{186}".as_bytes();
+    let mut hs = [0u64; 2];
+    for (k, cap) in [9, 18].into_iter().enumerate() {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut i = 0;
+        while i < word.len() {
+            if let Some(g) = vector::lookup(vector::next_char(word, &mut i)) {
+                h = fnv(h, &vector::advance(g, cap).to_le_bytes());
+                vector::glyph(g, cap, 0, &mut |lf, tp, w, hh, cov| {
+                    h = fnv(fnv(h, &[lf as u8, tp as u8, w as u8, hh as u8]), cov);
+                });
+            }
+        }
+        hs[k] = h;
+    }
+    crate::kprintln!("[desk] font: coverage hash cap 9 {:016x}, cap 18 {:016x}", hs[0], hs[1]);
+    // 3. half a pixel moves only the edges: no pixel full in both changes much, and the ink stays about the same
+    let o = vector::lookup(0x6F).unwrap_or(0);
+    let mut a = [0u8; 400];
+    let mut b = [0u8; 400];
+    let (mut sa, mut sb, mut dims) = (0u32, 0u32, (0, 0, 0, 0));
+    vector::glyph(o, 18, 0, &mut |lf, tp, w, h, cov| {
+        dims = (lf, tp, w, h);
+        let n = cov.len().min(400);
+        a[..n].copy_from_slice(&cov[..n]);
+        sa = cov.iter().map(|&v| v as u32).sum();
+    });
+    let mut same_box = false;
+    vector::glyph(o, 18, 2, &mut |lf, tp, w, h, cov| {
+        same_box = (lf, tp, w, h) == dims;
+        let n = cov.len().min(400);
+        b[..n].copy_from_slice(&cov[..n]);
+        sb = cov.iter().map(|&v| v as u32).sum();
+    });
+    let n = dims.2 * dims.3;
+    let differ = (0..n.min(400)).filter(|&k| a[k] != b[k]).count();
+    let full = (0..n.min(400)).filter(|&k| a[k] == 255 && b[k] == 255).count();
+    crate::kprintln!(
+        "[desk] font: half pixel 'o' at cap 18: ink {} and {} ({}), {} of {} pixels differ, {} full in both, same box {}",
+        sa,
+        sb,
+        if sa.abs_diff(sb) * 50 <= sa.max(1) { "within 2%" } else { "NOT within 2%" },
+        differ,
+        n,
+        full,
+        if same_box { "yes" } else { "no" }
+    );
+    // 4. a character the font does not have is the box
+    let pua = "\u{E000}".as_bytes();
+    crate::kprintln!(
+        "[desk] font: U+E000 is {} and {} pixels wide (the box is {})",
+        if vector::lookup(0xE000).is_none() { "not in the font" } else { "IN the font" },
+        vtext_w(pua, 9),
+        vector::box_size(9).1
+    );
+    // 5. UTF-8: six African letters, spaces, and a sequence cut short at the very end
+    let mut u = [0u8; 32];
+    let src = "\u{25B} \u{254} \u{14B} \u{1EB9} \u{1ECD} \u{1E63}".as_bytes();
+    u[..src.len()].copy_from_slice(src);
+    u[src.len()] = 0xE1;
+    u[src.len() + 1] = 0xBA;
+    let ul = src.len() + 2;
+    let (mut chars, mut bad, mut i, mut known) = (0, 0, 0, 0);
+    while i < ul {
+        let cp = vector::next_char(&u[..ul], &mut i);
+        chars += 1;
+        bad += (cp == 0xFFFD) as usize;
+        known += vector::lookup(cp).is_some() as usize;
+    }
+    crate::kprintln!("[desk] font: utf-8: {} characters, {} in the font, {} bad, ended at byte {} of {}", chars, known, bad, i, ul);
+    // 6. the cache: fill it until it empties itself, then the same text draws the same pixels
+    let probe_line = "Files \u{2022} Settings \u{1EB9}\u{1ECD}".as_bytes();
+    let runs_were = RUN_ON.swap(false, core::sync::atomic::Ordering::Relaxed);
+    rect(10, 80, 300, 30, SURFACE);
+    vtext(14, 88, probe_line, GOLD, 9);
+    let h1 = screen_hash(10, 80, 300, 30, &|_, _| false);
+    let r0 = vector::stats().4;
+    let mut asked = 0u32;
+    'fill: for cap in vector::MIN_CAP..=vector::MAX_CAP {
+        for sub in 0..4 {
+            for g in 0..400u16 {
+                vector::glyph(g, cap, sub, &mut |_, _, _, _, _| {});
+                asked += 1;
+                if vector::stats().4 > r0 + 1 {
+                    break 'fill;
+                }
+            }
+        }
+    }
+    rect(10, 80, 300, 30, SURFACE);
+    vtext(14, 88, probe_line, GOLD, 9);
+    let h2 = screen_hash(10, 80, 300, 30, &|_, _| false);
+    RUN_ON.store(runs_were, core::sync::atomic::Ordering::Relaxed);
+    crate::kprintln!(
+        "[desk] font: cache: {} glyphs asked for, emptied {} time(s), the same text after: {}",
+        asked,
+        vector::stats().4 - r0,
+        if h1 == h2 { "same pixels" } else { "DIFFERENT pixels" }
+    );
+    // 7. the largest size, and a size past it clamped
+    let drop0 = vector::stats().5;
+    let mut big = (0, 0, 0usize);
+    for ch in [0x57u32, 0x1EB8, 0x14A] {
+        if let Some(g) = vector::lookup(ch) {
+            vector::glyph(g, 1000, 0, &mut |_, _, w, h, cov| {
+                big = (big.0.max(w), big.1.max(h), big.2 + cov.iter().filter(|&&v| v == 255).count());
+            });
+        }
+    }
+    crate::kprintln!(
+        "[desk] font: largest: cap {} when 1000 is asked, boxes up to {}x{}, {} full pixels, lines dropped {}",
+        vector::clamp_cap(1000),
+        big.0,
+        big.1,
+        big.2,
+        vector::stats().5 - drop0
+    );
+    // 8. clipping: text across a window's right edge and its cut corner draws nothing outside
+    let (bx, by, bw, bh, k) = (100, 200, 60, 40, 8);
+    let zone = by + bh - k;
+    let outside = move |x: i32, y: i32| x < bx || x >= bx + bw || y < by || y >= by + bh || (y >= zone && x >= bx + bw - (y - zone));
+    rect(90, 190, 200, 60, SURFACE);
+    let before = screen_hash(90, 190, 200, 60, &|x, y| !outside(x, y));
+    // SAFETY: mainline only; cleared below.
+    unsafe { CLIP = Some((bx, by, bw, bh, k)) };
+    vtext(130, 206, b"Clipped text", TEXT, 9);
+    vtext(140, 224, b"Wg", TEXT, 18);
+    // SAFETY: as above.
+    unsafe { CLIP = None };
+    let after = screen_hash(90, 190, 200, 60, &|x, y| !outside(x, y));
+    let mut lit = 0;
+    let p = crate::canvas::pixels();
+    for y in by..by + bh {
+        for x in bx..bx + bw {
+            // SAFETY: on the canvas (every desk canvas is at least 640x480).
+            lit += (unsafe { *p.add(y as usize * W() as usize + x as usize) } != SURFACE) as usize;
+        }
+    }
+    crate::kprintln!(
+        "[desk] font: clip: outside the window and its cut corner {}, {} pixels drawn inside",
+        if before == after { "unchanged" } else { "CHANGED" },
+        lit
+    );
+    // 9. frames: a full frame with each face, the first after an empty cache, and a title-bar sized partial frame
+    let part: Rect = (W() / 2 - 150, H() / 2 - 12, 300, 24);
+    let frame = |v: bool, cold: bool| -> (u64, u64) {
+        set(v);
+        let (mut f, mut pt) = (u64::MAX, u64::MAX);
+        for k in 0..3 {
+            if cold {
+                vector::reset();
+                let t0 = crate::timer::cycles();
+                draw();
+                return (us(t0), 0);
+            }
+            let _ = k;
+            let t0 = crate::timer::cycles();
+            draw();
+            f = f.min(us(t0));
+            let t0 = crate::timer::cycles();
+            draw_damage(&[part]);
+            pt = pt.min(us(t0));
+        }
+        (f, pt)
+    };
+    let (bf, bp) = frame(false, false);
+    let (first, _) = frame(true, true);
+    let (vf, vp) = frame(true, false);
+    crate::kprintln!(
+        "[desk] font: frames at {}x{}: full bitmap {} us, outline {} us ({}%), the first after an empty cache {} us; partial 300x24 bitmap {} us, outline {} us",
+        W(),
+        H(),
+        bf,
+        vf,
+        vf * 100 / bf.max(1),
+        first,
+        bp,
+        vp
+    );
+    let (used, slots, made, hits, resets, _) = vector::stats();
+    crate::kprintln!("[desk] font: cache {} bytes in {} glyphs; made {}, hits {}, emptied {}", used, slots, made, hits, resets);
+    set(was);
+    draw();
+    // SAFETY: mainline only.
+    unsafe {
+        DRAW_US = keep_draw;
+        PART_US = keep_part;
+    }
+    s.frames = keep_frames;
+}
+
+
+/// `desk look probe` (afriui.md section 30): the corner table, the see-through mix, the shadow profile, frames with
+/// each switch, the mixed pixels of a frame, the run cache and its collision test. Leaves the switches as they were.
+pub(super) fn look_probe() {
+    let s = st();
+    let hz = crate::timer::hz().max(1);
+    let us = |t0: u64| crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / hz;
+    // SAFETY: mainline only; put back at the end.
+    let (keep_draw, keep_part, keep_frames) = unsafe { (DRAW_US, PART_US, s.frames) };
+    let was = (look::corners(), look::soft(), look::glass_switch(), RUN_ON.load(core::sync::atomic::Ordering::Relaxed));
+    let set = |c: look::Corners, soft: bool, glass: bool| {
+        look::set_corners(c);
+        look::set_soft(soft);
+        look::set_glass(glass);
+    };
+    // 1. the corner table, made at build time
+    let cut_mid = look::cov(look::Corners::Cut, 8, 3, 4);
+    crate::kprintln!(
+        "[desk] look: round corner table r8 {:016x}, r16 {:016x}; a cut corner's diagonal pixel {}",
+        look::round_hash(8),
+        look::round_hash(16),
+        cut_mid
+    );
+    // 2. see-through: white at 220 over black
+    rect(20, 40, 10, 10, 0);
+    look::fill(20, 40, 10, 10, 0xFF_FF_FF, look::GLASS_ALPHA);
+    let p = crate::canvas::pixels();
+    // SAFETY: (24, 44) is on every desk canvas.
+    let v = unsafe { *p.add(44 * W() as usize + 24) } & 0xFF_FF_FF;
+    crate::kprintln!("[desk] look: see-through white at {} over black gives {:06x} (expected dcdcdc)", look::GLASS_ALPHA, v);
+    // 3. the shadow's profile
+    crate::kprintln!(
+        "[desk] look: shadow alpha {} under the edge, {} at {} px out, 0 past it; damage reaches {} px out and {} down",
+        look::PROFILE[0],
+        look::PROFILE[look::REACH as usize],
+        look::REACH,
+        look::REACH,
+        look::DROP
+    );
+    // 4. frames: flat (before step 2), each part alone, everything (smooth cut and round); the partial frame is a
+    // title-bar sized box; mixed pixels counted over one full frame
+    let part: Rect = (W() / 2 - 150, H() / 2 - 12, 300, 24);
+    let frame = |c: look::Corners, soft: bool, glass: bool| -> (u64, u64, u64) {
+        set(c, soft, glass);
+        let (mut f, mut pt, mut mixed) = (u64::MAX, u64::MAX, 0);
+        for k in 0..3 {
+            // SAFETY: a scalar read and write, mainline only.
+            let m0 = unsafe { crate::framebuffer::MIXED };
+            let t0 = crate::timer::cycles();
+            draw();
+            f = f.min(us(t0));
+            if k == 0 {
+                // SAFETY: as above.
+                mixed = unsafe { crate::framebuffer::MIXED } - m0;
+            }
+            let t0 = crate::timer::cycles();
+            draw_damage(&[part]);
+            pt = pt.min(us(t0));
+        }
+        (f, pt, mixed)
+    };
+    let flat = frame(look::Corners::Hard, false, false);
+    let corners = frame(look::Corners::Cut, false, false);
+    let shadows = frame(look::Corners::Hard, true, false);
+    let glass = frame(look::Corners::Hard, false, true);
+    let all = frame(look::Corners::Cut, true, true);
+    let round = frame(look::Corners::Round, true, true);
+    let pct = |t: u64| t * 100 / flat.0.max(1);
+    let ppct = |t: u64| t * 100 / flat.1.max(1);
+    crate::kprintln!(
+        "[desk] look: full frames at {}x{}: flat {} us; smooth corners {}%, soft shadows {}%, see-through {}%; all on {} us ({}%), round {} us ({}%)",
+        W(), H(), flat.0, pct(corners.0), pct(shadows.0), pct(glass.0), all.0, pct(all.0), round.0, pct(round.0)
+    );
+    crate::kprintln!(
+        "[desk] look: partial 300x24: flat {} us, all on {} us ({}%), round {} us ({}%); mixed pixels in a full frame: flat {}, all on {}, round {}",
+        flat.1, all.1, ppct(all.1), round.1, ppct(round.1), flat.2, all.2, round.2
+    );
+    // the perf engineer's fixed lines (perf, pc-perf, perf-release grade ARM touch mode and track pointer mode, the
+    // architect's step 2 verdict): one per mode and look, timed as `desk perf` times frames. Fields and order fixed.
+    let was_touch = s.touch;
+    for (touch, mode) in [(true, "touch"), (false, "pointer")] {
+        s.touch = touch;
+        for (premium, name) in [(false, "flat"), (true, "premium")] {
+            let r = if premium { frame(look::Corners::Cut, true, true) } else { frame(look::Corners::Hard, false, false) };
+            crate::kprintln!("[desk] probe: mode {} look {} {}x{}: full {} us, partial {} us", mode, name, W(), H(), r.0, r.1);
+        }
+    }
+    s.touch = was_touch;
+    // the first frame after both caches are emptied, everything on
+    set(look::Corners::Cut, true, true);
+    vector::reset();
+    run_reset();
+    let t0 = crate::timer::cycles();
+    draw();
+    crate::kprintln!("[desk] look: the first frame after empty caches, all on: {} us", us(t0));
+    // 5. the run cache: the 40-character title, best and worst of 20, cache on and off
+    let title: &[u8] = b"Settings: AfriSovera desk, a window title";
+    let mut t = [[0u64; 2]; 2];
+    for (k, on) in [true, false].into_iter().enumerate() {
+        RUN_ON.store(on, core::sync::atomic::Ordering::Relaxed);
+        rect(10, 30, W() - 20, 40, SURFACE);
+        text(14, 40, &title[..40], TEXT, 1);
+        let (mut best, mut worst) = (u64::MAX, 0);
+        for _ in 0..20 {
+            let t0 = crate::timer::cycles();
+            text(14, 40, &title[..40], TEXT, 1);
+            let v = us(t0);
+            best = best.min(v);
+            worst = worst.max(v);
+        }
+        t[k] = [best, worst];
+    }
+    RUN_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+    crate::kprintln!(
+        "[desk] look: 40-character title at cap 9, warm: run cache on {} us (worst of 20 {} us), off {} us (worst of 20 {} us)",
+        t[0][0], t[0][1], t[1][0], t[1][1]
+    );
+    crate::kprintln!("[desk] probe: title worst of 20: {} us", t[0][1]); // the perf engineer's fixed line
+    // 6. collisions: with every hash colliding, two strings still draw as themselves (compared with the cache off)
+    let words: [&[u8]; 2] = [b"Alpha one", b"Bravo two"];
+    let mut with = [0u64; 2];
+    let mut without = [0u64; 2];
+    for (k, wd) in words.iter().enumerate() {
+        RUN_ON.store(false, core::sync::atomic::Ordering::Relaxed);
+        rect(10, 80, 200, 30, SURFACE);
+        text(14, 88, wd, TEXT, 1);
+        without[k] = screen_hash(10, 80, 200, 30, &|_, _| false);
+    }
+    RUN_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+    RUN_WEAK.store(true, core::sync::atomic::Ordering::Relaxed);
+    run_reset();
+    // SAFETY: a scalar read, mainline only.
+    let hits0 = unsafe { RUN_STATS.0 };
+    for _ in 0..2 {
+        for (k, wd) in words.iter().enumerate() {
+            rect(10, 80, 200, 30, SURFACE);
+            text(14, 88, wd, TEXT, 1);
+            with[k] = screen_hash(10, 80, 200, 30, &|_, _| false);
+        }
+    }
+    // SAFETY: as above.
+    let hits = unsafe { RUN_STATS.0 } - hits0;
+    RUN_WEAK.store(false, core::sync::atomic::Ordering::Relaxed);
+    run_reset();
+    crate::kprintln!(
+        "[desk] look: run cache with every hash colliding: {} hit(s), each string drew as itself: {}",
+        hits,
+        if with == without && without[0] != without[1] { "yes" } else { "NO" }
+    );
+    // SAFETY: scalar reads, mainline only.
+    let (h, m, e) = unsafe { RUN_STATS };
+    crate::kprintln!("[desk] look: run cache {} bytes in {} runs; hits {}, made {}, emptied {}", unsafe { RUN_USED }, unsafe { RUN_N }, h, m, e);
+    set(was.0, was.1, was.2);
+    RUN_ON.store(was.3, core::sync::atomic::Ordering::Relaxed);
+    draw();
+    // SAFETY: mainline only.
+    unsafe {
+        DRAW_US = keep_draw;
+        PART_US = keep_part;
+    }
+    s.frames = keep_frames;
 }

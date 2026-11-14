@@ -16,6 +16,13 @@
 # patterned windows hashing to the old code's hash for that kernel (WM_HASH_ARM, WM_HASH_PC, set from the probe
 # commit's the cloud runner run; empty = printed, not graded). On ARM, `wm` then leaves 3 app windows in use, `clear` brings the console
 # back, and a second `fbcon wm` must refuse with one line rather than reset them (the architect's condition 1).
+# `fbcon blit` also times draw_string (A to Z at scales 1 and 2) and draw_char x26, each under TEXT_BUDGET_US
+# (default 500; afriui.md section 23: the old code took 593 to 1471 us, the new 240 to 365), and grades its text check exactly: the old code's screen hash and end x,
+# 90 pixels lit by text hanging off the bottom right corner, the rest unchanged, and far text colouring nothing.
+# `fbcon wm` also times win_fill over a whole 240x130 and a whole 40x20 window (afriui.md section 21), each under
+# WM_BUDGET_US, and checks the clip: 1200 of 1200 inside for a fill hanging past the edges, 100 of 100 for one with
+# usize::MAX width and height, 0 pixels from a fill at the right edge or 0 wide, 0 from text far outside the surface,
+# nothing else changed.
 #   scripts/fbcon-time-test.sh              # grader selftest, then the two boots
 #   scripts/fbcon-time-test.sh --selftest   # grader selftest only
 set -uo pipefail
@@ -25,8 +32,9 @@ BUDGET="${FBCON_BUDGET_US:-5000}"
 BBUDGET="${BLIT_BUDGET_US:-5000}"
 WBUDGET="${WM_BUDGET_US:-1000}"
 PBUDGET="${WM_PRESENT_BUDGET_US:-3000}"
-WM_HASH_ARM="${WM_HASH_ARM-3962d25c879f188c}"  # the old code's screen, the cloud runner on 74d967b6
-WM_HASH_PC="${WM_HASH_PC-3962d25c879f188c}"    # the same on both kernels
+TBUDGET="${TEXT_BUDGET_US:-500}"
+WM_HASH_ARM="${WM_HASH_ARM-d6da56a7c9f713a4}"  # afriui.md section 22: the cloud runner afriui-bar-job (578f8757), was 3962d25c879f188c
+WM_HASH_PC="${WM_HASH_PC-d6da56a7c9f713a4}"
 
 grade_one() { # grade_one <serial> <kernel name>
     local fail=0 S got
@@ -45,6 +53,17 @@ grade_one() { # grade_one <serial> <kernel name>
     elif [ "$got" -ge "$BBUDGET" ]; then _f "the fastest console-block blit took $got us, not under $BBUDGET us" "$2"; fi
     printf '%s\n' "$S" | grep -aqE '^\[fbblit\] copy check: 192 of 192 pixels right; clip check: 200 of 200 inside, edge unchanged$' ||
         _f "a blit check failed" "$2"
+    local tl t1 t2 t3
+    tl="$(printf '%s\n' "$S" | sed -nE 's/^\[fbtext\] draw_string 26 chars at scale 1: fastest ([0-9]+) us; at scale 2: fastest ([0-9]+) us; draw_char 26 at scale 1: fastest ([0-9]+) us$/\1 \2 \3/p' | head -1)"
+    if [ -z "$tl" ]; then _f "no text timing line" "$2"
+    else
+        read -r t1 t2 t3 <<< "$tl"
+        [ "$t1" -lt "$TBUDGET" ] || _f "draw_string at scale 1 took $t1 us, not under $TBUDGET us" "$2"
+        [ "$t2" -lt "$TBUDGET" ] || _f "draw_string at scale 2 took $t2 us, not under $TBUDGET us" "$2"
+        [ "$t3" -lt "$TBUDGET" ] || _f "draw_char x26 took $t3 us, not under $TBUDGET us" "$2"
+    fi
+    printf '%s\n' "$S" | grep -aqxF '[fbtext] text check: screen hash 146c9edc133e9276, end x 1003; clip check: 90 lit in the corner, rest unchanged, far text 0' ||
+        _f "the text check differs from the old code's pixels (or far text was drawn)" "$2"
     local wl c1 c2 pr want hash
     wl="$(printf '%s\n' "$S" | sed -nE 's/^\[fbwm\] win_create 240x130: fastest ([0-9]+) us; 40x20: fastest ([0-9]+) us; win_present: fastest ([0-9]+) us \(wallpaper [0-9]+, text [0-9]+, windows [0-9]+\)$/\1 \2 \3/p' | head -1)"
     if [ -z "$wl" ]; then _f "no window-server timing line" "$2"
@@ -60,6 +79,16 @@ grade_one() { # grade_one <serial> <kernel name>
         if [ "$2" = arm ]; then want="$WM_HASH_ARM"; else want="$WM_HASH_PC"; fi
         if [ -z "$want" ]; then echo "  note ($2): screen hash $hash (no expected hash set yet, not graded)"
         elif [ "$hash" != "$want" ]; then _f "the screen after win_present hashes $hash, not the old code's $want" "$2"; fi
+    fi
+    local fl f1 f2 fclip
+    fl="$(printf '%s\n' "$S" | sed -nE 's/^\[fbwm\] win_fill 240x130: fastest ([0-9]+) us; 40x20: fastest ([0-9]+) us; clip check: (.*)$/\1 \2 \3/p' | head -1)"
+    if [ -z "$fl" ]; then _f "no window-fill line" "$2"
+    else
+        read -r f1 f2 fclip <<< "$fl"
+        [ "$f1" -lt "$WBUDGET" ] || _f "win_fill 240x130 took $f1 us, not under $WBUDGET us" "$2"
+        [ "$f2" -lt "$WBUDGET" ] || _f "win_fill 40x20 took $f2 us, not under $WBUDGET us" "$2"
+        [ "$fclip" = "1200 of 1200 inside, 100 of 100 corner, 0 from empty fills, 0 from far text, rest unchanged" ] ||
+            _f "win_fill clip check: $fclip (want 1200 of 1200 inside, 100 of 100 corner, 0 from empty fills, 0 from far text, rest unchanged)" "$2"
     fi
     if [ "$2" = arm ]; then
         printf '%s\n' "$S" | grep -aqE '^\[fbwm\] refused: [1-9] window\(s\) in use, desk hidden, console shown ' ||
@@ -84,9 +113,12 @@ GREEN="afrisovera> fbcon time
 afrisovera> fbcon blit
 [fbblit] console block 616x384: fastest 900 us; whole screen 640x480: fastest 1500 us
 [fbblit] copy check: 192 of 192 pixels right; clip check: 200 of 200 inside, edge unchanged
+[fbtext] draw_string 26 chars at scale 1: fastest 120 us; at scale 2: fastest 180 us; draw_char 26 at scale 1: fastest 90 us
+[fbtext] text check: screen hash 146c9edc133e9276, end x 1003; clip check: 90 lit in the corner, rest unchanged, far text 0
 afrisovera> fbcon wm
 [fbwm] win_create 240x130: fastest 80 us; 40x20: fastest 79 us; win_present: fastest 700 us (wallpaper 400, text 200, windows 100)
 [fbwm] clear check: 31200 of 31200 pixels zero; screen hash 0123456789abcdef
+[fbwm] win_fill 240x130: fastest 60 us; 40x20: fastest 20 us; clip check: 1200 of 1200 inside, 100 of 100 corner, 0 from empty fills, 0 from far text, rest unchanged
 afrisovera> fbcon wm
 [fbwm] refused: 3 window(s) in use, desk hidden, console shown (fbcon wm needs no windows and the console shown)"
 
@@ -123,20 +155,37 @@ selftest() {
     arm create-slow red "$(printf '%s\n' "$GREEN" | sed 's/240x130: fastest 80 us/240x130: fastest 5120 us/')" "$GREEN"
     arm small-slow red "$GREEN" "$(printf '%s\n' "$GREEN" | sed 's/40x20: fastest 79 us/40x20: fastest 1000 us/')"
     arm present-slow red "$(printf '%s\n' "$GREEN" | sed 's/win_present: fastest 700 us/win_present: fastest 5874 us/')" "$GREEN"
-    arm present-in-budget green "$GREEN" "$(printf '%s
-' "$GREEN" | sed 's/win_present: fastest 700 us/win_present: fastest 2999 us/')"
-    arm present-at-budget red "$GREEN" "$(printf '%s
-' "$GREEN" | sed 's/win_present: fastest 700 us/win_present: fastest 3000 us/')"
+    arm present-in-budget green "$GREEN" "$(printf '%s\n' "$GREEN" | sed 's/win_present: fastest 700 us/win_present: fastest 2999 us/')"
+    arm present-at-budget red "$GREEN" "$(printf '%s\n' "$GREEN" | sed 's/win_present: fastest 700 us/win_present: fastest 3000 us/')"
     arm parts-not-graded green "$GREEN" "$(printf '%s\n' "$GREEN" | sed 's/wallpaper 400/wallpaper 9000/')"
     arm wm-missing red "$GREEN" "$(printf '%s\n' "$GREEN" | grep -v '^\[fbwm\] win_create')"
     arm refuse-missing red "$(printf '%s\n' "$GREEN" | grep -v 'refused')" "$GREEN"
     arm refuse-pc-not-needed green "$GREEN" "$(printf '%s\n' "$GREEN" | grep -v 'refused')"
+    arm fill-slow red "$(printf '%s\n' "$GREEN" | sed 's/win_fill 240x130: fastest 60 us/win_fill 240x130: fastest 5770 us/')" "$GREEN"
+    arm fill-small-slow red "$GREEN" "$(printf '%s\n' "$GREEN" | sed 's/40x20: fastest 20 us/40x20: fastest 1000 us/')"
+    arm fill-missing red "$GREEN" "$(printf '%s\n' "$GREEN" | grep -v 'win_fill')"
+    arm fill-clip-bad red "$(printf '%s\n' "$GREEN" | sed 's/1200 of 1200 inside/1199 of 1200 inside/')" "$GREEN"
+    arm corner-not-run red "$(printf '%s\n' "$GREEN" | sed 's/100 of 100 corner/corner not run/')" "$GREEN"
+    arm empty-fill-coloured red "$GREEN" "$(printf '%s\n' "$GREEN" | sed 's/0 from empty fills/3 from empty fills/')"
+    arm far-text-not-run red "$(printf '%s\n' "$GREEN" | sed 's/0 from far text/far text not run/')" "$GREEN"
+    arm fill-rest-changed red "$GREEN" "$(printf '%s\n' "$GREEN" | sed 's/far text, rest unchanged/far text, rest CHANGED/')"
+    arm text-slow red "$(printf '%s\n' "$GREEN" | sed 's/scale 1: fastest 120 us/scale 1: fastest 852 us/')" "$GREEN"
+    arm text2-slow red "$GREEN" "$(printf '%s\n' "$GREEN" | sed 's/scale 2: fastest 180 us/scale 2: fastest 500 us/')"
+    arm char-slow red "$GREEN" "$(printf '%s\n' "$GREEN" | sed 's/draw_char 26 at scale 1: fastest 90 us/draw_char 26 at scale 1: fastest 593 us/')"
+    arm text-missing red "$(printf '%s\n' "$GREEN" | grep -v 'draw_string 26')" "$GREEN"
+    arm text-hash-bad red "$GREEN" "$(printf '%s\n' "$GREEN" | sed 's/hash 146c9edc133e9276/hash 146c9edc133e9277/')"
+    arm text-end-bad red "$(printf '%s\n' "$GREEN" | sed 's/end x 1003/end x 1002/')" "$GREEN"
+    arm text-corner-bad red "$GREEN" "$(printf '%s\n' "$GREEN" | sed 's/90 lit in the corner/91 lit in the corner/')"
+    arm text-rest-changed red "$(printf '%s\n' "$GREEN" | sed 's/corner, rest unchanged/corner, rest CHANGED/')" "$GREEN"
+    arm far-text-lit red "$GREEN" "$(printf '%s\n' "$GREEN" | sed 's/far text 0$/far text 16/')"
+    arm far-text-skipped red "$(printf '%s\n' "$GREEN" | sed 's/far text 0$/far text not run/')" "$GREEN"
+    arm text-check-missing red "$GREEN" "$(printf '%s\n' "$GREEN" | grep -v 'text check')"
     arm clear-bad red "$(printf '%s\n' "$GREEN" | sed 's/31200 of 31200/31199 of 31200/')" "$GREEN"
     WM_HASH_ARM=0123456789abcdef WM_HASH_PC=0123456789abcdef arm hash-match green "$GREEN" "$GREEN"
     WM_HASH_ARM=0123456789abcdef WM_HASH_PC=0123456789abcdef arm hash-differs red "$GREEN" "$(printf '%s\n' "$GREEN" | sed 's/hash 0123456789abcdef/hash 0123456789abcdee/')"
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 29 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 48 ]
 }
 
 echo "== the faster console: one console line with a scroll, and a blit, on both kernels =="
@@ -160,7 +209,7 @@ afrish_wait_boot
 python3 scripts/shell-demo.py 5980 5981 "$(winpath "$W/arm.png")" "fbcon time" "fbcon blit" "fbcon wm" "wm" "clear" "fbcon wm" > "$W/arm.log" 2>&1
 kill "$QPID" 2> /dev/null
 wait "$QPID" 2> /dev/null
-tr -d '\r' < "$W/arm.log" | grep -aE '^\[fb(con|blit|wm)\]' | sed 's/^/  arm | /'
+tr -d '\r' < "$W/arm.log" | grep -aE '^\[fb(con|blit|text|wm)\]|panic|PANIC' | sed 's/^/  arm | /'
 
 echo "  --- PC kernel ---"
 command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /usr/local/bin /usr/bin; do
@@ -179,7 +228,7 @@ if command -v qemu-system-x86_64 > /dev/null; then
             "fbcon time" "fbcon blit" "fbcon wm" > "$W/pc.log" 2>&1
         kill "$QPID" 2> /dev/null
         wait "$QPID" 2> /dev/null
-        tr -d '\r' < "$W/pc.log" | grep -aE '^\[fb(con|blit|wm)\]' | sed 's/^/  pc  | /'
+        tr -d '\r' < "$W/pc.log" | grep -aE '^\[fb(con|blit|text|wm)\]|panic|PANIC' | sed 's/^/  pc  | /'
     else
         echo "  (harness: $PC_EFI was not built)"
     fi

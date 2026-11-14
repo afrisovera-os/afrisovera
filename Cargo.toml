@@ -11,7 +11,7 @@ members = [
 ]
 # The mesh crates and the DRBG host tests are separate host-tested crates (each its own `[workspace]`); the kernel
 # uses mesh-crypto/-noise/-hpke as path dependencies, so they are excluded from auto-membership here.
-exclude = ["mesh-crypto", "mesh-noise", "mesh-hpke", "mesh-link", "drbg-host"]
+exclude = ["mesh-crypto", "mesh-noise", "mesh-hpke", "mesh-link", "drbg-host", "fuzz-host", "dira-host", "wlan-crypto"]
 # `cargo build` at the root builds only the kernel (for the bare-metal target).
 # The host tool `afriidl` is built explicitly with `--target <host-triple>`.
 default-members = ["kernel"]

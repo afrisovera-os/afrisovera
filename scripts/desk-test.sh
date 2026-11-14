@@ -36,8 +36,8 @@ T="${TMPDIR:-/tmp}"
 #   pointer Spine (44 px): the Circle button 4,6; Files' tile 4,52; tiles every 40 px
 #   pointer homes: Files 48,45 372x250; Terminal 177,160 410x260; Settings 82,60 380x300;
 #     About 287,70 330x300; a lintel is 26 px, its close button 26 px in from the right edge
-#   the Circle (pointer): 192,62 300x300; Settings (the bottom tile) at 342,305
-#   Settings' body starts under its lintel (y 86); the clock row is 114 to 134 below that
+#   the Circle (pointer): 192,62 300x300; Settings (the lower right tile of five, 13 Nov: section 32) at 400,286
+#   Settings' body starts under its lintel (y 86); the clock row is 134 to 154 below that (the language row came first, 13 Nov)
 TX=177 TY=160
 POINTS="20,250 40,4 40,20 42,8 $((TX + 98)),$TY $((TX + 98)),$((TY + 7)) $((TX + 385)),$((TY + 245)) 636,476"
 want_px() { # want_px <point> -> RRGGBB
@@ -149,11 +149,11 @@ afrisovera> desk key alt-tab
 [desk] focus terminal
 afrisovera> desk tap 20 22
 [desk] launcher open
-afrisovera> desk tap 342 305
+afrisovera> desk tap 400 286
 [desk] open settings
-afrisovera> desk tap 200 206
+afrisovera> desk tap 200 226
 [desk] settings: 24-hour clock off
-afrisovera> desk tap 200 206
+afrisovera> desk tap 200 226
 [desk] settings: 24-hour clock on
 afrisovera> desk key super
 [desk] launcher open
@@ -235,7 +235,7 @@ python3 scripts/shell-demo.py 4940 4941 "$W/screen.png" \
     "gui" "desk open about" "desk list" "desk tap 614 18" "desk mode pointer" \
     "desk open files" "desk open about" "desk open terminal" "desk tap 150 55" "desk drag 150 55 40 30" \
     "desk tap 602 84" "desk tap 20 68" "desk tap 20 68" "desk key alt-tab" "desk tap 20 22" \
-    "desk tap 342 305" "desk tap 200 206" "desk tap 200 206" "desk key super" "desk key right" "desk key enter" \
+    "desk tap 400 286" "desk tap 200 226" "desk tap 200 226" "desk key super" "desk key right" "desk key enter" \
     "desk notify Tests running" "desk list" "desk verify" \
     > "$W/serial.log" 2>&1
 kill "$QPID" 2> /dev/null

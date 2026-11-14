@@ -52,6 +52,7 @@ pub fn interrupts_on() -> bool {
 }
 pub fn wfi() {
     crate::xhci::service(); // USB devices plugged in or out since the last idle moment
+    crate::uvc::idle(); // a camera's new picture onto the screen, or a failed stream stopped
     if crate::acpi::power_button_pressed() {
         crate::acpi::power_off_pressed(); // files saved, then off
     }
@@ -63,6 +64,24 @@ pub fn wfi() {
     } else {
         core::hint::spin_loop();
     }
+}
+/// Sleep until the next interrupt unless `ready()` already holds, without losing a wake-up: interrupts are
+/// masked while `ready` is checked, and `sti; hlt` run back to back (an interrupt can only be taken after
+/// the instruction that follows `sti`, so one that arrives in between still ends the `hlt`). With
+/// interrupts off on entry it only checks once (a `hlt` would never end). Returns `ready()`'s answer.
+pub fn idle_until(mut ready: impl FnMut() -> bool) -> bool {
+    if !interrupts_on() {
+        return ready();
+    }
+    cli();
+    let r = ready();
+    if r {
+        sti();
+    } else {
+        // SAFETY: re-enables interrupts and waits for the next one; the timer bounds the wait.
+        unsafe { asm!("sti", "hlt", options(nomem, nostack)) }
+    }
+    r
 }
 pub fn halt_forever() -> ! {
     loop {
@@ -242,12 +261,22 @@ struct Gate {
 const EMPTY: Gate = Gate { off_lo: 0, sel: 0, ist: 0, attr: 0, off_mid: 0, off_hi: 0, zero: 0 };
 static mut IDT: [Gate; 256] = [EMPTY; 256];
 
+// Interrupt vector map (architect, 12 Nov 2026; pick a new vector from here):
+//   0x00-0x1F  CPU exceptions
+//   0x20-0x2F  legacy lines, 0x20 + IRQ 0-15 (0x20 the local-APIC timer, 0x24 COM1 = IRQ 4, 0x2C PS/2 aux = IRQ 12;
+//              0x2E would be IRQ 14, the primary IDE line)
+//   0x40       the inter-processor interrupt (smp.rs)
+//   0x50-0x6F  MSI and MSI-X devices, one per driver: 0x50 NVMe
+//   0x80       system call
+//   0xFF       spurious
 pub const TIMER_VECTOR: u64 = 32;
 pub const SPURIOUS_VECTOR: u64 = 255;
 /// COM1's receive interrupt (ISA IRQ 4), routed here through the IOAPIC.
 pub const COM1_VECTOR: u64 = 36;
 /// The i8042's aux port (ISA IRQ 12: the PS/2 mouse or touchpad), routed through the IOAPIC.
 pub const PS2_VECTOR: u64 = 44;
+/// The NVMe controller's MSI-X completions (nvme.rs), the first MSI vector.
+pub const NVME_VECTOR: u64 = 0x50;
 
 // One stub per vector: push a dummy error code where the CPU does not push one, push
 // the vector number, and join the common path, which saves every general register,
@@ -301,6 +330,7 @@ ISR_NOERR 32
 ISR_NOERR 36
 ISR_NOERR 44
 ISR_NOERR 64
+ISR_NOERR 80
 ISR_NOERR 128
 ISR_NOERR 255
 
@@ -352,13 +382,13 @@ isr_table:
     .quad isr8, isr9, isr10, isr11, isr12, isr13, isr14, isr15
     .quad isr16, isr17, isr18, isr19, isr20, isr21, isr22, isr23
     .quad isr24, isr25, isr26, isr27, isr28, isr29, isr30, isr31
-    .quad isr32, isr255, isr128, isr36, isr64, isr44
+    .quad isr32, isr255, isr128, isr36, isr64, isr44, isr80
 .text
 "#
 );
 
 extern "C" {
-    static isr_table: [u64; 38];
+    static isr_table: [u64; 39];
 }
 
 /// The frame `isr_common` builds: the saved registers, then what the stub and the CPU
@@ -406,6 +436,7 @@ pub fn load_idt() {
         set_gate(COM1_VECTOR as usize, t[35]);
         set_gate(crate::smp::IPI_VECTOR as usize, t[36]);
         set_gate(PS2_VECTOR as usize, t[37]);
+        set_gate(NVME_VECTOR as usize, t[38]);
         // F8: the double fault runs on IST 1 (TSS._ist[0], set in the GDT/TSS set-up), never on the stack that
         // overflowed.
         IDT[8].ist = 1;
@@ -469,6 +500,10 @@ extern "sysv64" fn pc_trap(f: &mut TrapFrame) {
         }
         PS2_VECTOR => {
             crate::ps2::aux_irq(); // a touchpad byte: taken as it lands, not at the next tick
+            lapic_eoi();
+        }
+        NVME_VECTOR => {
+            crate::nvme::irq(); // counts it; the waiting command reads its completion itself
             lapic_eoi();
         }
         SYSCALL_VECTOR if crate::proc::active() => crate::proc::syscall(f),
@@ -621,6 +656,9 @@ pub fn lapic_timer_start(initial_count: u32) {
 const REG_ICR_LO: u32 = 0x300;
 const REG_ICR_HI: u32 = 0x310;
 
+/// IPIs whose delivery was still pending after 10 ms (xAPIC only; x2APIC has no pending bit).
+pub static ICR_STUCK: AtomicU64 = AtomicU64::new(0);
+
 /// Send an inter-processor interrupt: `lo` is the ICR's low word, `dest` the target APIC id.
 fn icr(dest: u32, lo: u32) {
     // SAFETY: the interrupt-command register; xAPIC takes the destination in the high word
@@ -631,9 +669,15 @@ fn icr(dest: u32, lo: u32) {
         } else {
             lapic_write(REG_ICR_HI, dest << 24);
             lapic_write(REG_ICR_LO, lo);
-            let mut n = 0;
-            while lapic_read(REG_ICR_LO) & (1 << 12) != 0 && n < 1_000_000 {
-                n += 1; // delivery pending
+            // delivery pending (bit 12): waited by the clock (10 ms), not by a count of reads
+            // (before 12 Nov: a million reads, so the time allowed depended on the CPU and on
+            // how slow its APIC reads were). An IPI still pending then is counted, not waited on.
+            let (t0, hz) = (crate::timer::cycles(), crate::timer::hz().max(1));
+            while lapic_read(REG_ICR_LO) & (1 << 12) != 0 {
+                if crate::timer::cycles().wrapping_sub(t0) > hz / 100 {
+                    ICR_STUCK.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
                 core::hint::spin_loop();
             }
         }

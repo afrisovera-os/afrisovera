@@ -1,0 +1,435 @@
+GPL-2.0-or-later, a test-only change to QEMU; not part of AfriSovera
+TEST EQUIPMENT ONLY (14 Nov 2026, Bluetooth slice 1 plan, architect's OK): a USB HCI test controller for QEMU
+(usb-hci-test), applied to QEMU's own source when the CI builds QEMU (ci.yml, cloud/job.sh), never part of
+AfriSovera. QEMU has had no Bluetooth device since 5.0, so this is the weaker kind of evidence, because the same
+engineer wrote both ends; pc-bt grades it together with the fuzz target over the driver's parser (bt_event).
+No other QEMU device changes.
+
+--- a/hw/usb/meson.build
++++ b/hw/usb/meson.build
+@@ -36,6 +36,7 @@
+ # emulated usb devices
+ system_ss.add(when: 'CONFIG_USB_HUB', if_true: files('dev-hub.c'))
+ system_ss.add(when: 'CONFIG_USB_HID', if_true: files('dev-hid.c'))
++system_ss.add(when: 'CONFIG_USB', if_true: files('dev-hci-test.c'))  # AfriSovera test Bluetooth (test patch)
+ system_ss.add(when: 'CONFIG_USB_TABLET_WACOM', if_true: files('dev-wacom.c'))
+ system_ss.add(when: 'CONFIG_USB_STORAGE_CORE', if_true: files('dev-storage.c'))
+ system_ss.add(when: 'CONFIG_USB_STORAGE_BOT', if_true: files('dev-storage-bot.c'))
+--- /dev/null
++++ b/hw/usb/dev-hci-test.c
+@@ -0,0 +1,415 @@
++/*
++ * AfriSovera test Bluetooth controller (14 Nov 2026): a USB HCI device (class E0/01/01) for the AfriSovera PC
++ * kernel's Bluetooth driver (pc-bt), applied to QEMU's source when the AfriSovera CI builds QEMU. TEST EQUIPMENT
++ * ONLY, never part of AfriSovera. QEMU has had no Bluetooth device since 5.0; this one is the weaker kind of
++ * evidence (the same engineer wrote both ends), graded together with the fuzz target over the driver's parser.
++ *
++ * Full speed, one interface: an interrupt-IN endpoint for events (16 bytes a packet, so an event spans several),
++ * and bulk IN/OUT for ACL data (never used by slice 1: they NAK). Commands arrive as class control requests.
++ * It plays an Intel legacy controller: HCI_Reset, Read Local Version (manufacturer 2, Intel), Read BD_ADDR
++ * (11:22:33:44:55:66), Read Buffer Size, Intel Read Version (hw 0x37 0x08 0x10, fw 0x01 0x01, build `fw`, week
++ * 0x2c, year 0x13, patch 0), Intel Manufacturer Mode on and off, and the test patches' vendor command 0xFC52,
++ * each answered with Command Complete, status 0. An LE scan enable reports two devices (a phone, and one whose
++ * 40-byte name carries control bytes); an inquiry reports a speaker in an extended inquiry result. With bad=on a
++ * scan also sends an advertising report whose counts do not fit its event, a 257-byte vendor event whose last
++ * packet carries bytes past its end, and an answer to a command nobody asked. With mute=on Read BD_ADDR is never
++ * answered. Every Manufacturer Mode exit is counted and logged on stderr (reset, patches activated or not).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/module.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/usb/usb.h"
++#include "migration/vmstate.h"
++#include "desc.h"
++#include "qom/object.h"
++
++#define TYPE_USB_HCI_TEST "usb-hci-test"
++OBJECT_DECLARE_SIMPLE_TYPE(USBHCITestState, USB_HCI_TEST)
++
++#define HCI_VENDOR   0x46f4  /* QEMU's vendor id, as the other QEMU devices */
++#define HCI_PRODUCT  0xaf02  /* the AfriSovera test Bluetooth controller */
++#define HCI_QMAX     64
++#define HCI_EMAX     320
++
++enum {
++    STR_MANUFACTURER = 1,
++    STR_PRODUCT,
++    STR_SERIALNUMBER,
++};
++
++static const USBDescStrings hci_strings = {
++    [STR_MANUFACTURER] = "AfriSovera test equipment",
++    [STR_PRODUCT]      = "AfriSovera Test Bluetooth",
++    [STR_SERIALNUMBER] = "1",
++};
++
++static const USBDescIface hci_ifaces[] = {
++    {
++        .bInterfaceNumber   = 0,
++        .bNumEndpoints      = 3,
++        .bInterfaceClass    = 0xe0,         /* wireless controller */
++        .bInterfaceSubClass = 0x01,         /* RF controller */
++        .bInterfaceProtocol = 0x01,         /* Bluetooth programming interface */
++        .eps = (USBDescEndpoint[]) {
++            {
++                .bEndpointAddress = USB_DIR_IN | 0x01,
++                .bmAttributes     = USB_ENDPOINT_XFER_INT,
++                .wMaxPacketSize   = 16,
++                .bInterval        = 1,
++            }, {
++                .bEndpointAddress = USB_DIR_IN | 0x02,
++                .bmAttributes     = USB_ENDPOINT_XFER_BULK,
++                .wMaxPacketSize   = 64,
++            }, {
++                .bEndpointAddress = USB_DIR_OUT | 0x02,
++                .bmAttributes     = USB_ENDPOINT_XFER_BULK,
++                .wMaxPacketSize   = 64,
++            },
++        },
++    },
++};
++
++static const USBDescDevice hci_device_full = {
++    .bcdUSB             = 0x0200,
++    .bDeviceClass       = 0xe0,
++    .bDeviceSubClass    = 0x01,
++    .bDeviceProtocol    = 0x01,
++    .bMaxPacketSize0    = 64,
++    .bNumConfigurations = 1,
++    .confs = (USBDescConfig[]) {
++        {
++            .bNumInterfaces      = 1,
++            .bConfigurationValue = 1,
++            .bmAttributes        = USB_CFG_ATT_ONE,
++            .bMaxPower           = 50,
++            .nif                 = ARRAY_SIZE(hci_ifaces),
++            .ifs                 = hci_ifaces,
++        },
++    },
++};
++
++static const USBDesc hci_desc = {
++    .id = {
++        .idVendor      = HCI_VENDOR,
++        .idProduct     = HCI_PRODUCT,
++        .bcdDevice     = 0x0100,
++        .iManufacturer = STR_MANUFACTURER,
++        .iProduct      = STR_PRODUCT,
++        .iSerialNumber = STR_SERIALNUMBER,
++    },
++    .full = &hci_device_full,
++    .str  = hci_strings,
++};
++
++struct USBHCITestState {
++    USBDevice dev;
++    uint32_t fw;
++    bool bad;
++    bool mute;
++    uint8_t q[HCI_QMAX][HCI_EMAX];
++    uint16_t qlen[HCI_QMAX];
++    uint16_t qextra[HCI_QMAX];
++    int qh, qn;
++    int pos;                    /* bytes of the head event sent */
++    bool mfg;
++    uint32_t exits;
++};
++
++static void hci_wake(USBHCITestState *s)
++{
++    usb_wakeup(usb_ep_get(&s->dev, USB_TOKEN_IN, 1), 0);
++}
++
++/* one event to send; `extra` bytes of 0xEE follow its last byte in the same packet (a hostile event) */
++static void hci_queue(USBHCITestState *s, const uint8_t *e, int len, int extra)
++{
++    if (s->qn >= HCI_QMAX || len > HCI_EMAX) {
++        return;
++    }
++    int t = (s->qh + s->qn) % HCI_QMAX;
++    memcpy(s->q[t], e, len);
++    s->qlen[t] = len;
++    s->qextra[t] = extra;
++    s->qn++;
++    hci_wake(s);
++}
++
++static void hci_cc(USBHCITestState *s, uint16_t op, const uint8_t *ret, int n)
++{
++    uint8_t e[HCI_EMAX];
++    e[0] = 0x0e;
++    e[1] = 3 + n;
++    e[2] = 1;
++    e[3] = op & 0xff;
++    e[4] = op >> 8;
++    memcpy(e + 5, ret, n);
++    hci_queue(s, e, 5 + n, 0);
++}
++
++static void hci_cs(USBHCITestState *s, uint16_t op, uint8_t status)
++{
++    uint8_t e[6] = { 0x0f, 4, status, 1, op & 0xff, op >> 8 };
++    hci_queue(s, e, sizeof(e), 0);
++}
++
++/* an LE Advertising Report event for one device: a Complete Local Name, an appearance if given */
++static void hci_adv(USBHCITestState *s, const uint8_t *addr, uint8_t atype, const uint8_t *name, int nlen,
++                    uint16_t appearance, int8_t rssi, int extra)
++{
++    uint8_t e[HCI_EMAX];
++    int ad = 0, n = 0;
++    uint8_t data[64];
++    data[ad++] = nlen + 1;
++    data[ad++] = 0x09;
++    memcpy(data + ad, name, nlen);
++    ad += nlen;
++    if (appearance) {
++        data[ad++] = 3;
++        data[ad++] = 0x19;
++        data[ad++] = appearance & 0xff;
++        data[ad++] = appearance >> 8;
++    }
++    e[n++] = 0x3e;
++    e[n++] = 0;                 /* the length, below */
++    e[n++] = 0x02;              /* LE Advertising Report */
++    e[n++] = 1;                 /* one report */
++    e[n++] = 0x00;              /* connectable undirected */
++    e[n++] = atype;
++    memcpy(e + n, addr, 6);
++    n += 6;
++    e[n++] = ad;
++    memcpy(e + n, data, ad);
++    n += ad;
++    e[n++] = (uint8_t)rssi;
++    e[1] = n - 2;
++    hci_queue(s, e, n, extra);
++}
++
++static void hci_scan(USBHCITestState *s)
++{
++    static const uint8_t phone[6] = { 0x01, 0x02, 0x03, 0xa0, 0xb0, 0xc0 };
++    static const uint8_t other[6] = { 0x11, 0x12, 0x13, 0xd0, 0xe0, 0xf0 };
++    static const uint8_t name[] = "AfriSovera test phone";
++    uint8_t hostile[40];
++
++    memset(hostile, 'A', sizeof(hostile));
++    hostile[30] = 0x07;         /* a bell */
++    hostile[31] = 0x1b;         /* escape */
++    hostile[32] = 0xff;
++    hci_adv(s, phone, 0, name, sizeof(name) - 1, 0x0040, -45, 0);
++    hci_adv(s, other, 1, hostile, sizeof(hostile), 0, -80, 0);
++    if (s->bad) {
++        /* an advertising report that says two reports but holds one */
++        uint8_t e[16] = { 0x3e, 12, 0x02, 2, 0, 0, 1, 2, 3, 4, 5, 6, 0, 0xc0 };
++        hci_queue(s, e, 14, 0);
++        /* a 257-byte vendor event whose last packet carries bytes past its end */
++        uint8_t v[257];
++        memset(v, 0x5a, sizeof(v));
++        v[0] = 0xff;
++        v[1] = 255;
++        hci_queue(s, v, sizeof(v), 7);
++        /* an answer to a command nobody asked */
++        static const uint8_t ok[1] = { 0 };
++        hci_cc(s, 0x0c14, ok, 1);
++    }
++}
++
++static void hci_inquiry(USBHCITestState *s)
++{
++    static const uint8_t speaker[6] = { 0x0a, 0x0b, 0x0c, 0x30, 0x20, 0x10 };
++    static const char name[] = "AfriSovera test speaker";
++    uint8_t e[2 + 255];
++    int n = 0;
++
++    memset(e, 0, sizeof(e));
++    e[n++] = 0x2f;              /* Extended Inquiry Result */
++    e[n++] = 255;
++    e[n++] = 1;
++    memcpy(e + n, speaker, 6);
++    n += 6;
++    e[n++] = 1;                 /* page scan repetition mode */
++    e[n++] = 0;
++    e[n++] = 0x04;              /* class of device 0x240404: audio, a loudspeaker */
++    e[n++] = 0x04;
++    e[n++] = 0x24;
++    n += 2;                     /* clock offset */
++    e[n++] = (uint8_t)-60;
++    e[n++] = sizeof(name);      /* EIR: Complete Local Name */
++    e[n++] = 0x09;
++    memcpy(e + n, name, sizeof(name) - 1);
++    hci_queue(s, e, sizeof(e), 0);
++    uint8_t done[3] = { 0x01, 1, 0 };
++    hci_queue(s, done, sizeof(done), 0);
++}
++
++static void hci_command(USBHCITestState *s, uint16_t op, const uint8_t *p, int plen)
++{
++    static const uint8_t ok[1] = { 0 };
++    switch (op) {
++    case 0x0c03:                /* HCI_Reset */
++        s->mfg = false;
++        hci_cc(s, op, ok, 1);
++        break;
++    case 0x1001: {              /* Read Local Version: HCI 6, LMP 6, Intel (2) */
++        static const uint8_t v[9] = { 0, 0x06, 0x00, 0x10, 0x06, 0x02, 0x00, 0x09, 0x22 };
++        hci_cc(s, op, v, sizeof(v));
++        break;
++    }
++    case 0x1009: {              /* Read BD_ADDR */
++        static const uint8_t a[7] = { 0, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11 };
++        if (!s->mute) {
++            hci_cc(s, op, a, sizeof(a));
++        }
++        break;
++    }
++    case 0x1005: {              /* Read Buffer Size: ACL 1021 x 8, SCO 96 x 16 */
++        static const uint8_t b[8] = { 0, 0xfd, 0x03, 0x60, 0x08, 0x00, 0x10, 0x00 };
++        hci_cc(s, op, b, sizeof(b));
++        break;
++    }
++    case 0xfc05: {              /* Intel Read Version (legacy) */
++        uint8_t v[10] = { 0, 0x37, 0x08, 0x10, 0x01, 0x01, (uint8_t)s->fw, 0x2c, 0x13, 0x00 };
++        hci_cc(s, op, v, sizeof(v));
++        break;
++    }
++    case 0xfc11:                /* Intel Manufacturer Mode */
++        if (plen >= 1 && p[0]) {
++            s->mfg = true;
++        } else if (plen >= 2) {
++            s->mfg = false;
++            s->exits++;
++            fprintf(stderr, "usb-hci-test: manufacturer mode off (%s)\n",
++                    p[1] == 2 ? "reset, patches activated" : p[1] == 1 ? "reset, patches not activated" : "no reset");
++        }
++        hci_cc(s, op, ok, 1);
++        break;
++    case 0xfc52:                /* the test patches' vendor command */
++    case 0x200b:                /* LE Set Scan Parameters */
++    case 0x0402:                /* Inquiry Cancel */
++        hci_cc(s, op, ok, 1);
++        break;
++    case 0x200c:                /* LE Set Scan Enable */
++        hci_cc(s, op, ok, 1);
++        if (plen >= 1 && p[0] == 1) {
++            hci_scan(s);
++        }
++        break;
++    case 0x0401:                /* Inquiry */
++        hci_cs(s, op, 0);
++        hci_inquiry(s);
++        break;
++    default: {
++        static const uint8_t unknown[1] = { 0x01 };
++        hci_cc(s, op, unknown, 1);
++        break;
++    }
++    }
++}
++
++static void hci_handle_control(USBDevice *dev, USBPacket *p, int request, int value, int index,
++                               int length, uint8_t *data)
++{
++    USBHCITestState *s = USB_HCI_TEST(dev);
++    int ret;
++
++    ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
++    if (ret >= 0) {
++        return;
++    }
++    /* an HCI command: class request to the device, bRequest 0 */
++    if (request == (((USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_DEVICE) << 8) | 0x00) && length >= 3 &&
++        3 + data[2] <= length) {
++        hci_command(s, data[0] | data[1] << 8, data + 3, data[2]);
++        return;
++    }
++    p->status = USB_RET_STALL;
++}
++
++static void hci_handle_reset(USBDevice *dev)
++{
++    USBHCITestState *s = USB_HCI_TEST(dev);
++
++    s->qh = s->qn = s->pos = 0;
++    s->mfg = false;
++}
++
++static void hci_handle_data(USBDevice *dev, USBPacket *p)
++{
++    USBHCITestState *s = USB_HCI_TEST(dev);
++
++    if (p->pid != USB_TOKEN_IN || p->ep->nr != 1 || s->qn == 0) {
++        p->status = USB_RET_NAK;    /* the bulk endpoints, and no event waiting */
++        return;
++    }
++    int size = p->iov.size;
++    int rest = s->qlen[s->qh] - s->pos;
++    int extra = s->qextra[s->qh];
++    int n = MIN(size, rest);
++    if (extra && rest == size) {
++        n = rest - 1;               /* leave room in the next packet for the bytes past the end */
++    }
++    usb_packet_copy(p, s->q[s->qh] + s->pos, n);
++    s->pos += n;
++    if (s->pos == s->qlen[s->qh]) {
++        if (extra) {
++            uint8_t pad[64];
++            int k = MIN(extra, size - n);
++            memset(pad, 0xee, sizeof(pad));
++            usb_packet_copy(p, pad, k);
++        }
++        s->qh = (s->qh + 1) % HCI_QMAX;
++        s->qn--;
++        s->pos = 0;
++    }
++}
++
++static void hci_realize(USBDevice *dev, Error **errp)
++{
++    dev->usb_desc = &hci_desc;
++    usb_desc_create_serial(dev);
++    usb_desc_init(dev);
++}
++
++static const VMStateDescription vmstate_hci_test = {
++    .name = TYPE_USB_HCI_TEST,
++    .unmigratable = 1,
++};
++
++static const Property hci_properties[] = {
++    DEFINE_PROP_UINT32("fw", USBHCITestState, fw, 3),
++    DEFINE_PROP_BOOL("bad", USBHCITestState, bad, false),
++    DEFINE_PROP_BOOL("mute", USBHCITestState, mute, false),
++};
++
++static void hci_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    USBDeviceClass *k = USB_DEVICE_CLASS(klass);
++
++    dc->vmsd = &vmstate_hci_test;
++    device_class_set_props(dc, hci_properties);
++    set_bit(DEVICE_CATEGORY_USB, dc->categories);
++    k->product_desc   = "AfriSovera Test Bluetooth";
++    k->realize        = hci_realize;
++    k->handle_attach  = usb_desc_attach;
++    k->handle_reset   = hci_handle_reset;
++    k->handle_control = hci_handle_control;
++    k->handle_data    = hci_handle_data;
++}
++
++static const TypeInfo hci_test_info = {
++    .name          = TYPE_USB_HCI_TEST,
++    .parent        = TYPE_USB_DEVICE,
++    .instance_size = sizeof(USBHCITestState),
++    .class_init    = hci_class_init,
++};
++
++static void hci_test_register_types(void)
++{
++    type_register_static(&hci_test_info);
++}
++
++type_init(hci_test_register_types)
