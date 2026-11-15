@@ -33,6 +33,7 @@ Every spec here is open for comment for at least 7 days from its date (docs/poli
 | [AFR-0008](0008-pc-boot-and-install.md) | PC boot and install chain (GPT, ESP, boot entries) | Implemented · Secure Boot, A/B Designed | UEFI app, `installdisk`, `installpart`, `bootcopy`, `bootentry`, `bootnext` | 2026-11-15 |
 | [AFR-0009](0009-sovereign-mesh-wire-format.md) | Sovereign Mesh wire format (link, bundle, tags, pairing) | Draft | nothing (crypto prerequisites not built) | 2026-11-16 |
 | [AFR-0010](0010-safe-updates.md) | Safe updates (two boot files, firmware rollback) | Partly implemented | `updatecheck` (reads and checks an update file, writes nothing) | 2026-11-20 |
+| [AFR-0011](0011-afrifs.md) | VFS v1, the AfriSovera file system (format 3, `AFRIVFS2`) | Designed (formats 1 and 2 Implemented) | `AFRIVFS1`: 24 flat files up to 16 KiB, checksums on `claude/nia-a2` | 2026-11-21 |
 
 Test-vector files: [`vectors/`](vectors/). All use public RFC test keys (RFC 8032; RFC 7748 for AFR-0009) — never a real key.
 

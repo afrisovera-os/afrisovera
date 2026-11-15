@@ -56,7 +56,7 @@ pub fn signature_for(name: &str) -> Option<&'static [u8; 64]> {
     }
 }
 
-const MAX: usize = 16;
+const MAX: usize = 32; // 16 until A2: the bundled apps grow (Andika, Ngoma, Hati)
 static mut NAMES: [&str; MAX] = [""; MAX];
 static mut HASHES: [[u8; 32]; MAX] = [[0; 32]; MAX];
 static mut COUNT: usize = 0;

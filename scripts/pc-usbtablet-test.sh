@@ -77,19 +77,19 @@ grade() { # grade <serial capture> <pixel line>
     [ -n "$ks" ] && [ -n "$ts" ] && [ "$ks" = "$ts" ] && _f "keyboard and tablet share slot $ks"
     has '^\[xhci\] tablet: absolute pointer, report id 0, x 16 bits at bit 8 \(0\.\.32767\), y 16 bits at bit 24 \(0\.\.32767\), buttons$' ||
         _f "the tablet's report layout was not read from its HID report descriptor as QEMU's (x/y 16 bits at 8/24, 0..32767, buttons)"
-    printf '%s\n' "$S" | grep -aqE '^afrisovera> lsusb$' || _f "lsusb typed on the USB keyboard did not reach the shell"
-    printf '%s\n' "$S" | grep -aqE '^  port [0-9]+: connected, enabled, speed [0-9]+  <- tablet$' || _f "lsusb does not show the tablet's port"
+    grep -aqE '^afrisovera> lsusb$' <<< "$S" || _f "lsusb typed on the USB keyboard did not reach the shell"
+    grep -aqE '^  port [0-9]+: connected, enabled, speed [0-9]+  <- tablet$' <<< "$S" || _f "lsusb does not show the tablet's port"
     local m
     m="$(printf '%s\n' "$S" | grep -aoE '^  tablet: slot [0-9]+, [0-9]+ reports, pointer at [0-9]+,[0-9]+, buttons [01]{3}, [0-9]+ clicks$' | tail -1)"
     if [ -z "$m" ]; then
         _f "lsusb did not report the tablet"
     else
-        printf '%s\n' "$m" | grep -qE 'pointer at 100,50,' || _f "the pointer is not at 100,50 (the absolute place last sent): $m"
-        printf '%s\n' "$m" | grep -qE 'buttons 000, 2 clicks$' || _f "expected 2 clicks and no button held: $m"
-        printf '%s\n' "$m" | grep -qE ', ([4-9]|[1-9][0-9]+) reports,' || _f "fewer than 4 tablet reports arrived (2 moves + 4 button changes): $m"
+        grep -qE 'pointer at 100,50,' <<< "$m" || _f "the pointer is not at 100,50 (the absolute place last sent): $m"
+        grep -qE 'buttons 000, 2 clicks$' <<< "$m" || _f "expected 2 clicks and no button held: $m"
+        grep -qE ', ([4-9]|[1-9][0-9]+) reports,' <<< "$m" || _f "fewer than 4 tablet reports arrived (2 moves + 4 button changes): $m"
     fi
-    printf '%s\n' "$S" | grep -aqE '^afrisovera> devices$' || _f "devices typed on the USB keyboard did not reach the shell"
-    printf '%s\n' "$S" | grep -aqE '^usb-tablet +[a-z]+ .* OK$' || _f "devices does not list usb-tablet"
+    grep -aqE '^afrisovera> devices$' <<< "$S" || _f "devices typed on the USB keyboard did not reach the shell"
+    grep -aqE '^usb-tablet +[a-z]+ .* OK$' <<< "$S" || _f "devices does not list usb-tablet"
     case "$P" in *"tip=000000 "*) ;; *) _f "no black pointer tip at 100,50 on the screen ($P)" ;; esac
     case "$P" in *"fill=ffffff "*) ;; *) _f "no white pointer fill at 102,55 on the screen ($P)" ;; esac
     case "$P" in *"mid=ffffff"*) _f "the pointer is still drawn at the console's middle ($P)" ;; esac

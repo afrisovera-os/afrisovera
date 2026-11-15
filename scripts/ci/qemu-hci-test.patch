@@ -17,7 +17,7 @@ No other QEMU device changes.
  system_ss.add(when: 'CONFIG_USB_STORAGE_BOT', if_true: files('dev-storage-bot.c'))
 --- /dev/null
 +++ b/hw/usb/dev-hci-test.c
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,477 @@
 +/*
 + * AfriSovera test Bluetooth controller (14 Nov 2026): a USB HCI device (class E0/01/01) for the AfriSovera PC
 + * kernel's Bluetooth driver (pc-bt), applied to QEMU's source when the AfriSovera CI builds QEMU. TEST EQUIPMENT
@@ -124,11 +124,70 @@ No other QEMU device changes.
 +    .str  = hci_strings,
 +};
 +
++/*
++ * noint=on (15 Nov 2026, USB match tables slice 1, the architect's OK): the same controller without its
++ * interrupt-IN endpoint. The Bluetooth driver's table matches its interface (E0/01/01) but the driver's finer
++ * check (an event endpoint) refuses it, so hwscan must say "class", not "missing".
++ */
++static const USBDescIface hci_ifaces_noint[] = {
++    {
++        .bInterfaceNumber   = 0,
++        .bNumEndpoints      = 2,
++        .bInterfaceClass    = 0xe0,
++        .bInterfaceSubClass = 0x01,
++        .bInterfaceProtocol = 0x01,
++        .eps = (USBDescEndpoint[]) {
++            {
++                .bEndpointAddress = USB_DIR_IN | 0x02,
++                .bmAttributes     = USB_ENDPOINT_XFER_BULK,
++                .wMaxPacketSize   = 64,
++            }, {
++                .bEndpointAddress = USB_DIR_OUT | 0x02,
++                .bmAttributes     = USB_ENDPOINT_XFER_BULK,
++                .wMaxPacketSize   = 64,
++            },
++        },
++    },
++};
++
++static const USBDescDevice hci_device_noint = {
++    .bcdUSB             = 0x0200,
++    .bDeviceClass       = 0xe0,
++    .bDeviceSubClass    = 0x01,
++    .bDeviceProtocol    = 0x01,
++    .bMaxPacketSize0    = 64,
++    .bNumConfigurations = 1,
++    .confs = (USBDescConfig[]) {
++        {
++            .bNumInterfaces      = 1,
++            .bConfigurationValue = 1,
++            .bmAttributes        = USB_CFG_ATT_ONE,
++            .bMaxPower           = 50,
++            .nif                 = ARRAY_SIZE(hci_ifaces_noint),
++            .ifs                 = hci_ifaces_noint,
++        },
++    },
++};
++
++static const USBDesc hci_desc_noint = {
++    .id = {
++        .idVendor      = HCI_VENDOR,
++        .idProduct     = HCI_PRODUCT,
++        .bcdDevice     = 0x0100,
++        .iManufacturer = STR_MANUFACTURER,
++        .iProduct      = STR_PRODUCT,
++        .iSerialNumber = STR_SERIALNUMBER,
++    },
++    .full = &hci_device_noint,
++    .str  = hci_strings,
++};
++
 +struct USBHCITestState {
 +    USBDevice dev;
 +    uint32_t fw;
 +    bool bad;
 +    bool mute;
++    bool noint;
 +    uint8_t q[HCI_QMAX][HCI_EMAX];
 +    uint16_t qlen[HCI_QMAX];
 +    uint16_t qextra[HCI_QMAX];
@@ -388,7 +447,9 @@ No other QEMU device changes.
 +
 +static void hci_realize(USBDevice *dev, Error **errp)
 +{
-+    dev->usb_desc = &hci_desc;
++    USBHCITestState *s = (USBHCITestState *)dev;
++
++    dev->usb_desc = s->noint ? &hci_desc_noint : &hci_desc;
 +    usb_desc_create_serial(dev);
 +    usb_desc_init(dev);
 +}
@@ -402,6 +463,7 @@ No other QEMU device changes.
 +    DEFINE_PROP_UINT32("fw", USBHCITestState, fw, 3),
 +    DEFINE_PROP_BOOL("bad", USBHCITestState, bad, false),
 +    DEFINE_PROP_BOOL("mute", USBHCITestState, mute, false),
++    DEFINE_PROP_BOOL("noint", USBHCITestState, noint, false),
 +};
 +
 +static void hci_class_init(ObjectClass *klass, const void *data)

@@ -99,7 +99,7 @@ grade() { # grade <serial> <pixels>
     [ -z "$p" ] || _f "step ${p%% *}: no line matching '${p#* }' (after the step before it)"
     if has '\[desk\] moved files to 48,45'; then _f "a tap without a move was logged as a move"; fi
     # the last window list (pointer profile) must not hold About: its close button closed it
-    if printf '%s\n' "$S" | sed -n '/pointer profile, on screen/,$p' | grep -aq '^\[desk\] window about'; then
+    if grep -aq '^\[desk\] window about' <<< "$(sed -n '/pointer profile, on screen/,$p' <<< "$S")"; then
         _f "About is still open after its close button"
     fi
     for p in $POINTS; do

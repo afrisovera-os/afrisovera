@@ -703,6 +703,9 @@ pub fn walk_table(t: &[u8], w: &mut Walk) {
 // global lock is taken around each read by the EcIo's begin and end, when the controller needs it (battery.rs).
 
 pub const EC_WAIT: u32 = 100_000;
+/// The time one wait stands for (ACPI gives no figure; Linux's ec_delay is 500 ms per transaction): 100 ms per
+/// wait, by the EcIo's clock; EC_WAIT polls stay as the fallback where it has none (the host tests).
+pub const EC_WAIT_US: u64 = 100_000;
 pub const EC_READ: u8 = 0x80;
 
 pub trait EcIo {
@@ -719,6 +722,19 @@ pub trait EcIo {
     }
     /// The transaction ended (the global lock given back).
     fn end(&mut self) {}
+    /// A clock in microseconds for the waits' time bound; None (the default) where there is none, and then the
+    /// waits end after EC_WAIT polls.
+    fn now_us(&mut self) -> Option<u64> {
+        None
+    }
+}
+
+/// True once EC_WAIT_US have passed since `t0` (from `now_us`); never true without a clock.
+fn ec_late(io: &mut dyn EcIo, t0: Option<u64>) -> bool {
+    match (t0, io.now_us()) {
+        (Some(a), Some(b)) => b.wrapping_sub(a) > EC_WAIT_US,
+        _ => false,
+    }
 }
 
 // ---- the ACPI global lock (ACPI spec 5.2.10.1), over any 32-bit word: the FACS's in the kernel, a pretend one in
@@ -793,10 +809,17 @@ pub enum EcVal {
 }
 
 pub fn ec_wait(io: &mut dyn EcIo, cmd: u16, full: bool) -> bool {
-    (0..EC_WAIT).any(|_| {
+    let t0 = io.now_us();
+    for _ in 0..EC_WAIT {
         let s = io.inb(cmd);
-        if full { s & 1 != 0 } else { s & 2 == 0 }
-    })
+        if if full { s & 1 != 0 } else { s & 2 == 0 } {
+            return true;
+        }
+        if ec_late(io, t0) {
+            return false;
+        }
+    }
+    false
 }
 
 pub fn ec_byte(io: &mut dyn EcIo, data: u16, cmd: u16, a: u8) -> Result<u8, EcErr> {
@@ -813,6 +836,7 @@ pub fn ec_byte(io: &mut dyn EcIo, data: u16, cmd: u16, a: u8) -> Result<u8, EcEr
 /// the firmware's SMM code or an EC query, which would otherwise be taken as our answer; architect, 14 Nov).
 fn ec_byte_locked(io: &mut dyn EcIo, data: u16, cmd: u16, a: u8) -> Result<u8, EcErr> {
     let mut ready = false;
+    let t0 = io.now_us();
     for _ in 0..EC_WAIT {
         let s = io.inb(cmd);
         if s & 1 != 0 {
@@ -820,6 +844,9 @@ fn ec_byte_locked(io: &mut dyn EcIo, data: u16, cmd: u16, a: u8) -> Result<u8, E
         }
         if s & 2 == 0 {
             ready = true;
+            break;
+        }
+        if ec_late(io, t0) {
             break;
         }
     }

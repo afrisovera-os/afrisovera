@@ -57,9 +57,9 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log>
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     C="$(tr -d '\r' < "$3" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqE "$1"; }
-    hasB() { printf '%s\n' "$B" | grep -aqE "$1"; }
-    hasC() { printf '%s\n' "$C" | grep -aqE "$1"; }
+    hasA() { grep -aqE "$1" <<< "$A"; }
+    hasB() { grep -aqE "$1" <<< "$B"; }
+    hasC() { grep -aqE "$1" <<< "$C"; }
     hasA '^\[pc\] own boot file .*BOOTX64\.EFI \([0-9]+ KiB\) kept for installdisk$' ||
         _f "boot 1: the kernel did not keep its own boot file"
     hasA '^installdisk: EVERYTHING on this disk will be ERASED' || _f "boot 1: installdisk did not warn that everything is erased"
@@ -78,12 +78,12 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log>
         hasB '^  big copies \(installdisk, bootcopy\): [1-9][0-9]* run\(s\) in one command, [1-9][0-9]* sector\(s\), each read back'"$RUNS"'$' ||
             _f "boot 2: installdisk did not write its big copies in runs of several sectors ($LS)"
     fi
-    if [ "$KIND" = nvme ] || [ "$KIND" = nvme4k ]; then # 12 Nov 2026: one Flush at the end of the install step, not one per write
+    if [ "$KIND" = nvme ] || [ "$KIND" = nvme4k ] || [ "$KIND" = sata ]; then # 12 Nov 2026: one Flush at the end of the install step, not one per write (SATA: FLUSH CACHE EXT, 14 Nov)
         local fl sy
         fl="$(printf '%s\n' "$B" | sed -nE 's/^  volatile write cache: yes, ([0-9]+) Flush\(es\) sent.*/\1/p' | tail -1)"
         sy="$(printf '%s\n' "$B" | grep -acE '^\[vfs\] synced [0-9]+ files to disk$')"
         if [ -z "$fl" ]; then
-            _f "boot 2: lsnvme shows no Flush count (QEMU's NVMe has a volatile write cache)"
+            _f "boot 2: $LS shows no Flush count (QEMU's NVMe and SATA disks have a volatile write cache)"
         elif [ "$fl" -lt 1 ] || [ "$fl" -gt $((sy + 4)) ]; then
             _f "boot 2: $fl Flushes for $sy saves and one install step (want 1 to $((sy + 4)): once per step, not per write)"
         fi
@@ -93,10 +93,10 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log>
     hasC "^$DRV AfriSovera's partition at sector 616448 \\([0-9]+ MiB\\) holds our files\$" ||
         _f "boot 3: the driver did not find AfriSovera's partition with our files"
     hasC '^HELLO-INSTALL-6NOV$' || _f "boot 3: notes.txt did not come back from the installed disk"
-    if printf '%s\n%s\n%s\n' "$A" "$B" "$C" | grep -aqE '^installdisk: .*FAILED'; then
+    if grep -aqE '^installdisk: .*FAILED' <<< "$A"$'\n'"$B"$'\n'"$C"; then
         _f "installdisk failed: $(printf '%s\n%s\n' "$A" "$B" | grep -aE '^installdisk: .*FAILED' | head -1)"
     fi
-    if printf '%s\n%s\n%s\n' "$A" "$B" "$C" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$A"$'\n'"$B"$'\n'"$C"; then
         _f "the kernel panicked or took an exception"
     fi
     return "$fail"
@@ -154,6 +154,8 @@ if [ "$KIND" = nvme ] || [ "$KIND" = nvme4k ] || [ "$KIND" = sata ]; then # lsnv
 fi
 if [ "$KIND" = nvme ] || [ "$KIND" = nvme4k ]; then # the Flush at the end of the install step
     B2="$(printf '%s\n  volatile write cache: yes, 2 Flush(es) sent (one at the end of every save and every install step)' "$B2")"
+elif [ "$KIND" = sata ]; then
+    B2="$(printf '%s\n  volatile write cache: yes, 2 Flush(es) sent (one at the end of every save and every install step; FLUSH CACHE EXT on port 2)' "$B2")"
 fi
 
 selftest() {
@@ -187,7 +189,7 @@ selftest() {
         arm big-copies-off red "$B1" "$(printf '%s\n' "$B2" | sed 's/ (on)$/ (off)/')" "$B3"
         arm no-big-copies red "$B1" "$(printf '%s\n' "$B2" | grep -v 'big copies')" "$B3"
     fi
-    if [ "$KIND" = nvme ] || [ "$KIND" = nvme4k ]; then
+    if [ "$KIND" = nvme ] || [ "$KIND" = nvme4k ] || [ "$KIND" = sata ]; then
         NARMS=$((NARMS + 2))
         arm flush-per-write red "$B1" "$(printf '%s\n' "$B2" | sed 's/yes, 2 Flush/yes, 907 Flush/')" "$B3"
         arm no-flush-line red "$B1" "$(printf '%s\n' "$B2" | grep -v 'volatile write cache')" "$B3"

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # bundled-big (claude/nia-a7, OS_REQUESTS A7): a bundled app runs from the kernel's own bytes, and one over 16 KiB
-# (Andika, 29,238 bytes) is never a VFS file. The disk image holds stand-ins with bundled names: andika.wasm and
+# (Andika, 28,841 bytes) is never a VFS file. The disk image holds stand-ins with bundled names: andika.wasm and
 # hello.wasm are both wasm-textrun's f128 (it prints SUM_F128), so a run of either stand-in shows that number.
 # Graded on the console:
-#   boot: "bundled apps: 13 of 13 match the manifest", nothing refused; hello.wasm's bundled copy restored;
+#   boot: "bundled apps: 15 of 15 match the manifest", nothing refused; hello.wasm's bundled copy restored;
 #   `ls`: the andika.wasm stand-in is KEPT (the person's file, never deleted at boot: the architect's A7 change 1)
-#   and marked "(a file of yours; the built-in app is what runs)", and "29238  andika.wasm  (built in)" follows;
+#   and marked "(a file of yours; the built-in app is what runs)", and "28841  andika.wasm  (built in)" follows;
 #   after everything ran, `ls -l` still shows the stand-in at its own size;
 #   `verify andika.wasm` integrity OK, `verify andika.wasm tamper` TAMPERED;
 #   `appget ... andika.wasm ...` refused as bundled, nothing written;
@@ -26,7 +26,7 @@ T="${TMPDIR:-/tmp}/bundled-big"
 rm -rf "$T"; mkdir -p "$T/shots"
 python3 scripts/lib/textrun-wasm.py "$T/m" > "$T/names.txt" || { echo "BUNDLED-BIG TEST FAILED (generator)"; exit 1; }
 SUM="$(sed -nE 's/^f128 print\(([0-9]+)\).*/\1/p' "$T/names.txt")"
-SIZE=29238
+SIZE=28841
 STAND="$(wc -c < "$T/m/f128.wasm" | tr -d ' ')"
 IMG="$T/disk.img"
 python3 scripts/lib/mkvfs-big.py image "$IMG" --sectors 32768 andika.wasm="$T/m/f128.wasm" hello.wasm="$T/m/f128.wasm" \
@@ -68,7 +68,7 @@ grep -aq "removed a file\|^\[vfs\] andika" "$T/clean.txt" && fail "boot touched 
 # the part of the log from the command typed ($1, a fixed string) to the next prompt line
 seg() { awk -v c="afrisovera> $1" 'index($0, c) == 1 && length($0) == length(c) {on=1; next} on && index($0, "afrisovera>") {exit} on' "$T/clean.txt"; }
 
-has "[nia] bundled apps: 13 of 13 match the manifest" "$T/clean.txt"
+has "[nia] bundled apps: 15 of 15 match the manifest" "$T/clean.txt"
 has "[vfs] hello.wasm: the disk copy differed from the bundled app; bundled copy restored" "$T/clean.txt"
 
 seg "ls" > "$T/ls.txt"
@@ -94,7 +94,7 @@ andika() { # andika <segment file> <where>
     has "[nia] 'andika.wasm' is built in: running the kernel's own copy" "$1"
     has "[nia] integrity OK for 'andika.wasm' (matches manifest)" "$1"
     has "[nia] loaded 'andika.wasm' from the kernel image ($SIZE bytes)" "$1"
-    hasre "^\[nia\] loading module \($SIZE bytes\), granted caps = 0x3ff$" "$1"
+    hasre "^\[nia\] loading module \($SIZE bytes\), granted caps = 0x7ff$" "$1"
     has "[nia] permissions asked: draw, file" "$1"
     has "[nia] permissions granted: draw, file" "$1"
     has "[nia] permissions withheld: nothing" "$1"

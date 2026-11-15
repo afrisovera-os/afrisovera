@@ -217,6 +217,24 @@ pub fn intercept(line: &str) -> bool {
         }
         // every PCI, USB and ACPI device, each marked driven, class, missing or none needed; or one by its id (reads only)
         "hwscan" => crate::hwscan::command(_rest),
+        // process memory for ring 3 (AFR-0001 7.6, Dira M3 S1): the vmo program's checks, frames back, pc-perf's times
+        "vmotest" => crate::proc::vmo_test(),
+        // gap G2 on the PC: a ring-3 program hands every pointer-taking call kernel and bad addresses (suite pc-userptr)
+        "uptrtest" => crate::proc::uptr_test(),
+        // G2 part 3: the kernel reads a ring-3 page outside the door; SMAP must stop it (test rig only, halts)
+        "smapprobe" => crate::proc::smap_probe(),
+        // G2 part 3: a program sets RFLAGS.AC, then asks for a raw read; SMAP must still stop it (test rig only, halts)
+        "actest" => crate::proc::ac_test(),
+        // the cell window for ring 3 (AFR-0001 7.6 S2): the test rig only (fw_cfg opt/afrisovera/test-grants)
+        "celltest3" => crate::proc::cell_test(),
+        "nettest3" => crate::proc::net_test(),
+        // Daraja, foreign processes (AFR-0001 7.7): `daraja selftest` checks the hook (nothing is changed). Every
+        // other `daraja` line is the shared shell's Android permission bridge, unchanged.
+        "daraja" if _rest == "selftest" => crate::foreign::selftest(),
+        // the forwarded call's cost beside two native floors (COMPAT_STAGE0_PLAN 17; pc-perf reads the line)
+        "daraja" if _rest == "bench" => crate::foreign::bench(),
+        // Daraja stage 0 step 3: a Linux test program through the bridge (test images with compat0; pc-compat0)
+        "linux" => crate::foreign::linux_command(_rest),
         // a CDC-NCM adapter's block counters; `usbnettest ncm`: the NCM block parser's selftest (reads only)
         "usbnettest" => crate::xhci::ncm_command(_rest),
         // where AfriSovera's boot file and boot entry would go next to Windows (reads only)
@@ -261,6 +279,16 @@ pub fn intercept(line: &str) -> bool {
         }
         // the update file update.afu on a USB stick, checked whole: signature, machine, version, boot file (reads only)
         "updatecheck" => crate::update::command(),
+        "updatestage" => {
+            let mut w = _rest.split_whitespace();
+            match (w.next(), w.next(), w.next(), w.next()) {
+                (None, _, _, _) => crate::update::stage(None),
+                (Some("yes"), Some(c), None, _) => crate::update::stage(Some(c)),
+                (Some("remove"), None, _, _) => crate::update::unstage(None),
+                (Some("remove"), Some("yes"), Some(c), None) => crate::update::unstage(Some(c)),
+                _ => crate::kprintln!("updatestage: use  updatestage  or  updatestage remove  (each asks for the owner's code)"),
+            }
+        }
         "installplan" => match if _rest.is_empty() { Ok(1024) } else { _rest.parse::<u64>() } {
             // where AfriSovera's own partition would go on each internal disk (reads only)
             Ok(m) if (1..=1 << 20).contains(&m) => crate::gpt::list(m),
@@ -327,6 +355,8 @@ pub fn intercept(line: &str) -> bool {
         "lsusb" if _rest == "late0" => crate::xhci::late0_check(),
         "lsusb" if _rest == "stall0" => crate::xhci::stall0_check(),
         "lsusb" if _rest == "stallhub" => crate::xhci::stallhub_check(),
+        // the stick's gathered writes, then SYNCHRONIZE CACHE when it caches (AFR-0011 V2's msc_sync)
+        "lsusb" if _rest == "sync" => crate::xhci::sync_cmd(),
         "lsusb" => crate::xhci::list(),
         "lsps2" if _rest == "late" => crate::ps2::late_check(),
         "lsps2" if _rest == "cfg" => crate::ps2::cfg_check(),
@@ -346,10 +376,12 @@ pub fn intercept(line: &str) -> bool {
         "lshda" if _rest == "late" => crate::hda::late_check(),
         "lshda" => crate::hda::list(),
         // the PC's own microphone (HD Audio input): record up to 3 s, then play it back
+        "mic" if crate::nia::sound_busy("mic") => {} // an app's sound stream owns the device (N-A1a)
         "mic" => crate::hda::mic_cmd(_rest),
         "lssd" => crate::sdhci::list(),
         // sound through the PC's own HD Audio chip when there is no virtio-sound device
         // ... or through a USB headset or speaker, preferred when one is plugged in
+        "audio" if _rest == "tone" && crate::nia::sound_busy("audio") => {} // an app owns the device (N-A1a)
         "audio" if !crate::virtio_core::sound_present() && crate::xhci::audio_present() => crate::xhci::audio_cmd(_rest),
         "audio" if !crate::virtio_core::sound_present() && crate::hda::present() => crate::hda::audio(_rest),
         "screeninfo" => crate::screen::info(),

@@ -48,7 +48,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
         _f "boot 2: tablecheck did not see the change"
     has "$(blk "$B" 'tablebackup')" "tablebackup: nvme: the USB stick holds this disk.s table from BEFORE it changed; that copy is the way back \(tablerestore\), so nothing was written\. To save the tables as they are now instead, type: tablebackup new" ||
         _f "boot 2: tablebackup did not refuse to overwrite the copy from before the change"
-    printf '%s\n' "$(blk "$B" 'tablebackup')" | grep -aqE 'saved on the USB stick' && _f "boot 2: tablebackup overwrote the old copy"
+    grep -aqE 'saved on the USB stick' <<< "$(blk "$B" 'tablebackup')" && _f "boot 2: tablebackup overwrote the old copy"
     local B2; B2="$(blk "$B" 'tablerestore nvme')"
     has "$B2" 'tablerestore: nvme: CHANGED since the backup \(first difference in sector 1\)' || _f "boot 2: tablerestore did not report the change"
     has "$B2" "tablerestore: 4 of the table.s 67 sector\(s\) differ from the saved copy; .*" || _f "boot 2: not exactly 4 of 67 sectors differ"
@@ -56,21 +56,21 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     has "$(blk "$B" 'tablerestore sata2')" "tablerestore: sata port 2: already the same as its backup, so nothing to restore; $NW" ||
         _f "boot 2: the unchanged SATA disk was not left alone"
     has "$B" 'harness: disk images and the stick unchanged' || _f "boot 2: a disk image or the stick changed before the code was typed"
-    printf '%s\n' "$A" "$B" | grep -aqE 'saved table is back' && _f "boot 1/2: something was restored without the code"
+    grep -aqE 'saved table is back' <<< "$A"$'\n'"$B" && _f "boot 1/2: something was restored without the code"
     # boot 3: the code typed -> the table as it was
     has "$(blk "$C" "tablerestore nvme yes $CODE")" "tablerestore: nvme: the saved table is back: 4 sector\(s\) written, read back OK, tablecheck now says unchanged; no partition.s own sectors were touched" ||
         _f "boot 3: the code did not put the saved table back (4 sectors)"
     has "$(blk "$C" 'tablecheck')" 'tablecheck: nvme: unchanged since the backup \(67 sector\(s\)\)' || _f "boot 3: tablecheck does not say unchanged"
     local C3; C3="$(blk "$C" 'lsparts')"
     has "$C3" '  gpt: 4 partition\(s\), usable LBA 34-131038, primary header OK, backup header OK, entries CRC OK' || _f "boot 3: the GPT is not whole with 4 partitions"
-    printf '%s\n' "$C3" | grep -aqE '^  part 5:' && _f "boot 3: entry 5 is still listed"
+    grep -aqE '^  part 5:' <<< "$C3" && _f "boot 3: entry 5 is still listed"
     has "$C" 'harness: nvme image byte-identical to the original; other disk images unchanged' || _f "boot 3: the NVMe image is not exactly the original"
     # boot 4: tablebackup new replaces the copy
     has "$(blk "$D" 'tablebackup new')" "$SAVED" || _f "boot 4: tablebackup new did not save the changed table"
     has "$(blk "$D" 'tablecheck')" 'tablecheck: nvme: unchanged since the backup \(67 sector\(s\)\)' || _f "boot 4: tablecheck after tablebackup new"
     has "$D" "tablerestore: nvme: already the same as its backup, so nothing to restore; $NW" || _f "boot 4: tablerestore after tablebackup new"
     has "$D" 'harness: nvme image unchanged by the boot' || _f "boot 4: the NVMe image changed"
-    if printf '%s\n' "$A" "$B" "$C" "$D" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci|xhci)\] .*(failed|timed out)|FAILED'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci|xhci)\] .*(failed|timed out)|FAILED' <<< "$A"$'\n'"$B"$'\n'"$C"$'\n'"$D"; then
         _f "the kernel panicked or a disk command failed"
     fi
     return "$fail"

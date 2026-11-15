@@ -60,7 +60,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     has "$D" "\[ide\] primary master \(0x1f0\): ATA disk, 131072 sectors \(64 MiB\), LBA(28|48), AfriSovera's partition used for storage, the rest left alone" || _f "boot 4: the partition is not used for storage"
     has "$(blk "$D" 'cat notes.txt')" 'HELLO-IDE-10NOV' || _f "boot 4: notes.txt did not come back from the partition"
     has "$D" 'harness: boot 4: outside the partition the ide image is as the install left it' || _f "boot 4: something outside the partition changed"
-    if printf '%s\n' "$A" "$B" "$C" "$D" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci|xhci|ide)\] .*(failed|timed out|busy)|FAILED'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci|xhci|ide)\] .*(failed|timed out|busy)|FAILED' <<< "$A"$'\n'"$B"$'\n'"$C"$'\n'"$D"; then
         _f "the kernel panicked or a disk command failed"
     fi
     return "$fail"

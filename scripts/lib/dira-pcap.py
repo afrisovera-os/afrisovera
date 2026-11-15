@@ -7,6 +7,7 @@ Prints one line per finding the suite greps:
   from-fixed <n>                                     frames the guest sent from 10.0.2.15 (QEMU's fixed plan)
   dns <src> -> <dst>                                 every DNS query the guest sent
   maxseg <n>                                         the largest TCP payload the server sent the guest
+  rst <src>:<sport> -> <dst>:<dport>                 every reset the guest sent to the server (pc-net3)
 """
 import struct
 import sys
@@ -50,6 +51,8 @@ def main():
             total = struct.unpack(">H", fr[16:18])[0]
             if src == server and sport == port:
                 maxseg = max(maxseg, total - ihl - doff)
+            if flags & 0x04 and src == guest and dst == server and dport == port:
+                print("rst %s:%d -> %s:%d" % (src, sport, dst, dport))
             if flags & 0x12 == 0x02 and dst == server and dport == port:
                 mss = "none"
                 opts = fr[l4 + 20:l4 + doff]

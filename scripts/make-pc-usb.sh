@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# TEST IMAGE: built with the release profile for speed (performance plan; its gate: ARCHITECT_REVIEWS 14 Nov 2026), NOT a
+# release. `--features release` is the U1 update guard and cannot build until the owner's keys exist.
 # PC track step 4 (5 Nov 2026): the files for a bootable AfriSovera USB stick.
 #
 # A UEFI PC boots any FAT32 USB stick that holds EFI\BOOT\BOOTX64.EFI -- no disk image, no
@@ -10,15 +12,20 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-cargo build -p mansa-kernel --bin mansa-pc --features pc --target x86_64-unknown-uefi 2>&1 | tail -1
-EFI=target/x86_64-unknown-uefi/debug/mansa-pc.efi
+# The release profile: about 3x faster to boot and 4x faster to draw than the debug build the stick carried until
+# 14 Nov 2026 (docs/perf). STICK_PROFILE=debug builds the old way, for a comparison on the same PC.
+PROF="${STICK_PROFILE:-release}"
+CF=(); [ "$PROF" = release ] && CF=(--release)
+cargo build "${CF[@]}" -p mansa-kernel --bin mansa-pc --features pc --target x86_64-unknown-uefi 2>&1 | tail -1
+EFI=target/x86_64-unknown-uefi/$PROF/mansa-pc.efi
+md5sum "$EFI" 2> /dev/null | sed "s/^/stick kernel ($PROF) md5: /" || true
 OUT=build/pc-usb
 rm -rf "$OUT"
 mkdir -p "$OUT/EFI/BOOT"
 cp "$EFI" "$OUT/EFI/BOOT/BOOTX64.EFI"
 REV="$(git rev-parse --short HEAD 2> /dev/null || echo unknown)"
 cat > "$OUT/README-USB.txt" << EOF
-AfriSovera OS -- PC test stick (commit $REV, built $(date +%Y-%m-%d))
+AfriSovera OS -- PC test stick (commit $REV, $PROF build, built $(date +%Y-%m-%d))
 
 What this is: the AfriSovera kernel for ordinary PCs and laptops, run straight from a
 USB stick. Nothing is installed. Your Windows (or anything else on the PC) is not changed.

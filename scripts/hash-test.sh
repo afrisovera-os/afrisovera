@@ -25,8 +25,8 @@ wait "$QPID" 2>/dev/null
 echo "$SER" | grep -iE "\[hash\]|sha256|sha512" | sed 's/^/  /'
 echo "  reference sha256(abc) = $REF256"
 
-echo "$SER" | grep -q "sha256 $REF256" \
+grep -q "sha256 $REF256" <<< "$SER" \
     || { echo "HASH TEST FAILED (SHA-256 does not match hashlib)"; exit 1; }
-echo "$SER" | grep -q "sha512 $REF512" \
+grep -q "sha512 $REF512" <<< "$SER" \
     || { echo "HASH TEST FAILED (SHA-512 does not match hashlib)"; exit 1; }
 echo "HASH TEST PASSED  (kernel SHA-256 + SHA-512 of \"abc\" match Python hashlib)"

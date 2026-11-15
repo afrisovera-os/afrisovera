@@ -29,15 +29,15 @@ grade() { # grade <serial log> <kernel name>
     _f() { echo "  FAIL ($2): $1"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL ($2): missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasre() { printf '%s\n' "$S" | grep -aqE "$1" || _f "$3" "$2"; }
-    printf '%s\n' "$S" | grep -aqE 'PANIC|panicked' && _f "the kernel panicked or faulted" "$2"
-    printf '%s\n' "$S" | grep -aqE '^\[desk\] lang selftest: FAIL' && _f "a filler or safety selftest case failed" "$2"
+    hasre() { grep -aqE "$1" <<< "$S" || _f "$3" "$2"; }
+    grep -aqE 'PANIC|panicked' <<< "$S" && _f "the kernel panicked or faulted" "$2"
+    grep -aqE '^\[desk\] lang selftest: FAIL' <<< "$S" && _f "a filler or safety selftest case failed" "$2"
     hasre '^\[desk\] lang selftest: ([0-9]+)/\1 checks held$' "$2" "no lang selftest line with every check held"
-    printf '%s\n' "$S" | grep -aqE '^\[desk\] cell title: .*(NOT WHOLE|OVERLAP)' && _f "in Twi the unsigned mark is cut or Close anyway is covered" "$2"
+    grep -aqE '^\[desk\] cell title: .*(NOT WHOLE|OVERLAP)' <<< "$S" && _f "in Twi the unsigned mark is cut or Close anyway is covered" "$2"
     hasre '^\[desk\] cell title: window [0-9]+ wide .*mark [0-9]+\.\.[0-9]+ whole, .*nothing over Close anyway' "$2" "no cell title check in Twi"
-    printf '%s\n' "$S" | grep -aqE '^\[desk\] lang check: [a-z]+ ' && _f "lang check found a problem" "$2"
+    grep -aqE '^\[desk\] lang check: [a-z]+ ' <<< "$S" && _f "lang check found a problem" "$2"
     hasre '^\[desk\] lang check: [0-9]+ language\(s\), [0-9]+ ids, 0 problem\(s\)$' "$2" "no clean lang check line"
-    printf '%s\n' "$S" | grep -aqE '^\[desk\] lang fit: [a-z]+ ' && _f "a string is wider than its room" "$2"
+    grep -aqE '^\[desk\] lang fit: [a-z]+ ' <<< "$S" && _f "a string is wider than its room" "$2"
     hasre '^\[desk\] lang fit: [0-9]+ language\(s\), 0 too wide$' "$2" "no clean lang fit line"
     n="$(printf '%s\n' "$S" | sed -nE 's/^\[desk\] lang check: [0-9]+ language\(s\), ([0-9]+) ids, .*/\1/p' | head -1)"
     [ -n "$n" ] && hasre "^\[desk\] lang: en \(English\), $n strings, 0 drafts, $n checked, 0 in English$" "$2" "English is not all its own strings"
@@ -59,12 +59,12 @@ grade_reboot() { # grade_reboot <boot 1 log> <boot 2 log>
     _f() { echo "  FAIL (reboot): $1"; fail=1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    printf '%s\n%s\n' "$A" "$B" | grep -aqE 'PANIC|panicked' && _f "the kernel panicked or faulted"
-    printf '%s\n' "$A" | grep -aqE '^\[desk\] lang: tw \(Twi\), [0-9]+ drafts' || _f "boot 1 did not switch to Twi"
-    printf '%s\n' "$A" | grep -aqE '^\[desk\] lang: not saved' && _f "boot 1 could not save the language"
-    printf '%s\n' "$B" | grep -aqxF '[desk] lang: tw (from afrisovera.conf)' || _f "boot 2 did not read Twi back from afrisovera.conf"
-    printf '%s\n' "$B" | grep -aqE '^\[desk\] lang: tw \(Twi\), [0-9]+ strings' || _f "boot 2's desk is not in Twi"
-    printf '%s\n' "$B" | grep -aqE '^ *lang=tw$' || _f "boot 2's config has no lang=tw line"
+    grep -aqE 'PANIC|panicked' <<< "$A"$'\n'"$B" && _f "the kernel panicked or faulted"
+    grep -aqE '^\[desk\] lang: tw \(Twi\), [0-9]+ drafts' <<< "$A" || _f "boot 1 did not switch to Twi"
+    grep -aqE '^\[desk\] lang: not saved' <<< "$A" && _f "boot 1 could not save the language"
+    grep -aqxF '[desk] lang: tw (from afrisovera.conf)' <<< "$B" || _f "boot 2 did not read Twi back from afrisovera.conf"
+    grep -aqE '^\[desk\] lang: tw \(Twi\), [0-9]+ strings' <<< "$B" || _f "boot 2's desk is not in Twi"
+    grep -aqE '^ *lang=tw$' <<< "$B" || _f "boot 2's config has no lang=tw line"
     [ "$fail" -eq 0 ]
 }
 

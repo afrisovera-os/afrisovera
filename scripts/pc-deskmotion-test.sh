@@ -78,14 +78,14 @@ grade() { # grade <serial 1> <serial 2> <pixels 1> <pixels 2>
     got="$(printf '%s\n' "$P" | sed -n 's/^20,250=//p' | head -1)"
     [ "$got" = 100C0A ] || _f "the desktop's Spine is ${got:-missing} after the walk, not its night #100C0A"
     # boot 2: Files held at frame 1 over About
-    printf '%s\n' "$S2" | grep -aqE '^\[desk\] motion: unfold window held at 1/3$' || _f "boot 2: Files was not held at frame 1"
+    grep -aqE '^\[desk\] motion: unfold window held at 1/3$' <<< "$S2" || _f "boot 2: Files was not held at frame 1"
     got="$(printf '%s\n' "$P2" | sed -n 's/^300,262=//p' | head -1)"
     [ "$got" = 0C0907 ] || _f "below Files' first third (300,262) the screen is ${got:-missing}, not About's body #0C0907 (frame 1 must repaint what lies under it)"
     got="$(printf '%s\n' "$P2" | sed -n 's/^300,120=//p' | head -1)"
     [ "$got" = 1E1814 ] || _f "in Files' first third (300,120) the screen is ${got:-missing}, not Files' body #1E1814"
     got="$(printf '%s\n' "$P2" | sed -n 's/^150,262=//p' | head -1)"
     { [ -n "$got" ] && [ "$got" != 1E1814 ]; } || _f "below Files' first third, left of About (150,262), the screen is ${got:-missing}: Files' body was drawn below its clip"
-    if printf '%s\n%s\n' "$S" "$S2" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$S"$'\n'"$S2"; then _f "the kernel panicked"; fi
     return "$fail"
 }
 

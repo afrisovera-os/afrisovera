@@ -24,7 +24,7 @@ T="${TMPDIR:-/tmp}"
 # check_kinds <line> <ports>: both ranges present, inside 1..ports, no overlap, every port named
 check_kinds() {
     local l="$1" n="$2" a b c d
-    printf '%s\n' "$l" | grep -aqE 'port kinds: USB 2\.0 on ports [0-9]+-[0-9]+, USB 3\.0 on ports [0-9]+-[0-9]+$|port kinds: USB 3\.0 on ports [0-9]+-[0-9]+, USB 2\.0 on ports [0-9]+-[0-9]+$' || return 1
+    grep -aqE 'port kinds: USB 2\.0 on ports [0-9]+-[0-9]+, USB 3\.0 on ports [0-9]+-[0-9]+$|port kinds: USB 3\.0 on ports [0-9]+-[0-9]+, USB 2\.0 on ports [0-9]+-[0-9]+$' <<< "$l" || return 1
     read -r a b < <(printf '%s\n' "$l" | sed -E 's/.*USB 2\.0 on ports ([0-9]+)-([0-9]+).*/\1 \2/')
     read -r c d < <(printf '%s\n' "$l" | sed -E 's/.*USB 3\.0 on ports ([0-9]+)-([0-9]+).*/\1 \2/')
     [ "$a" -ge 1 ] && [ "$c" -ge 1 ] && [ "$b" -le "$n" ] && [ "$d" -le "$n" ] && [ "$a" -le "$b" ] && [ "$c" -le "$d" ] || return 1

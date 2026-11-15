@@ -59,6 +59,19 @@ pub fn hz() -> u64 {
     read_cntfrq()
 }
 
+/// A deadline `us` microseconds from now in `cycles()` units, or None while the counter's rate is not known yet
+/// (the time-waits rule, the architect's sweep of 15 Nov 2026: a wait that stands for a time is bound by the
+/// counter, and its spin count is only the fallback for when there is no rate).
+pub fn deadline_us(us: u64) -> Option<u64> {
+    let hz = hz();
+    (hz != 0).then(|| cycles().wrapping_add(hz.saturating_mul(us) / 1_000_000))
+}
+
+/// True once `deadline` (from `deadline_us`) has passed; never true without one.
+pub fn past(deadline: Option<u64>) -> bool {
+    deadline.is_some_and(|d| cycles().wrapping_sub(d) < 1 << 62)
+}
+
 /// Block for approximately `ms` milliseconds using the interrupt-driven timer
 /// tick (100 Hz = 10 ms/tick). Sleeps on `wfi` so the CPU idles between ticks,
 /// and returns the number of ticks actually elapsed. Bounded so it can never

@@ -11,6 +11,18 @@ use core::sync::atomic::{AtomicU64, Ordering};
 static HZ: AtomicU64 = AtomicU64::new(0);
 static T0: AtomicU64 = AtomicU64::new(0);
 
+/// The calibration loops run before the TSC rate is known, so their bound is raw TSC ticks: 1,000,000,000 is at
+/// least 100 ms on any TSC up to 10 GHz (each window wants 10 ms). Their spin counts stay as the last fallback.
+const CAL_TSC_MAX: u64 = 1_000_000_000;
+const PIT_SPIN_CAP: u64 = 20_000_000;
+const PMT_SPIN_CAP: u64 = 50_000_000;
+/// Calibration windows; the shortest is taken (the one the host disturbed least).
+const CAL_WINDOWS: u32 = 3;
+/// sleep_ms gives up after twice its time plus this, should the scheduler's tick stop; the wfi count is the
+/// fallback when there is no rate.
+const SLEEP_SLACK_MS: u64 = 20;
+const SLEEP_WFI_CAP: u64 = 200_000_000;
+
 #[inline]
 pub fn rdtsc() -> u64 {
     // SAFETY: RDTSC is unprivileged and side-effect-free.
@@ -32,7 +44,7 @@ fn pit_10ms() -> Option<u64> {
         let mut spins = 0u64;
         while inb(0x61) & 0x20 == 0 {
             spins += 1;
-            if spins > 20_000_000 {
+            if spins > PIT_SPIN_CAP || rdtsc().wrapping_sub(t0) > CAL_TSC_MAX {
                 outb(0x61, p61);
                 return None;
             }
@@ -79,7 +91,7 @@ pub fn pm_timer_hz() -> Option<u64> {
     let mut spins = 0u64;
     while read().wrapping_sub(p0) & 0xFF_FFFF < TICKS {
         spins += 1;
-        if spins > 50_000_000 {
+        if spins > PMT_SPIN_CAP || rdtsc().wrapping_sub(t0) > CAL_TSC_MAX {
             return None; // the timer does not count
         }
     }
@@ -91,7 +103,7 @@ pub fn pm_timer_hz() -> Option<u64> {
 pub fn init() -> u64 {
     let _ = T0.compare_exchange(0, rdtsc(), Ordering::Relaxed, Ordering::Relaxed);
     let mut best = u64::MAX;
-    for _ in 0..3 {
+    for _ in 0..CAL_WINDOWS {
         if let Some(t) = pit_10ms() {
             best = best.min(t);
         }
@@ -125,11 +137,25 @@ pub fn hz() -> u64 {
     }
 }
 
+/// A deadline `us` microseconds from now in `cycles()` units, or None while the counter's rate is not known yet
+/// (the time-waits rule, the architect's sweep of 15 Nov 2026: a wait that stands for a time is bound by the
+/// counter, and its spin count is only the fallback for when there is no rate).
+pub fn deadline_us(us: u64) -> Option<u64> {
+    let hz = HZ.load(Ordering::Relaxed);
+    (hz != 0).then(|| cycles().wrapping_add(hz.saturating_mul(us) / 1_000_000))
+}
+
+/// True once `deadline` (from `deadline_us`) has passed; never true without one.
+pub fn past(deadline: Option<u64>) -> bool {
+    deadline.is_some_and(|d| cycles().wrapping_sub(d) < 1 << 62)
+}
+
 /// Block for ~`ms` milliseconds in 10 ms scheduler ticks (the ARM contract); returns the
 /// ticks that passed.
 pub fn sleep_ms(ms: u64) -> u64 {
     let start = crate::sched::ticks();
     let want = (ms + 9) / 10;
+    let until = deadline_us((ms.saturating_mul(2) + SLEEP_SLACK_MS).saturating_mul(1000));
     let mut guard = 0u64;
     loop {
         let elapsed = crate::sched::ticks().wrapping_sub(start);
@@ -138,7 +164,7 @@ pub fn sleep_ms(ms: u64) -> u64 {
         }
         crate::cpu::wfi();
         guard += 1;
-        if guard > 200_000_000 {
+        if past(until) || guard > SLEEP_WFI_CAP {
             return crate::sched::ticks().wrapping_sub(start);
         }
     }

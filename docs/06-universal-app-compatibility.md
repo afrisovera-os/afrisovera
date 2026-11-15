@@ -1,13 +1,34 @@
-# 06 — Universal App Compatibility (Android + iOS + Windows)
+# 06: Universal App Compatibility (Linux + Windows + macOS + Android + iOS)
 
 > *"Run apps from every platform"* is the most seductive idea in OS design — and the most dangerous. This doc gives the real architecture, the honest feasibility per platform, and the strategic trap that killed BlackBerry. Read the warning at the end before believing the dream.
+
+> **Amendment, 14 Nov 2026 (the owner's decisions).** Linux and macOS
+> programs join this document, and the order is decided:
+> 1. **Linux programs first** (stage L): command-line programs, then ordinary ones with libraries and threads, then
+>    windowed ones. It is the smallest, best documented surface, and it builds the shared pieces every other bridge
+>    needs: the program loader, the bridge protocol, files, threads and the window.
+> 2. **Windows programs next, through our own layer** (stage W, Daraja·Dirisha): console programs first, then simple
+>    windowed ones. **Our own, not Wine:** the owner chose "only our own layer", written from public documents under
+>    the clean-room rule below. It is honestly smaller than Wine and
+>    grows program by program.
+> 3. **macOS command-line programs last** (stage M), also through our own layer, not Darling. Windowed macOS apps are
+>    not promised; iOS App Store apps stay ruled out, as below.
+>
+> **The protocol, for every stage:** the kernel marks a foreign process and hands its system calls to a bridge
+> server, a sandboxed user program that answers them with AfriSovera's own services. The kernel stays small, and a
+> bridge bug cannot take the machine down. **The proof, for every stage:** real programs, built from source by us,
+> run on AfriSovera and on their home system in the cloud, and their outputs must match. The Linux stage is also the
+> road to Daraja·Android, whose runtime is Linux programs. The rule at the end of this document stays: a bridge, not
+> a destination.
 
 ## The honest feasibility matrix
 
 | Platform | Binary apps (download & run as-is) | How | Reality |
 |---|---|---|---|
+| **Linux (added 14 Nov 2026)** | Yes, in stages | Our own Linux call server (stage L), the shape FreeBSD and WSL1 proved | Best documented; first, and the base for the others and for Android. |
 | **Android** | ✅ **Yes** | ART/AOSP runtime embedded (Waydroid/Anbox precedent) | Mature, legal (Apache AOSP), proven. The easy one. |
-| **Windows (Win32)** | ⚠️ **Technically yes** | Wine-style API translation + x86→ARM CPU emulation (Box64/FEX) | Clean-room legal; **heavy**, desktop-UX, x86 emulation tax. Fine on a desktop/convergence mode, awkward on a 2 GB phone. |
+| **Windows (Win32)** | ⚠️ **Technically yes** | Our own clean-room layer, no Wine (owner, 14 Nov 2026); x86 emulation on ARM only in a later plan | Clean-room legal; **heavy**, desktop-UX, x86 emulation tax. Fine on a desktop/convergence mode, awkward on a 2 GB phone. |
+| **macOS (added 14 Nov 2026)** | Command-line programs only | Our own clean-room layer, no Darling (stage M) | Windowed apps depend on Apple's closed frameworks: not promised. |
 | **iOS (App Store)** | ❌ **No — legally & practically blocked** | Would need to defeat FairPlay DRM + reimplement all Apple frameworks | DRM-encrypted, code-signed, Apple-SDK-forbidden. **Cannot ship App Store binaries.** Only source-recompile or clean-room reimplementation of *unencrypted* apps is possible — and limited. |
 
 So the truthful headline is: **Android: yes. Windows: yes-but-heavy. iOS App Store apps: no.** Anything that claims transparent iOS App Store support on a non-Apple phone is either lying or describing piracy that will get sued out of existence.
@@ -23,7 +44,7 @@ All foreign-platform support lives under **Daraja** (Swahili: *bridge*). Each fo
  ┌────────────┐   ┌──────────────┐   ┌──────────────────┐
  │ Daraja·    │   │ Daraja·Tofaa │   │ Daraja·Dirisha   │
  │ Android    │   │ (iOS, ltd.)  │   │ (Windows/Win32)  │
- │ ART+AOSP   │   │ Darwin+UIKit │   │ Wine + Box64/FEX │
+ │ ART+AOSP   │   │ Darwin+UIKit │   │ our own layer    │
  │ runtime    │   │ reimpl.      │   │ x86→ARM          │
  └─────┬──────┘   └──────┬───────┘   └────────┬─────────┘
        └─────────────────┼────────────────────┘
@@ -59,16 +80,32 @@ Each bridge sandboxes the foreign app and translates its system calls onto AfriS
 
 ## Daraja·Dirisha (Windows — feasible but mismatched)
 "Dirisha" = *window* in Swahili.
-- **Win32 apps** run via a **Wine-style clean-room reimplementation** of the Windows API (legal — Wine has done this for 20+ years) **plus x86/x64→ARM64 CPU translation** (Box64/FEX-Emu-class), since phones are ARM and most Windows apps are x86.
+- **Win32 apps** run via **our own clean-room reimplementation** of the Windows API (not Wine: the owner's decision, 14 Nov 2026; see the clean-room rule) (legal, as 20+ years of independent reimplementations show) **plus x86/x64→ARM64 CPU translation** (Box64/FEX-Emu-class), since phones are ARM and most Windows apps are x86.
 - **Two real costs:** (1) **performance** — API translation *and* CPU emulation stacked is heavy; rough on a 2 GB ARM phone. (2) **UX mismatch** — Win32 apps assume mouse, keyboard, resizable windows, big screens. They're miserable on a 6-inch touchscreen.
 - **Where it makes sense:** AfriSovera's **desktop/convergence mode** (phone → external monitor + keyboard, the "your phone is your PC" play that's genuinely valuable in markets where the phone is the only computer). On that mode, Dirisha lets a user run a needed legacy Windows tool. As a phone-touch experience, deprioritize it.
 
 ---
 
+## The clean-room rule for our own layers (14 Nov 2026)
+
+Every line of the Linux, Windows and macOS layers is ours, and provably so.
+- **Read and cite, never copy:** Microsoft's public documentation and published specifications (Win32 API, C runtime,
+  PE/COFF, the calling conventions); the MinGW-w64 headers for numeric constants and structure layouts only; books
+  that explain Windows behaviour, for understanding; the Linux man pages, POSIX, the published ABIs and the ELF
+  specification; FreeBSD's Linux layer (BSD licence) for facts; Apple's public documentation and the Mach-O format,
+  and Apple's open-source releases for constants and formats only.
+- **Never opened by anyone who writes layer code:** Wine, ReactOS and Darling source; Microsoft's or Apple's closed
+  system files (no disassembling, decompiling or stepping into them); any leaked source; the Linux kernel's source.
+- **Behaviour is learned black box:** our own test programs (or open-source ones built by us) run on real Windows,
+  Linux and macOS in cloud runners, and their outputs are the reference. Tests are compared against the real system,
+  never against another reimplementation.
+- **Each file of a layer starts with the documents it was written from**, and the release scan fails on Wine's,
+  ReactOS's or Microsoft's copyright lines anywhere in the tree.
+
 ## Performance & battery reality (don't forget the 2 GB phone)
 Our design center is a cheap, low-RAM, battery-constrained device. Compatibility layers cost RAM, CPU, storage, and battery:
 - **Android**: moderate cost; acceptable.
-- **Windows (Wine + x86 emulation)**: high cost; realistic only on better hardware / desktop mode.
+- **Windows (our own layer, plus x86 emulation on ARM)**: high cost; realistic only on better hardware / desktop mode.
 - **iOS framework reimplementation**: high cost *and* incomplete.
 
 So compatibility is **tiered by device capability**: every AfriSovera phone runs native + Web + Android; Windows/iOS bridges are opt-in modules for capable devices and convergence mode, not baseline promises on a $40 handset.
@@ -84,6 +121,8 @@ So compatibility is **tiered by device capability**: every AfriSovera phone runs
 
 ## Bottom line
 - **Android — yes**, and it's enough to solve the day-one app problem.
-- **Windows — yes via Wine + x86→ARM**, but treat it as a convergence/desktop feature for capable devices, not a phone-touch promise.
+- **Linux: yes, first**, through our own Linux call server, proven program by program.
+- **Windows: yes, through our own layer (not Wine)**, but treat it as a convergence/desktop feature for capable devices, not a phone-touch promise.
+- **macOS: command-line programs, last**, through our own layer (not Darling).
 - **iOS — no binary/App Store support is legally or practically possible.** Offer a **source-recompile SDK** and a limited clean-room runtime for developer-provided builds, and be honest that App Store apps will not run.
 - And above all: **keep the bridges a bridge.** The day developers stop building native AfriSovera apps because "Android/Windows already runs," the OS is dead — it just doesn't know it yet.

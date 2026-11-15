@@ -107,6 +107,10 @@ static mut PRPL: [PrpList; NFLY] = [const { PrpList([0; 512]) }; NFLY];
 const MAX_XFER: u64 = 2 << 20;
 /// The controller has a volatile write cache (Identify Controller VWC bit 0): a save ends with a Flush.
 static mut VWC: bool = false;
+/// AFR-0011 V2: a write that failed since the last `blk_flush` (sticky, the architect's rule 1).
+static mut WERR: bool = false;
+/// How long `wait` polls before a command counts as unanswered: 5 s, 30 s for blk_flush's Flush (rule 2).
+static mut WAIT_MS: u64 = 5000;
 /// Queue counters: most commands in flight at once, commands with a PRP list, largest transfer (bytes),
 /// Flushes, late completions set aside, completions dropped by `nvmetest drop`.
 static mut QSTATS: (u32, u64, u64, u64, u64, u64) = (0, 0, 0, 0, 0, 0);
@@ -255,7 +259,8 @@ fn wait(mut done: impl FnMut() -> bool) -> bool {
         if done() {
             return true;
         }
-        if crate::timer::cycles().wrapping_sub(t0) / (hz / 1000).max(1) > 5000 {
+        // SAFETY: scalar read.
+        if crate::timer::cycles().wrapping_sub(t0) / (hz / 1000).max(1) > unsafe { WAIT_MS } {
             return false;
         }
         core::hint::spin_loop();
@@ -286,10 +291,12 @@ fn submit(q: u64, mut cmd: [u32; 16]) -> Option<u16> {
         for _ in 0..QN {
             let slot = cq.add(pair.head);
             let phase = pair.phase;
-            if !wait(|| (read_volatile(slot)[3] >> 16) & 1 == phase) {
+            if !wait(|| (read_volatile((slot as *const u32).add(3)) >> 16) & 1 == phase) {
                 crate::kprintln!("[nvme] queue {} command {:#x} timed out", q, cmd[0] & 0xFF);
                 return None;
             }
+            // the phase bit was read alone above; the rest only after it (the ring audit, 14 Nov 2026)
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
             let e = read_volatile(slot);
             pair.head += 1;
             if pair.head == QN {
@@ -654,14 +661,16 @@ fn submit_io(cmds: &mut [[u32; 16]], res: &mut [Option<u16>]) -> bool {
             let slot = cq.add(pair.head);
             let phase = pair.phase;
             let ok = if sleep {
-                wait(|| crate::cpu::idle_until(|| (read_volatile(slot)[3] >> 16) & 1 == phase))
+                wait(|| crate::cpu::idle_until(|| (read_volatile((slot as *const u32).add(3)) >> 16) & 1 == phase))
             } else {
-                wait(|| (read_volatile(slot)[3] >> 16) & 1 == phase)
+                wait(|| (read_volatile((slot as *const u32).add(3)) >> 16) & 1 == phase)
             };
             if !ok {
                 crate::kprintln!("[nvme] {} of {} command(s) sent together got no answer", left, n);
                 return false;
             }
+            // the phase bit was read alone above; the rest only after it (the ring audit, 14 Nov 2026)
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
             let e = read_volatile(slot);
             pair.head += 1;
             if pair.head == QN {
@@ -827,6 +836,43 @@ pub fn settle() -> bool {
     flush() && cache_flush()
 }
 
+/// AFR-0011 V2 `blk_flush`: the gathered writes out, then the Flush (when the controller has a volatile write
+/// cache), with 30 s for the Flush to answer before the reset path runs (`run_io`: reset, send once more, then
+/// false). False when any write failed since the last call, even if the Flush succeeds (sticky). The test rig's
+/// `blkflush-hang` makes the Flush wait out its window unanswered and go down the same path.
+pub fn blk_flush() -> bool {
+    let sent = flush();
+    let cached = if crate::virtio::flush_hang_test() {
+        hang_then_reset()
+    } else {
+        // SAFETY: scalar statics, kernel context, one command in flight.
+        unsafe { WAIT_MS = 30_000 };
+        let c = cache_flush();
+        // SAFETY: as above.
+        unsafe { WAIT_MS = 5000 };
+        c
+    };
+    // SAFETY: scalar statics.
+    unsafe {
+        let ok = sent && cached && !WERR;
+        WERR = false;
+        ok
+    }
+}
+
+/// The test rig's hang: a Flush that never answers. Waits the 30 s window, then resets the controller as an
+/// unanswered command does, and fails.
+fn hang_then_reset() -> bool {
+    // SAFETY: scalar statics.
+    unsafe { WAIT_MS = 30_000 };
+    let _ = wait(|| false);
+    // SAFETY: as above.
+    unsafe { WAIT_MS = 5000 };
+    crate::kprintln!("[nvme] the Flush got no answer in 30 s (test rig)");
+    let _ = restart("a Flush got no answer");
+    false
+}
+
 /// `nvmetest prp`: blocks from an odd block read into a buffer at page offset 512 (so the first PRP
 /// entry starts inside its page and the rest go in a PRP list) must equal the same blocks read one at a
 /// time. `nvmetest drop`: lose the next completion on purpose (the reset path, then the resend). Reads only.
@@ -985,6 +1031,9 @@ fn flush() -> bool {
             };
             ra_update(at + j, s, good);
             ok = ok && good;
+        }
+        if !ok {
+            WERR = true;
         }
         ok
     }
@@ -1162,6 +1211,9 @@ pub fn write_sector(n: u64, buf: &[u8; 512]) -> bool {
             if last {
                 ok = cache_flush() && ok; // the save is on the medium, not only in the disk's cache
             }
+        }
+        if !(ok && got) {
+            WERR = true; // AFR-0011 V2: remembered until the next blk_flush
         }
         ok && got
     }

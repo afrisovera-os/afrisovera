@@ -46,7 +46,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     has "$B1" 'tablecheck: nvme: unchanged since the backup \(67 sector\(s\)\)' || _f "boot 2: NVMe not unchanged"
     has "$B1" 'tablecheck: sata port 2: unchanged since the backup \(1 sector\(s\)\)' || _f "boot 2: SATA port 2 not unchanged"
     has "$B1" 'tablecheck: sata port 3: unchanged since the backup \(34 sector\(s\)\)' || _f "boot 2: SATA port 3 not unchanged"
-    printf '%s\n' "$B1" | grep -aqE '(nvme|port [23]): (CHANGED|.*damaged|that disk)' && _f "boot 2: a disk that did not change was reported"
+    grep -aqE '(nvme|port [23]): (CHANGED|.*damaged|that disk)' <<< "$B1" && _f "boot 2: a disk that did not change was reported"
     has "$C1" 'tablecheck: nvme: CHANGED since the backup \(first difference in sector 1\); back it up again before any install' ||
         _f "boot 3: the renamed GPT entry (header CRC, sector 1) was not caught"
     has "$C1" 'tablecheck: sata port 2: the copy on the USB stick is damaged \(data CRC\)' ||
@@ -61,7 +61,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     for L in "$A" "$B" "$C" "$D"; do
         has "$L" 'harness: disk images unchanged' || _f "an internal disk image changed during a boot (or the check is missing)"
     done
-    if printf '%s\n' "$A" "$B" "$C" "$D" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci|xhci)\] .*(failed|timed out)|FAILED'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci|xhci)\] .*(failed|timed out)|FAILED' <<< "$A"$'\n'"$B"$'\n'"$C"$'\n'"$D"; then
         _f "the kernel panicked or a disk command failed"
     fi
     return "$fail"

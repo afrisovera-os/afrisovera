@@ -14,6 +14,7 @@
 //! speaker checks it.
 
 use core::sync::atomic::{AtomicU8, Ordering};
+use super::locale::Form;
 
 /// Is a string checked by a fluent speaker, or a machine draft? Every non-English string carries one.
 #[allow(dead_code)]
@@ -146,8 +147,8 @@ catalogue! {
     SetNoAddress = "Link up, no address yet",
     SetConnected = "   Connected  {0}",
     SetSystem = "System",
-    SetCores = "{0} core(s), {1} MiB memory",
-    SetBooted = "Booted {0} time(s), up {1} s",
+    SetCores = "one:{0#} core, {1} memory|other:{0#} cores, {1} memory",
+    SetBooted = "one:Booted {0#} time, up {1} s|other:Booted {0#} times, up {1} s",
     // About
     AboutMotto = "Own your device - own your future",
     AboutKernel = "Kernel",
@@ -158,26 +159,24 @@ catalogue! {
     AboutDesktopIs = "Tonga, Sovereign UI",
     AboutArm = "ARM64 (phone)",
     AboutPc = "x86-64 (PC)",
-    AboutDeviceIs = "{0}, {1} core(s)",
-    AboutMemoryIs = "{0} MiB, up {1} s",
+    AboutDeviceIs = "one:{0}, {1#} core|other:{0}, {1#} cores",
+    AboutMemoryIs = "{0}, up {1} s",
     // Files
     FilesName = "Name",
     FilesSize = "Size",
     FilesNone = "No files yet",
-    FilesBytes = "{0} bytes",
+    FilesBytes = "one:{0#} byte|other:{0#} bytes",
     FilesWasm = "WebAssembly program",
     FilesRunIt = "Run it from Terminal:",
     FilesBinary = "Binary data",
     FilesSelect = "Select a file",
     // the clock and power on the Spine and the bar
     ClockUtc = "UTC",
-    ClockAm = "am",
-    ClockPm = "pm",
     PowerAc = "AC",
     // the Circle
     CircleNoNet = "No network",
     CircleNoAddress = "Link up, no address",
-    CircleSummary = "{0},  {1} MiB,  {2} files",
+    CircleSummary = "one:{0},  {1},  {2#} file|other:{0},  {1},  {2#} files",
     CircleDevice = "This device",
     CircleUp = "Up {0} s.  Super or Esc closes the Circle.",
     // notices and the title bar
@@ -189,9 +188,8 @@ catalogue! {
     // the language switch (stage 2)
     SetLanguage = "Language",
     SetDraft = "draft",
-    // the Terminal scrolled back (afriui.md section 28; the owner's HP, 14 Nov); English only for now
-    TermBackOne = "1 line back, any key returns",
-    TermBack = "{0} lines back, any key returns",
+    // the Terminal scrolled back (afriui.md section 28; the owner's HP, 14 Nov)
+    TermBack = "one:{0#} line back, any key returns|other:{0#} lines back, any key returns",
     // the power panel on the Spine (the owner's HP, 14 Nov: no way to shut down from the desk); English only for now
     PowerTitle = "Power",
     PowerOff = "Shut down",
@@ -246,9 +244,19 @@ fn entry(l: Lang, m: Msg) -> (&'static str, Status) {
 /// The text of an id in a given language, falling back to English: when the language has no text yet, and for a
 /// safety word that is still a draft.
 pub fn text_in(l: Lang, m: Msg) -> &'static [u8] {
+    source(l, m).1
+}
+
+/// The text of an id in language `l` and the language it really is in: English when `l` has no text yet, and for a
+/// safety word that is still a draft (all its plural forms share one status, so one Draft form means English).
+/// Numbers and plural forms follow the language of the text, so an English fallback reads as English throughout.
+pub fn source(l: Lang, m: Msg) -> (Lang, &'static [u8]) {
     let (own, st) = entry(l, m);
-    let draft_safety = is_safety(m) && st != Status::Checked;
-    (if own.is_empty() || draft_safety { EN[m as usize] } else { own }).as_bytes()
+    if own.is_empty() || (is_safety(m) && st != Status::Checked) {
+        (Lang::En, EN[m as usize].as_bytes())
+    } else {
+        (l, own.as_bytes())
+    }
 }
 
 /// A language's table, indexed by id, from a list of (id, text, status): an id the list leaves out is "" (shown in
@@ -289,7 +297,7 @@ static TW: [(&str, Status); COUNT] = table(&[
     (Msg::SetNoAddress, "Ɛkeka ho, nanso address nni hɔ", Draft),
     (Msg::SetConnected, "   Ɛkeka ho  {0}", Draft),
     (Msg::SetSystem, "Sistem", Draft),
-    (Msg::SetCores, "Core {0}, memory {1} MiB", Draft),
+    (Msg::SetCores, "Core {0}, memory {1}", Draft),
     (Msg::SetBooted, "Wɔabue no mpɛn {0}, ɛreyɛ adwuma {1} s", Draft),
     (Msg::AboutMotto, "Wo afiri yɛ wo dea, wo daakye yɛ wo dea", Draft),
     (Msg::AboutKernel, "Kernel", Draft),
@@ -301,7 +309,7 @@ static TW: [(&str, Status); COUNT] = table(&[
     (Msg::AboutArm, "ARM64 (fon)", Draft),
     (Msg::AboutPc, "x86-64 (kɔmputa)", Draft),
     (Msg::AboutDeviceIs, "{0}, core {1}", Draft),
-    (Msg::AboutMemoryIs, "{0} MiB, adwuma {1} s", Draft),
+    (Msg::AboutMemoryIs, "{0}, adwuma {1} s", Draft),
     (Msg::FilesName, "Din", Draft),
     (Msg::FilesSize, "Kɛseɛ", Draft),
     (Msg::FilesNone, "Fael biara nni hɔ", Draft),
@@ -313,7 +321,7 @@ static TW: [(&str, Status); COUNT] = table(&[
     (Msg::ClockUtc, "UTC", Draft),
     (Msg::CircleNoNet, "Nkitahodi nni hɔ", Draft),
     (Msg::CircleNoAddress, "Ɛkeka ho, address nni hɔ", Draft),
-    (Msg::CircleSummary, "{0},  {1} MiB,  fael {2}", Draft),
+    (Msg::CircleSummary, "{0},  {1},  fael {2}", Draft),
     (Msg::CircleDevice, "Afiri yi", Draft),
     (Msg::CircleUp, "Adwuma {0} s.  Super anaa Esc to mu.", Draft),
     (Msg::NotesTitle, "Nkra", Draft),
@@ -346,27 +354,25 @@ static ES: [(&str, Status); COUNT] = table(&[
     (Msg::SetNoAddress, "Enlace, no hay dirección todavía", Draft),
     (Msg::SetConnected, "   Conectado {0}", Draft),
     (Msg::SetSystem, "Sistema", Draft),
-    (Msg::SetCores, "{0} núcleo(s), {1} MiB memoria", Draft),
-    (Msg::SetBooted, "Arrancado {0} tiempo(s), hasta {1} s", Draft),
+    (Msg::SetCores, "one:{0#} núcleo, {1} de memoria|many:{0#} de núcleos, {1} de memoria|other:{0#} núcleos, {1} de memoria", Draft),
+    (Msg::SetBooted, "one:Iniciado {0#} vez, activo {1} s|many:Iniciado {0#} de veces, activo {1} s|other:Iniciado {0#} veces, activo {1} s", Draft),
     (Msg::AboutMotto, "Posee tu dispositivo - posee tu futuro", Draft),
     (Msg::AboutDesktop, "Escritorio", Draft),
     (Msg::AboutDevice, "Dispositivo", Draft),
     (Msg::AboutMemory, "Memoria", Draft),
-    (Msg::AboutDeviceIs, "{0}, {1} núcleo(s)", Draft),
-    (Msg::AboutMemoryIs, "{0} MiB, up {1} s", Draft),
+    (Msg::AboutDeviceIs, "one:{0}, {1#} núcleo|many:{0}, {1#} de núcleos|other:{0}, {1#} núcleos", Draft),
+    (Msg::AboutMemoryIs, "{0}, activo {1} s", Draft),
     (Msg::FilesName, "Nombre", Draft),
     (Msg::FilesSize, "Tamaño", Draft),
     (Msg::FilesNone, "Aún no hay archivos.", Draft),
-    (Msg::FilesBytes, "{0} bytes", Draft),
+    (Msg::FilesBytes, "one:{0#} byte|many:{0#} de bytes|other:{0#} bytes", Draft),
     (Msg::FilesWasm, "Programa WebAssembly", Draft),
     (Msg::FilesRunIt, "Ejecutarlo desde Terminal:", Draft),
     (Msg::FilesBinary, "Datos binarios", Draft),
     (Msg::FilesSelect, "Seleccione un archivo", Draft),
-    (Msg::ClockAm, "- Sí.", Draft),
-    (Msg::ClockPm, "pm", Draft),
     (Msg::CircleNoNet, "Sin red", Draft),
     (Msg::CircleNoAddress, "Enlace, no hay dirección", Draft),
-    (Msg::CircleSummary, "{0}, {1} MiB, {2} archivos", Draft),
+    (Msg::CircleSummary, "one:{0}, {1}, {2#} archivo|many:{0}, {1}, {2#} de archivos|other:{0}, {1}, {2#} archivos", Draft),
     (Msg::CircleDevice, "Este dispositivo", Draft),
     (Msg::CircleUp, "Up {0} s. Super o Esc cierra el círculo.", Draft),
     (Msg::NotesTitle, "Notificaciones", Draft),
@@ -376,14 +382,13 @@ static ES: [(&str, Status); COUNT] = table(&[
     (Msg::TitleAnyway, "Cierra de todos modos.", Draft),
     (Msg::SetLanguage, "Idioma", Draft),
     (Msg::SetDraft, "proyecto", Draft),
-    (Msg::TermBackOne, "1 línea atrás, cualquier clave devuelve", Draft),
-    (Msg::TermBack, "{0} líneas atrás, cualquier clave devuelve", Draft),
+    (Msg::TermBack, "one:{0#} línea atrás, cualquier tecla vuelve|many:{0#} de líneas atrás, cualquier tecla vuelve|other:{0#} líneas atrás, cualquier tecla vuelve", Draft),
 ]);
 
 /// French (Français), machine drafts on 14 Nov 2026 by Helsinki-NLP/opus-mt-en-fr at revision dd7f6540a7a4 (licence apache-2.0), made in the cloud by
 /// tools/lang/draft.py. Every string is a Draft until a fluent speaker checks it; the safety words are drawn in
 /// English until then whatever this table says.
-/// Left out (too wide for their place on the desk; the English shows until a speaker gives a shorter word): AboutMemoryIs, CircleUp, FilesRunIt, FilesWasm, SetPointer, SetTouch, TermBack, TermBackOne.
+/// Left out (too wide for their place on the desk; the English shows until a speaker gives a shorter word): AboutMemoryIs, CircleUp, FilesRunIt, FilesWasm, SetPointer, SetTouch, TermBack.
 static FR: [(&str, Status); COUNT] = table(&[
     (Msg::AppFiles, "Fichiers", Draft),
     (Msg::AppSettings, "Paramètres", Draft),
@@ -400,24 +405,22 @@ static FR: [(&str, Status); COUNT] = table(&[
     (Msg::SetNoAddress, "Lien vers le haut, pas d'adresse pour l'instant", Draft),
     (Msg::SetConnected, "   Connecté {0}", Draft),
     (Msg::SetSystem, "Système", Draft),
-    (Msg::SetCores, "{0} cœur(s), {1} Mio de mémoire", Draft),
+    (Msg::SetCores, "one:{0#} cœur, {1} de mémoire|many:{0#} de cœurs, {1} de mémoire|other:{0#} cœurs, {1} de mémoire", Draft),
     (Msg::SetBooted, "Démarrage {0} fois, jusqu'à {1} s", Draft),
     (Msg::AboutMotto, "Posséder votre appareil - posséder votre futur", Draft),
     (Msg::AboutDesktop, "Bureau", Draft),
     (Msg::AboutDevice, "Périphérique", Draft),
     (Msg::AboutMemory, "Mémoire", Draft),
-    (Msg::AboutDeviceIs, "{0}, {1} cœur(s)", Draft),
+    (Msg::AboutDeviceIs, "one:{0}, {1#} cœur|many:{0}, {1#} de cœurs|other:{0}, {1#} cœurs", Draft),
     (Msg::FilesName, "Dénomination", Draft),
     (Msg::FilesSize, "Taille", Draft),
     (Msg::FilesNone, "Pas encore de fichiers", Draft),
-    (Msg::FilesBytes, "{0} octets", Draft),
+    (Msg::FilesBytes, "one:{0#} octet|many:{0#} d'octets|other:{0#} octets", Draft),
     (Msg::FilesBinary, "Données binaires", Draft),
     (Msg::FilesSelect, "Sélectionnez un fichier", Draft),
-    (Msg::ClockAm, "Je suis", Draft),
-    (Msg::ClockPm, "pm", Draft),
     (Msg::CircleNoNet, "Pas de réseau", Draft),
     (Msg::CircleNoAddress, "Lien vers le haut, pas d'adresse", Draft),
-    (Msg::CircleSummary, "{0}, {1} fichiers MiB, {2} fichiers", Draft),
+    (Msg::CircleSummary, "one:{0}, {1}, {2#} fichier|many:{0}, {1}, {2#} de fichiers|other:{0}, {1}, {2#} fichiers", Draft),
     (Msg::CircleDevice, "Ce dispositif", Draft),
     (Msg::NotesTitle, "Notifications", Draft),
     (Msg::NotesNone, "Rien de nouveau", Draft),
@@ -431,7 +434,7 @@ static FR: [(&str, Status); COUNT] = table(&[
 /// Portuguese (Português), machine drafts on 14 Nov 2026 by Helsinki-NLP/opus-mt-tc-big-en-pt at revision 9f2863d807ec (licence cc-by-4.0), made in the cloud by
 /// tools/lang/draft.py. Every string is a Draft until a fluent speaker checks it; the safety words are drawn in
 /// English until then whatever this table says.
-/// Left out (too wide for their place on the desk; the English shows until a speaker gives a shorter word): AppSettings, SetPointer.
+/// Left out (too wide for their place on the desk; the English shows until a speaker gives a shorter word): AppSettings, SetPointer, AboutDeviceIs.
 static PT: [(&str, Status); COUNT] = table(&[
     (Msg::AppFiles, "Ficheiros", Draft),
     (Msg::AppAbout, "Acerca", Draft),
@@ -448,27 +451,24 @@ static PT: [(&str, Status); COUNT] = table(&[
     (Msg::SetNoAddress, "Link up, nenhum endereço ainda", Draft),
     (Msg::SetConnected, "   Conectado {0}", Draft),
     (Msg::SetSystem, "Sistema", Draft),
-    (Msg::SetCores, "{0} núcleo(s), {1} MiB memória", Draft),
-    (Msg::SetBooted, "Booted {0} vez(s), até {1} s", Draft),
+    (Msg::SetCores, "one:{0#} núcleo, {1} de memória|many:{0#} de núcleos, {1} de memória|other:{0#} núcleos, {1} de memória", Draft),
+    (Msg::SetBooted, "one:Iniciado {0#} vez, ativo há {1} s|many:Iniciado {0#} de vezes, ativo há {1} s|other:Iniciado {0#} vezes, ativo há {1} s", Draft),
     (Msg::AboutMotto, "Possuir o seu dispositivo - possuir o seu futuro", Draft),
     (Msg::AboutDesktop, "Área de trabalho", Draft),
     (Msg::AboutDevice, "Dispositivo", Draft),
     (Msg::AboutMemory, "Memória", Draft),
-    (Msg::AboutDeviceIs, "{0}, {1} núcleo(s)", Draft),
-    (Msg::AboutMemoryIs, "{0} MiB, até {1} s", Draft),
+    (Msg::AboutMemoryIs, "{0}, ativo {1} s", Draft),
     (Msg::FilesName, "Nome", Draft),
     (Msg::FilesSize, "Tamanho", Draft),
     (Msg::FilesNone, "Nenhum arquivo ainda", Draft),
-    (Msg::FilesBytes, "{0} bytes", Draft),
+    (Msg::FilesBytes, "one:{0#} byte|many:{0#} de bytes|other:{0#} bytes", Draft),
     (Msg::FilesWasm, "Programa WebAssembly", Draft),
     (Msg::FilesRunIt, "Execute-o a partir do terminal:", Draft),
     (Msg::FilesBinary, "Dados binários", Draft),
     (Msg::FilesSelect, "Selecione um arquivo", Draft),
-    (Msg::ClockAm, "am", Draft),
-    (Msg::ClockPm, "pm", Draft),
     (Msg::CircleNoNet, "Nenhuma rede", Draft),
     (Msg::CircleNoAddress, "Ligar, sem endereço", Draft),
-    (Msg::CircleSummary, "{0}, {1} MiB, {2} arquivos", Draft),
+    (Msg::CircleSummary, "one:{0}, {1}, {2#} arquivo|many:{0}, {1}, {2#} de arquivos|other:{0}, {1}, {2#} arquivos", Draft),
     (Msg::CircleDevice, "Este dispositivo", Draft),
     (Msg::CircleUp, "Até {0} s. Super ou Esc fecha o Círculo.", Draft),
     (Msg::NotesTitle, "Notificações", Draft),
@@ -478,8 +478,7 @@ static PT: [(&str, Status); COUNT] = table(&[
     (Msg::TitleAnyway, "Fechar de qualquer maneira", Draft),
     (Msg::SetLanguage, "Língua", Draft),
     (Msg::SetDraft, "projecto", Draft),
-    (Msg::TermBackOne, "1 linha para trás, qualquer chave retorna", Draft),
-    (Msg::TermBack, "{0} linhas para trás, qualquer chave retorna", Draft),
+    (Msg::TermBack, "one:{0#} linha atrás, qualquer tecla volta|many:{0#} de linhas atrás, qualquer tecla volta|other:{0#} linhas atrás, qualquer tecla volta", Draft),
 ]);
 
 /// Indonesian (Bahasa Indonesia), machine drafts on 14 Nov 2026 by Helsinki-NLP/opus-mt-en-id at revision 6e4c52d61a6b (licence apache-2.0), made in the cloud by
@@ -503,13 +502,13 @@ static ID: [(&str, Status); COUNT] = table(&[
     (Msg::SetNoAddress, "Link up, tidak ada alamat belum", Draft),
     (Msg::SetConnected, "   Terhubung {0}", Draft),
     (Msg::SetSystem, "Sistem", Draft),
-    (Msg::SetCores, "{0} core 1936s), {1} MiB memori", Draft),
-    (Msg::SetBooted, "Ditendang {0} kali di tahun 1964s), naik {1} s", Draft),
+    (Msg::SetCores, "{0} inti, memori {1}", Draft),
+    (Msg::SetBooted, "Dinyalakan {0} kali, aktif {1} s", Draft),
     (Msg::AboutDesktop, "Desktop", Draft),
     (Msg::AboutDevice, "Perangkat", Draft),
     (Msg::AboutMemory, "Memori", Draft),
-    (Msg::AboutDeviceIs, "{0}, {1} core 1932s)", Draft),
-    (Msg::AboutMemoryIs, "{0} MiB, naik {1} s", Draft),
+    (Msg::AboutDeviceIs, "{0}, {1} inti", Draft),
+    (Msg::AboutMemoryIs, "{0}, aktif {1} s", Draft),
     (Msg::FilesName, "Nama", Draft),
     (Msg::FilesSize, "Ukuran", Draft),
     (Msg::FilesNone, "Belum ada berkas", Draft),
@@ -518,11 +517,9 @@ static ID: [(&str, Status); COUNT] = table(&[
     (Msg::FilesRunIt, "Jalankan dari Terminal:", Draft),
     (Msg::FilesBinary, "Data binari", Draft),
     (Msg::FilesSelect, "Pilih sebuah berkas", Draft),
-    (Msg::ClockAm, "am", Draft),
-    (Msg::ClockPm, "pm", Draft),
     (Msg::CircleNoNet, "Tidak ada jaringan", Draft),
     (Msg::CircleNoAddress, "Link up, tidak ada alamat", Draft),
-    (Msg::CircleSummary, "{0}, {1} MiB, {2} file", Draft),
+    (Msg::CircleSummary, "{0}, {1}, {2} file", Draft),
     (Msg::CircleDevice, "Perangkat ini", Draft),
     (Msg::NotesTitle, "Pemberitahuan", Draft),
     (Msg::NotesNone, "Tidak ada yang baru", Draft),
@@ -531,14 +528,13 @@ static ID: [(&str, Status); COUNT] = table(&[
     (Msg::TitleAnyway, "Tetap tutup", Draft),
     (Msg::SetLanguage, "Bahasa", Draft),
     (Msg::SetDraft, "draft", Draft),
-    (Msg::TermBackOne, "1 baris kembali, setiap kunci kembali", Draft),
     (Msg::TermBack, "{0} baris kembali, setiap kunci kembali", Draft),
 ]);
 
 /// German (Deutsch), machine drafts on 14 Nov 2026 by Helsinki-NLP/opus-mt-en-de at revision 6183067f769a (licence cc-by-4.0), made in the cloud by
 /// tools/lang/draft.py. Every string is a Draft until a fluent speaker checks it; the safety words are drawn in
 /// English until then whatever this table says.
-/// Left out (too wide for their place on the desk; the English shows until a speaker gives a shorter word): CircleUp, ClockPm, FilesRunIt, SetTouch, TermBack, TermBackOne.
+/// Left out (too wide for their place on the desk; the English shows until a speaker gives a shorter word): CircleUp, FilesRunIt, SetTouch, TermBack.
 static DE: [(&str, Status); COUNT] = table(&[
     (Msg::AppFiles, "Dateien", Draft),
     (Msg::AppSettings, "Einstellungen", Draft),
@@ -556,25 +552,24 @@ static DE: [(&str, Status); COUNT] = table(&[
     (Msg::SetNoAddress, "Link up, noch keine Adresse", Draft),
     (Msg::SetConnected, "   Verbunden {0}", Draft),
     (Msg::SetSystem, "System", Draft),
-    (Msg::SetCores, "{0} Kern(e), {1} MiB-Speicher", Draft),
-    (Msg::SetBooted, "Gebootet {0} Zeit(e), bis {1} s", Draft),
+    (Msg::SetCores, "one:{0#} Kern, {1} Speicher|other:{0#} Kerne, {1} Speicher", Draft),
+    (Msg::SetBooted, "one:{0#} Start, seit {1} s aktiv|other:{0#} Starts, seit {1} s aktiv", Draft),
     (Msg::AboutMotto, "Besitzen Sie Ihr Gerät - besitzen Sie Ihre Zukunft", Draft),
     (Msg::AboutDesktop, "Arbeitsfläche", Draft),
     (Msg::AboutDevice, "Gerät", Draft),
     (Msg::AboutMemory, "Speicher", Draft),
-    (Msg::AboutDeviceIs, "{0}, {1} Kern(e)", Draft),
-    (Msg::AboutMemoryIs, "{0} MiB, nach oben {1} s", Draft),
+    (Msg::AboutDeviceIs, "one:{0}, {1#} Kern|other:{0}, {1#} Kerne", Draft),
+    (Msg::AboutMemoryIs, "{0}, seit {1} s aktiv", Draft),
     (Msg::FilesName, "Bezeichnung", Draft),
     (Msg::FilesSize, "Größe", Draft),
     (Msg::FilesNone, "Noch keine Dateien", Draft),
-    (Msg::FilesBytes, "{0} Bytes", Draft),
+    (Msg::FilesBytes, "one:{0#} Byte|other:{0#} Bytes", Draft),
     (Msg::FilesWasm, "WebAssembly-Programm", Draft),
     (Msg::FilesBinary, "Binäre Daten", Draft),
     (Msg::FilesSelect, "Eine Datei auswählen", Draft),
-    (Msg::ClockAm, "bin", Draft),
     (Msg::CircleNoNet, "Kein Netz", Draft),
     (Msg::CircleNoAddress, "Verlinken, keine Adresse", Draft),
-    (Msg::CircleSummary, "{0}, {1} MiB, {2} Dateien", Draft),
+    (Msg::CircleSummary, "one:{0}, {1}, {2#} Datei|other:{0}, {1}, {2#} Dateien", Draft),
     (Msg::CircleDevice, "Dieses Gerät", Draft),
     (Msg::NotesTitle, "Mitteilungen", Draft),
     (Msg::NotesNone, "Nichts Neues", Draft),
@@ -607,14 +602,14 @@ static TR: [(&str, Status); COUNT] = table(&[
     (Msg::SetNoAddress, "Bağlantı, henüz adres yok", Draft),
     (Msg::SetConnected, "   Bağlı {0}", Draft),
     (Msg::SetSystem, "Sistem", Draft),
-    (Msg::SetCores, "{0} çekirdek(ler), {1} MiB bellek", Draft),
-    (Msg::SetBooted, "Booted {0} kez, yukarı {1} s", Draft),
+    (Msg::SetCores, "{0} çekirdek, {1} bellek", Draft),
+    (Msg::SetBooted, "{0} kez başlatıldı, {1} s açık", Draft),
     (Msg::AboutMotto, "Cihazınıza sahip olun - geleceğinize sahip olun", Draft),
     (Msg::AboutDesktop, "Masaüstü", Draft),
     (Msg::AboutDevice, "Aygıt", Draft),
     (Msg::AboutMemory, "Bellek", Draft),
-    (Msg::AboutDeviceIs, "{0}, {1} çekirdek(ler)", Draft),
-    (Msg::AboutMemoryIs, "{0} MiB, yukarı {1} s", Draft),
+    (Msg::AboutDeviceIs, "{0}, {1} çekirdek", Draft),
+    (Msg::AboutMemoryIs, "{0}, {1} s açık", Draft),
     (Msg::FilesName, "İsim", Draft),
     (Msg::FilesSize, "Boyut", Draft),
     (Msg::FilesNone, "Henüz dosya yok", Draft),
@@ -623,11 +618,9 @@ static TR: [(&str, Status); COUNT] = table(&[
     (Msg::FilesRunIt, "Terminal'den çalıştır:", Draft),
     (Msg::FilesBinary, "İkili veri", Draft),
     (Msg::FilesSelect, "Bir dosya seçin", Draft),
-    (Msg::ClockAm, "ben", Draft),
-    (Msg::ClockPm, "pm", Draft),
     (Msg::CircleNoNet, "Ağ yok", Draft),
     (Msg::CircleNoAddress, "Bağlan, adres yok", Draft),
-    (Msg::CircleSummary, "{0}, {1} MiB, {2} dosya", Draft),
+    (Msg::CircleSummary, "{0}, {1}, {2} dosya", Draft),
     (Msg::CircleDevice, "Bu cihaz", Draft),
     (Msg::NotesTitle, "Bildirimler", Draft),
     (Msg::NotesNone, "Yeni bir şey yok.", Draft),
@@ -636,29 +629,150 @@ static TR: [(&str, Status); COUNT] = table(&[
     (Msg::TitleAnyway, "Yine de kapat.", Draft),
     (Msg::SetLanguage, "Dil", Draft),
     (Msg::SetDraft, "taslak", Draft),
-    (Msg::TermBackOne, "1 satır geri, herhangi bir anahtar döner", Draft),
     (Msg::TermBack, "{0} satır geri, herhangi bir anahtar döner", Draft),
 ]);
 
 /// One value for a gap in a sentence.
 #[derive(Clone, Copy)]
 pub enum Arg<'a> {
+    /// A number in plain digits (screen sizes, addresses' parts): never grouped.
     N(u64),
+    /// A count or an amount, grouped the language's way (65,536 / 65 536 / 65.536).
+    G(u64),
+    /// A memory size in MiB, written as MiB or GiB (locale::memory).
+    Mem(u64),
     S(&'a [u8]),
 }
 
-/// Write the sentence for `m` with its gaps filled through `put` (a number is written as decimal digits).
-pub fn fill_with(m: Msg, args: &[Arg], put: &mut dyn FnMut(&[u8])) {
-    fill_text(t(m), args, put)
+/// Plural forms (stage 5): a text that starts with a form name and a colon holds one text per form, split by `|`:
+/// "one:{0#} core|other:{0#} cores". The gap marked `#` is the count that picks the form. A text without forms reads
+/// the same for every number.
+pub fn has_forms(s: &[u8]) -> bool {
+    match s.iter().position(|&b| b == b':') {
+        Some(i) => Form::from_name(&s[..i]).is_some(),
+        None => false,
+    }
 }
 
-/// Fill the gaps of a template. `{d}` (one digit) takes `args[d]`; a gap with no argument writes nothing; any other
-/// byte, a lone `{` included, is copied as it is. Never reads past the template.
+/// The forms of a text with forms, in order: (form, its text), up to 6; a part that does not start with a known form
+/// name and a colon is (None, the part), which `check` reports.
+pub fn forms(s: &[u8]) -> ([(Option<Form>, &[u8]); 6], usize) {
+    let mut out: [(Option<Form>, &[u8]); 6] = [(None, &[]); 6];
+    let mut n = 0;
+    for part in s.split(|&b| b == b'|') {
+        if n == out.len() {
+            break;
+        }
+        out[n] = match part.iter().position(|&b| b == b':') {
+            Some(i) => match Form::from_name(&part[..i]) {
+                Some(f) => (Some(f), &part[i + 1..]),
+                None => (None, part),
+            },
+            None => (None, part),
+        };
+        n += 1;
+    }
+    (out, n)
+}
+
+fn form_text(s: &[u8], f: Form) -> Option<&[u8]> {
+    let (fs, n) = forms(s);
+    fs[..n].iter().find(|x| x.0 == Some(f)).map(|x| x.1)
+}
+
+/// The gaps marked `#` in a text, as a bit set (one bit when it is well made).
+pub fn marks(s: &[u8]) -> u16 {
+    let mut g = 0u16;
+    let mut i = 0;
+    while i + 3 < s.len() {
+        if s[i] == b'{' && s[i + 1].is_ascii_digit() && s[i + 2] == b'#' && s[i + 3] == b'}' {
+            g |= 1 << (s[i + 1] - b'0');
+        }
+        i += 1;
+    }
+    g
+}
+
+/// How often a plural form was missing and another stood in (the language's "other", then English).
+static STAND_INS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub fn stand_ins() -> u32 {
+    STAND_INS.load(Ordering::Relaxed)
+}
+
+/// The text for one number: the form `n` takes in language `l` (or "other" when there is no count), else the
+/// language's "other" (counted); None when neither is there.
+fn pick<'s>(l: Lang, s: &'s [u8], args: &[Arg]) -> Option<&'s [u8]> {
+    if !has_forms(s) {
+        return Some(s);
+    }
+    let mk = marks(s);
+    let d = if mk == 0 { 99 } else { mk.trailing_zeros() as usize };
+    let f = match args.get(d) {
+        Some(Arg::N(v)) | Some(Arg::G(v)) | Some(Arg::Mem(v)) => super::locale::plural(l, *v),
+        _ => Form::Other,
+    };
+    form_text(s, f).or_else(|| {
+        STAND_INS.fetch_add(1, Ordering::Relaxed);
+        form_text(s, Form::Other)
+    })
+}
+
+/// Write the sentence for `m` in the desk's language, in the form its count needs, with its gaps filled through
+/// `put`. A missing form falls back to the language's "other", then to the English.
+pub fn fill_with(m: Msg, args: &[Arg], put: &mut dyn FnMut(&[u8])) {
+    let (l, s) = source(current(), m);
+    match pick(l, s, args) {
+        Some(t) => fill_text_in(l, t, args, put),
+        None => {
+            STAND_INS.fetch_add(1, Ordering::Relaxed);
+            let e = EN[m as usize].as_bytes();
+            fill_text_in(Lang::En, pick(Lang::En, e, args).unwrap_or(e), args, put)
+        }
+    }
+}
+
+/// How many texts an id has in language `l` (its forms, or 1), for `desk lang fit`, which measures every one.
+pub fn form_count(l: Lang, m: Msg) -> usize {
+    let s = text_in(l, m);
+    if has_forms(s) {
+        forms(s).1
+    } else {
+        1
+    }
+}
+
+/// Fill the `i`th form of an id's text in language `l` (`desk lang fit`).
+pub fn fill_form_in(l: Lang, m: Msg, i: usize, args: &[Arg], put: &mut dyn FnMut(&[u8])) {
+    let (src, s) = source(l, m);
+    let t = if has_forms(s) { forms(s).0[i.min(5)].1 } else { s };
+    fill_text_in(src, t, args, put)
+}
+
+/// Fill the gaps of a template the English way (the filler's selftest).
 pub fn fill_text(s: &[u8], args: &[Arg], put: &mut dyn FnMut(&[u8])) {
+    fill_text_in(Lang::En, s, args, put)
+}
+
+/// Fill the gaps of a template, numbers written the way of language `l`. `{d}` or `{d#}` (one digit) takes
+/// `args[d]`; a gap with no argument writes nothing; any other byte, a lone `{` included, is copied as it is. Never
+/// reads past the template.
+pub fn fill_text_in(l: Lang, s: &[u8], args: &[Arg], put: &mut dyn FnMut(&[u8])) {
     let mut i = 0;
     let mut from = 0;
     while i < s.len() {
-        if s[i] == b'{' && i + 2 < s.len() && s[i + 1].is_ascii_digit() && s[i + 2] == b'}' {
+        let gap = if s[i] == b'{' && i + 2 < s.len() && s[i + 1].is_ascii_digit() {
+            if s[i + 2] == b'}' {
+                3
+            } else if s[i + 2] == b'#' && i + 3 < s.len() && s[i + 3] == b'}' {
+                4
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        if gap > 0 {
             put(&s[from..i]);
             match args.get((s[i + 1] - b'0') as usize) {
                 Some(Arg::N(v)) => {
@@ -675,10 +789,12 @@ pub fn fill_text(s: &[u8], args: &[Arg], put: &mut dyn FnMut(&[u8])) {
                     }
                     put(&d[k..]);
                 }
+                Some(Arg::G(v)) => super::locale::group(l, *v, put),
+                Some(Arg::Mem(v)) => super::locale::memory(l, *v, put),
                 Some(Arg::S(b)) => put(b),
                 None => {}
             }
-            i += 3;
+            i += gap;
             from = i;
         } else {
             i += 1;
@@ -726,8 +842,36 @@ pub fn check(bad: &mut dyn FnMut(&str, &str, &str)) {
     for &l in LANGS.iter() {
         for k in 0..COUNT {
             let s = text_in(l, ALL[k]);
-            if gaps(s) != gaps(EN[k].as_bytes()) {
+            let en = EN[k].as_bytes();
+            let (src, _) = source(l, ALL[k]);
+            let count = marks(en);
+            if has_forms(s) {
+                let (fs, n) = forms(s);
+                if fs[..n].iter().any(|f| f.0.is_none()) {
+                    bad(l.code(), IDS[k], "a part without a form name");
+                }
+                for &f in [Form::Zero, Form::One, Form::Two, Form::Few, Form::Many, Form::Other].iter() {
+                    let has = fs[..n].iter().any(|x| x.0 == Some(f));
+                    if super::locale::uses(src, f) && !has {
+                        bad(l.code(), IDS[k], "a plural form the language uses is missing");
+                    } else if has && !super::locale::uses(src, f) {
+                        bad(l.code(), IDS[k], "a plural form the language never uses");
+                    }
+                }
+                let m = marks(s);
+                if m.count_ones() != 1 || (count != 0 && m != count) {
+                    bad(l.code(), IDS[k], "the counted gap {d#} is not the English one");
+                }
+                for x in fs[..n].iter() {
+                    // a form may leave out its count ("one core" spelled out), never another gap
+                    if gaps(x.1) & !m != gaps(en) & !m {
+                        bad(l.code(), IDS[k], "gaps differ from the English");
+                    }
+                }
+            } else if gaps(s) != gaps(en) {
                 bad(l.code(), IDS[k], "gaps differ from the English");
+            } else if marks(s) != 0 {
+                bad(l.code(), IDS[k], "a counted gap {d#} without plural forms");
             }
             let st = core::str::from_utf8(s).unwrap_or("");
             if st.is_empty() && !s.is_empty() {
@@ -758,6 +902,9 @@ pub fn gaps(s: &[u8]) -> u16 {
         if s[i] == b'{' && s[i + 1].is_ascii_digit() && s[i + 2] == b'}' {
             g |= 1 << (s[i + 1] - b'0');
             i += 3;
+        } else if s[i] == b'{' && s[i + 1].is_ascii_digit() && s[i + 2] == b'#' && i + 3 < s.len() && s[i + 3] == b'}' {
+            g |= 1 << (s[i + 1] - b'0');
+            i += 4;
         } else {
             i += 1;
         }

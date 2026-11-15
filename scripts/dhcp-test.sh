@@ -49,7 +49,7 @@ wait "$QPID" 2>/dev/null
 # of when each grep ran (2.770 measured a MISS following a HIT on a still-growing
 # log in `smp`).
 SNAP="$(cat "$OUT")"
-have() { printf '%s\n' "$SNAP" | grep -qE "$1"; }
+have() { grep -qE "$1" <<< "$SNAP"; }
 
 have "${DHCP_RE[0]}" || { echo "DHCP TEST FAILED (DISCOVER not sent)"; exit 1; }
 have "${DHCP_RE[1]}" || { echo "DHCP TEST FAILED (no OFFER of 10.0.2.15)"; exit 1; }

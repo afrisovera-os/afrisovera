@@ -36,11 +36,39 @@ CMDS=(
     "desk cell titlecheck"
 )
 
+# The PC only (afriui.md section 29, the architect's condition for native slice 1): at every scale from 1.25 to 2,
+# the narrow cell title's mark stays whole and nothing covers Close anyway, wide and at the narrowest width.
+SCALES=(1.25 1.5 1.75 2)
+PC_TAIL=()
+for sc in "${SCALES[@]}"; do
+    PC_TAIL+=("screen ui $sc" "desk cell resize 400 300" "desk cell titlecheck" "desk cell resize 40 30" "desk cell titlecheck" "desk verify")
+done
+
+grade_scales() { # grade_scales <serial log>: the titlechecks and verifies the PC tail adds
+    local fail=0 S n
+    _g() { echo "  FAIL (pc scales): $1"; fail=1; }
+    S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
+    for sc in "${SCALES[@]}"; do
+        grep -aqE "^screen: the desktop is now [0-9]+x[0-9]+ logical pixels at scale " <<< "$S" || { _g "no native scale line"; break; }
+    done
+    # 1 at the default scale, then 2 a scale (wide and narrowest); all whole, none overlapping
+    n="$(grep -acE '^\[desk\] cell title: window [0-9]+ wide \(at least [0-9]+\), mark [0-9]+\.\.[0-9]+ whole, Close anyway [0-9]+\.\.[0-9]+, buttons from [0-9]+; nothing over Close anyway; name (cut|whole)$' <<< "$S")"
+    [ "$n" -eq $((1 + 2 * ${#SCALES[@]})) ] || _g "$n of $((1 + 2 * ${#SCALES[@]})) titlechecks had the mark whole and nothing over Close anyway"
+    grep -aqE '^\[desk\] cell title: .*(NOT WHOLE|OVERLAP)' <<< "$S" && _g "a titlecheck found the mark cut or Close anyway covered"
+    # the narrowest at each scale is the lintel's minimum
+    n="$(grep -aoE '^\[desk\] cell title: window [0-9]+ wide \(at least [0-9]+\)' <<< "$S" | awk '{w=$5; m=$9; sub(/\)/,"",m); if (w == m) k++} END {print k+0}')"
+    [ "$n" -ge $((1 + ${#SCALES[@]})) ] || _g "only $n titlecheck(s) at the lintel's minimum width, not $((1 + ${#SCALES[@]}))"
+    n="$(grep -acE '^\[desk\] verify: 0 of [0-9]+ rows differ after a full redraw' <<< "$S")"
+    [ "$n" -eq $((4 + ${#SCALES[@]})) ] || _g "$n of $((4 + ${#SCALES[@]})) desk verify runs found 0 rows differ"
+    return "$fail"
+}
+
 grade() { # grade <serial log> <kernel name> <pc: 1 to grade the cold-frame budget>
     local fail=0 S got a b
     _f() { echo "  FAIL ($2): $1"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL ($2): missing serial log"; return 1; }
-    S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
+    # stray control bytes and trailing spaces never hide a line (a once-seen ARM desk-cell miss, 15 Nov)
+    S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | tr -d '\000-\010\013-\037\177' | sed 's/[[:space:]]*$//')"
     has() { grep -aqxF "$1" <<< "$S" || _f "no line: $1" "$2"; }
     hasre() { grep -aqE "$1" <<< "$S" || _f "$3" "$2"; }
     grep -aqE 'PANIC|panicked' <<< "$S" && _f "the kernel panicked or faulted" "$2"
@@ -144,9 +172,27 @@ selftest() {
     case_ title-too-narrow red "$(printf '%s\n' "$GREEN" | sed 's/window 259 wide (at least 259)/window 40 wide (at least 259)/')"
     case_ title-missing red "$(printf '%s\n' "$GREEN" | grep -v 'cell title:')"
     case_ titletest-missing red "$(printf '%s\n' "$GREEN" | grep -v 'cell titletest:')"
+    # the scales grader (section 29): nine whole titlechecks and eight clean verifies pass; one overlap fails
+    local SC_OK SC_BAD k
+    SC_OK="screen: the desktop is now 1536x864 logical pixels at scale 1.25 on the screen's own 1920x1080 pixels"
+    for k in 1 2 3 4 5 6 7 8 9; do
+        SC_OK="$SC_OK
+[desk] cell title: window 259 wide (at least 259), mark 45..97 whole, Close anyway 105..189, buttons from 207; nothing over Close anyway; name cut"
+    done
+    for k in 1 2 3 4 5 6 7 8; do
+        SC_OK="$SC_OK
+[desk] verify: 0 of 1080 rows differ after a full redraw (3 partial frame(s) drawn before it)"
+    done
+    SC_BAD="$(sed '0,/nothing over Close anyway/s/nothing over Close anyway/OVERLAP/' <<< "$SC_OK")"
+    printf '%s\n' "$SC_OK" > "$D/s1"
+    printf '%s\n' "$SC_BAD" > "$D/s2"
+    if grade_scales "$D/s1" > "$D/log" 2>&1; then pass=$((pass+1)); echo "    scales-green: green OK"
+    else bad=$((bad+1)); echo "    scales-green: red  <-- GRADER BUG"; sed 's/^/      /' "$D/log"; fi
+    if grade_scales "$D/s2" > /dev/null 2>&1; then bad=$((bad+1)); echo "    scales-overlap: green  <-- GRADER BUG"
+    else pass=$((pass+1)); echo "    scales-overlap: red OK"; fi
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 30 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 32 ]
 }
 
 echo "== smooth text that scales: the outline face's checks and budgets, on both kernels =="
@@ -188,11 +234,15 @@ PATH="$PWD/scripts/lib/pc-arch:$PATH" qemu-system-aarch64 -M virt -m 256M -displ
     -vga none -device VGA,xres=1920,yres=1080 \
     -serial "tcp:127.0.0.1:5994,server,nowait" -qmp "tcp:127.0.0.1:5995,server,nowait" &
 QPID=$!
-AFRISH_BOOT_GRACE="${AFRISH_BOOT_GRACE:-10}" python3 scripts/shell-demo.py 5994 5995 "$(winpath "$W/pc.png")" "screen ui" "${CMDS[@]}" > "$W/pc.log" 2>&1
+AFRISH_BOOT_GRACE="${AFRISH_BOOT_GRACE:-10}" python3 scripts/shell-demo.py 5994 5995 "$(winpath "$W/pc.png")" "screen ui" "${CMDS[@]}" "${PC_TAIL[@]}" > "$W/pc.log" 2>&1
 kill "$QPID" 2> /dev/null
 wait "$QPID" 2> /dev/null
 tr -d '\r' < "$W/pc.log" | grep -aE '^\[desk\] (font|verify)|panic|PANIC' | sed 's/^/  pc  | /'
-grade "$W/pc.log" pc 1 || fails=$((fails + 1))
+# the PC's own checks on the log before the scale tail, then the tail's (section 29)
+sed '/^afrisovera> screen ui 1.25/,$d' "$W/pc.log" > "$W/pc-main.log"
+grade "$W/pc-main.log" pc 1 || fails=$((fails + 1))
+tr -d '\r' < "$W/pc.log" | grep -aE '^\[desk\] cell title:|^screen: the desktop is now' | sed 's/^/  pc  | /'
+grade_scales "$W/pc.log" || fails=$((fails + 1))
 
 if [ "$fails" -eq 0 ]; then
     echo "  screenshots: $W/arm.png $W/pc.png"

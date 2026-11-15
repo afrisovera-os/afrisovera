@@ -29,8 +29,8 @@ grade() { # grade <serial capture>
     has() { grep -aqE "$1" <<< "$S"; }
     has '^\[ps2\] i8042 keyboard controller \(config 0x[0-9a-f]{2} -> 0x[0-9a-f]{2}\), scancode set 1, polled$' ||
         _f "the i8042 keyboard controller was not found"
-    printf '%s\n' "$S" | grep -aqE "^afrisovera> echo $WORD$" || _f "the command typed on the PS/2 keyboard did not reach the shell"
-    printf '%s\n' "$S" | grep -aqE "^$WORD$" || _f "the shell did not run the command typed on the PS/2 keyboard"
+    grep -aqE "^afrisovera> echo $WORD$" <<< "$S" || _f "the command typed on the PS/2 keyboard did not reach the shell"
+    grep -aqE "^$WORD$" <<< "$S" || _f "the shell did not run the command typed on the PS/2 keyboard"
     local k
     k="$(printf '%s\n' "$S" | grep -aoE '^ps2: i8042 keyboard, polled; [0-9]+ scancodes read, [0-9]+ keys typed$' | tail -1 | awk '{print $8}')"
     if [ -z "$k" ]; then

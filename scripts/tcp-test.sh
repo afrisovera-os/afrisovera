@@ -103,8 +103,11 @@ while off + 16 <= len(d):
     ihl = (fr[14] & 0x0f) * 4
     toff = 14 + ihl
     flags = fr[toff+13]
-    tcp = fr[toff:toff+20]
-    pseudo = fr[26:30] + fr[30:34] + bytes([0, 6]) + struct.pack(">H", 20)
+    # the whole segment, by the IP header's total length: the PC's SYN carries an MSS option since Dira M1b
+    # (a12f84dd), so its TCP header is 24 bytes, and a sum over a fixed 20 called a valid SYN BAD (PC walk)
+    tcp_len = (fr[16] << 8 | fr[17]) - ihl
+    tcp = fr[toff:toff+tcp_len]
+    pseudo = fr[26:30] + fr[30:34] + bytes([0, 6]) + struct.pack(">H", tcp_len)
     ck_ok = (csum(pseudo + tcp) == 0)
     if src == "10.0.2.15" and (flags & 0x02) and not (flags & 0x10):
         print(f"  SYN     {src} -> {'.'.join(str(x) for x in fr[30:34])} checksum {'OK' if ck_ok else 'BAD'}")

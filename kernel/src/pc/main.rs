@@ -30,7 +30,9 @@ extern crate alloc;
 mod uart;
 mod cpu;
 mod mmu;
+mod uaccess; // G2 part 3: the one door for ring-3 memory, and SMAP
 mod proc;
+mod foreign; // Daraja: foreign processes and their bridges (AFR-0001 7.7)
 mod uefi;
 mod user;
 mod qemu;
@@ -90,11 +92,13 @@ mod integrity;
 #[allow(dead_code)]
 #[path = "../nia.rs"]
 mod nia;
+#[path = "../keyseq.rs"]
+mod keyseq;
 #[path = "../appget.rs"]
 mod appget;
 #[path = "dnscheck.rs"] // DNS answers believed only from the name server, with our id, port and question (Dira M1b)
 mod dnscheck;
-#[path = "../dira/mod.rs"] // the web browser, milestone M1 (BROWSER_PLAN.md)
+#[path = "dira_proc.rs"] // the web browser: on the PC a ring-3 process (Dira M3 S4); kernel/src/dira is ARM-only
 mod dira;
 #[allow(dead_code)]
 #[path = "../store.rs"]
@@ -603,6 +607,8 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
         "[pc] IDT loaded; breakpoint exception taken and returned ({})",
         cpu::BREAKPOINTS.load(Ordering::Relaxed)
     );
+    // Daraja (AFR-0001 7.7): the `syscall` instruction for foreign processes. Native programs still enter by int 0x80.
+    cpu::syscall_init();
 
     // The kernel's own page tables, replacing the firmware's (see mmu.rs). Everything up to
     // the end of the highest memory region in the map is mapped 1:1. Device windows (MMIO,
@@ -641,6 +647,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     } else {
         kprintln!("[pc] no-execute: this CPU does not offer it (CPUID 8000_0001h EDX bit 20), ring-3 pages stay executable");
     }
+    uaccess::init();
     // Proof the tables are the kernel's: touch pages nobody mapped. Each touch faults, the
     // #PF handler maps a fresh frame, the write runs again; then read every page back both
     // through its virtual address and through the frame's own 1:1 address.
@@ -978,6 +985,7 @@ extern "sysv64" fn shell_on_kernel_stack() -> ! {
     for (name, bytes) in nia::BUNDLED {
         integrity::record(name, bytes());
     }
+    dira::record(); // Dira's program (S4): its hash beside the bundled apps', and a line if it is not the built one
     nia::check_bundled(); // every bundled app is in the manifest (A7)
     boot_step("files-apps");
     boot_steps_report();

@@ -26,4 +26,9 @@ Cargo.lock
 /.rat-logs/
 /.rat-logs-*/
 /.rat-pc-logs/
+# the Full walk's own outputs (full-walk.yml: --results results.tsv --logdir logs > walk.out); the report receiver
+# refuses to write inside the tree unless its folder is ignored (pc-report, pc-reportsave)
+/logs/
+/results.tsv
+/walk.out
 /rat.out

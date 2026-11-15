@@ -80,7 +80,7 @@ grade() { # grade <boot1 log> .. <boot5 log>
         _f "boot 1: bootplan did not list the Windows EFI partition on $NAME"
     in_blk "$W1" "  \\\\EFI holds: $HOLDS" || _f "boot 1: bootplan did not see $HOLDS in $NAME's EFI partition"
     if [ "$KIND" = mbr ]; then # the old Windows disk is named as such, and no EFI partition is found on it
-        printf '%s\n' "$P1" | grep -aqxF "$MBRL" || _f "boot 1: bootplan did not call $OTHER an old MBR disk"
+        grep -aqxF "$MBRL" <<< "$P1" || _f "boot 1: bootplan did not call $OTHER an old MBR disk"
         [ -z "$L1" ] || _f "boot 1: bootplan found an EFI partition on the MBR disk ($OTHER)"
     elif [ -n "$SHARED" ]; then # one EFI partition only: the blank disk has none
         [ -z "$L1" ] || _f "boot 1: bootplan found an EFI partition on the blank disk ($OTHER)"
@@ -98,7 +98,7 @@ grade() { # grade <boot1 log> .. <boot5 log>
         _f "boot 1: bootcopy did not name $NAME partition 1"
     in_blk "$(blk "$A" bootcopy)" 'bootcopy: nothing written yet. To do it, type exactly: bootcopy yes [0-9a-f]{4}' || _f "boot 1: bootcopy gave no code"
     # boot 2
-    printf '%s\n' "$(pblk "$B" 'bootcopy yes ')" | grep -aqE "^bootcopy: copied to $NAME partition 1$FILE_RE, read back the same" ||
+    grep -aqE "^bootcopy: copied to $NAME partition 1$FILE_RE, read back the same" <<< "$(pblk "$B" 'bootcopy yes ')" ||
         _f "boot 2: bootcopy did not copy into $NAME partition 1"
     in_blk "$(blk "$B" bootentry)" "bootentry: $NUM \"AfriSovera\" -> $NAME partition 1 \(start $STARTL, $BLOCKS blocks\)$FILE_RE" ||
         _f "boot 2: bootentry did not show $NUM -> $NAME partition 1 (start $STARTL, $BLOCKS blocks)"
@@ -108,18 +108,18 @@ grade() { # grade <boot1 log> .. <boot5 log>
         _f "boot 3: bootentry did not add $NUM"
     in_blk "$(blk "$C" bootentries)" "  $NUM  active  \"AfriSovera\"  HD\(1,GPT,$WING,start $STARTL\)/$FILE_RE" ||
         _f "boot 3: the entry does not point at the Windows EFI partition ($WING, start $STARTL)"
-    if printf '%s\n' "$C" | grep -aq "HD(1,GPT,$LING"; then _f "boot 3: an entry points at the Linux EFI partition"; fi
+    if grep -aq "HD(1,GPT,$LING" <<< "$C"; then _f "boot 3: an entry points at the Linux EFI partition"; fi
     P3="$(blk "$C" bootplan)"; W3="$(part "$P3" "$NAME")"; L3="$(part "$P3" "$OTHER")"
     in_blk "$W3" "  \\\\EFI holds: $HOLDS, afrisovera" || _f "boot 3: bootplan does not list $HOLDS, afrisovera in $NAME's EFI partition"
     if [ "$KIND" = mbr ]; then
-        printf '%s\n' "$P3" | grep -aqxF "$MBRL" || _f "boot 3: bootplan did not call $OTHER an old MBR disk"
+        grep -aqxF "$MBRL" <<< "$P3" || _f "boot 3: bootplan did not call $OTHER an old MBR disk"
         [ -z "$L3" ] || _f "boot 3: bootplan found an EFI partition on the MBR disk ($OTHER)"
     elif [ -n "$SHARED" ]; then
         [ -z "$L3" ] || _f "boot 3: bootplan found an EFI partition on the blank disk ($OTHER)"
-        printf '%s\n' "$C" | grep -aqxF "$KEPT" || _f "boot 3: the Microsoft, BOOT or ubuntu files (or their FAT entries) in $NAME's EFI partition changed"
+        grep -aqxF "$KEPT" <<< "$C" || _f "boot 3: the Microsoft, BOOT or ubuntu files (or their FAT entries) in $NAME's EFI partition changed"
     else
     in_blk "$L3" '  \\EFI holds: ubuntu, BOOT' || _f "boot 3: $OTHER's EFI partition does not hold just ubuntu and BOOT"
-    if printf '%s\n' "$L3" | grep -aq 'afrisovera is already there'; then _f "boot 3: the file is in $OTHER's EFI partition too"; fi
+    if grep -aq 'afrisovera is already there' <<< "$L3"; then _f "boot 3: the file is in $OTHER's EFI partition too"; fi
     fi
     # the harness's byte comparisons (after boot 3)
     in_blk "$C" "harness: $OTHER image byte-identical to a fresh copy" || _f "the second disk ($OTHER) was changed"
@@ -145,16 +145,16 @@ grade() { # grade <boot1 log> .. <boot5 log>
     in_blk "$E2" "bootcopy remove: \\\\EFI\\\\afrisovera taken out of $NAME partition 1, read back \(both FAT copies equal, ${FREE1:-none} KiB free again\)" ||
         _f "boot 5: bootcopy remove did not take the file out of $NAME partition 1 with ${FREE1:-(unknown)} KiB free again"
     in_blk "$EE" "  BootOrder: ${ORDER0:-none}" || _f "boot 5: BootOrder is not back to ${ORDER0:-(unknown)}"
-    if printf '%s\n' "$EE" | grep -aq '"AfriSovera"'; then _f "boot 5: bootentries still lists an AfriSovera entry"; fi
+    if grep -aq '"AfriSovera"' <<< "$EE"; then _f "boot 5: bootentries still lists an AfriSovera entry"; fi
     P5="$(blk "$E" bootplan)"; W5="$(part "$P5" "$NAME")"; L5="$(part "$P5" "$OTHER")"
     in_blk "$W5" "  \\\\EFI holds: $HOLDS" || _f "boot 5: $NAME's EFI partition does not hold just $HOLDS again"
     in_blk "$W5" "  FAT32, [0-9]+-byte clusters, ${FREE1:-none} KiB free" || _f "boot 5: $NAME's EFI partition does not have its boot 1 free space back"
     if [ "$KIND" = mbr ]; then
-        printf '%s\n' "$P5" | grep -aqxF "$MBRL" || _f "boot 5: bootplan did not call $OTHER an old MBR disk"
+        grep -aqxF "$MBRL" <<< "$P5" || _f "boot 5: bootplan did not call $OTHER an old MBR disk"
         [ -z "$L5" ] || _f "boot 5: bootplan found an EFI partition on the MBR disk ($OTHER)"
     elif [ -n "$SHARED" ]; then
         [ -z "$L5" ] || _f "boot 5: bootplan found an EFI partition on the blank disk ($OTHER)"
-        printf '%s\n' "$E" | grep -aqxF "$KEPT" || _f "after the way back the Microsoft, BOOT or ubuntu files (or their FAT entries) in $NAME's EFI partition changed"
+        grep -aqxF "$KEPT" <<< "$E" || _f "after the way back the Microsoft, BOOT or ubuntu files (or their FAT entries) in $NAME's EFI partition changed"
     else
     in_blk "$L5" '  \\EFI holds: ubuntu, BOOT' || _f "boot 5: $OTHER's EFI partition does not hold just ubuntu and BOOT"
     fi
@@ -162,7 +162,7 @@ grade() { # grade <boot1 log> .. <boot5 log>
         _f "boot 5: bootplan does not plan the copy into $NAME partition 1 again"
     in_blk "$E" "harness: $OTHER image byte-identical to a fresh copy" || _f "after the way back the second disk ($OTHER) was changed"
     in_blk "$E" "harness: $NAME image changed only inside its EFI partition" || _f "after the way back the Windows disk changed outside its EFI partition"
-    if printf '%s\n%s\n%s\n%s\n%s\n' "$A" "$B" "$C" "$D" "$E" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)|FAILED|refused to write|could not be written|did not read back|did not delete'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)|FAILED|refused to write|could not be written|did not read back|did not delete' <<< "$A"$'\n'"$B"$'\n'"$C"$'\n'"$D"$'\n'"$E"; then
         _f "the kernel panicked, a disk command or a firmware write failed, or something FAILED"
     fi
     return "$fail"

@@ -32,14 +32,14 @@ kill "$APID" 2>/dev/null
 wait "$APID" 2>/dev/null
 A="$(cat "$LOG_A")"
 
-echo "$A" | grep -q "MMU enabled"                          || fail "MMU did not come up"
-echo "$A" | grep -q "RECV got 0x42"                        || fail "IPC message not delivered"
-echo "$A" | grep -q "SEND refused (no capability)"         || fail "capability rights not enforced"
-echo "$A" | grep -q "capability-secured IPC demo complete" || fail "Phase 0 demo did not complete"
-echo "$A" | grep -q 'sha256 self-test.*PASS'               || fail "SHA-256 self-test did not pass"
-echo "$A" | grep -q 'sha512 self-test.*PASS'               || fail "SHA-512 self-test did not pass"
-echo "$A" | grep -q 'ed25519 self-test.*PASS'              || fail "Ed25519 self-test did not pass"
-echo "$A" | grep -qE "$NEG" && fail "kernel panic / fault in boot log"
+grep -q "MMU enabled" <<< "$A" || fail "MMU did not come up"
+grep -q "RECV got 0x42" <<< "$A" || fail "IPC message not delivered"
+grep -q "SEND refused (no capability)" <<< "$A" || fail "capability rights not enforced"
+grep -q "capability-secured IPC demo complete" <<< "$A" || fail "Phase 0 demo did not complete"
+grep -q 'sha256 self-test.*PASS' <<< "$A" || fail "SHA-256 self-test did not pass"
+grep -q 'sha512 self-test.*PASS' <<< "$A" || fail "SHA-512 self-test did not pass"
+grep -q 'ed25519 self-test.*PASS' <<< "$A" || fail "Ed25519 self-test did not pass"
+grep -qE "$NEG" <<< "$A" && fail "kernel panic / fault in boot log"
 echo "[A] OK: MMU, capability IPC, SHA-256 + SHA-512 + Ed25519 self-tests, no faults"
 
 # ---------------------------------------------------------------------------
@@ -77,17 +77,17 @@ B="$(python3 scripts/shell-demo.py 4470 4471 "${TMPDIR:-/tmp}/mansa-b.png" "${CM
 kill "$BPID" 2>/dev/null
 wait "$BPID" 2>/dev/null
 
-echo "$B" | grep -q "board: qemu-virt"         || fail "board command did not report"
-echo "$B" | grep -q "device tree:"             || fail "dtb command did not report"
-echo "$B" | grep -q "integrity OK"             || fail "verify did not confirm a good app"
-echo "$B" | grep -q "TAMPERED"                 || fail "verify did not catch a tampered app"
-echo "$B" | grep -q "need consent"             || fail "daraja did not translate permissions"
-echo "$B" | grep -q "integrity OK for"         || fail "app launch did not run the integrity gate"
-echo "$B" | grep -q "signature valid"          || fail "Ed25519 signed-app verification failed"
-echo "$B" | grep -q "ANSWER: 30"               || fail "Asili assistant did not compute 20% of 150"
-echo "$B" | grep -qE "$NEG" && fail "kernel panic / fault during shell run"
+grep -q "board: qemu-virt" <<< "$B" || fail "board command did not report"
+grep -q "device tree:" <<< "$B" || fail "dtb command did not report"
+grep -q "integrity OK" <<< "$B" || fail "verify did not confirm a good app"
+grep -q "TAMPERED" <<< "$B" || fail "verify did not catch a tampered app"
+grep -q "need consent" <<< "$B" || fail "daraja did not translate permissions"
+grep -q "integrity OK for" <<< "$B" || fail "app launch did not run the integrity gate"
+grep -q "signature valid" <<< "$B" || fail "Ed25519 signed-app verification failed"
+grep -q "ANSWER: 30" <<< "$B" || fail "Asili assistant did not compute 20% of 150"
+grep -qE "$NEG" <<< "$B" && fail "kernel panic / fault during shell run"
 if [ "$HAVE_SND" = 1 ]; then
-    echo "$B" | grep -q "asili voice] synthesized" || fail "Asili Voice did not synthesize audio"
+    grep -q "asili voice] synthesized" <<< "$B" || fail "Asili Voice did not synthesize audio"
     echo "[B] OK: board, dtb, integrity (OK+tamper), verify-on-launch, Ed25519 signed-app, daraja, voice"
 else
     echo "[B] OK: board, dtb, integrity (OK+tamper), verify-on-launch, Ed25519 signed-app, daraja (voice skipped)"

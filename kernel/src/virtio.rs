@@ -325,6 +325,17 @@ static mut PCM_PERIODS: usize = 0;
 static mut PHASE: u32 = 0; // tone phase, persists across periods for continuity
 static mut STARTED: bool = false; // PCM stream configured + started once
 
+/// A used ring's index, read before anything the device wrote with it (the ring audit, ARCHITECT_REVIEWS 14 Nov
+/// 2026): the index first, then an Acquire fence, so no later read of a used element or a response buffer can
+/// see memory older than the index promised. ARM may reorder two loads; x86 does not, and there the fence only
+/// keeps the compiler from moving them.
+#[inline]
+unsafe fn used_idx(p: *const u16) -> u16 {
+    let i = read_volatile(p);
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+    i
+}
+
 #[inline] #[cfg(target_arch = "aarch64")]
 unsafe fn dsb() {
     core::arch::asm!("dsb sy", options(nostack, preserves_flags));
@@ -378,14 +389,14 @@ unsafe fn ctrl_request(base: u64, req_len: u32, resp_len: u32) -> u32 {
     dsb();
     write_volatile(addr_of_mut!((*avail).idx), idx.wrapping_add(1));
     dsb();
-    let prev = read_volatile(addr_of!(CTRL_USED.idx));
+    let prev = used_idx(addr_of!(CTRL_USED.idx));
     w(base, R_QUEUE_NOTIFY, 0);
     // Bound the wait to ~50ms of real time (CNTPCT), not a raw spin count: a slow
     // or unresponsive sound control queue must NOT stall the interactive shell for
     // multiple seconds. The normal path completes in microseconds.
     let start = crate::timer::cycles();
     let deadline = (crate::timer::hz() / 20).max(1);
-    while read_volatile(addr_of!(CTRL_USED.idx)) == prev {
+    while used_idx(addr_of!(CTRL_USED.idx)) == prev {
         if crate::timer::cycles().wrapping_sub(start) > deadline {
             crate::kprintln!("[virtio-sound] control queue timeout");
             return 0;
@@ -588,14 +599,14 @@ unsafe fn tx_period(base: u64, len: u32) -> u32 {
     dsb();
     write_volatile(addr_of_mut!((*avail).idx), idx.wrapping_add(1));
     dsb();
-    let prev = read_volatile(addr_of!(TX_USED.idx));
+    let prev = used_idx(addr_of!(TX_USED.idx));
     w(base, R_QUEUE_NOTIFY, 2);
     // Bound to real time (see `tx_deadline`): a stalled tx queue must not hang
     // the shell.
     let start = crate::timer::cycles();
     let hz = crate::timer::hz().max(1);
     let deadline = tx_deadline(hz);
-    while read_volatile(addr_of!(TX_USED.idx)) == prev {
+    while used_idx(addr_of!(TX_USED.idx)) == prev {
         if crate::timer::cycles().wrapping_sub(start) > deadline {
             // OBSERVABILITY ONLY (3.347) -- the return value and the abort are
             // UNCHANGED. Reporting the elapsed time AT this arm is tautological:
@@ -612,7 +623,7 @@ unsafe fn tx_period(base: u64, len: u32) -> u32 {
             let pm = hz;
             let mut landed: u64 = 0;
             while crate::timer::cycles().wrapping_sub(start) < pm {
-                if read_volatile(addr_of!(TX_USED.idx)) != prev {
+                if used_idx(addr_of!(TX_USED.idx)) != prev {
                     landed = crate::timer::cycles().wrapping_sub(start);
                     break;
                 }
@@ -1060,7 +1071,7 @@ pub fn net_rx_clo_offtuple() -> u32 { unsafe { RX_CLO_OFFTUPLE } }
 ///
 /// SAFETY on both: volatile scalar read of a driver-owned ring header.
 pub fn net_rx_avail_idx() -> u16 { unsafe { read_volatile(addr_of!(NET_RX_AVAIL.idx)) } }
-pub fn net_rx_used_idx() -> u16 { unsafe { read_volatile(addr_of!(NET_RX_USED.idx)) } }
+pub fn net_rx_used_idx() -> u16 { unsafe { used_idx(addr_of!(NET_RX_USED.idx)) } }
 
 /// ONE-PLACE SNAPSHOT of the pair, with `used` read FIRST (finding 3.531's
 /// pre-registered step). The census used to take these as two separate reads
@@ -1166,7 +1177,7 @@ pub fn net_arp_probe() -> bool {
         let base = NET_BASE;
         // Capture the RX used index BEFORE sending — the reply can arrive almost
         // instantly, so baselining after the send would miss it.
-        let base_rx = read_volatile(addr_of!(NET_RX_USED.idx));
+        let base_rx = used_idx(addr_of!(NET_RX_USED.idx));
         let tx = addr_of_mut!(TX_BUF) as *mut u8;
         for i in 0..VNET_HDR {
             *tx.add(i) = 0; // zero virtio_net_hdr
@@ -1204,7 +1215,7 @@ pub fn net_arp_probe() -> bool {
         // Wait for a NEW frame (rx used index advances past the baseline).
         let mut spins = 0u64;
         loop {
-            if read_volatile(addr_of!(NET_RX_USED.idx)) != base_rx {
+            if used_idx(addr_of!(NET_RX_USED.idx)) != base_rx {
                 let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
                 let elem = read_volatile(uring.add((base_rx as usize) % QSZ));
                 RX_RAW_COUNT += 1;
@@ -1306,7 +1317,7 @@ pub fn net_ping() -> bool {
         }
         let frame_len = 14 + 20 + 8;
 
-        let base_rx = read_volatile(addr_of!(NET_RX_USED.idx)); // baseline before send
+        let base_rx = used_idx(addr_of!(NET_RX_USED.idx)); // baseline before send
         let txd = addr_of_mut!(NET_TX_DESC) as *mut Desc;
         write_volatile(
             txd.add(0),
@@ -1325,7 +1336,7 @@ pub fn net_ping() -> bool {
         let mut cur = base_rx;
         let mut spins = 0u64;
         loop {
-            if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+            if used_idx(addr_of!(NET_RX_USED.idx)) != cur {
                 let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
                 let elem = read_volatile(uring.add((cur as usize) % QSZ));
                 cur = cur.wrapping_add(1);
@@ -1504,7 +1515,7 @@ fn dns_query(name: &str) -> DnsOutcome {
         }
         let frame_len = 14 + 20 + 8 + dns_len;
 
-        let base_rx = read_volatile(addr_of!(NET_RX_USED.idx));
+        let base_rx = used_idx(addr_of!(NET_RX_USED.idx));
         let txd = addr_of_mut!(NET_TX_DESC) as *mut Desc;
         write_volatile(
             txd.add(0),
@@ -1522,7 +1533,7 @@ fn dns_query(name: &str) -> DnsOutcome {
         let mut cur = base_rx;
         let mut spins = 0u64;
         loop {
-            if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+            if used_idx(addr_of!(NET_RX_USED.idx)) != cur {
                 let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
                 let elem = read_volatile(uring.add((cur as usize) % QSZ));
                 cur = cur.wrapping_add(1);
@@ -1756,7 +1767,7 @@ unsafe fn recv_dhcp(base_rx: u16, want_type: u8) -> bool {
     let mut cur = base_rx;
     let mut spins = 0u64;
     loop {
-        if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+        if used_idx(addr_of!(NET_RX_USED.idx)) != cur {
             let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
             let elem = read_volatile(uring.add((cur as usize) % QSZ));
             cur = cur.wrapping_add(1);
@@ -1786,7 +1797,7 @@ pub fn net_dhcp() -> bool {
     unsafe {
         let base = NET_BASE;
 
-        let base_rx = read_volatile(addr_of!(NET_RX_USED.idx));
+        let base_rx = used_idx(addr_of!(NET_RX_USED.idx));
         send_dhcp(base, 1, None, None); // DISCOVER
         crate::kprintln!("[net] DHCP DISCOVER sent (broadcast, xid {:#010x})", DHCP_XID);
         if !recv_dhcp(base_rx, 2) {
@@ -1801,7 +1812,7 @@ pub fn net_dhcp() -> bool {
             server[0], server[1], server[2], server[3]
         );
 
-        let base_rx2 = read_volatile(addr_of!(NET_RX_USED.idx));
+        let base_rx2 = used_idx(addr_of!(NET_RX_USED.idx));
         send_dhcp(base, 3, Some(offered), Some(server)); // REQUEST
         crate::kprintln!("[net] DHCP REQUEST sent (requesting {}.{}.{}.{})",
             offered[0], offered[1], offered[2], offered[3]);
@@ -2154,7 +2165,7 @@ unsafe fn tcp_ready(what: &str) -> Option<u64> {
 unsafe fn tcp_open(base: u64, dst_ip: &[u8; 4], src_port: u16, dst_port: u16, iss: u32) -> TcpOpen {
     // The cursor is taken BEFORE the send: a reply can land before the notify
     // returns, and a baseline read afterwards misses it (the 2.41 ARP bug).
-    let mut cur = read_volatile(addr_of!(NET_RX_USED.idx));
+    let mut cur = used_idx(addr_of!(NET_RX_USED.idx));
     if send_tcp_segment(base, dst_ip, src_port, dst_port, iss, 0, 0x02, &[]) == 0 {
         crate::kprintln!("[net] tcp: could not build the SYN");
         return TcpOpen::NoReply;
@@ -2170,7 +2181,7 @@ unsafe fn tcp_open(base: u64, dst_ip: &[u8; 4], src_port: u16, dst_port: u16, is
 
     let mut spins = 0u64;
     loop {
-        if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+        if used_idx(addr_of!(NET_RX_USED.idx)) != cur {
             let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
             let elem = read_volatile(uring.add((cur as usize) % QSZ));
             cur = cur.wrapping_add(1);
@@ -2284,7 +2295,7 @@ unsafe fn tcp_close_cur(
     let mut fin_acked = false;
     let mut spins = 0u64;
     loop {
-        if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+        if used_idx(addr_of!(NET_RX_USED.idx)) != cur {
             let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
             let elem = read_volatile(uring.add((cur as usize) % QSZ));
             cur = cur.wrapping_add(1);
@@ -2478,7 +2489,7 @@ unsafe fn tcp_accept(base: u64, port: u16, iss: u32, wait_ms: u64, mut cur: u16)
     cur = rx_skip_consumed(cur);
 
     loop {
-        if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+        if used_idx(addr_of!(NET_RX_USED.idx)) != cur {
             let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
             let elem = read_volatile(uring.add((cur as usize) % QSZ));
             cur = cur.wrapping_add(1);
@@ -2645,7 +2656,7 @@ pub fn net_tcp_listen(port: u16, wait_ms: u64) -> bool {
         // ARP for the gateway, and that ARP is the only announcement a peer gets
         // that this end is about to listen. Everything from here on is fair game
         // for a caller that reacts to it.
-        let cur = read_volatile(addr_of!(NET_RX_USED.idx));
+        let cur = used_idx(addr_of!(NET_RX_USED.idx));
         let base = match tcp_ready("tcp listen") {
             Some(b) => b,
             None => return false,
@@ -2746,7 +2757,7 @@ pub fn net_tcp_serve_with(port: u16, wait_ms: u64, conns: u32, mut handler: Opti
         // for the gateway, that ARP is the peer's cue to dial, and a cursor read
         // after it starts PAST the SYN it provoked. Measured in 2.759, not feared:
         // 4.0 s (waiting for the caller's retransmitted SYN) versus 115 ms.
-        let cur0 = read_volatile(addr_of!(NET_RX_USED.idx));
+        let cur0 = used_idx(addr_of!(NET_RX_USED.idx));
         let base = match tcp_ready("tcp serve") {
             Some(b) => b,
             None => return false,
@@ -2837,7 +2848,7 @@ pub fn net_tcp_serve_with(port: u16, wait_ms: u64, conns: u32, mut handler: Opti
             let mut rst = false;
 
             loop {
-                if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+                if used_idx(addr_of!(NET_RX_USED.idx)) != cur {
                     let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
                     let elem = read_volatile(uring.add((cur as usize) % QSZ));
                     cur = cur.wrapping_add(1);
@@ -3227,7 +3238,7 @@ pub fn net_tcp_sink(port: u16, wait_ms: u64) -> bool {
         // Cursor BEFORE anything that can ARP (tcp_accept's header, measured in
         // 2.759): the ARP is the peer's cue to dial, so a cursor read after it
         // starts PAST the SYN it provoked.
-        let cur0 = read_volatile(addr_of!(NET_RX_USED.idx));
+        let cur0 = used_idx(addr_of!(NET_RX_USED.idx));
         let base = match tcp_ready("tcp sink") {
             Some(b) => b,
             None => return false,
@@ -3275,7 +3286,7 @@ pub fn net_tcp_sink(port: u16, wait_ms: u64) -> bool {
         let mut t_end = t0;
 
         loop {
-            if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+            if used_idx(addr_of!(NET_RX_USED.idx)) != cur {
                 let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
                 let elem = read_volatile(uring.add((cur as usize) % QSZ));
                 cur = cur.wrapping_add(1);
@@ -3533,7 +3544,7 @@ pub fn net_tcp_data(dst_ip: [u8; 4], dst_port: u16, payload: &[u8]) -> bool {
         let mut peer_fin = false;
         let mut spins = 0u64;
         loop {
-            if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+            if used_idx(addr_of!(NET_RX_USED.idx)) != cur {
                 let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
                 let elem = read_volatile(uring.add((cur as usize) % QSZ));
                 cur = cur.wrapping_add(1);
@@ -3704,7 +3715,7 @@ pub fn net_tcp_dial_with(dst_ip: [u8; 4], dst_port: u16, first: &[u8], wait_ms: 
         let mut segs_out = 1u32;
         let mut spins = 0u64;
         loop {
-            if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+            if used_idx(addr_of!(NET_RX_USED.idx)) != cur {
                 let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
                 let elem = read_volatile(uring.add((cur as usize) % QSZ));
                 cur = cur.wrapping_add(1);
@@ -3900,7 +3911,7 @@ unsafe fn rx_reclaim() -> usize {
         return 0;
     }
     let avail = read_volatile(addr_of!(NET_RX_AVAIL.idx));
-    let used = read_volatile(addr_of!(NET_RX_USED.idx));
+    let used = used_idx(addr_of!(NET_RX_USED.idx));
     let offered = (avail.wrapping_sub(used) as usize).min(NBUF);
     let ring = addr_of!(NET_RX_AVAIL.ring) as *const u16;
     let mut owned = [false; NBUF];
@@ -3944,7 +3955,7 @@ unsafe fn tx_raw(frame: &[u8]) {
 #[cfg(feature = "pc")]
 unsafe fn tx_settle() {
     let end = tcp_rto_deadline(50);
-    while read_volatile(addr_of!(NET_TX_USED.idx)) != read_volatile(addr_of!(NET_TX_AVAIL.idx)) {
+    while used_idx(addr_of!(NET_TX_USED.idx)) != read_volatile(addr_of!(NET_TX_AVAIL.idx)) {
         if end == 0 || crate::timer::cycles() >= end {
             break;
         }
@@ -3985,12 +3996,12 @@ unsafe fn arp_answer(fr: &[u8], our_ip: &[u8; 4]) {
 #[cfg(feature = "pc")]
 unsafe fn arp_resolve(target: &[u8; 4], our_ip: &[u8; 4]) -> Option<[u8; 6]> {
     for _ in 0..3 {
-        let mut cur = read_volatile(addr_of!(NET_RX_USED.idx));
+        let mut cur = used_idx(addr_of!(NET_RX_USED.idx));
         let f = arp_frame(1, our_ip, &[0; 6], target);
         tx_raw(&f);
         let end = tcp_rto_deadline(1000);
         loop {
-            if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+            if used_idx(addr_of!(NET_RX_USED.idx)) != cur {
                 let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
                 let elem = read_volatile(uring.add((cur as usize) % QSZ));
                 cur = cur.wrapping_add(1);
@@ -4103,7 +4114,7 @@ pub fn report_send(dst_ip: [u8; 4], dst_port: u16, data: &[u8]) -> Result<Report
         let dst = &dst_ip;
         let sport: u16 = 41000 + (crate::rng::next_u32() % 20000) as u16;
         let iss = crate::rng::next_u32();
-        let mut cur = read_volatile(addr_of!(NET_RX_USED.idx));
+        let mut cur = used_idx(addr_of!(NET_RX_USED.idx));
 
         // --- open: SYN, resent after 1, 2, 4 ... s of silence ---
         let mut our_ack = 0u32;
@@ -4127,7 +4138,7 @@ pub fn report_send(dst_ip: [u8; 4], dst_port: u16, data: &[u8]) -> Result<Report
             let end = tcp_rto_deadline(rto);
             rto = (rto * 2).min(4000); // 1+2+4+4+4+4 s: about 19 s in all
             loop {
-                if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+                if used_idx(addr_of!(NET_RX_USED.idx)) != cur {
                     let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
                     let elem = read_volatile(uring.add((cur as usize) % QSZ));
                     cur = cur.wrapping_add(1);
@@ -4181,7 +4192,7 @@ pub fn report_send(dst_ip: [u8; 4], dst_port: u16, data: &[u8]) -> Result<Report
                 next += n;
                 end = tcp_rto_deadline(rto);
             }
-            if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+            if used_idx(addr_of!(NET_RX_USED.idx)) != cur {
                 let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
                 let elem = read_volatile(uring.add((cur as usize) % QSZ));
                 cur = cur.wrapping_add(1);
@@ -4236,7 +4247,7 @@ pub fn report_send(dst_ip: [u8; 4], dst_port: u16, data: &[u8]) -> Result<Report
             tx_settle();
             let end = tcp_rto_deadline(1000);
             loop {
-                if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
+                if used_idx(addr_of!(NET_RX_USED.idx)) != cur {
                     let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
                     let elem = read_volatile(uring.add((cur as usize) % QSZ));
                     cur = cur.wrapping_add(1);
@@ -4440,6 +4451,9 @@ static mut BLK_USED: UsedRing = UsedRing { flags: 0, idx: 0, ring: [UsedElem { i
 static mut BLK_HDR: [u8; 16] = [0; 16];
 static mut BLK_DATA: [u8; 512] = [0; 512];
 static mut BLK_STATUS: [u8; 1] = [0; 1];
+/// AFR-0011 V2: a write that failed since the last `blk_flush` (the architect's rule 1: write errors are sticky,
+/// cleared only by a blk_flush that returns).
+static mut BLK_WERR: bool = false;
 
 fn blk_setup(base: u64) -> bool {
     // SAFETY: MMIO on a detected virtio-blk device; single-threaded bring-up.
@@ -4511,10 +4525,10 @@ unsafe fn blk_request(kind: u32, sector: u64) -> u8 {
     dsb();
     write_volatile(addr_of_mut!((*avail).idx), idx.wrapping_add(1));
     dsb();
-    let prev = read_volatile(addr_of!(BLK_USED.idx));
+    let prev = used_idx(addr_of!(BLK_USED.idx));
     w(base, R_QUEUE_NOTIFY, 0);
     let mut spins = 0u64;
-    while read_volatile(addr_of!(BLK_USED.idx)) == prev {
+    while used_idx(addr_of!(BLK_USED.idx)) == prev {
         spins += 1;
         if spins > 60_000_000 {
             crate::kprintln!("[virtio-blk] request timeout");
@@ -4553,7 +4567,42 @@ pub fn write_sector(n: u64, data: &[u8; 512]) -> bool {
         for i in 0..512 {
             *dst.add(i) = data[i];
         }
-        blk_request(BLK_T_OUT, n) == 0
+        let ok = blk_request(BLK_T_OUT, n) == 0;
+        if !ok {
+            BLK_WERR = true;
+        }
+        ok
+    }
+}
+
+/// AFR-0011 V2: every write acknowledged before this call is on the medium. Each request above waits for its
+/// completion, and VIRTIO_BLK_F_FLUSH is not negotiated (blk_setup offers only VERSION_1). QEMU turns its write
+/// cache off when the driver does not take F_FLUSH, so it writes each request through before reporting it complete:
+/// a completed write is already on the medium and nothing is sent. Any other host must negotiate F_FLUSH and send
+/// a T_FLUSH request here first (architect, V2 verdict). False after a failed write since the last call.
+pub fn blk_flush() -> bool {
+    if !blk_present() {
+        return false;
+    }
+    // SAFETY: scalar statics, kernel context, single core.
+    unsafe {
+        let ok = !BLK_WERR;
+        BLK_WERR = false;
+        ok
+    }
+}
+
+/// How the last `blk_flush` was confirmed, for `blkflush` (the PC's disk.rs has its own; nothing to add here).
+pub fn blk_note() -> &'static str {
+    ""
+}
+
+/// Which disk `blk_flush` answers for (for `blkflush`; the PC's disk.rs has its own).
+pub fn blk_name() -> &'static str {
+    if blk_present() {
+        "virtio"
+    } else {
+        "none"
     }
 }
 
@@ -4673,10 +4722,10 @@ pub fn virtio_entropy(buf: &mut [u8]) -> usize {
         dsb();
         write_volatile(addr_of_mut!((*avail).idx), idx.wrapping_add(1));
         dsb();
-        let prev = read_volatile(addr_of!(RNG_USED.idx));
+        let prev = used_idx(addr_of!(RNG_USED.idx));
         w(base, R_QUEUE_NOTIFY, 0);
         let mut spins = 0u64;
-        while read_volatile(addr_of!(RNG_USED.idx)) == prev {
+        while used_idx(addr_of!(RNG_USED.idx)) == prev {
             spins += 1;
             if spins > 60_000_000 {
                 return 0;
@@ -4707,10 +4756,53 @@ pub fn virtio_entropy(buf: &mut [u8]) -> usize {
 fn pc_send_fixups(frame: &mut [u8], len: usize, flags: u8, route: Option<([u8; 4], [u8; 6])>) -> usize {
     let len = if flags == 0x02 { add_mss(frame, len) } else { len };
     if let Some((sip, _)) = route {
+        // the connection's smaller window (S4, rtl8139): set before set_src_ip, which recomputes both checksums
+        // SAFETY: a plain read of a PC-only static that conn_tx sets around its own sends.
+        let win = unsafe { read_volatile(addr_of!(TCP_WINDOW)) };
+        if win <= 0xFFFF && len >= TCP_FRAME_MIN {
+            frame[48] = (win >> 8) as u8;
+            frame[49] = win as u8;
+        }
         set_src_ip(&mut frame[..len], &sip);
     }
     len
 }
+
+/// The receive window a ring-3 connection advertises (0: the builder's 65,535). A process reads one segment a call,
+/// and the rtl8139's frames reach the receive ring only when the kernel polls (32 in its own ring): a 64 KiB window let
+/// the server send ~45 segments at once, the card dropped the rest, and big.html crawled on retransmit timers (36 KB
+/// in 30 s, pc-dira-net, 14 Nov). Eight segments keeps every card's ring ahead of the sender.
+#[cfg(feature = "pc")]
+static mut TCP_WINDOW: u32 = NO_WINDOW;
+/// TCP_WINDOW's "leave the builder's window" value (a zero window must be sayable).
+#[cfg(feature = "pc")]
+const NO_WINDOW: u32 = u32::MAX;
+/// The connection's receive buffer: eight segments. The window it advertises is the buffer's free space (RFC 793), so
+/// the sender can never send more than Dira has room for: an in-order segment is never dropped for want of room.
+#[cfg(feature = "pc")]
+const CONN_BUF: usize = 8 * 1460;
+/// Sets TCP_WINDOW for the frames built while it lives, and puts NO_WINDOW back when it drops, on every way out
+/// (architect's S3+S4 merge review: no later kernel frame may carry a ring-3 connection's window).
+#[cfg(feature = "pc")]
+struct WindowGuard;
+#[cfg(feature = "pc")]
+impl WindowGuard {
+    fn set(win: usize) -> WindowGuard {
+        // SAFETY: a plain store to a PC-only static that only pc_send_fixups reads, kernel context.
+        unsafe { write_volatile(addr_of_mut!(TCP_WINDOW), win.min(0xFFFF) as u32) };
+        WindowGuard
+    }
+}
+#[cfg(feature = "pc")]
+impl Drop for WindowGuard {
+    fn drop(&mut self) {
+        // SAFETY: as in `set`.
+        unsafe { write_volatile(addr_of_mut!(TCP_WINDOW), NO_WINDOW) };
+    }
+}
+/// The window last advertised, so a read that frees room after a small window sends an update.
+#[cfg(feature = "pc")]
+static mut CONN_ADV: usize = CONN_BUF;
 
 /// The SYN carries MSS 1460: without it a server may send only RFC 879's default 536 bytes a segment, each one
 /// ACKed. Appends the 4-byte option to a SYN built with no options (TX_BUF has room), fixes the lengths and both
@@ -4893,6 +4985,10 @@ unsafe fn dhcp_stoppable() -> bool {
 unsafe fn recv_dhcp_stoppable(base_rx: u16, want_type: u8) -> bool {
     let mut cur = base_rx;
     let mut spins = 0u64;
+    // a clock, not a spin count: 60,000,000 spins ended the wait in under a second on the release kernel (and would on
+    // a fast machine in debug), before a slow router answered or a person could stop it (performance engineer, 15 Nov).
+    // DHCP_WAIT_MS each for the OFFER and the ACK; the spin cap stays only for a machine with no counter frequency.
+    let end = tcp_rto_deadline(DHCP_WAIT_MS);
     loop {
         if read_volatile(addr_of!(NET_RX_USED.idx)) != cur {
             let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
@@ -4911,11 +5007,20 @@ unsafe fn recv_dhcp_stoppable(base_rx: u16, want_type: u8) -> bool {
         if spins & 0xFF == 0 && net_abort() {
             return false;
         }
-        if spins > 60_000_000 {
+        if end != 0 {
+            if crate::timer::cycles() >= end {
+                return false;
+            }
+        } else if spins > 60_000_000 {
             return false;
         }
+        core::hint::spin_loop();
     }
 }
+
+/// How long `recv_dhcp_stoppable` waits for each DHCP answer (RFC 2131 4.1 starts its retransmits at 4 s).
+#[cfg(feature = "pc")]
+const DHCP_WAIT_MS: u64 = 4000;
 
 /// The name server the lease named (`dhcp_dns`), asked through an open route (Dira M1b, the must-fix): a random id
 /// and a random source port from 49152, and an answer believed only if it passes `dnscheck::check`. Two tries of
@@ -5039,5 +5144,452 @@ pub fn lease_stoppable() -> bool {
             return dhcp_stoppable();
         }
         true
+    }
+}
+// ---------------------------------------------------------------------------
+// Dira M3 S3: one TCP connection that lives between a ring-3 process's calls (AFR-0001 7.6, calls 72 to 75;
+// DIRA_S3_PLAN.md, architect's verdict 14 Nov). PC-only and at the end of the file, as M1b, so the ARM image's lines
+// stay put. Built from the proven pieces: `route_open` (the lease, the next hop, ARP), `tcp_open` (the handshake),
+// `send_tcp_segment` with the RTO schedule of `net_tcp_dial_with`. One connection in all (only Dira dials in v0.5).
+// Every wait asks the stop hook (`set_net_abort`); pc/proc.rs decides whether a stop was a close request or its
+// own deadline. Received bytes are copied out of the RX buffer at once: the receive buffer below (eight segments) is the
+// only place they are kept, and out-of-order segments are re-ACKed, never kept.
+// ---------------------------------------------------------------------------
+/// The most one connection may receive (7.6): past it the connection is reset and the call says E_TOOBIG.
+#[cfg(feature = "pc")]
+pub const CONN_MAX_IN: u64 = 4 << 20;
+/// One segment's payload at MSS 1460: the most one `conn_recv` returns.
+#[cfg(feature = "pc")]
+pub const CONN_SEG: usize = 1460;
+/// Why a connection call failed.
+#[cfg(feature = "pc")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConnErr {
+    /// a route or a connection is already open (one at a time)
+    Busy,
+    /// no card, no lease, no next hop: the route could not be opened
+    NoRoute,
+    /// the peer answered the SYN with a reset (nothing listens there)
+    Refused,
+    /// no answer in time, or the peer stopped acknowledging
+    NoReply,
+    /// the peer reset the connection
+    PeerReset,
+    /// past CONN_MAX_IN (the connection was reset)
+    TooBig,
+    /// the stop hook said stop (a close request, or the caller's deadline)
+    Stopped,
+    /// no connection is open, or the bytes to send are not 1 to TCP_MAX_PAYLOAD
+    NotOpen,
+}
+#[cfg(feature = "pc")]
+struct PcConn {
+    _route: RouteHold,
+    ip: [u8; 4],
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    ack: u32,
+    cur: u16,
+    fin: bool,
+    total: u64,
+    stash: [u8; CONN_BUF],
+    stash_at: usize,
+    stash_len: usize,
+    /// segments that came ahead of a hole, kept at their place in `stash` (within the window): their sequence ranges
+    ooo: [(u32, u32); CONN_HOLES],
+    nooo: usize,
+}
+
+/// How many out-of-order runs the connection remembers (the window is eight segments).
+#[cfg(feature = "pc")]
+const CONN_HOLES: usize = 8;
+#[cfg(feature = "pc")]
+static mut PC_CONN: Option<PcConn> = None;
+
+/// Send one segment of the connection and wait (up to 50 ms) until the card has taken it. All TCP frames are built in
+/// the one TX_BUF: the builder writes QEMU's fixed source, then the route's fix-up writes the lease's, so a second
+/// segment written while the card still reads the first can leave as a frame from 10.0.2.15 (pc-net3's capture,
+/// 14 Nov: four re-ACKs sent back to back). The connection sends in bursts (re-ACKs, an ACK right after data), so it
+/// never starts a frame before the card has finished the last one.
+#[cfg(feature = "pc")]
+unsafe fn conn_tx(dst_ip: &[u8; 4], sport: u16, dport: u16, seq: u32, ack: u32, flags: u8, data: &[u8]) -> usize {
+    tx_settle();
+    // the window is the receive buffer's free space; with no connection yet (the dial), the whole buffer
+    let free = match (*addr_of!(PC_CONN)).as_ref() {
+        Some(c) => CONN_BUF - c.stash_len,
+        None => CONN_BUF,
+    };
+    write_volatile(addr_of_mut!(CONN_ADV), free);
+    let n = {
+        let _win = WindowGuard::set(free);
+        send_tcp_segment(NET_BASE, dst_ip, sport, dport, seq, ack, flags, data)
+    };
+    tx_settle();
+    n
+}
+
+/// The open connection (kernel context, one caller at a time).
+#[cfg(feature = "pc")]
+unsafe fn pc_conn() -> Option<&'static mut PcConn> {
+    (*addr_of_mut!(PC_CONN)).as_mut()
+}
+
+/// A connection is open.
+#[cfg(feature = "pc")]
+pub fn conn_open() -> bool {
+    // SAFETY: kernel context, a read of the static above.
+    unsafe { pc_conn().is_some() }
+}
+
+/// Dial `ip`:`port`: the route (lease, next hop, ARP), then the handshake. Asks the stop hook while it waits.
+#[cfg(feature = "pc")]
+pub fn conn_dial(ip: [u8; 4], port: u16) -> Result<(), ConnErr> {
+    // SAFETY: exclusive kernel-context access to the device, its rings and the network statics.
+    unsafe {
+        if pc_conn().is_some() {
+            return Err(ConnErr::Busy);
+        }
+        let route = match route_open(ip, "[net]", "server") {
+            Ok(r) => r,
+            Err(RouteErr::Busy) => return Err(ConnErr::Busy),
+            Err(e) => {
+                // a stop during the route (the caller's deadline, or a close request, which the caller tells apart)
+                // is no route too: there was no lease or next hop in the time given
+                let why = match e {
+                    RouteErr::NoCard => "no card",
+                    RouteErr::NoLease => "no address from the router",
+                    RouteErr::NoRoute => "no router",
+                    RouteErr::NoArp(_) => "the next hop did not answer ARP",
+                    RouteErr::Stopped => "stopped before the route was open",
+                    RouteErr::Busy => "busy",
+                };
+                crate::kprintln!(
+                    "[net] conn: no route to {}.{}.{}.{} ({}; rx used {}, avail {}, frames seen {})",
+                    ip[0], ip[1], ip[2], ip[3], why,
+                    read_volatile(addr_of!(NET_RX_USED.idx)),
+                    read_volatile(addr_of!(NET_RX_AVAIL.idx)),
+                    RX_RAW_COUNT
+                );
+                return Err(ConnErr::NoRoute);
+            }
+        };
+        let sport: u16 = 41000 + (crate::rng::next_u32() % 20000) as u16;
+        let iss = crate::rng::next_u32();
+        let opened = {
+            let _win = WindowGuard::set(CONN_BUF);
+            tcp_open(NET_BASE, &ip, sport, port, iss)
+        };
+        match opened {
+            TcpOpen::Established { our_seq, our_ack, cur } => {
+                *addr_of_mut!(PC_CONN) = Some(PcConn {
+                    _route: route,
+                    ip,
+                    sport,
+                    dport: port,
+                    seq: our_seq,
+                    ack: our_ack,
+                    cur,
+                    fin: false,
+                    total: 0,
+                    stash: [0; CONN_BUF],
+                    stash_at: 0,
+                    stash_len: 0,
+                    ooo: [(0, 0); CONN_HOLES],
+                    nooo: 0,
+                });
+                Ok(())
+            }
+            TcpOpen::Refused => Err(ConnErr::Refused),
+            TcpOpen::NoReply if net_abort() => Err(ConnErr::Stopped),
+            TcpOpen::NoReply => Err(ConnErr::NoReply),
+        }
+    }
+}
+
+/// What one received frame meant to the open connection.
+#[cfg(feature = "pc")]
+enum ConnSeg {
+    /// not ours, or nothing new (an ACK, a duplicate re-ACKed)
+    Nothing,
+    /// new in-order bytes were added to the receive buffer
+    Data,
+    /// the peer's FIN, in order (ACKed)
+    Fin,
+    Reset,
+    TooBig,
+}
+
+/// Take the next frame from the RX ring, if one is there, and apply it to `c`. `acked` is set when the frame's ACK
+/// covers `want` (the sender's wait). New in-order data is added to the receive buffer; the advertised window keeps
+/// the sender within its free space, and a segment that still does not fit is left unacknowledged and sent again.
+/// A segment that comes ahead of a hole (one lost on the way, pc-dira-net's rtl8139) is kept at its place in the same
+/// buffer, within the window, and the ACK moves over it once the hole is filled. Before, it was dropped and re-ACKed,
+/// so after the server's fast retransmit every later segment came back one retransmit timeout at a time (1 s, 2 s,
+/// 4 s...: big.html took 37 s on rtl, the cloud runner 15 Nov).
+#[cfg(feature = "pc")]
+unsafe fn conn_step(c: &mut PcConn, want: u32, acked: &mut bool) -> Option<ConnSeg> {
+    if read_volatile(addr_of!(NET_RX_USED.idx)) == c.cur {
+        return None;
+    }
+    let uring = addr_of!(NET_RX_USED.ring) as *const UsedElem;
+    let elem = read_volatile(uring.add((c.cur as usize) % QSZ));
+    c.cur = c.cur.wrapping_add(1);
+    RX_RAW_COUNT += 1;
+    let _slot = RxSlot(elem.id);
+    let fr = rx_bytes(&elem);
+    if let Some((our_ip, _)) = read_volatile(addr_of!(NET_ROUTE)) {
+        arp_answer(fr, &our_ip);
+    }
+    let Some(s) = parse_tcp(fr) else { return Some(ConnSeg::Nothing) };
+    if s.dport != c.sport || s.sport != c.dport || s.src != c.ip {
+        return Some(ConnSeg::Nothing);
+    }
+    RX_COUNT += 1;
+    if s.flags & 0x04 != 0 {
+        return Some(ConnSeg::Reset);
+    }
+    if s.flags & 0x10 != 0 && seq_ge(s.ack, want) {
+        *acked = true;
+    }
+    let mut got = ConnSeg::Nothing;
+    if s.dlen > 0 {
+        let off = s.seq.wrapping_sub(c.ack) as i32;
+        let n = s.dlen;
+        if off < 0 || off as usize + n > CONN_BUF - c.stash_len {
+            // a duplicate, or past the window we gave: say where we are; the peer sends it again
+            conn_tx(&c.ip, c.sport, c.dport, c.seq, c.ack, 0x10, &[]);
+            return Some(ConnSeg::Nothing);
+        }
+        let off = off as usize;
+        if off > 0 && c.nooo == CONN_HOLES && !c.ooo[..c.nooo].iter().any(|r| r.0 == s.seq) {
+            conn_tx(&c.ip, c.sport, c.dport, c.seq, c.ack, 0x10, &[]);
+            return Some(ConnSeg::Nothing); // no room to remember another run: the peer sends it again
+        }
+        if c.stash_at + c.stash_len + off + n > CONN_BUF {
+            // room at the front: move the unread bytes, and any runs kept ahead of a hole, there first
+            c.stash.copy_within(c.stash_at..CONN_BUF, 0);
+            c.stash_at = 0;
+        }
+        let at = c.stash_at + c.stash_len + off;
+        c.stash[at..at + n].copy_from_slice(&fr[s.doff..s.doff + n]);
+        if off > 0 {
+            // ahead of a hole: keep it (once), and say where we are, so the peer resends the hole at once
+            if !c.ooo[..c.nooo].iter().any(|r| r.0 == s.seq) {
+                c.ooo[c.nooo] = (s.seq, s.seq.wrapping_add(n as u32));
+                c.nooo += 1;
+            }
+            conn_tx(&c.ip, c.sport, c.dport, c.seq, c.ack, 0x10, &[]);
+            return Some(ConnSeg::Nothing);
+        }
+        // in order: the ACK moves over it, then over every kept run the hole was holding back
+        let mut end = s.seq.wrapping_add(n as u32);
+        loop {
+            let mut moved = false;
+            let mut k = 0;
+            while k < c.nooo {
+                let (a, b) = c.ooo[k];
+                if seq_ge(end, a) {
+                    if seq_ge(b, end) && b != end {
+                        end = b;
+                    }
+                    c.ooo[k] = c.ooo[c.nooo - 1];
+                    c.nooo -= 1;
+                    moved = true;
+                } else {
+                    k += 1;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        let new = end.wrapping_sub(c.ack) as usize;
+        c.total += new as u64;
+        if c.total > CONN_MAX_IN {
+            return Some(ConnSeg::TooBig);
+        }
+        c.stash_len += new;
+        c.ack = end;
+        got = ConnSeg::Data;
+    }
+    if !c.fin && s.flags & 0x01 != 0 && s.seq.wrapping_add(s.dlen as u32) == c.ack {
+        c.fin = true;
+        c.ack = c.ack.wrapping_add(1);
+        if matches!(got, ConnSeg::Nothing) {
+            got = ConnSeg::Fin;
+        }
+    }
+    if !matches!(got, ConnSeg::Nothing) {
+        conn_tx(&c.ip, c.sport, c.dport, c.seq, c.ack, 0x10, &[]);
+    }
+    Some(got)
+}
+
+/// Forget the open connection after a reset (sent or received): the route closes with it.
+#[cfg(feature = "pc")]
+unsafe fn conn_drop() {
+    *addr_of_mut!(PC_CONN) = None;
+}
+
+/// Send `data` (1 to TCP_MAX_PAYLOAD bytes) and wait for its ACK, resending on the RTO schedule. Data the peer sends
+/// meanwhile goes to the stash for the next `conn_recv`.
+#[cfg(feature = "pc")]
+pub fn conn_send(data: &[u8]) -> Result<usize, ConnErr> {
+    // SAFETY: exclusive kernel-context access to the device, its rings and the network statics.
+    unsafe {
+        let Some(c) = pc_conn() else { return Err(ConnErr::NotOpen) };
+        if data.is_empty() || data.len() > TCP_MAX_PAYLOAD {
+            return Err(ConnErr::NotOpen);
+        }
+        let seq = c.seq;
+        if conn_tx(&c.ip, c.sport, c.dport, seq, c.ack, 0x18, data) == 0 {
+            return Err(ConnErr::NoReply);
+        }
+        let want = seq.wrapping_add(data.len() as u32);
+        c.seq = want;
+        let mut rto_ms = TCP_RTO_MS;
+        let mut rto_at = tcp_rto_deadline(rto_ms);
+        let mut retx = 0u32;
+        let mut acked = false;
+        let mut spins = 0u32;
+        loop {
+            match conn_step(c, want, &mut acked) {
+                Some(ConnSeg::Reset) => {
+                    conn_drop();
+                    return Err(ConnErr::PeerReset);
+                }
+                Some(ConnSeg::TooBig) => {
+                    conn_reset("past 4 MiB");
+                    return Err(ConnErr::TooBig);
+                }
+                Some(_) => {}
+                None => {
+                    spins = spins.wrapping_add(1);
+                    if spins & 0xFF == 0 && net_abort() {
+                        return Err(ConnErr::Stopped);
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+            if acked {
+                return Ok(data.len());
+            }
+            if rto_at != 0 && crate::timer::cycles() >= rto_at {
+                if retx >= TCP_MAX_RETX {
+                    crate::kprintln!("[net] conn: {} byte(s) unacknowledged after {} resends", data.len(), retx);
+                    conn_reset("the peer is gone");
+                    return Err(ConnErr::NoReply);
+                }
+                retx += 1;
+                conn_tx(&c.ip, c.sport, c.dport, seq, c.ack, 0x18, data);
+                rto_ms = rto_ms.saturating_mul(2);
+                rto_at = tcp_rto_deadline(rto_ms);
+            }
+        }
+    }
+}
+
+/// Up to `out.len()` (at most CONN_SEG) received bytes: the stash first, else the next in-order segment. Ok(0): the
+/// peer closed. Waits until the stop hook says stop (Err(Stopped)).
+#[cfg(feature = "pc")]
+pub fn conn_recv(out: &mut [u8]) -> Result<usize, ConnErr> {
+    // SAFETY: exclusive kernel-context access to the device, its rings and the network statics.
+    unsafe {
+        let Some(c) = pc_conn() else { return Err(ConnErr::NotOpen) };
+        let mut spins = 0u32;
+        loop {
+            if c.stash_len > 0 {
+                let n = c.stash_len.min(out.len());
+                out[..n].copy_from_slice(&c.stash[c.stash_at..c.stash_at + n]);
+                c.stash_at += n;
+                c.stash_len -= n;
+                if c.stash_len == 0 && c.nooo == 0 {
+                    c.stash_at = 0; // nothing kept ahead of a hole either: start the buffer again at its front
+                }
+                // the window we last gave was under two segments and this read made room: say so, or a sender
+                // waiting on a small window waits for its persist timer
+                if read_volatile(addr_of!(CONN_ADV)) < 2 * 1460 && CONN_BUF - c.stash_len >= 2 * 1460 && !c.fin {
+                    conn_tx(&c.ip, c.sport, c.dport, c.seq, c.ack, 0x10, &[]);
+                }
+                return Ok(n);
+            }
+            if c.fin {
+                return Ok(0);
+            }
+            let mut acked = false;
+            let want = c.seq;
+            match conn_step(c, want, &mut acked) {
+                Some(ConnSeg::Reset) => {
+                    conn_drop();
+                    return Err(ConnErr::PeerReset);
+                }
+                Some(ConnSeg::TooBig) => {
+                    conn_reset("past 4 MiB");
+                    return Err(ConnErr::TooBig);
+                }
+                Some(_) => {}
+                None => {
+                    spins = spins.wrapping_add(1);
+                    if spins & 0xFF == 0 && net_abort() {
+                        return Err(ConnErr::Stopped);
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+}
+
+/// Reset the open connection at once (exit, a stop, the 4 MiB cap): RST|ACK, then the route closes. `why` goes in
+/// the line.
+#[cfg(feature = "pc")]
+pub fn conn_reset(why: &str) {
+    // SAFETY: exclusive kernel-context access to the device, its rings and the network statics.
+    unsafe {
+        let Some(c) = pc_conn() else { return };
+        conn_tx(&c.ip, c.sport, c.dport, c.seq, c.ack, 0x14, &[]);
+        tx_settle();
+        crate::kprintln!("[net] conn to {}.{}.{}.{}:{} reset ({})", c.ip[0], c.ip[1], c.ip[2], c.ip[3], c.dport, why);
+        conn_drop();
+    }
+}
+
+/// Close the open connection from this end: FIN|ACK, then up to 200 ms for the peer's ACK and FIN; a reset if they
+/// do not come. Never waits longer.
+#[cfg(feature = "pc")]
+pub fn conn_close() {
+    // SAFETY: exclusive kernel-context access to the device, its rings and the network statics.
+    unsafe {
+        let Some(c) = pc_conn() else { return };
+        c.stash_len = 0; // nothing more is read: unread data is not kept
+        let seq = c.seq;
+        conn_tx(&c.ip, c.sport, c.dport, seq, c.ack, 0x11, &[]);
+        c.seq = seq.wrapping_add(1);
+        let t0 = crate::timer::cycles();
+        let end = tcp_rto_deadline(200);
+        let mut acked = false;
+        let want = c.seq;
+        loop {
+            match conn_step(c, want, &mut acked) {
+                Some(ConnSeg::Reset) => {
+                    conn_drop();
+                    return;
+                }
+                Some(ConnSeg::Data) => c.stash_len = 0,
+                Some(_) => {}
+                None => core::hint::spin_loop(),
+            }
+            if acked && c.fin {
+                let ms = crate::timer::cycles().saturating_sub(t0) * 1000 / crate::timer::hz().max(1);
+                crate::kprintln!("[net] conn to {}.{}.{}.{}:{} closed in {} ms", c.ip[0], c.ip[1], c.ip[2], c.ip[3], c.dport, ms);
+                conn_drop();
+                return;
+            }
+            if end == 0 || crate::timer::cycles() >= end {
+                conn_reset("no FIN back in 200 ms");
+                return;
+            }
+        }
     }
 }

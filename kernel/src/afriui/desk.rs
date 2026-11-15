@@ -18,6 +18,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering, AtomicI32
 
 #[path = "lang.rs"]
 mod lang; // the desk's words by id, in each language (LANGUAGES_PLAN.md; afriui.md section 27)
+#[path = "locale.rs"]
+mod locale; // numbers, plural forms and the clock per language, from Unicode CLDR (LANGUAGES_PLAN.md stage 5)
 #[path = "paint.rs"]
 mod paint; // the theme and every drawing function (afriui.md section 14)
 #[path = "cell_abi.rs"]
@@ -116,6 +118,7 @@ struct Snap {
     wall: bool,
     clock24: bool,
     size: (i32, i32),
+    ghost: Option<Rect>,
 }
 
 fn snap() -> Snap {
@@ -141,6 +144,7 @@ fn snap() -> Snap {
         wall: s.wallpaper,
         clock24: s.clock24,
         size: (W(), H()),
+        ghost: ghost(),
     }
 }
 
@@ -195,6 +199,12 @@ fn diff(a: &Snap, b: &Snap) -> bool {
     if a.clock24 != b.clock24 {
         damage(spine);
     }
+    if a.ghost != b.ghost {
+        // the resize or snap outline (section 33): its old and new place
+        for g in [a.ghost, b.ghost].into_iter().flatten() {
+            damage(grow(g, 2));
+        }
+    }
     true
 }
 
@@ -246,16 +256,16 @@ fn row_hashes(out: &mut [u64]) {
     }
 }
 
-/// The desktop's size in logical pixels: the PC canvas (kernel/src/pc/canvas.rs), the screen's
-/// own size over the UI scale (afriui.md section 13), read at every use so `screen ui`
-/// re-lays the desktop out.
+/// The desktop's size in logical pixels: the PC canvas (kernel/src/pc/canvas.rs) over the desk's scale (afriui.md
+/// sections 13 and 29), read at every use so `screen ui` re-lays the desktop out. Every layout number, hit test and
+/// damage box in this file is in these logical pixels at every scale; only paint.rs's primitives meet physical ones.
 #[allow(non_snake_case)]
 fn W() -> i32 {
-    crate::canvas::width() as i32
+    crate::canvas::logical_w() as i32
 }
 #[allow(non_snake_case)]
 fn H() -> i32 {
-    crate::canvas::height() as i32
+    crate::canvas::logical_h() as i32
 }
 
 // ---------------------------------------------------------------------------------------
@@ -372,6 +382,9 @@ impl App {
     }
 }
 
+/// A window. x, y, w, h are its normal place and size (the rest rectangle); a maximised or snapped window keeps them
+/// and stores only its state, so its place is worked out from the free space at every layout and a change of
+/// resolution, scale or Spine keeps it filling the space (afriui.md section 33, the architect's point 1).
 #[derive(Clone, Copy)]
 struct Win {
     open: bool,
@@ -380,8 +393,22 @@ struct Win {
     y: i32,
     w: i32,
     h: i32,
+    fit: Fit,
 }
-const WIN0: Win = Win { open: false, min: false, x: 0, y: 0, w: 0, h: 0 };
+const WIN0: Win = Win { open: false, min: false, x: 0, y: 0, w: 0, h: 0, fit: Fit::Normal };
+
+/// How a window fills the screen (section 33).
+#[derive(Clone, Copy, PartialEq)]
+enum Fit {
+    Normal,
+    Max,
+    Left,
+    Right,
+}
+
+/// The smallest size the pointer may resize each app's window to (logical pixels; section 33, point 3). The cell
+/// window's width also keeps its lintel's minimum (`cell_min_w`).
+const MIN_SIZE: [(i32, i32); NWIN] = [(240, 150), (260, 140), (300, 220), (240, 180), (120, 80)];
 
 /// Default pointer-profile windows (afriui.md section 14): each app's centre as an offset
 /// from the middle of the free space right of the Spine, and its size: a cascade round the
@@ -419,6 +446,20 @@ struct State {
     toast_until: u64,
     drag: Option<(usize, i32, i32)>,
     drag_moved: bool,
+    /// Where the press that started a drag was, and the window's normal place then (a drag of a maximised window
+    /// restores it only once the pointer has moved 4 px; an edge snap keeps the place it was dragged from).
+    press: (i32, i32),
+    drag_from: (i32, i32),
+    /// The last press on a title: the window, when (ms) and where. A second press within 400 ms and 4 px arms a
+    /// double click (`dbl`), which maximises or restores on its release if the pointer did not drag.
+    last_title: (usize, u64, i32, i32),
+    dbl: bool,
+    /// A pointer resize under way (section 33, point 4): the window, which edges (1 right, 2 bottom, 3 both), the
+    /// press point, the size at the press, and the size the outline shows; applied on release.
+    resize: Option<(usize, u8, i32, i32, i32, i32)>,
+    resize_to: (i32, i32),
+    /// The half an edge drag would snap to on release (shown as an outline while dragging).
+    snap_hint: Fit,
     files_sel: Option<usize>,
     wallpaper: bool,
     clock24: bool,
@@ -453,6 +494,13 @@ static mut S: State = State {
     toast_until: 0,
     drag: None,
     drag_moved: false,
+    press: (0, 0),
+    drag_from: (0, 0),
+    last_title: (usize::MAX, 0, 0, 0),
+    dbl: false,
+    resize: None,
+    resize_to: (0, 0),
+    snap_hint: Fit::Normal,
     files_sel: None,
     wallpaper: true,
     clock24: true,
@@ -1007,32 +1055,122 @@ fn dock_tile(i: usize) -> (i32, i32, i32) {
     (x, 6 + s + 14 + (i as i32 - 1) * (s + 8), s)
 }
 
-/// The window rectangle for an app (touch: maximised right of the Spine).
-fn win_rect(a: usize) -> (i32, i32, i32, i32) {
-    let s = st();
-    if s.touch {
-        let sw = spine_w();
-        return (sw, TOP, W() - sw, H() - TOP - bar_h());
-    }
-    let w = s.wins[a];
-    (w.x, w.y, w.w, w.h)
+/// The free space: right of the Spine (or above the lying bar), the whole height (section 33).
+fn free_space() -> Rect {
+    let sw = spine_w();
+    (sw, TOP, W() - sw, H() - TOP - bar_h())
 }
 
-/// A window's cut corners (top left, bottom right): none when maximised (touch).
-fn win_cut() -> i32 {
-    if st().touch {
+/// The rectangle a fit fills, from the free space as it is now.
+fn fit_rect(f: Fit) -> Rect {
+    let (fx, fy, fw, fh) = free_space();
+    match f {
+        Fit::Left => (fx, fy, fw / 2, fh),
+        Fit::Right => (fx + fw / 2, fy, fw - fw / 2, fh),
+        _ => (fx, fy, fw, fh),
+    }
+}
+
+/// The window rectangle for an app: touch mode and a maximised window fill the free space, a snapped one its half,
+/// a normal one its own place (section 33).
+fn win_rect(a: usize) -> (i32, i32, i32, i32) {
+    let s = st();
+    let w = s.wins[a];
+    if s.touch {
+        return fit_rect(Fit::Max);
+    }
+    match w.fit {
+        Fit::Normal => (w.x, w.y, w.w, w.h),
+        f => fit_rect(f),
+    }
+}
+
+/// Window a's cut corners (top left, bottom right): none when it fills the free space or a half of it.
+fn win_cut(a: usize) -> i32 {
+    if st().touch || st().wins[a].fit != Fit::Normal {
         0
     } else {
         CUT
     }
 }
 
-/// The two title-bar buttons of window a: (close box, minimise box) as (x, y, w, h).
+/// The title-bar buttons of window a: (close box, minimise box) as (x, y, w, h). In pointer mode the maximise
+/// button sits between them (`max_button`); in touch mode, where every window fills the space, there is none.
 fn title_buttons(a: usize) -> ((i32, i32, i32, i32), (i32, i32, i32, i32)) {
     let (x, y, w, _) = win_rect(a);
     let th = title_h();
-    let bw = if st().touch { 44 } else { 22 }; // touch: a 44 px wide target
-    ((x + w - bw - 4, y + 5, bw, th - 7), (x + w - 2 * bw - 8, y + 5, bw, th - 7))
+    let touch = st().touch;
+    let bw = if touch { 44 } else { 22 }; // touch: a 44 px wide target
+    let n = if touch { 2 } else { 3 }; // the minimise button is the leftmost
+    ((x + w - bw - 4, y + 5, bw, th - 7), (x + w - n * bw - 4 * n, y + 5, bw, th - 7))
+}
+
+/// The maximise (or restore) button of window a, between minimise and close; pointer mode only.
+pub(super) fn max_button(a: usize) -> Option<Rect> {
+    if st().touch {
+        return None;
+    }
+    let (x, y, w, _) = win_rect(a);
+    Some((x + w - 2 * 22 - 8, y + 5, 22, title_h() - 7))
+}
+
+/// Window a fills the space or a half of it.
+pub(super) fn win_fit(a: usize) -> u8 {
+    st().wins[a].fit as u8
+}
+
+/// The outline a resize or an edge snap shows while the pointer drags (section 33, point 4), if any.
+pub(super) fn ghost() -> Option<Rect> {
+    let s = st();
+    if let Some((a, _, _, _, _, _)) = s.resize {
+        let (x, y, _, _) = win_rect(a);
+        return Some((x, y, s.resize_to.0, s.resize_to.1));
+    }
+    match (s.drag, s.snap_hint) {
+        (Some(_), f) if f != Fit::Normal => Some(fit_rect(f)),
+        _ => None,
+    }
+}
+
+/// Window a's normal place, kept on the screen when it is used (the architect's point 1): at most the free space,
+/// and at least 48 px of its lintel where the pointer can take it.
+fn clamp_rest(a: usize) {
+    let w = &mut st().wins[a];
+    w.w = w.w.min(W() - SPINE_P - 8).max(MIN_SIZE[a].0.min(W() - SPINE_P - 8));
+    w.h = w.h.min(H() - TOP - 8).max(MIN_SIZE[a].1.min(H() - TOP - 8));
+    w.x = w.x.clamp(SPINE_P - (w.w - 48), W() - 48);
+    w.y = w.y.clamp(TOP, H() - TITLE_P);
+}
+
+/// Fill the space, a half, or go back to the normal place (section 33). Logged as the suite reads it.
+fn set_fit(a: usize, f: Fit) {
+    let s = st();
+    if s.touch || !s.wins[a].open {
+        return;
+    }
+    finish_motion();
+    if s.wins[a].min {
+        open(a);
+    }
+    s.wins[a].fit = f;
+    if f == Fit::Normal {
+        clamp_rest(a);
+    }
+    raise(a);
+    DIRTY.store(true, Ordering::Relaxed);
+    let what: &[u8] = match f {
+        Fit::Normal => b"restore ",
+        Fit::Max => b"maximise ",
+        Fit::Left => b"snap left ",
+        Fit::Right => b"snap right ",
+    };
+    log(what, a);
+}
+
+/// The maximise button, a double-click on the title, Super+Up: maximise, or restore a filled window.
+fn toggle_max(a: usize) {
+    let f = if st().wins[a].fit == Fit::Normal { Fit::Max } else { Fit::Normal };
+    set_fit(a, f);
 }
 
 fn inside(px: i32, py: i32, r: (i32, i32, i32, i32)) -> bool {
@@ -1170,7 +1308,7 @@ fn open(a: usize) {
     let appears = !s.wins[a].open || s.wins[a].min; // opened or restored: it unfolds
     if !s.wins[a].open {
         let (x, y, w, h) = home(a);
-        s.wins[a] = Win { open: true, min: false, x, y, w, h };
+        s.wins[a] = Win { open: true, min: false, x, y, w, h, fit: Fit::Normal };
         if a == App::Files as usize {
             s.files_sel = None;
         }
@@ -1689,6 +1827,17 @@ pub fn cell_forced() -> bool {
     CELL_FORCED.load(Ordering::Relaxed)
 }
 
+/// The owner's window has a close request waiting, or is gone or closed anyway. It reads, never takes: the request
+/// stays queued for `app_cell_event` (AFR-0001 7.6, the stop rule; pc/proc.rs's network waits, Dira M3 S3).
+/// CELL_REQ_AT is cleared only by the end of the app's run or a new open, so this stays true until the app ends.
+/// `!cell_live()` already covers Close anyway (CELL_FORCED) and a window closed under the app: no separate check.
+#[allow(dead_code)] // called by pc/proc.rs
+pub fn cell_close_pending() -> bool {
+    // SAFETY: mainline only; a scalar read (the desk's pass and the app's host calls run on the one core, never at
+    // once).
+    cell_owned() && (unsafe { CELL_REQ_AT } != 0 || !cell_live())
+}
+
 /// The title the desk draws for the cell window: the owner's file name and whether it is signed.
 pub(super) fn cell_owner() -> Option<(&'static [u8], bool)> {
     if TITLE_TEST.load(Ordering::Relaxed) {
@@ -1797,7 +1946,36 @@ pub fn cell_serial_byte(b: u8) {
         return;
     }
     if focused() == Some(App::Cell as usize) {
-        cq_post(abi::EV_KEY, b as u32);
+        // A4: the bytes go through keyseq.rs, so an arrow is one key event (KEY_BASE + n), the same code the app's
+        // getkey gets; Ctrl+C and every plain byte stay what they were.
+        let now = ms_now();
+        // SAFETY: mainline only.
+        let seq = unsafe { &mut *core::ptr::addr_of_mut!(CELL_KEYS) };
+        cell_key_out(seq.tick(now));
+        cell_key_out(seq.feed(b, now));
+    }
+}
+
+/// The cell window's key decoder (A4): one per desk, reset when an app opens the window.
+static mut CELL_KEYS: crate::keyseq::Seq = crate::keyseq::Seq::new();
+
+/// One decoder result as key events. Alt+F4 stays the desk's: it is the close request, never the app's key (the
+/// architect's A4 condition; the PC keyboard's Alt+F4 never reaches here, the serial line's ESC [ 1 ; 3 S does).
+fn cell_key_out(o: crate::keyseq::Out) {
+    match o {
+        crate::keyseq::Out::None => {}
+        crate::keyseq::Out::Key(k) if k == (abi::KEY_BASE + crate::keyseq::F1 + 3) | abi::ALT => cell_close_request("Alt+F4"),
+        crate::keyseq::Out::Key(k) => cq_post(abi::EV_KEY, k),
+        crate::keyseq::Out::Bytes(b, n) => b[..n].iter().for_each(|&c| cq_post(abi::EV_KEY, c as u32)),
+    }
+}
+
+/// An ESC that has waited ESC_MS alone is Esc: from the event wait and the desk tick.
+fn cell_key_tick() {
+    // SAFETY: mainline only.
+    let seq = unsafe { &mut *core::ptr::addr_of_mut!(CELL_KEYS) };
+    if seq.pending() {
+        cell_key_out(seq.tick(ms_now()));
     }
 }
 
@@ -1891,6 +2069,8 @@ pub fn app_cell_open(name: &[u8], signed: bool, min_cols: i32, min_rows: i32) ->
     damage(win_box(c));
     DIRTY.store(true, Ordering::Relaxed);
     CELL_OWNED.store(true, Ordering::Relaxed);
+    // SAFETY: mainline only.
+    unsafe { (*core::ptr::addr_of_mut!(CELL_KEYS)).reset() }; // A4: no half sequence from an earlier app
     let (cols, rows) = cell_grid();
     // SAFETY: mainline only.
     unsafe { CELL_GRID = abi::grid(cols, rows) };
@@ -1960,6 +2140,7 @@ pub fn app_cell_event(timeout_ms: i32) -> i32 {
         while let Some(b) = crate::uart::getc() {
             cell_serial_byte(b);
         }
+        cell_key_tick();
         idle();
         if CELL_FORCED.load(Ordering::Relaxed) || !cell_live() {
             return closed;
@@ -1992,6 +2173,7 @@ pub fn app_tick() {
         }
         CELL_TICK_AT = now;
     }
+    cell_key_tick();
     idle();
 }
 
@@ -2196,6 +2378,10 @@ fn down(px: i32, py: i32) {
     s.py = py;
     s.drag = None;
     s.drag_moved = false;
+    s.resize = None;
+    s.snap_hint = Fit::Normal;
+    s.press = (px, py);
+    s.dbl = false;
     DIRTY.store(true, Ordering::Relaxed);
 
     // 0. the language list: a row picks, outside closes (the click goes no further)
@@ -2312,13 +2498,30 @@ fn down(px: i32, py: i32) {
             if close_or_ask(a) {
                 log(b"close ", a);
             }
-        } else if inside(px, py, mn) && !s.touch {
+        } else if max_button(a).is_some_and(|b| inside(px, py, b)) {
+            toggle_max(a);
+        } else if inside(px, py, mn) {
             minimise(a);
             log(b"minimise ", a);
         } else if py < r.1 + title_h() {
+            // a second press on the same title within 400 ms and 4 px maximises or restores (section 33)
+            let now = ms_now();
+            let (la, lt, lx, ly) = s.last_title;
+            // the second press only arms it: the release maximises, and only if the pointer did not drag
+            s.dbl = !s.touch && la == a && now.saturating_sub(lt) <= 400 && (px - lx).abs() <= 4 && (py - ly).abs() <= 4;
+            s.last_title = if s.dbl { (usize::MAX, 0, 0, 0) } else { (a, now, px, py) };
             if !s.touch {
                 s.drag = Some((a, px - r.0, py - r.1));
+                s.drag_from = (s.wins[a].x, s.wins[a].y);
             }
+            if !was_focused {
+                log(b"focus ", a);
+            }
+        } else if let Some(edges) = resize_edges(a, px, py) {
+            // the bottom-right grip, or the right or bottom edge: an outline follows the pointer (section 33)
+            let w = s.wins[a];
+            s.resize = Some((a, edges, px, py, w.w, w.h));
+            s.resize_to = (w.w, w.h);
             if !was_focused {
                 log(b"focus ", a);
             }
@@ -2337,10 +2540,43 @@ fn pointer_move(px: i32, py: i32) {
     s.px = px;
     s.py = py;
     if let Some((a, ox, oy)) = s.drag {
+        if s.wins[a].fit != Fit::Normal {
+            // a filled window taken by its title: once the pointer has moved 4 px it goes back to its normal size
+            // under the pointer, keeping the grab point in proportion (section 33)
+            if (px - s.press.0).abs() < 4 && (py - s.press.1).abs() < 4 {
+                return;
+            }
+            let (_, _, cw, _) = win_rect(a);
+            let w = &mut s.wins[a];
+            let ox2 = (ox as i64 * w.w as i64 / cw.max(1) as i64) as i32;
+            w.fit = Fit::Normal;
+            w.x = px - ox2;
+            w.y = py - oy;
+            clamp_rest(a);
+            s.drag = Some((a, ox2, oy));
+            s.drag_from = (s.wins[a].x, s.wins[a].y);
+            log(b"restore ", a);
+        }
+        let (ox, oy) = (s.drag.map_or(ox, |d| d.1), s.drag.map_or(oy, |d| d.2));
         let (x, y, _, _) = win_rect(a);
         move_by(a, px - ox - x, py - oy - y);
         s.drag_moved = true;
+        // an edge snap waits for the release; meanwhile its half shows as an outline
+        let (fx, _, fw, _) = free_space();
+        s.snap_hint = if px <= fx + 8 { Fit::Left } else if px >= fx + fw - 8 { Fit::Right } else { Fit::Normal };
         DIRTY.store(true, Ordering::Relaxed);
+    }
+    if let Some((a, edges, sx, sy, w0, h0)) = s.resize {
+        // only the outline moves: the window and its app are laid out once, on release (the architect's point 4)
+        let (x, y, _, _) = win_rect(a);
+        let (fx, fy, fw, fh) = free_space();
+        let (minw, minh) = (MIN_SIZE[a].0.max(if a == App::Cell as usize { cell_min_w() } else { 0 }), MIN_SIZE[a].1);
+        let w = if edges & 1 != 0 { (w0 + px - sx).clamp(minw.min(fx + fw - x), (fx + fw - x).max(1)) } else { w0 };
+        let h = if edges & 2 != 0 { (h0 + py - sy).clamp(minh.min(fy + fh - y), (fy + fh - y).max(1)) } else { h0 };
+        if (w, h) != s.resize_to {
+            s.resize_to = (w, h);
+            DIRTY.store(true, Ordering::Relaxed);
+        }
     }
     // the close button under the pointer turns red
     let mut hover = None;
@@ -2363,12 +2599,56 @@ fn pointer_move(px: i32, py: i32) {
 
 fn up() {
     let s = st();
+    if let Some((a, w0, h0)) = s.resize.take().map(|r| (r.0, r.4, r.5)) {
+        let (w, h) = s.resize_to;
+        if (w, h) != (w0, h0) {
+            damage(win_box(a));
+            s.wins[a].w = w;
+            s.wins[a].h = h;
+            damage(win_box(a));
+            DIRTY.store(true, Ordering::Relaxed);
+            crate::kprintln!("[desk] resized {} to {}x{}", APPS[a].id(), w, h);
+        }
+        return;
+    }
+    let hint = core::mem::replace(&mut s.snap_hint, Fit::Normal);
+    let dbl = core::mem::take(&mut s.dbl);
     if let Some((a, _, _)) = s.drag.take() {
         if !core::mem::take(&mut s.drag_moved) {
+            if dbl {
+                toggle_max(a); // a double click on the title
+            }
+            return;
+        }
+        if hint != Fit::Normal {
+            // dropped on an edge: the half, and the normal place it was dragged from is kept for the restore
+            s.wins[a].x = s.drag_from.0;
+            s.wins[a].y = s.drag_from.1;
+            set_fit(a, hint);
             return;
         }
         let w = s.wins[a];
         crate::kprintln!("[desk] moved {} to {},{}", APPS[a].id(), w.x, w.y);
+    }
+}
+
+/// Which edges a press at (px, py) inside a normal window would resize: the 12 px grip at the bottom-right corner,
+/// the 6 px right edge or the 6 px bottom edge below the lintel (1 right, 2 bottom, 3 both). Pointer mode only.
+fn resize_edges(a: usize, px: i32, py: i32) -> Option<u8> {
+    let s = st();
+    if s.touch || s.wins[a].fit != Fit::Normal {
+        return None;
+    }
+    let (x, y, w, h) = win_rect(a);
+    if px >= x + w - 12 && py >= y + h - 12 {
+        return Some(3);
+    }
+    let right = px >= x + w - 6 && py > y + title_h();
+    let bottom = py >= y + h - 6;
+    match (right, bottom) {
+        (true, _) => Some(1),
+        (_, true) => Some(2),
+        _ => None,
     }
 }
 
@@ -2422,7 +2702,11 @@ fn key(k: u32) {
             }
         }
         KEY_ALT_TAB => {
-            if s.nz > 1 {
+            // a minimised window comes back first (section 33), then the cycle round the open ones
+            if let Some(a) = (0..NWIN).find(|&a| s.wins[a].open && s.wins[a].min) {
+                open(a);
+                log(b"focus ", a);
+            } else if s.nz > 1 {
                 let a = s.z[0]; // the window at the bottom comes to the front: a full cycle
                 raise(a);
                 log(b"focus ", a);
@@ -2438,22 +2722,29 @@ fn key(k: u32) {
                 }
             }
         }
+        // Super with an arrow is always the desk's, never an app's (the architect's point 5)
         KEY_SUPER_DOWN => {
             if let Some(a) = focused() {
-                minimise(a);
-                log(b"minimise ", a);
+                if s.wins[a].fit != Fit::Normal && !s.touch {
+                    set_fit(a, Fit::Normal); // a filled window goes back first; the next Super+Down minimises
+                } else {
+                    minimise(a);
+                    log(b"minimise ", a);
+                }
             }
         }
-        KEY_SUPER_LEFT | KEY_SUPER_RIGHT | KEY_SUPER_UP => {
+        KEY_SUPER_UP => {
             if let Some(a) = focused() {
-                let (dx, dy) = match k {
-                    KEY_SUPER_LEFT => (-16, 0),
-                    KEY_SUPER_RIGHT => (16, 0),
-                    _ => (0, -16),
-                };
-                move_by(a, dx, dy);
-                let w = s.wins[a];
-                crate::kprintln!("[desk] moved {} to {},{}", APPS[a].id(), w.x, w.y);
+                if s.wins[a].fit != Fit::Max {
+                    set_fit(a, Fit::Max);
+                }
+            }
+        }
+        KEY_SUPER_LEFT | KEY_SUPER_RIGHT => {
+            if let Some(a) = focused() {
+                let f = if k == KEY_SUPER_LEFT { Fit::Left } else { Fit::Right };
+                // the same key again goes back to the normal place
+                set_fit(a, if s.wins[a].fit == f { Fit::Normal } else { f });
             }
         }
         _ => {}
@@ -2480,7 +2771,10 @@ fn body_click(a: usize, bx: i32, by: i32) {
                     match k {
                         0 => set_touch(bx >= settings_seg_x(a) + 64),
                         1 => s.wallpaper = !s.wallpaper,
-                        2 => s.clock24 = !s.clock24,
+                        2 => {
+                            s.clock24 = !s.clock24;
+                            save_clock(s.clock24);
+                        }
                         3 => set_motion(!s.motion),
                         4 => {
                             if bx >= settings_seg_x(a) && bx < settings_seg_x(a) + 128 {
@@ -2595,6 +2889,10 @@ fn lang_pick(i: usize) {
 /// frame is whole; the choice is kept in afrisovera.conf (on the disk when there is one).
 fn set_lang(l: lang::Lang) {
     lang::set(l);
+    // the clock follows the language until the person chooses one (stage 5b)
+    if crate::config::clock24().is_none() {
+        st().clock24 = locale::h24(l);
+    }
     FULL.store(true, Ordering::Relaxed);
     DIRTY.store(true, Ordering::Relaxed);
     let (_, draft, _, english) = lang::counts(l);
@@ -2616,6 +2914,36 @@ fn apply_saved_lang() {
         }
         None => crate::kprintln!("[desk] lang: '{}' in afrisovera.conf is not a language the desk has; English", code),
     }
+    if let Some(v) = crate::config::clock24_damaged() {
+        crate::kprintln!("[desk] clock: clock24={} in afrisovera.conf is not 0 or 1; the clock follows the language", v);
+    }
+    st().clock24 = crate::config::clock24().unwrap_or(locale::h24(lang::current()));
+}
+
+/// The person chose a clock (the Settings switch, `desk clock 24|12`): keep it in afrisovera.conf.
+fn save_clock(on: bool) {
+    if let Err(why) = crate::config::set_clock24(on) {
+        crate::kprintln!("[desk] clock: not saved: {}", why);
+    }
+}
+
+/// `desk clock`: the clock and where its setting comes from.
+fn report_clock() {
+    let l = lang::current();
+    crate::kprintln!(
+        "[desk] clock: {}, {}",
+        if st().clock24 { "24-hour" } else { "12-hour" },
+        match crate::config::clock24() {
+            Some(_) => "the person's choice",
+            None => {
+                if locale::h24(l) {
+                    "the language's default (24-hour)"
+                } else {
+                    "the language's default (12-hour)"
+                }
+            }
+        }
+    );
 }
 
 /// Motion on or off (Settings, `desk motion on|off`); off shows every final frame at once.
@@ -2766,11 +3094,6 @@ pub fn idle() {
         pointer_move(mx, my);
     }
     later_step();
-    // an app tile is bright only while the shell is free: redraw the Circle when that changes
-    let busy = circle_busy();
-    if WAS_BUSY.swap(busy, Ordering::Relaxed) != busy && st().launcher && ntile() > NTILES {
-        FULL.store(true, Ordering::Relaxed);
-    }
     TERM_MUTE.store(false, Ordering::Relaxed);
     cell_watch();
     settle(before);
@@ -2803,6 +3126,13 @@ pub fn relayout() {
 fn settle(before: Snap) {
     let s = st();
     let mut want = DIRTY.swap(false, Ordering::Relaxed);
+    // an app tile is bright only while the shell is free (section 32): redraw the Circle when that changes. Here, not
+    // in idle, so `desk verify` (a command: the shell is busy) settles the dim tile before it compares
+    let busy = circle_busy();
+    if WAS_BUSY.swap(busy, Ordering::Relaxed) != busy && s.launcher && ntile() > NTILES {
+        damage(paint::panel_box(launcher_box()));
+        want = true;
+    }
     if TERM_DIRTY.load(Ordering::Relaxed) {
         term_apply();
     }
@@ -3063,15 +3393,17 @@ pub fn command(rest: &str) {
                 }
                 return;
             }
-            "hex" => {
-                // shape any UTF-8 given in hex (up to 256 bytes) and print its visual order
+            "hex" | "prose" => {
+                // shape any UTF-8 given in hex (up to 256 bytes) and print its visual order: `hex` as an identity
+                // string (the embeddings and overrides dropped), `prose` with every control working (C2b)
                 let mut b = [0u8; 256];
                 let n = unhex(rest.split_whitespace().nth(2).unwrap_or(""), &mut b);
-                paint::shape_report(&b[..n]);
+                let kind = if arg == "prose" { paint::shape::Text::Prose } else { paint::shape::Text::Identity };
+                paint::shape_report(&b[..n], kind);
                 return;
             }
             _ => {
-                crate::kprintln!("[desk] shape: desk shape sample|probe|hex <utf-8 in hex>");
+                crate::kprintln!("[desk] shape: desk shape sample|probe|hex <utf-8 in hex>|prose <utf-8 in hex>");
                 return;
             }
         },
@@ -3183,6 +3515,56 @@ pub fn command(rest: &str) {
                 None => crate::kprintln!("desk: no file '{}'", arg),
             }
         }
+        // section 33's suite: press a window's part where a person would, through the same press, move and release
+        // as the pointer (so the hit tests are tested at every scale): max, min, close, title, title2 (a double
+        // click), grip, right or bottom, with an optional drag of dx dy
+        "press" => match (App::from(arg), it.next()) {
+            (Some(a), Some(part)) if s.wins[a as usize].open => {
+                let a = a as usize;
+                let (x, y, w, h) = win_rect(a);
+                let (cl, mn) = title_buttons(a);
+                let mid = |r: Rect| (r.0 + r.2 / 2, r.1 + r.3 / 2);
+                let at = match part {
+                    "max" => max_button(a).map(mid),
+                    "min" => Some(mid(mn)),
+                    "close" => Some(mid(cl)),
+                    "title" | "title2" => Some((x + 40, y + 12)),
+                    "grip" => Some((x + w - 3, y + h - 3)),
+                    "right" => Some((x + w - 2, y + h / 2)),
+                    "bottom" => Some((x + w / 2, y + h - 2)),
+                    _ => None,
+                };
+                match at {
+                    Some((px, py)) => {
+                        down(px, py);
+                        if part == "title2" {
+                            up();
+                            down(px, py);
+                        }
+                        if let (Some(dx), Some(dy)) = (num_arg(it.next()), num_arg(it.next())) {
+                            pointer_move(px + dx / 2, py + dy / 2);
+                            pointer_move(px + dx, py + dy);
+                        }
+                        up();
+                    }
+                    None => crate::kprintln!("desk: press <app> max|min|close|title|title2|grip|right|bottom [dx dy]"),
+                }
+            }
+            _ => crate::kprintln!("desk: press <open app> max|min|close|title|title2|grip|right|bottom [dx dy]"),
+        },
+        // section 33: fill the space, a half, or the normal place, as the buttons and Super keys do
+        "max" | "restore" => match App::from(arg) {
+            Some(a) if s.wins[a as usize].open => {
+                set_fit(a as usize, if verb == "max" { Fit::Max } else { Fit::Normal });
+            }
+            _ => crate::kprintln!("desk: max|restore <open app>"),
+        },
+        "snap" => match (arg, it.next().and_then(App::from)) {
+            ("left" | "right", Some(a)) if s.wins[a as usize].open => {
+                set_fit(a as usize, if arg == "left" { Fit::Left } else { Fit::Right });
+            }
+            _ => crate::kprintln!("desk: snap left|right <open app>"),
+        },
         "move" => match (App::from(arg), num_arg(it.next()), num_arg(it.next())) {
             (Some(a), Some(dx), Some(dy)) if s.wins[a as usize].open => {
                 let a = a as usize;
@@ -3346,6 +3728,16 @@ pub fn command(rest: &str) {
                 case("a lone or unmatched brace is literal", fill(b"a{b{9 }{x}{", &[lang::Arg::N(1)]).get(), b"a{b{9 }{x}{");
                 case("two digits are not a gap", fill(b"{12}", &[lang::Arg::N(7)]).get(), b"{12}");
                 case("the largest number", fill(b"{0}", &[lang::Arg::N(u64::MAX)]).get(), b"18446744073709551615");
+                // stage 5: the counted gap, grouping and memory, the English way
+                case("a counted gap fills like a gap", fill(b"{0#} cores", &[lang::Arg::N(3)]).get(), b"3 cores");
+                case("a half-made counted gap is literal", fill(b"{0#", &[lang::Arg::N(3)]).get(), b"{0#");
+                case("a count is grouped by three", fill(b"{0}", &[lang::Arg::G(1234567)]).get(), b"1,234,567");
+                case("a short count is not grouped", fill(b"{0}", &[lang::Arg::G(999)]).get(), b"999");
+                case("the largest count", fill(b"{0}", &[lang::Arg::G(u64::MAX)]).get(), b"18,446,744,073,709,551,615");
+                case("memory under 1 GiB is MiB", fill(b"{0}", &[lang::Arg::Mem(512)]).get(), b"512 MiB");
+                case("memory in GiB with one decimal", fill(b"{0}", &[lang::Arg::Mem(3891)]).get(), b"3.8 GiB");
+                case("a whole GiB has no decimal", fill(b"{0}", &[lang::Arg::Mem(16384)]).get(), b"16 GiB");
+                case("the largest memory", fill(b"{0}", &[lang::Arg::Mem(u64::MAX)]).get(), b"1,801,439,850,948,198.3 GiB");
                 let long = [b'x'; 300];
                 let over = fill(b"<{0}>", &[lang::Arg::S(&long)]);
                 all += 1;
@@ -3402,6 +3794,65 @@ pub fn command(rest: &str) {
                 None => crate::kprintln!("desk: lang [check|fit|<code>]; codes: {}", lang::codes()),
             },
         },
+        "clock" => match arg {
+            // stage 5b: `desk clock` reports, `desk clock 24|12` chooses (and saves) like the Settings switch
+            "" => report_clock(),
+            "24" | "12" => {
+                st().clock24 = arg == "24";
+                save_clock(arg == "24");
+                FULL.store(true, Ordering::Relaxed);
+                DIRTY.store(true, Ordering::Relaxed);
+                report_clock();
+            }
+            _ => crate::kprintln!("desk: clock [24|12]"),
+        },
+        "locale" => match arg {
+            // stage 5: each language's numbers, plural forms and clock words, graded against CLDR by desk-locale
+            "probe" => {
+                for &l in lang::LANGS.iter() {
+                    let mut line = Line::new();
+                    line.s(b"plural");
+                    for n in [0u64, 1, 2, 3, 5, 11, 21, 101, 1000000] {
+                        line.s(b" ").u(n).s(b"=").s(locale::plural(l, n).name().as_bytes());
+                    }
+                    // three parts: one Line holds 128 bytes, a whole probe line is longer
+                    let mut two = Line::new();
+                    two.s(b"; group");
+                    for n in [1000u64, 1234567] {
+                        two.s(b" ").u(n).s(b"=");
+                        locale::group(l, n, &mut |b: &[u8]| {
+                            two.s(b);
+                        });
+                    }
+                    two.s(b"; memory");
+                    for m in [512u64, 3891, 16384] {
+                        two.s(b" ").u(m).s(b"=");
+                        locale::memory(l, m, &mut |b: &[u8]| {
+                            two.s(b);
+                        });
+                    }
+                    let mut three = Line::new();
+                    three.s(b"; am=").s(locale::am(l)).s(b" pm=").s(locale::pm(l));
+                    three.s(if locale::h24(l) { b"; clock 24" } else { b"; clock 12" });
+                    crate::kprintln!(
+                        "[desk] locale {}: {}{}{}",
+                        l.code(),
+                        core::str::from_utf8(line.get()).unwrap_or("?"),
+                        core::str::from_utf8(two.get()).unwrap_or("?"),
+                        core::str::from_utf8(three.get()).unwrap_or("?")
+                    );
+                }
+                let (ok, all, first) = locale::check_samples();
+                if let Some((l, n, want, got)) = first {
+                    crate::kprintln!("[desk] locale samples: FAIL {} {}: CLDR says {}, the desk says {}", l.code(), n, want.name(), got.name());
+                }
+                crate::kprintln!(
+                    "[desk] locale samples: {}/{} held; table order {}; plural stand-ins {}",
+                    ok, all, if locale::order_ok() { "ok" } else { "WRONG" }, lang::stand_ins()
+                );
+            }
+            _ => crate::kprintln!("desk: locale probe"),
+        },
         "notify" => {
             let msg = rest.trim_start()["notify".len()..].trim();
             if msg.is_empty() {
@@ -3430,12 +3881,18 @@ pub fn command(rest: &str) {
                 any = true;
                 let (x, y, ww, hh) = win_rect(a);
                 crate::kprintln!(
-                    "[desk] window {} at {},{} size {}x{}{}",
+                    "[desk] window {} at {},{} size {}x{}{}{}",
                     APPS[a].id(),
                     x,
                     y,
                     ww,
                     hh,
+                    match w.fit {
+                        Fit::Normal => "",
+                        Fit::Max => " maximised",
+                        Fit::Left => " snapped left",
+                        Fit::Right => " snapped right",
+                    },
                     if w.min { " minimised" } else if focused() == Some(a) { " focused" } else { "" }
                 );
             }

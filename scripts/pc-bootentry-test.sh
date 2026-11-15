@@ -76,7 +76,7 @@ grade() { # grade <boot1 log> ... <boot5 log>
     in_blk "$(blk "$A" 'bootentry remove')" 'bootentry remove: AfriSovera has no boot entry; nothing to remove' ||
         _f "boot 1: bootentry remove did not find nothing to remove"
     # boot 2
-    printf '%s\n' "$(pblk "$B" 'bootcopy yes ')" | grep -aqE "^bootcopy: copied to $NAME partition $PNO.*read back the same" ||
+    grep -aqE "^bootcopy: copied to $NAME partition $PNO.*read back the same" <<< "$(pblk "$B" 'bootcopy yes ')" ||
         _f "boot 2: bootcopy did not copy the boot file"
     local B2; B2="$(blk "$B" bootentry)"
     in_blk "$B2" "bootentry: $NUM \"AfriSovera\" -> $NAME partition $PNO \(start $STARTL, $BLOCKS blocks\)$FILE_RE" ||
@@ -105,7 +105,7 @@ grade() { # grade <boot1 log> ... <boot5 log>
     in_blk "$DE" "bootentries: the firmware's boot entries, as read at power-on \(nothing is changed\)" || _f "boot 4: bootentries did not read at power-on"
     in_blk "$DE" "  BootOrder:$ORDER0 $N4" || _f "boot 4: at power-on BootOrder is not$ORDER0 $N4 (the entry was not stored)"
     in_blk "$DE" "  $NUM  active  \"AfriSovera\"  HD\($PNO,GPT,$G,start $STARTL\)/$FILE_RE" || _f "boot 4: at power-on $NUM is not there as written"
-    if printf '%s\n' "$DE" | grep -aq '  <- started this time' && printf '%s\n' "$DE" | grep -a '<- started this time' | grep -aq '"AfriSovera"'; then
+    if grep -aq '  <- started this time' <<< "$DE" && grep -aq '"AfriSovera"' <<< "$(grep -a '<- started this time' <<< "$DE")"; then
         _f "boot 4: the PC started AfriSovera's entry instead of its first choice"
     fi
     local D2; D2="$(blk "$D" 'bootentry remove')"
@@ -121,8 +121,8 @@ grade() { # grade <boot1 log> ... <boot5 log>
         _f "boot 5: bootentry remove did not delete $NUM and read back"
     in_blk "$EE" "  BootOrder:$ORDER0" || _f "boot 5: BootOrder is not back to$ORDER0"
     in_blk "$EE" "  AfriSovera's own entry: none yet \(adding one will ask for the owner's word\)" || _f "boot 5: an AfriSovera entry is still there"
-    if printf '%s\n' "$EE" | grep -aq '"AfriSovera"'; then _f "boot 5: bootentries still lists an AfriSovera entry"; fi
-    if printf '%s\n%s\n%s\n%s\n%s\n' "$A" "$B" "$C" "$D" "$E" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)|FAILED|refused to write|could not be written|did not read back|did not delete'; then
+    if grep -aq '"AfriSovera"' <<< "$EE"; then _f "boot 5: bootentries still lists an AfriSovera entry"; fi
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)|FAILED|refused to write|could not be written|did not read back|did not delete' <<< "$A"$'\n'"$B"$'\n'"$C"$'\n'"$D"$'\n'"$E"; then
         _f "the kernel panicked, a disk command or a firmware write failed, or something FAILED"
     fi
     return "$fail"

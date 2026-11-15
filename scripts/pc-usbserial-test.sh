@@ -30,8 +30,8 @@ grade() { # grade <COM1 capture> <cable capture>
     [ -r "$2" ] || { echo "  FAIL: missing cable capture"; return 1; }
     C="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     U="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hc() { printf '%s\n' "$C" | grep -aqE "$1"; }
-    hu() { printf '%s\n' "$U" | grep -aqE "$1"; }
+    hc() { grep -aqE "$1" <<< "$C"; }
+    hu() { grep -aqE "$1" <<< "$U"; }
     hc '^\[xhci\] controller [0-9a-f]{2}:[0-9a-f]{2}\.[0-7] \(xHCI [0-9]+\.[0-9]+\), [0-9]+ ports, [0-9]+ slots' ||
         _f "the xHCI controller did not come up"
     hc "$CABLE" || _f "COM1: the USB serial cable was not set up (FTDI FT232, 115200 8N1, bulk IN 1 / OUT 2)"
@@ -53,7 +53,7 @@ grade() { # grade <COM1 capture> <cable capture>
         [ "$er" = 0 ] || _f "cable: $er transfer errors"
     fi
     hu 'usb-serial +[a-z]+ +0x0+ +OK' || _f "cable: usb-serial is not in devices"
-    if printf '%s\n%s\n' "$C" "$U" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[xhci\] .*(failed|timed out|did not)'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[xhci\] .*(failed|timed out|did not)' <<< "$C"$'\n'"$U"; then
         _f "$(printf '%s\n%s\n' "$C" "$U" | grep -aE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[xhci\] .*(failed|timed out|did not)' | head -1)"
     fi
     return "$fail"

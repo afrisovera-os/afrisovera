@@ -60,7 +60,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
     has "$D" "\[nvme\] namespace 1: .*AfriSovera's partition \(AFRIVFS1\): used for storage, the rest left alone" || _f "boot 4: the partition is not used for storage"
     has "$(blk "$D" 'cat notes.txt')" 'HELLO-PART-6NOV' || _f "boot 4: notes.txt did not come back from the partition"
     has "$D" 'harness: boot 4: outside the partition the nvme image is as the install left it' || _f "boot 4: something outside the partition changed"
-    if printf '%s\n' "$A" "$B" "$C" "$D" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci|xhci)\] .*(failed|timed out)|FAILED'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci|xhci)\] .*(failed|timed out)|FAILED' <<< "$A"$'\n'"$B"$'\n'"$C"$'\n'"$D"; then
         _f "the kernel panicked or a disk command failed"
     fi
     return "$fail"

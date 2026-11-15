@@ -78,7 +78,8 @@ grade() { # grade <serial log> <kernel name>
     local fail=0 S got h
     _f() { echo "  FAIL ($2): $1"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL ($2): missing serial log"; return 1; }
-    S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
+    # stray control bytes and trailing spaces never hide a line (a once-seen ARM desk-cell miss, 15 Nov)
+    S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | tr -d '\000-\010\013-\037\177' | sed 's/[[:space:]]*$//')"
     has() { grep -aqxF "$1" <<< "$S" || _f "no line: $1" "$2"; }
     grep -aqE 'PANIC|panicked' <<< "$S" && _f "the kernel panicked or faulted" "$2"
     has "[desk] cell: 65x24 grid" "$2"
@@ -166,6 +167,7 @@ selftest() {
     case_ crlf green "$(printf '%s\n' "$GREEN" | sed 's/$/\r/')"
     case_ empty red ""
     case_ panic red "$(printf '%s\nKERNEL PANIC at desk.rs\n' "$GREEN")"
+    case_ stray-bytes green "$(sed 's/^\[desk\] cell: 65x24 grid$/[desk] cell: 65x24 grid\x07\x01  /' <<< "$GREEN")"
     case_ grid-size-bad red "$(printf '%s\n' "$GREEN" | sed 's/^\[desk\] cell: 65x24 grid$/[desk] cell: 64x24 grid/')"
     case_ demo-hash-bad red "$(printf '%s\n' "$GREEN" | sed 's/hash 0123456789abcdef/hash 0123456789abcdee/')"
     case_ demo-missing red "$(printf '%s\n' "$GREEN" | grep -v 'cell demo:')"
@@ -192,7 +194,7 @@ selftest() {
     case_ anyway-weak red "$(sed 's/close anyway F2EADC on C1121F/close anyway F2EADC on E8A090/' <<< "$GREEN")"
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 28 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 29 ]
 }
 
 echo "== the cell window on the desk: put, cursor, clip, box, resize, verify, on both kernels =="

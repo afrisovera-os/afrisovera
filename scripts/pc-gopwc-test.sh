@@ -40,10 +40,10 @@ grade() { # grade <serial> <pixels>
     [ -z "$p" ] || _f "step ${p%% *}: no line matching '${p#* }' (after the step before it)"
     got="$(printf '%s\n' "$P" | sed -n 's/^20,250=//p' | head -1)"
     [ "$got" = 100C0A ] || _f "the desktop's Spine is ${got:-missing} on the screenshot, not its night #100C0A"
-    if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$S"; then _f "the kernel panicked"; fi
     # D1a and D1c: on QEMU core 1 always answers and both cores' PAT has WC
-    if printf '%s\n' "$S" | grep -aq '^screen: core 1 did not answer'; then _f "core 1 did not answer a shootdown"; fi
-    if printf '%s\n' "$S" | grep -aq '^screen: PAT entry 4 is WC on only'; then _f "a core's PAT has no WC, so the screen fell back to uncached"; fi
+    if grep -aq '^screen: core 1 did not answer' <<< "$S"; then _f "core 1 did not answer a shootdown"; fi
+    if grep -aq '^screen: PAT entry 4 is WC on only' <<< "$S"; then _f "a core's PAT has no WC, so the screen fell back to uncached"; fi
     return "$fail"
 }
 

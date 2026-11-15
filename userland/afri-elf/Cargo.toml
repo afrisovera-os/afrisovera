@@ -1,0 +1,20 @@
+# afri-elf: the ELF reader of the Daraja Linux bridge (userland/daraja-linux, compatibility stage 0 step 3; AFR-0001
+# 7.7 and COMPAT_STAGE0_PLAN.md). The kernel never reads a foreign program file: the bridge does, with this crate,
+# and gives the kernel only page mappings and an entry point. It is a separate crate so it can be tested and fuzzed
+# on its own.
+#
+# no_std, no dependencies, no allocation, no unsafe. Written from the published ELF specification (System V gABI) and
+# the System V AMD64 psABI only (the clean-room rule, ARCHITECT_REVIEWS 14 Nov 2026); no Linux source was read.
+#
+# The empty [workspace] table detaches this crate from the kernel workspace, like wlan-crypto. Host tests:
+#   cd userland/afri-elf && cargo test
+[package]
+name = "afri-elf"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "A strict, allocation-free reader for static x86-64 ELF executables (the Daraja Linux bridge)."
+
+[dependencies]
+
+[workspace]

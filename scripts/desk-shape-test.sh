@@ -37,12 +37,26 @@ WANT_B="8 chars, 0 dropped, paragraph 0, levels 0 0 0 1 1 1 2 2, order 0 1 2 6 7
 WANT_C="6 chars, 0 dropped, paragraph 1, levels 1 1 1 1 1 2, order 5 4 3 2 1 0,"
 WANT_D="4 chars, 1 dropped, paragraph 0, levels 0 0 1 1, order 0 1 3 2,"
 WANT_E="6 chars, 0 dropped, paragraph 1, levels 2 2 2 1 1 1, order 5 4 3 0 1 2,"
+# C2b, the explicit controls (the architect's rule): an identity string drops the embeddings and overrides, prose
+# keeps them; isolates work in both.
+#  F  "abc" RLO "def" PDF as an identity string (desk shape hex): both controls dropped, the name in its logical order.
+#  G  the same as prose (desk shape prose): RLO makes "def" R at level 1, drawn reversed; RLO and PDF are removed (x).
+#  H  "ab " RLI "cd" PDI " ef" as prose: cd sits in a right-to-left isolate as L at level 2, so it still reads cd.
+#  I  "a " FSI بك PDI " b" as an identity string: the isolate stays, FSI takes R from بك, which is reversed alone.
+HEX_F=616263e280ae646566e280ac
+HEX_H=616220e281a76364e281a9206566
+HEX_I=6120e281a8d8a8d983e281a92062
+WANT_F="6 chars, 2 dropped, paragraph 0, levels 0 0 0 0 0 0, order 0 1 2 3 4 5,"
+WANT_G="8 chars, 0 dropped, paragraph 0, levels 0 0 0 x 1 1 1 x, order 0 1 2 6 5 4,"
+WANT_H="10 chars, 0 dropped, paragraph 0, levels 0 0 0 0 2 2 0 0 0 0, order 0 1 2 3 4 5 6 7 8 9,"
+WANT_I="8 chars, 0 dropped, paragraph 0, levels 0 0 0 1 1 0 0 0, order 0 1 2 4 3 5 6 7,"
 # the title: تطبيق app 2 (16 bytes)
 TITLE_HEX=d8aad8b7d8a8d98ad982206170702032
 
 CMDS=(
     "gui" "desk mode pointer" "desk shape probe"
     "desk shape hex $HEX_A" "desk shape hex $HEX_B" "desk shape hex $HEX_C" "desk shape hex $HEX_D" "desk shape hex $HEX_E"
+    "desk shape hex $HEX_F" "desk shape prose $HEX_F" "desk shape prose $HEX_H" "desk shape hex $HEX_I"
     "desk cell open" "desk cell titlehex $TITLE_HEX" "desk verify" "desk cell titlecheck"
     "desk cell resize 40 30" "desk cell titlecheck" "desk cell titletest off" "desk cell close"
     "desk shape sample" "desk verify" "desk notes" "desk verify"
@@ -77,10 +91,10 @@ grade() { # grade <serial log> <kernel name>
     has "[desk] shape: needed: latin no, yoruba no, arabic yes, hebrew yes, control yes" "$2"
     hasre '^\[desk\] shape: arabic 40 characters: cap 9 cold [0-9]+ us, warm [0-9]+ us \(worst of 20 [0-9]+ us\); cap 18 ' "$2" "no Arabic speed line"
     hasre '^\[desk\] shape: latin 40 characters: cap 9 cold [0-9]+ us, warm [0-9]+ us \(worst of 20 [0-9]+ us\); cap 18 ' "$2" "no Latin speed line"
-    for want in "$WANT_A" "$WANT_B" "$WANT_C" "$WANT_D" "$WANT_E"; do
+    for want in "$WANT_A" "$WANT_B" "$WANT_C" "$WANT_D" "$WANT_E" "$WANT_F" "$WANT_G" "$WANT_H" "$WANT_I"; do
         grep -aqF "[desk] shape: $want width " <<< "$S" || _f "no bidi line: $want" "$2"
     done
-    [ "$(grep -acE '^\[desk\] shape: oracle [0-9a-f]{16}$' <<< "$S")" -eq 5 ] || _f "not five oracle lines after desk shape hex" "$2"
+    [ "$(grep -acE '^\[desk\] shape: oracle [0-9a-f]{16}$' <<< "$S")" -eq 9 ] || _f "not nine oracle lines after desk shape hex and prose" "$2"
     has "[desk] cell titlehex: 16 bytes (unsigned, Close anyway offered)" "$2"
     got="$(grep -acE '^\[desk\] cell title: window [0-9]+ wide \(at least [0-9]+\), mark [0-9]+\.\.[0-9]+ whole, Close anyway [0-9]+\.\.[0-9]+, buttons from [0-9]+; nothing over Close anyway; name (cut|whole)$' <<< "$S")"
     [ "$got" -eq 2 ] || _f "$got of 2 Arabic titles kept the mark whole and nothing over Close anyway" "$2"
@@ -117,6 +131,14 @@ selftest() {
 [desk] shape: oracle 4444444444444444
 [desk] shape: $WANT_E width 28, needed yes
 [desk] shape: oracle 5555555555555555
+[desk] shape: $WANT_F width 30, needed no
+[desk] shape: oracle 6666666666666666
+[desk] shape: $WANT_G width 30, needed no
+[desk] shape: oracle 7777777777777777
+[desk] shape: $WANT_H width 45, needed no
+[desk] shape: oracle 8888888888888888
+[desk] shape: $WANT_I width 30, needed yes
+[desk] shape: oracle 9999999999999999
 [desk] cell titlehex: 16 bytes (unsigned, Close anyway offered)
 [desk] verify: 0 of 540 rows differ after a full redraw (3 partial frame(s) drawn before it)
 [desk] cell title: window 300 wide (at least 259), mark 60..112 whole, Close anyway 120..204, buttons from 222; nothing over Close anyway; name whole
@@ -151,6 +173,9 @@ selftest() {
     case_ order-wrong red "$(printf '%s\n' "$GREEN" | sed 's/order 0 1 2 6 7 5 4 3/order 0 1 2 7 6 5 4 3/')"
     case_ levels-wrong red "$(printf '%s\n' "$GREEN" | sed 's/levels 2 2 2 1 1 1/levels 2 2 2 2 1 1/')"
     case_ dropped-missing red "$(printf '%s\n' "$GREEN" | sed 's/4 chars, 1 dropped/5 chars, 0 dropped/')"
+    case_ identity-override-kept red "$(printf '%s\n' "$GREEN" | sed 's/6 chars, 2 dropped, paragraph 0, levels 0 0 0 0 0 0, order 0 1 2 3 4 5,/6 chars, 0 dropped, paragraph 0, levels 0 0 0 1 1 1, order 0 1 2 5 4 3,/')"
+    case_ prose-override-lost red "$(printf '%s\n' "$GREEN" | sed 's/levels 0 0 0 x 1 1 1 x, order 0 1 2 6 5 4/levels 0 0 0 x 0 0 0 x, order 0 1 2 4 5 6/')"
+    case_ isolate-wrong red "$(printf '%s\n' "$GREEN" | sed 's/levels 0 0 0 0 2 2 0 0 0 0/levels 0 0 0 0 1 1 0 0 0 0/')"
     case_ title-overlap red "$(printf '%s\n' "$GREEN" | sed '0,/nothing over Close anyway/s/nothing over Close anyway/OVERLAP/')"
     case_ title-mark-cut red "$(printf '%s\n' "$GREEN" | sed 's/mark 45..97 whole/mark 45..97 NOT WHOLE/')"
     case_ title-not-narrowest red "$(printf '%s\n' "$GREEN" | sed 's/window 259 wide (at least 259)/window 270 wide (at least 259)/')"
@@ -159,7 +184,7 @@ selftest() {
     case_ stale-rows red "$(printf '%s\n' "$GREEN" | sed '0,/verify: 0 of/s/verify: 0 of/verify: 12 of/')"
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 23 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 26 ]
 }
 
 echo "== Arabic joined and right to left (SHAPING_PLAN C1), on both kernels =="

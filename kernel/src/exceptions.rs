@@ -228,7 +228,30 @@ sync_el1h:
     add x0, x0, #0x1000
     cmp sp, x0
     b.lo 4f
-2:  mrs x0, tpidr_el1
+2:  // G2 part 2 (kernel/src/uaccess.rs): a data abort taken at EL1 (EC 0x25) EXACTLY on one of the uaccess
+    // helpers' own LDTRB/STTRB resumes at that helper's fixup, which returns -1. The table is fixed at link time;
+    // anything else stays fatal. Only x0 (parked) and x1, x2 (saved here) are used, so the helper's x30 and stack
+    // are untouched and its `ret` goes back to its caller.
+    mrs x0, esr_el1
+    ubfx x0, x0, #26, #6
+    cmp x0, #0x25
+    b.ne 6f
+    stp x1, x2, [sp, #-16]!
+    mrs x0, elr_el1
+    ldr x1, =uaccess_extable
+5:  ldr x2, =uaccess_extable_end
+    cmp x1, x2
+    b.hs 7f
+    ldr x2, [x1], #16
+    cmp x2, x0
+    b.ne 5b
+    ldur x2, [x1, #-8]
+    msr elr_el1, x2
+    ldp x1, x2, [sp], #16
+    mrs x0, tpidr_el1
+    eret
+7:  ldp x1, x2, [sp], #16
+6:  mrs x0, tpidr_el1
     bl  rust_sync_handler
 3:  ldr x0, =__emerg_top0
     mov sp, x0

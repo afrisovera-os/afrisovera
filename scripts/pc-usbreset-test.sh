@@ -28,8 +28,8 @@ grade() { # grade <serial>
     if [ -z "$line" ]; then
         _f "no reset line at boot"
     else
-        printf '%s\n' "$line" | grep -aq '^\[xhci\] reset: halted, ready' || _f "the controller did not halt before its reset: $line"
-        printf '%s\n' "$line" | grep -aq 'this is one' && _f "QEMU's controller called an Intel host: $line"
+        grep -aq '^\[xhci\] reset: halted, ready' <<< "$line" || _f "the controller did not halt before its reset: $line"
+        grep -aq 'this is one' <<< "$line" && _f "QEMU's controller called an Intel host: $line"
         ms="$(printf '%s\n' "$line" | sed -E 's/.* ready ([0-9]+) ms after.*/\1/')"
         { [ "$ms" -ge 1 ] && [ "$ms" -le 100 ]; } || _f "ready after $ms ms (1 to 100 expected: the 1 ms wait comes first)"
     fi

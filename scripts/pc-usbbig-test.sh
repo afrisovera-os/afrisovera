@@ -28,8 +28,8 @@ grade() { # grade <boot1 log> <boot2 log>
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqE "$1"; }
-    hasB() { printf '%s\n' "$B" | grep -aqE "$1"; }
+    hasA() { grep -aqE "$1" <<< "$A"; }
+    hasB() { grep -aqE "$1" <<< "$B"; }
     hasA "^\[xhci\] USB storage: $BLOCKS blocks, past what READ\(10\) can address: READ\(16\)/WRITE\(16\) for every read and write$" ||
         _f "boot 1: the disk's real size was not read with READ CAPACITY(16)"
     hasA "^\[xhci\] USB storage: 16-byte commands checked at block $LAST \(written, read back, put back; block $WRAP untouched\)$" ||
@@ -46,7 +46,7 @@ grade() { # grade <boot1 log> <boot2 log>
     hasB '^\[xhci\] USB storage: 16-byte commands checked at block ' || _f "boot 2: the 16-byte check did not pass"
     hasB '^\[vfs\] VFS restored from disk: [0-9]+ files$' || _f "boot 2: the VFS was not restored from the disk"
     hasB '^HELLO-USB-BIG-9NOV$' || _f "boot 2: notes.txt did not come back from the disk"
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE "$BAD"; then
+    if grep -aqE "$BAD" <<< "$A"$'\n'"$B"; then
         _f "$(printf '%s\n%s\n' "$A" "$B" | grep -aE "$BAD" | head -1)"
     fi
     return "$fail"

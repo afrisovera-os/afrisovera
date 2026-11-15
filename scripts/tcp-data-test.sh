@@ -97,7 +97,7 @@ sed 's/^/  /' "$PEERLOG" 2>/dev/null
 FAIL=0
 
 # 1. The segment self-test.
-if ! echo "$SER" | grep -qE "\[tcpseg\] 10/10 passed"; then
+if ! grep -qE "\[tcpseg\] 10/10 passed" <<< "$SER"; then
     echo "  segment self-test did NOT report 10/10"
     FAIL=1
 fi
@@ -111,7 +111,7 @@ fi
 # 3. The kernel's account of the round trip.
 for want in "TCP data sent: ${#PAYLOAD} bytes" "TCP peer ACKed our ${#PAYLOAD} bytes" \
             "TCP received " "TCP data round-trip OK"; do
-    if ! echo "$SER" | grep -qF "$want"; then
+    if ! grep -qF "$want" <<< "$SER"; then
         echo "  serial is missing: $want"
         FAIL=1
     fi

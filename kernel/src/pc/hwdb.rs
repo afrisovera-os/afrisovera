@@ -13,7 +13,7 @@ use crate::pci::cfg_read32 as cfg32;
 
 /// One thing a driver binds to. Plain data, as the v1 manifest's `binds`.
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // the USB and ACPI forms are declared for the standard; the xHCI walk still decides USB
+#[allow(dead_code)] // the ACPI form is declared for the standard (ACPI devices use AcpiV, below)
 pub enum Bind {
     /// A PCI vendor and device id; `mask` picks the device-id bits that must be equal (0xFFFF for one
     /// device), `min_rev` is the lowest revision taken (0 for any).
@@ -50,6 +50,29 @@ pub const fn pci_ids(vendor: u16, device: u16, mask: u16, name: &'static str) ->
 /// A PCI class code under a mask.
 pub const fn pci_class(class: u32, mask: u32, name: &'static str) -> Part {
     Part { bind: Bind::PciClass { class, mask }, name }
+}
+/// A USB interface class, subclass and protocol; `mask` bit 0 class, bit 1 subclass, bit 2 protocol.
+pub const fn usb_class(class: u8, sub: u8, proto: u8, mask: u8, name: &'static str) -> Part {
+    Part { bind: Bind::UsbClass { class, sub, proto, mask }, name }
+}
+/// One USB vendor and product id (0xFFFF product: any product of that vendor).
+pub const fn usb_id(vendor: u16, product: u16, name: &'static str) -> Part {
+    Part { bind: Bind::UsbId { vendor, product }, name }
+}
+
+/// The part of a USB driver's `parts` that takes an interface of class `cls` (class, subclass, protocol) on a
+/// device `vid`:`pid`, if any. An id row beats a class row (AFR-0002 section 5.1, the Driver Standard's rule 3).
+/// The xHCI driver's descriptor walk decides with this, and `hwscan` reads the same tables (rule 1).
+pub fn usb_part(parts: &'static [Part], cls: (u8, u8, u8), vid: u16, pid: u16) -> Option<&'static Part> {
+    let id = parts.iter().find(|p| matches!(p.bind, Bind::UsbId { vendor, product } if vendor == vid && (product == 0xFFFF || product == pid)));
+    id.or_else(|| {
+        parts.iter().find(|p| match p.bind {
+            Bind::UsbClass { class, sub, proto, mask } => {
+                (mask & 1 == 0 || cls.0 == class) && (mask & 2 == 0 || cls.1 == sub) && (mask & 4 == 0 || cls.2 == proto)
+            }
+            _ => false,
+        })
+    })
 }
 
 /// Does `bind` take the PCI function with this vendor:device (`id`, configuration dword 0) and
@@ -88,9 +111,9 @@ pub fn class_part(parts: &'static [Part], class: u32) -> Option<&'static Part> {
 pub enum How {
     /// From its own BINDS, on the PCI buses (`pci_part`).
     Pci(&'static [Part]),
-    /// Inside the xHCI driver's descriptor walk, as the device is enumerated (the USB function drivers:
-    /// not yet moved onto BINDS, so they give no `class` verdict).
-    UsbWalk,
+    /// From its own BINDS of USB classes and ids, which the xHCI driver's descriptor walk asks (`usb_part`) as
+    /// the device is enumerated. A device a table matches but the driver refuses is a `class` verdict.
+    Usb(&'static [Part]),
     /// At a fixed place the CPU or the firmware gives (legacy ports, the firmware's framebuffer, the CPU's
     /// own timer and interrupt controller, memory): no bus id.
     Platform,
@@ -108,13 +131,13 @@ pub const DRIVERS: &[(&str, How)] = &[
     ("intel-hda", How::Pci(crate::hda::BINDS)),
     ("usb-host (xhci)", How::Pci(crate::xhci::BINDS)),
     ("virtio", How::Pci(VIRTIO_BINDS)),
-    ("usb-storage", How::UsbWalk),
-    ("usb-ethernet", How::UsbWalk),
-    ("usb-keyboard", How::UsbWalk),
-    ("usb-mouse", How::UsbWalk),
-    ("usb-tablet", How::UsbWalk),
-    ("usb-audio", How::UsbWalk),
-    ("usb-serial", How::UsbWalk),
+    ("usb-storage", How::Usb(crate::xhci::MSC_BINDS)),
+    ("usb-ethernet", How::Usb(crate::xhci::NET_BINDS)),
+    ("usb-keyboard", How::Usb(crate::xhci::KBD_BINDS)),
+    ("usb-mouse", How::Usb(crate::xhci::MOUSE_BINDS)),
+    ("usb-tablet", How::Usb(crate::xhci::TABLET_BINDS)),
+    ("usb-audio", How::Usb(crate::xhci::AUDIO_BINDS)),
+    ("usb-serial", How::Usb(crate::xhci::SERIAL_BINDS)),
     ("ps2-keyboard", How::Platform),
     ("ps2-mouse", How::Platform),
     ("16550-uart", How::Platform),
@@ -455,10 +478,11 @@ pub const ACPI_IDS: &[(&str, &str, AcpiV)] = &[
     ("INT3403", "Intel thermal sensor (DPTF)", AcpiV::NoneNeeded),
     ("PNP0C0C", "power button (ACPI control method)", AcpiV::Missing),
     ("PNP0C0E", "sleep button", AcpiV::Missing),
-    ("PNP0C0D", "laptop lid", AcpiV::Missing),
-    ("PNP0C0A", "battery", AcpiV::Missing),
-    ("ACPI0003", "AC adapter", AcpiV::Missing),
-    ("PNP0C09", "embedded controller", AcpiV::Missing),
+    // battery.rs says (AML C1, read only; the hooks read the tables, never the controller)
+    ("PNP0C0D", "laptop lid", AcpiV::Asks(crate::battery::claim_lid)),
+    ("PNP0C0A", "battery", AcpiV::Asks(crate::battery::claim_battery)),
+    ("ACPI0003", "AC adapter", AcpiV::Asks(crate::battery::claim_ac)),
+    ("PNP0C09", "embedded controller", AcpiV::Asks(crate::battery::claim_ec)),
     ("PNP0C14", "WMI (the maker's own controls)", AcpiV::Missing),
     ("ACPI0008", "ambient light sensor", AcpiV::Missing),
     ("PNP0C50", "HID over I2C (touchpad, touchscreen or keyboard)", AcpiV::Missing),

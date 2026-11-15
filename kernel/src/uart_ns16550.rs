@@ -96,6 +96,9 @@ pub const FCR_INIT: u32 = FCR_FIFOE | FCR_RFIFOR | FCR_XFIFOR;
 /// return. At any sane baud rate this many polls is orders of magnitude longer
 /// than one character time, so it never trips on a working UART.
 pub const TX_SPIN_LIMIT: u32 = 200_000;
+/// The time the same wait stands for (15 Nov 2026, the time-waits rule): about 100 characters at 115200 baud. The
+/// counter's deadline ends the wait; TX_SPIN_LIMIT stays as the fallback when there is no counter rate.
+pub const TX_WAIT_US: u64 = 10_000;
 
 /// A DesignWare 8250/16550 UART at a given MMIO base.
 ///
@@ -130,11 +133,16 @@ impl Ns16550 {
     /// [`TX_SPIN_LIMIT`] polls — the byte is dropped rather than hanging the core.
     pub fn write_byte(&self, b: u8) -> bool {
         let mut spins = 0u32;
+        // the deadline only once the byte has to wait (THRE is almost always set): no counter read per byte
+        let mut until = None;
         // SAFETY: `base` is valid MMIO (or the self-test scratch block); LSR is
         // read-only and the read has no side effects on a 16550.
         while unsafe { read_volatile(self.r(LSR)) } & LSR_THRE == 0 {
+            if until.is_none() {
+                until = crate::timer::deadline_us(TX_WAIT_US);
+            }
             spins += 1;
-            if spins >= TX_SPIN_LIMIT {
+            if spins >= TX_SPIN_LIMIT || crate::timer::past(until) {
                 return false; // UART not transmitting: drop, don't hang
             }
             core::hint::spin_loop();

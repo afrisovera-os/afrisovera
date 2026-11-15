@@ -18,6 +18,10 @@ pub mod frame {
     static BASE: AtomicUsize = AtomicUsize::new(0);
     static TOTAL: AtomicUsize = AtomicUsize::new(0);
     static USED: AtomicUsize = AtomicUsize::new(0);
+    /// No frame below this bitmap word is free (a hint: `free` lowers it, `alloc` raises it past full words), so an
+    /// allocation does not walk the whole taken prefix again. Before it, mapping a 16 MiB ring-3 object took 764 ms
+    /// for 4,096 frames (each scan from frame 0, bit by bit); Dira M3 S1, os2 43621136921.
+    static LOW: AtomicUsize = AtomicUsize::new(0);
     static mut BITMAP: [u64; MAX_FRAMES / 64] = [0; MAX_FRAMES / 64];
 
     /// Manage `frames` frames from `base` (page-aligned, free conventional RAM).
@@ -31,15 +35,26 @@ pub mod frame {
         // SAFETY: single core; the heap's own GROW_LOCK serialises its callers.
         unsafe {
             let bm = &mut *core::ptr::addr_of_mut!(BITMAP);
-            for i in 0..total {
-                if bm[i / 64] & (1 << (i % 64)) == 0 {
-                    bm[i / 64] |= 1 << (i % 64);
+            // a word at a time from the lowest word that may hold a free frame; the same lowest-first choice as
+            // before (the first clear bit of the first word with one), found without testing every taken bit
+            let words = total.div_ceil(64);
+            let mut w = LOW.load(Ordering::Relaxed).min(words);
+            while w < words {
+                if bm[w] != u64::MAX {
+                    let i = w * 64 + bm[w].trailing_ones() as usize;
+                    if i >= total {
+                        break;
+                    }
+                    bm[w] |= 1 << (i % 64);
+                    LOW.store(w, Ordering::Relaxed);
                     USED.fetch_add(1, Ordering::Relaxed);
                     let pa = BASE.load(Ordering::Relaxed) + i * FRAME_SIZE;
                     core::ptr::write_bytes(pa as *mut u8, 0, FRAME_SIZE);
                     return Some(pa);
                 }
+                w += 1;
             }
+            LOW.store(words, Ordering::Relaxed);
         }
         None
     }
@@ -56,6 +71,7 @@ pub mod frame {
             if bm[i / 64] & (1 << (i % 64)) != 0 {
                 bm[i / 64] &= !(1 << (i % 64));
                 USED.fetch_sub(1, Ordering::Relaxed);
+                LOW.fetch_min(i / 64, Ordering::Relaxed);
             }
         }
     }

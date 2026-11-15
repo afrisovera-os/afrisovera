@@ -79,7 +79,10 @@ s.sendall(b"reboot\r")
 wait_for(lambda: buf.count(b"AfriSh ready") >= 2, CEILING, "boot-2 shell banner")
 txt = buf.decode("latin1")
 n = txt.count("AfriSh ready")
-if "[reboot]" not in txt:
+# the ARM shell says "[reboot] resetting via PSCI SYSTEM_RESET..."; the PC saves its files and says "[pc] restarting
+# (the firmware's ResetSystem)" since claude/pc-power (15 Nov 2026: that change, not a broken restart, made this red
+# on the PC). The second banner below stays the proof that the machine restarted.
+if "[reboot]" not in txt and "[pc] restarting (" not in txt:
     print("REBOOT TEST FAILED (reboot command not acknowledged)"); sys.exit(1)
 if n < 2:
     print(f"REBOOT TEST FAILED (AfriSh ready seen {n}x; PSCI reset did not restart the machine)"); sys.exit(1)

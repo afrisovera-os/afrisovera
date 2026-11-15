@@ -67,6 +67,79 @@ pub fn write_sector(n: u64, data: &[u8; 512]) -> bool {
     }
 }
 
+/// AFR-0011 V2: every write acknowledged before this call is on the medium of the disk in use (AFR-0011 section
+/// 9). Same order as the calls above. A disk whose driver has no flush yet answers false ("cannot confirm"), never
+/// true; each driver's own blk_flush replaces its false in V2.
+pub fn blk_flush() -> bool {
+    if crate::virtio_core::blk_present() {
+        crate::virtio_core::blk_flush()
+    } else if crate::nvme::present() {
+        crate::nvme::blk_flush()
+    } else if crate::ahci::present() {
+        crate::ahci::blk_flush()
+    } else if crate::ide::present() {
+        crate::ide::blk_flush()
+    } else if crate::sdhci::internal() {
+        crate::sdhci::blk_flush()
+    } else if crate::xhci::msc_present() {
+        // the driver engineer's msc_sync: the gathered writes, then SYNCHRONIZE CACHE(10) when the stick said WCE; a
+        // write failed since the last call makes it Failed (sticky). Unknown and Refused are true here; V3 marks them
+        // "cannot confirm saves" (the architect's V2 verdict).
+        let r = crate::xhci::msc_sync();
+        // SAFETY: scalar write, kernel context.
+        unsafe { MSC_LAST = Some(r) };
+        r != crate::xhci::MscSync::Failed
+    } else {
+        crate::sdhci::blk_flush()
+    }
+}
+
+/// The test rig's `blkflush-hang` (fw_cfg `opt/afrisovera/blkflush-hang`): the next device flush gets no answer, so
+/// the driver's timeout and reset path runs (the architect's rule 2). A real PC has no fw_cfg: always false.
+pub fn flush_hang_test() -> bool {
+    crate::qemu::fw_cfg_file(b"opt/afrisovera/blkflush-hang")
+}
+
+/// The USB stick's last `msc_sync` answer, for `blkflush`'s note.
+static mut MSC_LAST: Option<crate::xhci::MscSync> = None;
+
+/// A few words on how the last `blk_flush` was confirmed, for `blkflush` (empty for a disk with nothing to add).
+pub fn blk_note() -> &'static str {
+    use crate::xhci::MscSync::*;
+    if blk_name() != "usb" {
+        return "";
+    }
+    // SAFETY: scalar read.
+    match unsafe { MSC_LAST } {
+        Some(Flushed) => " (SYNCHRONIZE CACHE passed)",
+        Some(WriteThrough) => " (the stick has no write cache)",
+        Some(Unknown) => " (the stick did not say whether it caches: this disk cannot confirm saves)",
+        Some(Refused) => " (the stick refused SYNCHRONIZE CACHE: this disk cannot confirm saves)",
+        _ => "",
+    }
+}
+
+/// Which disk `blk_flush` answers for (for `blkflush`).
+pub fn blk_name() -> &'static str {
+    if crate::virtio_core::blk_present() {
+        "virtio"
+    } else if crate::nvme::present() {
+        "nvme"
+    } else if crate::ahci::present() {
+        "ahci"
+    } else if crate::ide::present() {
+        "ide"
+    } else if crate::sdhci::internal() {
+        "emmc"
+    } else if crate::xhci::msc_present() {
+        "usb"
+    } else if crate::sdhci::present() {
+        "sd"
+    } else {
+        "none"
+    }
+}
+
 /// The shared write/read-back check, over whichever disk is in use.
 pub fn blk_selftest() -> bool {
     if crate::virtio_core::blk_present() {

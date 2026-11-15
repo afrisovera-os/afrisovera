@@ -135,7 +135,7 @@ for want in "state LISTEN" \
             "connection ESTABLISHED" \
             "TCP inbound connection ACCEPTED on port $GPORT from 10.0.2.2:$PEERPORT" \
             "state TIME_WAIT"; do
-    if ! echo "$SER" | grep -qF "$want"; then
+    if ! grep -qF "$want" <<< "$SER"; then
         echo "  serial is missing: $want"
         FAIL=1
     fi
@@ -144,7 +144,7 @@ for bad in "no SYN arrived on port" \
            "usage: net tcp listen" \
            "SYN/ACK unacknowledged" \
            "did NOT close cleanly"; do
-    if echo "$SER" | grep -qF "$bad"; then
+    if grep -qF "$bad" <<< "$SER"; then
         echo "  serial reports a failed listen: $bad"
         FAIL=1
     fi

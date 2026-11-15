@@ -19,6 +19,9 @@
 
 use crate::gpt::{self, Disk};
 
+/// Safe updates U3: the spare boot file in `\EFI\afrisovera` (`updatestage`).
+pub(crate) mod stage;
+
 fn u16le(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
 }
@@ -1072,7 +1075,7 @@ fn code(tag: &[u8], s: &Spot, fat: &Fat, extra: u64) -> Option<u32> {
 }
 
 /// Whether the owner typed this exact code; says why not.
-fn agreed(cmd: &str, given: Option<&str>, want: u32) -> bool {
+pub(crate) fn agreed(cmd: &str, given: Option<&str>, want: u32) -> bool {
     match given {
         Some(c) if c.len() == 4 && u32::from_str_radix(c, 16).ok() == Some(want) => true,
         Some(_) => {

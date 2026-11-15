@@ -54,6 +54,8 @@ const SIG_ATA: u32 = 0x0000_0101;
 const ATA_READ_DMA_EXT: u8 = 0x25;
 const ATA_WRITE_DMA_EXT: u8 = 0x35;
 const ATA_IDENTIFY: u8 = 0xEC;
+const ATA_FLUSH_CACHE: u8 = 0xE7;
+const ATA_FLUSH_CACHE_EXT: u8 = 0xEA;
 
 // --- DMA structures: 1:1-mapped kernel memory, so their addresses are physical ---
 #[repr(C, align(1024))]
@@ -78,6 +80,8 @@ static mut PORTS: u32 = 0;
 static mut VERSION: u32 = 0;
 /// The port whose disk the VFS may use (`None` = no usable disk).
 static mut DISK_PORT: Option<u32> = None;
+/// AFR-0011 V2: a write that failed since the last `blk_flush` (sticky, the architect's rule 1).
+static mut WERR: bool = false;
 static mut DISK_SECTORS: u64 = 0;
 /// AfriSovera's own GPT partition on DISK_PORT holding the VFS (first 512-byte sector, sectors);
 /// (0, 0) = the whole disk. Set at boot when the partition already holds AFRIVFS1, or by
@@ -113,6 +117,12 @@ static mut WSTATS: (u64, u64, u64) = (0, 0, 0);
 static mut TRUN: u8 = 0;
 /// Big copies sent in one command: runs, sectors.
 static mut TSTATS: (u64, u64) = (0, 0);
+/// Each port's volatile write cache (IDENTIFY word 85 bit 5: on): the flush command a save or an install step
+/// ends with (FLUSH CACHE EXT when word 83 bit 13 says the drive has it, else FLUSH CACHE), 0 = no cache on.
+/// What the drive acknowledged may still be only in that cache until the flush (14 Nov 2026, architect's A5 note).
+static mut WCACHE: [u8; 32] = [0; 32];
+/// Cache flushes sent, and how many the drive refused.
+static mut FLUSHES: (u64, u64) = (0, 0);
 /// Link resets (COMRESET) sent to bring a port back after a failed command left the drive busy.
 static mut RESETS: u64 = 0;
 
@@ -212,16 +222,17 @@ fn xfer(p: u32, ata: u8, lba: u64, k: u32, buf: u64, write: bool) -> bool {
         t[8] = (lba >> 24) as u8;
         t[9] = (lba >> 32) as u8;
         t[10] = (lba >> 40) as u8;
-        t[12] = k as u8; // sector count (0 would mean 65536: never sent)
+        t[12] = k as u8; // sector count (0 would mean 65536 for a transfer: only the flush, which has no data, sends 0)
         t[13] = (k >> 8) as u8;
         // PRD 0: the buffer, byte count - 1
         t[0x80..0x84].copy_from_slice(&(buf as u32).to_le_bytes());
         t[0x84..0x88].copy_from_slice(&((buf >> 32) as u32).to_le_bytes());
         // byte count - 1: IDENTIFY is always 512 bytes, data is one logical sector
         let bytes = if ata == ATA_IDENTIFY { 512 } else { LBS[p as usize & 31] * k };
-        t[0x8C..0x90].copy_from_slice(&(bytes - 1).to_le_bytes());
+        t[0x8C..0x90].copy_from_slice(&(bytes.max(1) - 1).to_le_bytes()); // unused when there is no PRD (the flush)
         let h = &mut (*addr_of_mut!(CLIST)).0;
-        h[0] = 5 | if write { 1 << 6 } else { 0 } | 1 << 16; // CFL 5 dwords, W, PRDTL 1
+        // CFL 5 dwords, W, PRDTL 1 (0 for a command with no data: the cache flush)
+        h[0] = 5 | if write { 1 << 6 } else { 0 } | if k == 0 { 0 } else { 1 << 16 };
         h[1] = 0; // PRDBC
         h[2] = ct as u32;
         h[3] = (ct >> 32) as u32;
@@ -438,6 +449,12 @@ pub fn init() {
         }
         // SAFETY: as above.
         unsafe { LBS[p as usize] = lbs };
+        // the volatile write cache: word 85 bit 5 (enabled), valid when words 82-87 are (word 83 bits 15:14 = 01);
+        // FLUSH CACHE EXT when word 83 bit 13 says so, else FLUSH CACHE
+        let valid = w(83) & 0xC000 == 0x4000;
+        let wc = if valid && w(85) & 1 << 5 != 0 { if w(83) & 1 << 13 != 0 { ATA_FLUSH_CACHE_EXT } else { ATA_FLUSH_CACHE } } else { 0 };
+        // SAFETY: as above.
+        unsafe { WCACHE[p as usize] = wc };
         let sectors = logical * (lbs as u64 / 512); // in 512-byte sectors, what the VFS speaks
         let mut model = [b' '; 40];
         for i in 0..20 {
@@ -493,6 +510,12 @@ pub fn init() {
                 "holds other data (boot disk?): left alone"
             }
         );
+        if wc != 0 {
+            crate::kprintln!(
+                "[ahci] port {}: the drive has a volatile write cache: every save and install step ends with {}",
+                p, if wc == ATA_FLUSH_CACHE_EXT { "FLUSH CACHE EXT" } else { "FLUSH CACHE" }
+            );
+        }
     }
     // SAFETY: as above.
     let n = unsafe { N_FOUND };
@@ -658,6 +681,59 @@ fn flush() -> bool {
             ra_update(at + j, s, good);
             ok = ok && good;
         }
+        if !ok {
+            WERR = true;
+        }
+        ok
+    }
+}
+
+/// The drive's volatile write cache onto the medium (FLUSH CACHE EXT, or FLUSH CACHE): what it acknowledged
+/// is then kept when power goes. True without a cache on.
+fn cache_flush(p: u32) -> bool {
+    // SAFETY: scalar read.
+    let wc = unsafe { WCACHE[p as usize & 31] };
+    if wc == 0 {
+        return true;
+    }
+    let ok = xfer(p, wc, 0, 0, 0, false);
+    // SAFETY: scalar counters.
+    unsafe {
+        FLUSHES.0 += 1;
+        FLUSHES.1 += !ok as u64;
+    }
+    if !ok {
+        crate::kprintln!("[ahci] port {}: the cache flush after a save or an install step failed: the last writes may still be only in the drive's cache", p);
+    }
+    ok
+}
+
+/// The end of an install step (gpt.rs Disk::settle): the storage disk's gathered writes out, then the cache flush.
+pub fn settle(p: u32) -> bool {
+    // SAFETY: scalar read.
+    let ours = unsafe { DISK_PORT } == Some(p);
+    (!ours || flush()) && cache_flush(p)
+}
+
+/// AFR-0011 V2 `blk_flush`: `settle` on the storage port (the gathered writes, then FLUSH CACHE EXT or FLUSH CACHE
+/// when the drive's cache is on), each command bounded by CMD_MS (30 s) before the port's reset path. False when any
+/// write failed since the last call (sticky). The test rig's `blkflush-hang` makes the cache flush wait out its
+/// 30 s unanswered.
+pub fn blk_flush() -> bool {
+    // SAFETY: scalar read.
+    let Some(p) = (unsafe { DISK_PORT }) else { return false };
+    let settled = if crate::virtio::flush_hang_test() {
+        let _ = flush();
+        let _ = wait(CMD_MS, || false);
+        crate::kprintln!("[ahci] port {}: the cache flush got no answer in 30 s (test rig)", p);
+        false
+    } else {
+        settle(p)
+    };
+    // SAFETY: scalar statics.
+    unsafe {
+        let ok = settled && !WERR;
+        WERR = false;
         ok
     }
 }
@@ -837,6 +913,12 @@ pub fn write_sector(n: u64, data: &[u8; 512]) -> bool {
             if last || (off + 512 == bs && WB_N >= cap) {
                 ok = flush() && ok;
             }
+            if last {
+                ok = cache_flush(p) && ok; // the save is on the medium, not only in the drive's cache
+            }
+        }
+        if !(ok && got) {
+            WERR = true; // AFR-0011 V2: remembered until the next blk_flush
         }
         ok && got
     }
@@ -981,6 +1063,21 @@ pub fn list() {
             "  big copies (installdisk, bootcopy): {} run(s) in one command, {} sector(s), each read back ({})",
             t.0, t.1, if tr == 1 { "on" } else { "off" }
         );
+    }
+    // SAFETY: scalar reads of boot-time state and counters.
+    let (wc, fl, found, disk) = unsafe { (*addr_of!(WCACHE), FLUSHES, *addr_of!(FOUND), DISK_PORT) };
+    let cached = |p: &u32| wc[*p as usize & 31] != 0;
+    // the storage disk's cache when it has one, else the first disk's that has one (an install target)
+    if let Some(p) = disk.filter(cached).or_else(|| found[..n].iter().map(|d| d.0).find(cached)) {
+        crate::kprintln!(
+            "  volatile write cache: yes, {} Flush(es) sent (one at the end of every save and every install step; {} on port {})",
+            fl.0,
+            if wc[p as usize & 31] == ATA_FLUSH_CACHE_EXT { "FLUSH CACHE EXT" } else { "FLUSH CACHE" },
+            p
+        );
+        if fl.1 > 0 {
+            crate::kprintln!("  cache flushes the drive refused: {}", fl.1);
+        }
     }
     // SAFETY: scalar read.
     let resets = unsafe { RESETS };

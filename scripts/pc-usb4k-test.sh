@@ -29,8 +29,8 @@ grade() { # grade <boot1 log> <boot2 log>
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqE "$1"; }
-    hasB() { printf '%s\n' "$B" | grep -aqE "$1"; }
+    hasA() { grep -aqE "$1" <<< "$A"; }
+    hasB() { grep -aqE "$1" <<< "$B"; }
     hasA '^\[xhci\] port [0-9]+: USB storage [0-9a-f]{4}:[0-9a-f]{4} ".*", 2048 blocks of 4096 B \(8 MiB\), blank or ours: used for storage$' ||
         _f "boot 1: the blank USB stick was not identified and chosen for storage"
     hasA '^\[xhci\] USB storage: multi-block reads on \(READ\(10\) of up to 2 blocks per command; the first 2 equal one at a time\)$' ||
@@ -59,7 +59,7 @@ grade() { # grade <boot1 log> <boot2 log>
     hasA '^\[vfs\] synced [0-9]+ files to disk$' || _f "boot 1: the VFS never synced to the stick"
     hasB '^\[vfs\] VFS restored from disk: [0-9]+ files$' || _f "boot 2: the VFS was not restored from the stick"
     hasB '^HELLO-USB-4K-10NOV$' || _f "boot 2: notes.txt did not come back from the stick"
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE "$BAD"; then
+    if grep -aqE "$BAD" <<< "$A"$'\n'"$B"; then
         _f "$(printf '%s\n%s\n' "$A" "$B" | grep -aE "$BAD" | head -1)"
     fi
     return "$fail"

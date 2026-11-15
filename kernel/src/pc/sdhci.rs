@@ -132,6 +132,11 @@ static mut CARD: Option<(u64, bool, u32, bool)> = None;
 static mut NAME: [u8; 6] = [b' '; 6];
 /// The device is an eMMC (MMC start-up): its EXT_CSD revision and boot partition size (KiB).
 static mut MMC: Option<(u8, u32)> = None;
+/// AFR-0011 V2: the eMMC's volatile cache from EXT_CSD: (0 none, 1 off, 2 on; CACHE_SIZE in KiB; the SWITCH time
+/// limit in ms from GENERIC_CMD6_TIME, at least 500 ms).
+static mut EMMC_CACHE: (u8, u32, u64) = (0, 0, 500);
+/// AFR-0011 V2: a write that failed since the last `blk_flush` (sticky, the architect's rule 1).
+static mut WERR: bool = false;
 /// Probing for an SD card: an eMMC's silence to ACMD41 is expected, not reported.
 static mut QUIET: bool = false;
 /// SDHCI controllers found on PCI (each tried in turn).
@@ -558,6 +563,19 @@ fn mmc_start() -> bool {
         unsafe { BUS = (1, set_clock(25_000), false) };
     }
     let (rev, boot_kib) = if have_ext { (ext[192], ext[226] as u32 * 128) } else { (0xFF, 0) };
+    if have_ext {
+        // CACHE_SIZE [252:249] (KiB), CACHE_CTRL [33] bit 0, GENERIC_CMD6_TIME [248] (units of 10 ms)
+        let kib = u32::from_le_bytes([ext[249], ext[250], ext[251], ext[252]]);
+        let state = if kib == 0 { 0 } else if ext[33] & 1 != 0 { 2 } else { 1 };
+        let ms = (ext[248] as u64 * 10).max(500);
+        // SAFETY: init, single core.
+        unsafe { EMMC_CACHE = (state, kib, ms) };
+        match state {
+            0 => crate::kprintln!("[sdhci] eMMC cache: none"),
+            1 => crate::kprintln!("[sdhci] eMMC cache: off ({} KiB, not turned on)", kib),
+            _ => crate::kprintln!("[sdhci] eMMC cache: on ({} KiB): every save ends with a cache flush", kib),
+        }
+    }
     // SAFETY: init, single core.
     unsafe { MMC = Some((rev, boot_kib)) };
     finish(sectors, high, rca, true, name); // no write-protect switch on a soldered chip
@@ -1118,6 +1136,9 @@ fn flush() -> bool {
                 }
             }
         }
+        if !ok {
+            WERR = true;
+        }
         ok
     }
 }
@@ -1252,7 +1273,57 @@ pub fn read_sector(n: u64, out: &mut [u8; 512]) -> bool {
 pub fn write_sector(n: u64, data: &[u8; 512]) -> bool {
     let last = n >= 2 * crate::vfs::MAX_FILES as u64;
     // SAFETY: scalar reads.
-    present() && n < capacity() && unsafe { CARD.is_some_and(|c| c.3) } && queue(n + unsafe { PART.0 }, data, last)
+    let ok = present() && n < capacity() && unsafe { CARD.is_some_and(|c| c.3) } && queue(n + unsafe { PART.0 }, data, last);
+    if !ok {
+        // SAFETY: scalar write.
+        unsafe { WERR = true };
+    }
+    ok
+}
+
+/// AFR-0011 V2 `blk_flush`: the gathered writes out; then, on an eMMC whose cache is on, the cache flush (SWITCH
+/// EXT_CSD FLUSH_CACHE [32] = 1, an R1b command: busy waited out within GENERIC_CMD6_TIME, at least 500 ms, then CMD13
+/// for SWITCH_ERROR). An SD card, or an eMMC with no cache or its cache off, has nothing to flush: each write already
+/// waited for the card to report it done. A timeout or error resets the command and data lines and answers false.
+/// False when any write failed since the last call (sticky). The test rig's `blkflush-hang` makes the flush wait out
+/// its window unanswered.
+pub fn blk_flush() -> bool {
+    if !present() {
+        return false;
+    }
+    let sent = flush();
+    // SAFETY: scalar reads of boot-time state.
+    let (mmc, (state, _, ms)) = unsafe { (MMC, EMMC_CACHE) };
+    let cached = if mmc.is_none() || state != 2 {
+        true
+    } else if crate::virtio::flush_hang_test() {
+        let _ = wait_ms(ms, || false);
+        crate::kprintln!("[sdhci] the eMMC's cache flush got no answer in {} ms (test rig): resetting the command and data lines", ms);
+        let _ = reset(RESET_CMD | RESET_DAT);
+        false
+    } else {
+        emmc_cache_flush(ms)
+    };
+    // SAFETY: scalar statics.
+    unsafe {
+        let ok = sent && cached && !WERR;
+        WERR = false;
+        ok
+    }
+}
+
+/// SWITCH (CMD6, write byte) EXT_CSD FLUSH_CACHE = 1, then the busy wait and CMD13's SWITCH_ERROR check.
+fn emmc_cache_flush(ms: u64) -> bool {
+    // SAFETY: scalar read.
+    let rca = unsafe { CARD.map_or(0, |c| c.2) };
+    let ok = command(6, 3 << 24 | 32 << 16 | 1 << 8, R_48B, 0).is_some()
+        && wait_ms(ms, || r32(PRESENT) & PS_DAT_INHIBIT == 0)
+        && command(13, rca << 16, R_48, 0).is_some_and(|r| r[0] & 1 << 7 == 0);
+    if !ok {
+        crate::kprintln!("[sdhci] the eMMC's cache flush failed or got no answer in {} ms: resetting the command and data lines", ms);
+        let _ = reset(RESET_CMD | RESET_DAT);
+    }
+    ok
 }
 
 /// Read-only view for `lsparts` / `installdisk`: (512-byte sectors, block bytes) of a built-in eMMC,

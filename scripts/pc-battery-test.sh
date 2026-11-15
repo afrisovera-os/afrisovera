@@ -82,6 +82,10 @@ R_HEAD='^battery: what the firmware describes, read from its ACPI tables \(nothi
 R_USAGE='^battery: type battery, battery ec, or battery selftest$'
 R_TABLES='^  tables: the DSDT and [0-9]+ SSDT\(s\) read: ([0-9]+) named objects, [0-9]+ conditional block\(s\) not entered, [0-9]+ cut short$'
 R_NONE='^  battery: none described \(a desktop PC or a virtual machine has none\)$'
+R_HW_BAT='^  acpi PNP0C0A( x[0-9]+)? \([^)]*\): battery: driven by: battery, read only \(battery ec runs its _BST\)$'
+R_HW_AC='^  acpi ACPI0003( x[0-9]+)? \([^)]*\): AC adapter: driven by: battery, read only \(battery ec runs its _PSR\)$'
+R_HW_LID='^  acpi PNP0C0D( x[0-9]+)? \([^)]*\): laptop lid: off: battery lists it; reading _LID and lid events wait for AML rung C4$'
+R_HW_EC='^  acpi PNP0C09( x[0-9]+)? \([^)]*\): embedded controller: driven by: battery ec, read only \(command 0x80, the global lock when asked\)$'
 R_BAT='^  battery: \\_SB_\.BAT0, methods _STA _BIF _BST, status 0x1F \(present\)$'
 R_AC='^  AC adapter: \\_SB_\.ADP1, methods _PSR, status 0x0F \(present\)$'
 R_LID='^  lid: \\_SB_\.LID0, methods _LID, no _STA \(present by the ACPI rules\)$'
@@ -147,6 +151,14 @@ grade() { # grade <boot 1 log> <boot 2 log>
         grep -aqE "$r" <<< "$S2" || { echo "  FAIL: boot 2: missing line matching $r"; fail=1; }
     done
     if grep -aqE "$R_NONE" <<< "$S2"; then echo "  FAIL: boot 2: 'none described' with the test battery present"; fail=1; fi
+    # hwscan asks battery.rs through hwdb's AcpiV::Asks (the test SSDT's devices; plain q35 has none of them)
+    for r in "$R_HW_BAT" "$R_HW_AC" "$R_HW_LID" "$R_HW_EC"; do
+        grep -aqE "$r" <<< "$S2" || { echo "  FAIL: boot 2: hwscan has no line matching $r"; fail=1; }
+    done
+    # hook rule 2: the lid's off is counted as off, not as a class driver's
+    grep -aqE '^hwscan: [0-9]+ device\(s\): [0-9]+ driven, [0-9]+ class, [1-9][0-9]* off, [0-9]+ missing, [0-9]+ none needed$' <<< "$S2" ||
+        { echo "  FAIL: boot 2: hwscan's count line has no off device (the lid is off until C4)"; fail=1; }
+    if grep -aqE '^  acpi (PNP0C0A|ACPI0003|PNP0C0D|PNP0C09)' <<< "$S1"; then echo "  FAIL: boot 1: hwscan lists a battery, adapter, lid or controller on plain q35"; fail=1; fi
     if grep -aqE '\(partly read\)$' <<< "$S2"; then echo "  FAIL: boot 2: a test device was only partly read"; fail=1; fi
     local t1 k1 r1 t2 k2 r2
     t1="$(sta "$S1" 1)"; k1="$(sta "$S1" 2)"; r1="$(sta "$S1" 3)"
@@ -219,7 +231,13 @@ battery ec: the embedded controller's named fields, read through its ports (read
 afrisovera> battery selftest
 $SELF
 afrisovera> acpiinfo
-acpi: 1 core(s), local-APIC ids [0], I/O APIC at 0xfec00000"
+acpi: 1 core(s), local-APIC ids [0], I/O APIC at 0xfec00000
+afrisovera> hwscan
+  acpi PNP0C0A (BAT0): battery: driven by: battery, read only (battery ec runs its _BST)
+  acpi ACPI0003 x2 (ADP1): AC adapter: driven by: battery, read only (battery ec runs its _PSR)
+  acpi PNP0C0D (LID0): laptop lid: off: battery lists it; reading _LID and lid events wait for AML rung C4
+  acpi PNP0C09 (EC0_): embedded controller: driven by: battery ec, read only (command 0x80, the global lock when asked)
+hwscan: 25 device(s): 14 driven, 1 class, 1 off, 3 missing, 6 none needed"
 
 selftest() {
     local D pass=0 bad=0
@@ -249,6 +267,7 @@ selftest() {
     arm none-with-battery red "$B1" "$(printf '%s\n  battery: none described (a desktop PC or a virtual machine has none)\n' "$B2")"
     arm shell-stopped red "$B1" "$(printf '%s\n' "$B2" | grep -v '^acpi:')"
     arm panic red "$B1" "$(printf '%s\nKERNEL PANIC\n' "$B2")"
+    arm no-hwdb-hook red "$B1" "$(printf '%s\n' "$B2" | grep -v '^  acpi PNP0C0A')"
     arm no-sta-line red "$B1" "$(printf '%s\n' "$B2" | grep -v '^  status (_STA)')"
     arm wrong-status red "$B1" "$(printf '%s\n' "$B2" | sed 's/BST, status 0x1F/BST, status 0x01/')"
     arm sta-not-worked red "$B1" "$(printf '%s\n' "$B2" | sed 's/_PSR, status 0x0F (present)/_PSR, status needs the interpreter/')"
@@ -286,7 +305,7 @@ selftest() {
     arm empty red "" ""
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 52 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 53 ]
 }
 
 echo "== PC battery, AC adapter, lid: battery (read only) =="
@@ -393,7 +412,7 @@ boot() { # boot <log> <extra qemu args, as one string or empty> <commands...>
     [ -s "$log.qemu" ] && sed 's/^/  qemu says: /' "$log.qemu"
 }
 
-CMDS=("battery" "battery ec" "battery selftest" "battery x" "acpiinfo")
+CMDS=("battery" "battery ec" "battery selftest" "battery x" "acpiinfo" "hwscan")
 echo "  --- boot 1: plain q35, no battery ---"
 boot "$W/boot1.log" "" "${CMDS[@]}"
 tr -d '\r' < "$W/boot1.log" | grep -aE '^battery|^  (tables|status|battery|AC|lid|embedded|thermal|charge|\(|  )' | sed 's/^/  | /'

@@ -28,7 +28,7 @@ wait "$QPID" 2>/dev/null
 # snapshot is taken once, after the writer is reaped, so all ten assertions grade
 # the SAME bytes and the verdict is a property of the guest, not of scheduling.
 SNAP="$(cat "$OUT")"
-have() { printf '%s\n' "$SNAP" | grep -q "$1"; }
+have() { grep -q "$1" <<< "$SNAP"; }
 
 have "core 1] online" || { echo "SMP TEST FAILED (secondary core did not start)"; exit 1; }
 have "SMP: 2 cores online" || { echo "SMP TEST FAILED (primary did not confirm 2 cores)"; exit 1; }

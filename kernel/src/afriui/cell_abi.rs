@@ -14,10 +14,15 @@ pub const EV_CLOSED: u32 = 4; // the window is gone ("Close anyway"); returned a
 /// The payload: bits 0 to 27.
 pub const PAYLOAD: u32 = (1 << 28) - 1;
 
-/// Key modifier bits (stage 3 sets them; plain keys keep the serial line's values).
-pub const SHIFT: u32 = 0x1000;
-pub const CTRL: u32 = 0x2000;
-pub const ALT: u32 = 0x4000;
+/// A key's payload (A4, the architect's layout of 14 Nov 2026), the same for getkey, pollkey and EV_KEY:
+/// bits 0 to 20 a Unicode code point (0 to 0x10FFFF), or a special key at KEY_BASE + n (keyseq.rs: the arrows 0 to 3,
+/// Home and End 4 and 5, PgUp and PgDn 6 and 7, Insert and Delete 8 and 9, F1 to F12 0x10 to 0x1B); bit 21 SHIFT,
+/// 22 CTRL, 23 ALT; bits 24 to 27 reserved (0). Above Unicode, so a key can never be taken for a letter (Hausa's
+/// U+0253 and the like). Plain bytes stay what they were.
+pub const KEY_BASE: u32 = 0x11_0000;
+pub const SHIFT: u32 = 1 << 21;
+pub const CTRL: u32 = 1 << 22;
+pub const ALT: u32 = 1 << 23;
 
 /// Errors, negative as everywhere in Nia.
 pub const ERR_BAD_WINDOW: i32 = -1; // not the handle `cell_open` gave

@@ -47,6 +47,26 @@ pub struct Glyph {
 }
 
 /// All zero, so the buffers and the line cache below are .bss, not .data in the image.
+/// What a string is, for the explicit bidi controls (the architect's rule, C2b). `Identity`, the default: a name a
+/// person must recognise (window titles, app and file names, network and device names, store entries); the
+/// embeddings and overrides (U+202A..U+202E) are dropped and counted, so an override cannot make "gpj.exe" read
+/// "exe.jpg", and the isolates stay. `Prose`: text whose content is the point (notices, documents, the catalogue);
+/// every control works, inside this one string.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Text {
+    Identity,
+    Prose,
+}
+
+/// Default-ignorable characters (Unicode's Default_Ignorable_Code_Point): never drawn, no width. They still take
+/// part in bidi (the isolates, LRM, RLM, ALM) and break joining where Unicode says so.
+pub fn hidden(cp: u32) -> bool {
+    matches!(cp,
+        0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F | 0x200B..=0x200F
+        | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFE00..=0xFE0F | 0xFEFF | 0xFFA0 | 0xFFF0..=0xFFF8
+        | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0000..=0xE0FFF)
+}
+
 const NONE: Glyph = Glyph { face: 0, g: 0, boxed: false, adv: 0, cp: 0, ch: 0 };
 
 /// (explicit controls dropped, characters cut past MAX, lines shaped) since boot, for `desk shape probe`.
@@ -177,12 +197,17 @@ fn arabic_script(cp: u32) -> bool {
 /// x in 1/256 pixel from the line's start, y in whole pixels down from the baseline. Glyphs come in visual order.
 /// Returns the line's advance in 1/256 pixel.
 pub fn layout(s: &[u8], cap: i32, rtl: Option<bool>, f: &mut dyn FnMut(&Glyph, i32, i32)) -> i32 {
+    layout_as(s, cap, rtl, Text::Identity, f)
+}
+
+/// `layout` for a string of a given kind (`Text::Prose` lets the explicit embeddings and overrides work).
+pub fn layout_as(s: &[u8], cap: i32, rtl: Option<bool>, kind: Text, f: &mut dyn FnMut(&Glyph, i32, i32)) -> i32 {
     if BUSY.swap(true, core::sync::atomic::Ordering::Acquire) {
         panic!("shape::layout entered twice");
     }
     let cap = vector::clamp_cap(cap);
     let mut emit = |g: &Glyph, x: i32, y: i32| f(g, vector::px256(x, cap), -vector::px_round(y, cap));
-    let w = match cache_find(s, cap, rtl) {
+    let w = match cache_find(s, cap, rtl, kind) {
         Some((w, recs)) => {
             for r in recs {
                 emit(&r.0, r.1, r.2);
@@ -193,7 +218,7 @@ pub fn layout(s: &[u8], cap: i32, rtl: Option<bool>, f: &mut dyn FnMut(&Glyph, i
             // SAFETY: mainline only (BUSY); the scratch list is only touched here.
             let tmp = unsafe { &mut *core::ptr::addr_of_mut!(TMP) };
             let mut k = 0;
-            let w = layout_inner(s, cap, rtl, &mut |g, x, y| {
+            let w = layout_inner(s, cap, rtl, kind, &mut |g, x, y| {
                 if k < tmp.len() {
                     tmp[k] = (*g, x, y);
                 }
@@ -201,7 +226,7 @@ pub fn layout(s: &[u8], cap: i32, rtl: Option<bool>, f: &mut dyn FnMut(&Glyph, i
                 emit(g, x, y);
             });
             if k <= tmp.len() {
-                cache_put(s, cap, rtl, w, &tmp[..k]);
+                cache_put(s, cap, rtl, kind, w, &tmp[..k]);
             }
             w
         }
@@ -245,12 +270,12 @@ fn chash(s: &[u8]) -> u64 {
     h
 }
 
-fn rtl_key(rtl: Option<bool>) -> u8 {
-    match rtl {
+fn rtl_key(rtl: Option<bool>, kind: Text) -> u8 {
+    (match rtl {
         None => 0,
         Some(false) => 1,
         Some(true) => 2,
-    }
+    }) + if kind == Text::Prose { 3 } else { 0 }
 }
 
 /// The line's bytes as stored: 16 bytes in each entry's glyph and places (packed into the `cp`, `x` and `y` words
@@ -266,7 +291,7 @@ fn pack(b: &[u8]) -> (Glyph, i32, i32) {
     )
 }
 
-fn cache_find(s: &[u8], cap: i32, rtl: Option<bool>) -> Option<(i32, &'static [(Glyph, i32, i32)])> {
+fn cache_find(s: &[u8], cap: i32, rtl: Option<bool>, kind: Text) -> Option<(i32, &'static [(Glyph, i32, i32)])> {
     if s.len() > CMAXB {
         return None;
     }
@@ -274,7 +299,7 @@ fn cache_find(s: &[u8], cap: i32, rtl: Option<bool>) -> Option<(i32, &'static [(
     // SAFETY: mainline only (BUSY).
     let (slots, ns, arena) = unsafe { (&*core::ptr::addr_of!(CSLOT), CNS, &*core::ptr::addr_of!(CARN)) };
     for sl in slots.iter().take(ns) {
-        if sl.hash != h || sl.cap != cap || sl.rtl != rtl_key(rtl) || sl.len as usize != s.len() {
+        if sl.hash != h || sl.cap != cap || sl.rtl != rtl_key(rtl, kind) || sl.len as usize != s.len() {
             continue;
         }
         let nb = (s.len() + 15) / 16;
@@ -294,7 +319,7 @@ fn cache_find(s: &[u8], cap: i32, rtl: Option<bool>) -> Option<(i32, &'static [(
     None
 }
 
-fn cache_put(s: &[u8], cap: i32, rtl: Option<bool>, w: i32, recs: &[(Glyph, i32, i32)]) {
+fn cache_put(s: &[u8], cap: i32, rtl: Option<bool>, kind: Text, w: i32, recs: &[(Glyph, i32, i32)]) {
     if s.len() > CMAXB {
         return;
     }
@@ -316,7 +341,7 @@ fn cache_put(s: &[u8], cap: i32, rtl: Option<bool>, w: i32, recs: &[(Glyph, i32,
         arena[off + nb..off + need].copy_from_slice(recs);
         CUSED += need;
         (&mut *core::ptr::addr_of_mut!(CSLOT))[CNS] =
-            CSlot { hash: chash(s), cap, rtl: rtl_key(rtl), len: s.len() as u16, off: off as u16, nglyph: recs.len() as u16, w };
+            CSlot { hash: chash(s), cap, rtl: rtl_key(rtl, kind), len: s.len() as u16, off: off as u16, nglyph: recs.len() as u16, w };
         CNS += 1;
     }
 }
@@ -332,7 +357,7 @@ pub fn reset_cache() {
 }
 
 /// The same in font units (x from the line's start, y up). Returns the advance in font units.
-fn layout_inner(s: &[u8], cap: i32, rtl: Option<bool>, f: &mut dyn FnMut(&Glyph, i32, i32)) -> i32 {
+fn layout_inner(s: &[u8], cap: i32, rtl: Option<bool>, kind: Text, f: &mut dyn FnMut(&Glyph, i32, i32)) -> i32 {
     // SAFETY: mainline only, and BUSY keeps this the only user of the buffers.
     // SAFETY: mainline only (BUSY), touched only here.
     let gxo = unsafe { &mut *core::ptr::addr_of_mut!(GXO) };
@@ -355,7 +380,7 @@ fn layout_inner(s: &[u8], cap: i32, rtl: Option<bool>, f: &mut dyn FnMut(&Glyph,
     let (mut n, mut i, mut dropped, mut cut) = (0usize, 0usize, 0u64, 0u64);
     while i < s.len() {
         let cp = vector::next_char(s, &mut i);
-        if bidi::is_explicit(cp) {
+        if kind == Text::Identity && bidi::is_embedding(cp) {
             dropped += 1;
             continue;
         }
@@ -453,7 +478,7 @@ fn layout_inner(s: &[u8], cap: i32, rtl: Option<bool>, f: &mut dyn FnMut(&Glyph,
     let mut m = 0usize;
     let mut k = 0usize;
     while k < n {
-        if levels[k] == bidi::REMOVED {
+        if levels[k] == bidi::REMOVED || hidden(cps[k]) {
             k += 1;
             continue;
         }
@@ -509,7 +534,10 @@ fn layout_inner(s: &[u8], cap: i32, rtl: Option<bool>, f: &mut dyn FnMut(&Glyph,
         k += 1;
     }
     // 6. visual order (L2) over the glyphs, then the pens of the glyphs that hang on nothing
-    let cnt = bidi::reorder(&glv[..m], &mut order[..m]);
+    let cnt = {
+        let gl = &*gl;
+        bidi::reorder_by(&glv[..m], &mut order[..m], &|j| gl.get(j).map_or(false, |g| bidi::class(g.cp) == bidi::B))
+    };
     let mut pen = 0i32;
     for &j in &order[..cnt] {
         let j = j as usize;
@@ -540,7 +568,7 @@ pub fn oracle_hash(s: &[u8]) -> u64 {
         panic!("shape::layout entered twice");
     }
     let mut h: u64 = 0xCBF29CE484222325;
-    layout_inner(s, 9, None, &mut |g, x, y| {
+    layout_inner(s, 9, None, Text::Identity, &mut |g, x, y| {
         let gid = if g.face == vector::ARABIC && !g.boxed { g.g } else { 0xFFFF };
         for b in gid.to_le_bytes().iter().chain(x.to_le_bytes().iter()).chain(y.to_le_bytes().iter()) {
             h ^= *b as u64;

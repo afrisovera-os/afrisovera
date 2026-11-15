@@ -12,7 +12,8 @@
 #     refused; Ctrl+\ twice closes Andika; the tile starts it again (the tile is bright once more), and it closes again;
 #   a tile tapped while `more help` waits at More: is refused, and the pager receives nothing but its q;
 #   ARM only: a tile tapped while appget waits for its y is refused, and appget receives only the n (cancelled);
-#   `nia andika.wasm` runs exactly twice, `desk verify` finds 0 rows, no panic.
+#   `nia andika.wasm` runs exactly twice, `desk verify` finds 0 rows (also with the Circle open while the shell is
+#   busy, so its app tile is dim), no panic.
 #   scripts/desk-andika-test.sh              # grader selftest, then the two boots
 #   scripts/desk-andika-test.sh --selftest   # grader selftest only
 set -uo pipefail
@@ -28,13 +29,14 @@ HEAD=("gui" "desk mode pointer" "desk circle" "desk launcher" "~1.5" "!circle"
       "&desk later 500 tile andika.wasm" "@opened by andika.wasm" "~2"
       ":1c" "~0.8" "~3.5" ":1c" "@cell window closed" "~1"
       "desk later 6000 tile andika.wasm" "&more help" "@More:" "~9" ":71" "@stopped after" "~1")
-TAIL=("desk circle" "desk verify" "desk cell open" "desk cell demo" "~1" "!cell-roles")
+TAIL=("desk circle" "desk verify" "desk launcher" "desk verify" "desk key esc" "desk cell open" "desk cell demo" "~1" "!cell-roles")
 
 grade() { # grade <serial log> <kernel name> <arm|pc>
     local fail=0 S n
     _f() { echo "  FAIL ($2): $1"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL ($2): missing serial log"; return 1; }
-    S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/^[[:space:]]*//')"
+    # stray control bytes and trailing spaces never hide a line (a once-seen ARM desk-cell miss, 15 Nov)
+    S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/^[[:space:]]*//' | tr -d '\000-\010\013-\037\177' | sed 's/[[:space:]]*$//')"
     has() { grep -aqxF "$1" <<< "$S" || _f "no line: $1" "$2"; }
     count() { grep -acxF "$1" <<< "$S"; }
     grep -aqE 'PANIC|panicked|\[nia\] TRAP' <<< "$S" && _f "the kernel panicked, faulted or the app trapped" "$2"
@@ -62,7 +64,9 @@ grade() { # grade <serial log> <kernel name> <arm|pc>
         has "appget: cancelled; nothing written" "$2"
     fi
     has "[desk] circle: 5 tiles: files terminal settings about andika.wasm; app tiles dim (the shell is busy)" "$2"
-    grep -aqE '^\[desk\] verify: 0 of [0-9]+ rows differ after a full redraw' <<< "$S" || _f "desk verify did not find 0 rows" "$2"
+    # two verifies: after the runs, and with the Circle open while the shell is busy (its app tile dim)
+    n="$(grep -acE '^\[desk\] verify: 0 of [0-9]+ rows differ after a full redraw' <<< "$S")"
+    [ "$n" -eq 2 ] || _f "$n of 2 desk verify runs found 0 rows differ" "$2"
     return "$fail"
 }
 
@@ -98,7 +102,11 @@ appget: cancelled; nothing written
 afrisovera> desk circle
 [desk] circle: 5 tiles: files terminal settings about andika.wasm; app tiles dim (the shell is busy)
 afrisovera> desk verify
-[desk] verify: 0 of 480 rows differ after a full redraw (12 partial frame(s) drawn before it)"
+[desk] verify: 0 of 480 rows differ after a full redraw (12 partial frame(s) drawn before it)
+afrisovera> desk launcher
+[desk] launcher open
+afrisovera> desk verify
+[desk] verify: 0 of 480 rows differ after a full redraw (14 partial frame(s) drawn before it)"
 
 selftest() {
     local D pass=0 bad=0
@@ -129,10 +137,11 @@ selftest() {
     case_ enter-launched red "$(sed '0,/not started, the shell is busy/s/andika.wasm not started, the shell is busy/start andika.wasm/' <<< "$GREEN")"
     case_ pager-stuck red "$(grep -v '\[more\] stopped' <<< "$GREEN")"
     case_ stale-rows red "$(sed 's/verify: 0 of 480/verify: 7 of 480/' <<< "$GREEN")"
+    case_ circle-stale red "$(sed 's/verify: 0 of 480 rows differ after a full redraw (14/verify: 3 of 480 rows differ after a full redraw (14/' <<< "$GREEN")"
     case_ trap red "$(printf '%s\n[nia] TRAP in andika.wasm\n' "$GREEN")"
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 18 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 19 ]
 }
 
 echo "== the Andika tile in the Circle: started through the shell's prompt, refused while the shell is busy =="

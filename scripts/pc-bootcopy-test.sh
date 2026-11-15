@@ -92,7 +92,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
         _f "boot 1: a wrong code was not refused"
     in_blk "$(blk "$A" 'bootcopy remove')" "bootcopy remove: no EFI system partition holds \\\\EFI\\\\afrisovera that may be changed \(bootplan says why\); nothing written" ||
         _f "boot 1: bootcopy remove did not find nothing to take out"
-    printf '%s\n' "$A" | grep -aqx 'harness: disk images unchanged' || _f "boot 1: a disk image changed (or the check is missing)"
+    grep -aqx 'harness: disk images unchanged' <<< "$A" || _f "boot 1: a disk image changed (or the check is missing)"
     local B1 BP B2
     B1="$(printf '%s\n' "$B" | awk '/^afrisovera> bootcopy yes /{on=1;next} /^afrisovera>/{on=0} on')"
     BP="$(blk "$B" bootplan)"; B2="$(blk "$B" bootcopy)"
@@ -106,12 +106,12 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
         _f "boot 2: bootplan did not say the file has no boot entry yet"
     in_blk "$B2" "bootcopy: $NAME partition $PNO already holds \\\\EFI\\\\afrisovera; nothing to copy \(bootcopy remove takes it out\)" ||
         _f "boot 2: a second bootcopy did not refuse"
-    printf '%s\n' "$B" | grep -aqx 'harness: bootcopy image check PASSED' || _f "boot 2: the image check did not pass"
-    printf '%s\n' "$B" | grep -aqxE "check: the EFI system partition is GPT entry $PNO \(start $STARTL\)" ||
+    grep -aqx 'harness: bootcopy image check PASSED' <<< "$B" || _f "boot 2: the image check did not pass"
+    grep -aqxE "check: the EFI system partition is GPT entry $PNO \(start $STARTL\)" <<< "$B" ||
         _f "boot 2: the image check did not check GPT entry $PNO (start $STARTL)"
-    printf '%s\n' "$D" | grep -aqxE "check: the EFI system partition is GPT entry $PNO \(start $STARTL\)" ||
+    grep -aqxE "check: the EFI system partition is GPT entry $PNO \(start $STARTL\)" <<< "$D" ||
         _f "boot 4: the removal check did not check GPT entry $PNO (start $STARTL)"
-    printf '%s\n' "$D" | grep -aqx 'check: every sector outside the EFI partition is as it was before bootcopy' ||
+    grep -aqx 'check: every sector outside the EFI partition is as it was before bootcopy' <<< "$D" ||
         _f "boot 4: the removal check did not find everything outside the EFI partition as before bootcopy"
     # the copy goes in runs of several sectors, one command and one read back each (IDE mode: one cache flush too)
     in_blk "$(blk "$B" $LS)" '  big copies \(installdisk, bootcopy\): [1-9][0-9]* run\(s\) in one command, [1-9][0-9]* sector\(s\), each read back'"$RUNS" ||
@@ -122,15 +122,15 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log> <boot4 log>
         _f "boot 3: bootcopy remove did not give the code"
     in_blk "$(blk "$C" 'bootcopy remove yes zzzz')" 'bootcopy remove: that code does not fit this EFI partition as it is now; nothing written' ||
         _f "boot 3: a wrong code was not refused"
-    printf '%s\n' "$C" | grep -aqx 'harness: disk images unchanged' || _f "boot 3: a disk image changed (or the check is missing)"
+    grep -aqx 'harness: disk images unchanged' <<< "$C" || _f "boot 3: a disk image changed (or the check is missing)"
     local D1
     D1="$(printf '%s\n' "$D" | awk '/^afrisovera> bootcopy remove yes /{on=1;next} /^afrisovera>/{on=0} on')"
     in_blk "$D1" "bootcopy remove: \\\\EFI\\\\afrisovera taken out of $NAME partition $PNO, read back \(both FAT copies equal, $FREE KiB free again\)" ||
         _f "boot 4: the removal was not read back with $FREE KiB free again"
     in_blk "$(blk "$D" bootplan)" "  plan: AfriSovera's boot file would be copied to $FILE_RE \([1-9][0-9]* KiB of the $FREE KiB free\); nothing else in this partition changes" ||
         _f "boot 4: bootplan does not plan the copy again"
-    printf '%s\n' "$D" | grep -aqx 'harness: bootcopy removal check PASSED' || _f "boot 4: the removal check did not pass"
-    if printf '%s\n%s\n%s\n%s\n' "$A" "$B" "$C" "$D" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci|ide)\] .*(failed|timed out)|FAILED'; then
+    grep -aqx 'harness: bootcopy removal check PASSED' <<< "$D" || _f "boot 4: the removal check did not pass"
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci|ide)\] .*(failed|timed out)|FAILED' <<< "$A"$'\n'"$B"$'\n'"$C"$'\n'"$D"; then
         _f "the kernel panicked, a disk command failed or something FAILED"
     fi
     return "$fail"

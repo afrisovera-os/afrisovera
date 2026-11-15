@@ -417,6 +417,23 @@ static mut MSC_EPO_ADDR: u8 = 0;
 static mut MSC_IFACE: u8 = 0;
 static mut MSC_RECOVERIES: u64 = 0;
 static mut MSC_STALE: u64 = 0; // transfer events for an older TRB, set aside by wait_xfer
+/// The stick's write cache, from MODE SENSE(6) page 8 once at attach (AFR-0011 V2, the architect's verdict of
+/// 14 Nov 2026): 0 not asked, 1 on (WCE: a sync sends SYNCHRONIZE CACHE), 2 write-through (WCE clear),
+/// 3 unknown (MODE SENSE refused, unanswered or unreadable: treated as write-through), 4 on but the stick
+/// refused SYNCHRONIZE CACHE (ILLEGAL REQUEST, ASC 0x20 or 0x24: no cache to flush, not asked again).
+static mut MSC_CACHE: u8 = 0;
+/// A write to the stick failed since the last `msc_sync` (sticky, the architect's V2 rule 1): only a
+/// returning `msc_sync` clears it, and that one returns `Failed`.
+static mut MSC_WERR: bool = false;
+/// `msc_sync` answers since boot, in MscSync's order.
+static mut MSC_SYNCS: [u64; 5] = [0; 5];
+/// The test rig's lost answer (fw_cfg `opt/afrisovera/msc-sync-lose`, never reachable from the shell): the next
+/// SYNCHRONIZE CACHE's status is taken as never come, so the driver takes the path a silent stick sends it down
+/// (Bulk-Only: the reset; UAS: the recovery). 0 not read yet, 1 armed, 2 off or used. QEMU cannot hold a flush
+/// back itself: a held request deadlocks it when the reset cancels the command.
+static mut MSC_LOSE: u8 = 0;
+/// Set for one command by msc_sync when MSC_LOSE is armed; bot_inner and the UAS paths take it.
+static mut MSC_DROP_STATUS: bool = false;
 static mut CTL_STALE: u64 = 0; // endpoint 0 events for an older request, set aside by wait_control
 static mut CTL_TOOK: u64 = 0; // the TRB whose event ended the last control transfer (lsusb late0)
 static mut CTL_WANT: u64 = 0; // the status TRB of the last control transfer queued
@@ -529,12 +546,26 @@ static mut PUAS_SR: [Prod; 6] = [Prod { idx: 0, cycle: 1 }; 6];
 /// four fields as LAST_OTHER), for `wifi`: a USB Wi-Fi stick is named from its vendor:product.
 static mut OTHERS: [(u16, u16, u8, u8); 8] = [(0, 0, 0, 0); 8];
 static mut NOTHERS: usize = 0;
+/// The first interface's (class, subclass, protocol) of the device just enumerated, and of each in OTHERS.
+static mut LAST_IF: (u8, u8, u8) = (0, 0, 0);
+static mut OTHER_IF: [(u8, u8, u8); 8] = [(0, 0, 0); 8];
 unsafe fn note_other() {
     let (o, n, list) = (LAST_OTHER, NOTHERS, OTHERS);
     if (o.0, o.1) != (0, 0) && n < list.len() && !list[..n].iter().any(|x| (x.0, x.1) == (o.0, o.1)) {
         OTHERS[n] = o;
+        OTHER_IF[n] = LAST_IF;
         NOTHERS = n + 1;
     }
+}
+/// The first interface's class of each device in `others()`, same order.
+pub(crate) fn others_if() -> [(u8, u8, u8); 8] {
+    // SAFETY: single core, shell context; a plain copy.
+    unsafe { OTHER_IF }
+}
+/// The words for why a device left alone was not used, for hwscan's class line (other_name's reasons).
+pub(crate) fn other_words(c: u8) -> &'static str {
+    // SAFETY: a scalar read of boot-time bookkeeping.
+    unsafe { other_name(c) }
 }
 /// The devices in use now, for `hwscan`: (vendor, product, what this driver does with it), and how many.
 pub(crate) fn used() -> ([(u16, u16, &'static str); NDEV], usize) {
@@ -667,6 +698,9 @@ static mut DEVS: [Dev; NDEV] = [NO_DEV; NDEV];
 static mut PENDING: [u32; NCTL] = [0; NCTL];
 /// F2: each controller's power-on wait (`settle`): ms waited, ports with a device, steady.
 static mut SETTLE: [(u32, u32, bool); NCTL] = [(0, 0, false); NCTL];
+/// Boot's device set-ups (`hid`, every try): (time in all, tries, the slowest's time and port), in TSC cycles, for
+/// the start-up line (14 Nov 2026: the owner's HP spent 810 ms in xhci at boot; this line says where).
+static mut SETUP_T: (u64, u32, u64, u32) = (0, 0, 0, 0);
 /// F2: each controller's reset (`reset`): ms from HCRST to ready, halted before it, Intel host.
 static mut RESET: [(u32, bool, bool); NCTL] = [(0, false, false); NCTL];
 /// Each controller's Supported Protocol capabilities (xHCI 7.2): (major, minor revision in BCD,
@@ -763,9 +797,10 @@ static mut KBD_PORT: u32 = 0;
 /// letters to capitals (Shift then gives small letters, as on other systems), and the keyboard's
 /// own Caps Lock light is set with a HID SET_REPORT on its interface. The keyboard's lights are
 /// the host's to set; the request is sent from `service` (the idle loop), never from the timer
-/// interrupt. Counters for `lsusb`: lights set and requests the keyboard refused.
+/// interrupt. Counters for `lsusb`: lights set and requests the keyboard refused. Since 13 Nov
+/// 2026 the Caps Lock state is the one the PS/2 keyboard shares (ps2::caps_lock), so either
+/// keyboard's key turns it and both lights follow.
 static mut KBD_IFACE: u16 = 0;
-static mut CAPS_LOCK: bool = false;
 static mut LED_WANT: bool = false;
 static mut LED_SETS: u32 = 0;
 static mut LED_FAILS: u32 = 0;
@@ -1075,6 +1110,74 @@ fn ctx(base: *mut u8, i: usize) -> *mut u32 {
 
 /// Asili v0 BINDS (pc/hwdb.rs): `init` takes the controllers this table matches.
 pub(crate) const BINDS: &[crate::hwdb::Part] = &[crate::hwdb::pci_class(0x0C_03_30, 0xFF_FF_FF, "xHCI USB controller")];
+
+// The USB function drivers' BINDS (the Driver Standard section 4 rule 5, slice 1, the architect's OK of 14 Nov
+// 2026): exactly the classes and ids the descriptor walk tested inline before, moved here. The walk asks them
+// (hwdb::usb_part) and hwscan reads them, so a device a driver covers but refuses reads "class", not "missing".
+// Finer checks (a usable report, a data interface, streams for UAS on USB 3) stay in the walk (rule 2).
+use crate::hwdb::{usb_class, usb_id, Part};
+pub(crate) const KBD_BINDS: &[Part] = &[usb_class(3, 1, 1, 7, "HID boot keyboard")];
+pub(crate) const MOUSE_BINDS: &[Part] = &[usb_class(3, 1, 2, 7, "HID boot mouse")];
+/// Any other HID interface, tried as an absolute pointer (its report descriptor must give X and Y).
+pub(crate) const TABLET_BINDS: &[Part] = &[usb_class(3, 0, 0, 1, "HID absolute pointer (touchscreen, tablet)")];
+/// [0] Bulk-Only, [1] UAS (the order msc_setup reads).
+pub(crate) const MSC_BINDS: &[Part] =
+    &[usb_class(8, 6, 0x50, 7, "mass storage, Bulk-Only, SCSI"), usb_class(8, 6, 0x62, 7, "mass storage, USB Attached SCSI")];
+/// The communication interface of each kind: [0] NCM, [1] ECM, [2..] RNDIS (net_setup's NetKind by row).
+pub(crate) const NET_BINDS: &[Part] = &[
+    usb_class(2, 0x0D, 0, 3, "CDC-NCM"),
+    usb_class(2, 6, 0, 3, "CDC-ECM"),
+    usb_class(2, 2, 0xFF, 7, "RNDIS (CDC ACM, vendor protocol)"),
+    usb_class(0xE0, 1, 3, 7, "RNDIS (Android tethering)"),
+    usb_class(0xEF, 4, 1, 7, "RNDIS (miscellaneous class)"),
+];
+pub(crate) const AUDIO_BINDS: &[Part] =
+    &[usb_class(1, 1, 0, 3, "USB Audio Class 1, control"), usb_class(1, 2, 0, 3, "USB Audio Class 1, streaming")];
+/// FTDI chips by id, the chip's name as the part's name.
+pub(crate) const SERIAL_BINDS: &[Part] = &[
+    usb_id(0x0403, 0x6001, "FT232R/FT232BM"),
+    usb_id(0x0403, 0x6010, "FT2232"),
+    usb_id(0x0403, 0x6011, "FT4232"),
+    usb_id(0x0403, 0x6014, "FT232H"),
+    usb_id(0x0403, 0x6015, "FT-X"),
+];
+pub(crate) const BT_BINDS: &[Part] = &[usb_class(0xE0, 1, 1, 7, "Bluetooth HCI")];
+pub(crate) const VIDEO_BINDS: &[Part] = &[usb_class(0x0E, 1, 0, 3, "USB Video Class")];
+/// Every USB function driver and its table, in the walk's order, for hwscan's class verdict.
+pub(crate) const USB_TABLES: &[(&str, &[Part])] = &[
+    ("usb-keyboard", KBD_BINDS),
+    ("usb-mouse", MOUSE_BINDS),
+    ("usb-tablet", TABLET_BINDS),
+    ("bt", BT_BINDS),
+    ("usb-serial", SERIAL_BINDS),
+    ("usb-video", VIDEO_BINDS),
+    ("usb-audio", AUDIO_BINDS),
+    ("usb-ethernet", NET_BINDS),
+    ("usb-storage", MSC_BINDS),
+];
+
+/// The first driver whose table covers a device left alone (its first interface's class `cls`), and the part.
+pub(crate) fn covers(cls: (u8, u8, u8), vid: u16, pid: u16) -> Option<(&'static str, &'static Part)> {
+    USB_TABLES.iter().find_map(|&(drv, parts)| crate::hwdb::usb_part(parts, cls, vid, pid).map(|p| (drv, p)))
+}
+
+/// One line per device a driver took (the architect's slice 1 proof: the same set before and after the tables).
+unsafe fn bound_line(d: usize) {
+    let drv = match DEVS[d].kind {
+        KIND_KBD => "usb-keyboard",
+        KIND_MOUSE => "usb-mouse",
+        KIND_TABLET => "usb-tablet",
+        KIND_NET => "usb-ethernet",
+        KIND_HUB => "usb-host (hub)",
+        KIND_MSC => "usb-storage",
+        KIND_AUDIO => "usb-audio",
+        KIND_SERIAL => "usb-serial",
+        KIND_CAM => "usb-video",
+        KIND_BT => "bt",
+        _ => return,
+    };
+    crate::kprintln!("[xhci] bound: {:04x}:{:04x} {}", DEVS[d].vid, DEVS[d].pid, drv);
+}
 /// The older USB 2 controllers (EHCI): not driven, only looked for by `intel_switch` (port routing).
 const EHCI: &[crate::hwdb::Part] = &[crate::hwdb::pci_class(0x0C_03_20, 0xFF_FF_FF, "EHCI USB 2 controller")];
 
@@ -1373,6 +1476,7 @@ pub fn init() {
             );
         }
     }
+    let boot_t0 = crate::timer::cycles();
     // SAFETY: boot, single core; BUSY keeps the timer poll away until every controller is up
     // (the waits inside serve the events meanwhile).
     unsafe {
@@ -1404,6 +1508,15 @@ pub fn init() {
                 crate::kprintln!("[xhci] no USB mouse");
             }
         }
+        // where start-up's time went: the power-on waits, the device set-ups (and the slowest), the rest
+        let ms = |c: u64| c.saturating_mul(1000) / crate::timer::hz().max(1);
+        let total = ms(crate::timer::cycles().wrapping_sub(boot_t0));
+        let settle: u64 = (*core::ptr::addr_of!(SETTLE)).iter().map(|s| s.0 as u64).sum();
+        let (st, tries, slow, slow_port) = SETUP_T;
+        crate::kprintln!(
+            "[xhci] start-up {} ms: power-on wait {} ms, {} device set-up(s) {} ms (slowest port {}, {} ms), the rest {} ms",
+            total, settle, tries, ms(st), slow_port, ms(slow), total.saturating_sub(settle + ms(st))
+        );
         BUSY = false;
     }
 }
@@ -1577,6 +1690,7 @@ unsafe fn settle(c: usize) {
 /// A device that is neither gets its slot disabled again, so `d` stays free.
 unsafe fn hid(d: usize, port: u32, speed: u32) -> bool {
     LAST_OTHER = (0, 0, 0, 0); // this try's own descriptor, never the last device's
+    LAST_IF = (0, 0, 0);
     MSC_SEEN = (0, 0);
     let ev = match command(0, T_ENABLE_SLOT << 10) {
         Some(e) => e,
@@ -1584,7 +1698,14 @@ unsafe fn hid(d: usize, port: u32, speed: u32) -> bool {
     };
     let slot = ev.control >> 24;
     DEVS[d] = Dev { slot, dci: 0, kind: 0, port, ctl: CUR, route: PATH.0, vid: 0, pid: 0 };
+    let t0 = crate::timer::cycles();
     let ok = enumerate(d, port, speed);
+    let dt = crate::timer::cycles().wrapping_sub(t0);
+    SETUP_T.0 += dt;
+    SETUP_T.1 += 1;
+    if dt > SETUP_T.2 {
+        (SETUP_T.2, SETUP_T.3) = (dt, port);
+    }
     if !ok {
         command(0, T_DISABLE_SLOT << 10 | slot << 24);
         DCBAA[CUR].0[slot as usize] = 0;
@@ -1698,6 +1819,7 @@ unsafe fn enumerate(d: usize, port: u32, speed: u32) -> bool {
     }
     if total >= 9 + 9 && DBUF.0[9 + 1] == 4 {
         LAST_OTHER.3 = DBUF.0[9 + 5]; // the first interface's class
+        LAST_IF = (DBUF.0[9 + 5], DBUF.0[9 + 6], DBUF.0[9 + 7]);
     }
     // find a HID boot keyboard (3/1/1) or boot mouse (3/1/2) interface (one of a kind not
     // already enumerated) and its interrupt-IN endpoint
@@ -1713,17 +1835,24 @@ unsafe fn enumerate(d: usize, port: u32, speed: u32) -> bool {
         }
         match DBUF.0[i + 1] {
             4 if i + 8 <= total => {
-                let k = match (DBUF.0[i + 5], DBUF.0[i + 6], DBUF.0[i + 7]) {
-                    (3, 1, 1) if KBD_SLOT == 0 => KIND_KBD,
-                    (3, 1, 2) if MOUSE_SLOT == 0 => KIND_MOUSE,
-                    _ => 0,
+                let cls = (DBUF.0[i + 5], DBUF.0[i + 6], DBUF.0[i + 7]);
+                let k = if KBD_SLOT == 0 && crate::hwdb::usb_part(KBD_BINDS, cls, vid, pid).is_some() {
+                    KIND_KBD
+                } else if MOUSE_SLOT == 0 && crate::hwdb::usb_part(MOUSE_BINDS, cls, vid, pid).is_some() {
+                    KIND_MOUSE
+                } else {
+                    0
                 };
                 in_kbd = k != 0 && ep.is_none();
                 if in_kbd {
                     iface = DBUF.0[i + 2];
                     kind = k;
                 }
-                in_tab = k == 0 && tab.is_none() && TABLET_SLOT == 0 && DBUF.0[i + 5] == 3 && (DBUF.0[i + 6], DBUF.0[i + 7]) != (1, 1);
+                in_tab = k == 0
+                    && tab.is_none()
+                    && TABLET_SLOT == 0
+                    && crate::hwdb::usb_part(TABLET_BINDS, cls, vid, pid).is_some()
+                    && (cls.1, cls.2) != (1, 1);
                 if in_tab {
                     tab = Some((DBUF.0[i + 2], 0, None));
                 }
@@ -1821,7 +1950,7 @@ unsafe fn enumerate(d: usize, port: u32, speed: u32) -> bool {
         KBD_SLOT = slot;
         KBD_PORT = port;
         KBD_IFACE = iface as u16;
-        LED_WANT = CAPS_LOCK; // a keyboard plugged in while Caps Lock is on gets its light too
+        LED_WANT = crate::ps2::caps_lock(); // a keyboard plugged in while Caps Lock is on gets its light too
     } else if kind == KIND_TABLET {
         TABLET_SLOT = slot;
         TABLET_PORT = port;
@@ -1874,6 +2003,25 @@ unsafe fn queue_report(d: usize) {
         T_NORMAL << 10 | 1 << 5 | 1 << 2,
     );
     doorbell(DEVS[d].slot, DEVS[d].dci);
+}
+
+/// A4: a HID keyboard usage as a special key's number (keyseq.rs), for a running Nia app.
+fn app_special(usage: u8) -> Option<u32> {
+    use crate::keyseq as k;
+    Some(match usage {
+        0x52 => k::UP,
+        0x51 => k::DOWN,
+        0x50 => k::LEFT,
+        0x4F => k::RIGHT,
+        0x4A => k::HOME,
+        0x4D => k::END,
+        0x4B => k::PGUP,
+        0x4E => k::PGDN,
+        0x49 => k::INS,
+        0x4C => k::DEL,
+        0x3A..=0x45 => k::F1 + (usage - 0x3A) as u32,
+        _ => return None,
+    })
 }
 
 /// HID usage -> ASCII (unshifted, shifted), boot keyboard page.
@@ -2053,6 +2201,28 @@ unsafe fn handle(ev: Trb) {
                     crate::desk::post_key(dk);
                     continue;
                 }
+                // A4: while a Nia app runs, the keys the shell drops reach the app as a terminal sends them (keyseq.rs
+                // decodes them); Super with anything stays the desk's. With no app running nothing here changes.
+                if crate::nia::app_running() && !sup {
+                    let ctrl = r[0] & 0x11 != 0;
+                    let mods = if shift { crate::desk::cell_abi::SHIFT } else { 0 }
+                        | if alt { crate::desk::cell_abi::ALT } else { 0 }
+                        | if ctrl { crate::desk::cell_abi::CTRL } else { 0 };
+                    if let Some(n) = app_special(k) {
+                        if crate::keyseq::inject_special(n, mods, crate::uart::inject) {
+                            KEYS += 1;
+                        }
+                        continue;
+                    }
+                    // Caps Lock turns letters, as on the normal path below (the driver owner's review)
+                    let up = if (0x04..=0x1D).contains(&k) { shift ^ crate::ps2::caps_lock() } else { shift };
+                    if let Some(c) = ascii(k, up) {
+                        if crate::keyseq::inject_char(c, ctrl, alt, crate::uart::inject) {
+                            KEYS += 1;
+                            continue;
+                        }
+                    }
+                }
                 if k == 0x52 || k == 0x51 {
                     crate::uart::history_key(k == 0x52); // Up/Down: shell history (uart.rs)
                     continue;
@@ -2062,12 +2232,11 @@ unsafe fn handle(ev: Trb) {
                     continue;
                 }
                 if k == 0x39 {
-                    CAPS_LOCK = !CAPS_LOCK; // Caps Lock: its light is set by `service`
-                    LED_WANT = true;
+                    crate::ps2::toggle_caps(); // Caps Lock, shared with PS/2: the lights are set from the idle loop
                     continue;
                 }
                 // Caps Lock turns letters only; Shift with it gives small letters
-                let up = if (0x04..=0x1D).contains(&k) { shift ^ CAPS_LOCK } else { shift };
+                let up = if (0x04..=0x1D).contains(&k) { shift ^ crate::ps2::caps_lock() } else { shift };
                 if let Some(c) = ascii(k, up) {
                     crate::uart::inject(c);
                     KEYS += 1;
@@ -2119,6 +2288,13 @@ pub(crate) fn class_name(c: u8) -> &'static str {
         0xFF => "vendor-specific",
         _ => "unknown class",
     }
+}
+
+/// Caps Lock changed (ps2::toggle_caps, from either keyboard): the USB keyboard's light is set
+/// at the next `service`. Called with interrupts off (the timer or IRQ 12), like the key path.
+pub fn caps_light() {
+    // SAFETY: a flag `service` reads from the idle loop, as the key path sets it.
+    unsafe { LED_WANT = true };
 }
 
 /// Hot-plug: called from the shell's idle loop (cpu::wfi), never from an interrupt. A root
@@ -2185,7 +2361,7 @@ pub fn service() {
             if let Some(d) = kbd {
                 select(DEVS[d].ctl);
                 // SET_REPORT (output report 0): bit 1 is the Caps Lock light, the others off
-                (*addr_of_mut!(DBUF)).0[0] = (CAPS_LOCK as u8) << 1;
+                (*addr_of_mut!(DBUF)).0[0] = (crate::ps2::caps_lock() as u8) << 1;
                 CTL_QUIET = true; // a keyboard without lights may refuse; that is counted, not logged
                 if control(d, 0x21, 0x09, 0x0200, KBD_IFACE, 1) {
                     LED_SETS += 1;
@@ -2242,7 +2418,10 @@ unsafe fn forget(d: usize, c: usize) {
             MSC_SLOT = 0;
             (MSC_USABLE, MSC_RAW) = (false, false);
             (MSC_UAS, UAS_STREAMS) = (false, false);
-            (MSC_RA_N, MSC_WB_N) = (0, 0); // gathered writes are lost with the device
+            // gathered writes are lost with the device: the next sync says so (sticky)
+            MSC_WERR = MSC_WERR || MSC_WB_N > 0;
+            (MSC_RA_N, MSC_WB_N) = (0, 0);
+            MSC_CACHE = 0;
         }
         KIND_HUB if HUBI[d].3 != 0 => {
             HUBS = HUBS.saturating_sub(1);
@@ -2471,6 +2650,9 @@ unsafe fn hub_port(d: usize, hp: u32, fd: usize) -> bool {
         BSR_NOW = bsr;
         LAST_CC = 0;
         ok = hid(fd, port, cspeed);
+        if ok {
+            bound_line(fd);
+        }
         BSR_NOW = BSR_FIRST;
         PATH = saved;
         answered = ok || LAST_OTHER.0 != 0 || LAST_OTHER.1 != 0;
@@ -2530,6 +2712,9 @@ unsafe fn attach(fd: usize, p: u32, sc: u32) -> bool {
         BSR_NOW = bsr;
         LAST_CC = 0;
         let ok = hid(fd, p, port_speed(CUR, p, (sc >> 10) & 0xF));
+        if ok {
+            bound_line(fd);
+        }
         BSR_NOW = BSR_FIRST;
         let answered = ok || LAST_OTHER.0 != 0 || LAST_OTHER.1 != 0;
         if answered && n > 1 {
@@ -2946,8 +3131,10 @@ unsafe fn msc_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bool
         }
         match DBUF.0[i + 1] {
             4 if i + 9 <= total => {
-                ours = (DBUF.0[i + 5], DBUF.0[i + 6], DBUF.0[i + 7]) == (8, 6, 0x50);
-                uas = (DBUF.0[i + 5], DBUF.0[i + 6], DBUF.0[i + 7]) == (8, 6, 0x62) && uas_if.is_none();
+                let cls = (DBUF.0[i + 5], DBUF.0[i + 6], DBUF.0[i + 7]);
+                let hit = crate::hwdb::usb_part(MSC_BINDS, cls, vid, pid).map(|q| q.name == MSC_BINDS[1].name);
+                ours = hit == Some(false);
+                uas = hit == Some(true) && uas_if.is_none();
                 last_ep = None;
                 if ours {
                     MSC_IFACE = DBUF.0[i + 2];
@@ -3161,6 +3348,7 @@ unsafe fn msc_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bool
             { MSC_BLOCKS }
         );
     }
+    msc_cache_check(port);
     let raw = matches!(MSC_BS, 512 | 1024 | 2048 | 4096) && msc_io(0, false);
     let usable = raw && {
         let s0 = &mscbuf()[..512];
@@ -3185,6 +3373,110 @@ unsafe fn msc_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bool
     );
     msc_multi_check();
     true
+}
+
+/// At attach: does the stick keep a volatile write cache? MODE SENSE(6), page 8 (caching), current values, no
+/// block descriptors, 192 bytes asked (the length Windows asks; some sticks misbehave on others). WCE (byte 2
+/// bit 2 of the page) set: `msc_sync` ends with SYNCHRONIZE CACHE(10). Clear: write-through. A refusal, a stall
+/// or no answer goes through bot()'s own recovery (REQUEST SENSE, or the Bulk-Only reset) and leaves the stick
+/// usable and treated as write-through, marked unknown (AFR-0011 V2: the architect's verdict, 14 Nov 2026).
+/// Asking first keeps SYNCHRONIZE CACHE off the many sticks that never claim a cache. One boot line says which.
+unsafe fn msc_cache_check(port: u32) {
+    MSC_CACHE = 3;
+    mscbuf()[..192].fill(0);
+    if bot(&[0x1A, 0x08, 0x08, 0, 192, 0], 192, true) {
+        let b = &mscbuf();
+        let (len, p) = (b[0] as usize + 1, 4 + b[3] as usize);
+        if len >= p + 3 && p + 2 < 192 && b[p] & 0x3F == 0x08 && b[p + 1] >= 2 {
+            MSC_CACHE = if b[p + 2] & 0x04 != 0 { 1 } else { 2 };
+        }
+    }
+    crate::kprintln!(
+        "[xhci] port {}: USB storage write cache: {}",
+        port,
+        match MSC_CACHE {
+            1 => "on (MODE SENSE page 8, WCE): a sync ends with SYNCHRONIZE CACHE",
+            2 => "none (MODE SENSE page 8: write-through)",
+            _ => "unknown (MODE SENSE page 8 not answered): treated as write-through, its saves cannot be confirmed",
+        }
+    );
+}
+
+/// What `msc_sync` found (AFR-0011 V2's hand-over to `blk_flush`; V3 marks Unknown and Refused as "cannot
+/// confirm saves").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MscSync {
+    /// SYNCHRONIZE CACHE passed: every write acknowledged before the call is on the medium.
+    Flushed,
+    /// The stick's page 8 says it has no write cache: the gathered writes went out and are on it.
+    WriteThrough,
+    /// MODE SENSE page 8 was not answered at attach: the writes went out, the cache is not known.
+    Unknown,
+    /// A stick that said WCE refused SYNCHRONIZE CACHE with ILLEGAL REQUEST (ASC 0x20 or 0x24).
+    Refused,
+    /// A write failed since the last sync, the gathered writes could not be sent, or SYNCHRONIZE CACHE failed
+    /// any other way (refused otherwise, stalled, or not answered: bot()'s recovery has run).
+    Failed,
+}
+
+/// `blk_flush` for a USB stick or disk: the gathered writes, then SYNCHRONIZE CACHE(10) when the stick said it
+/// caches. A write that failed since the last call makes this `Failed`, and only this call clears that.
+pub fn msc_sync() -> MscSync {
+    if !msc_attached() {
+        // SAFETY: scalar state, mainline.
+        unsafe { MSC_WERR = false };
+        return MscSync::Failed;
+    }
+    // SAFETY: mainline (the VFS or the shell); bot() keeps the timer poll off the event ring meanwhile.
+    unsafe {
+        let Some(home) = on(DEVS[MSC_D].ctl) else {
+            return MscSync::Failed; // nothing was sent: the sticky error stays for the next call
+        };
+        let sent = msc_flush();
+        let cache = match MSC_CACHE {
+            1 => {
+                if MSC_LOSE == 0 {
+                    MSC_LOSE = if crate::qemu::fw_cfg_file(b"opt/afrisovera/msc-sync-lose") { 1 } else { 2 };
+                }
+                if MSC_LOSE == 1 {
+                    (MSC_LOSE, MSC_DROP_STATUS) = (2, true);
+                    crate::kprintln!("[xhci] USB storage: test switch: the next SYNCHRONIZE CACHE's status is taken as lost");
+                }
+                let ok = bot(&[0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0, false);
+                MSC_DROP_STATUS = false;
+                if ok {
+                    MscSync::Flushed
+                } else if matches!(MSC_SENSE, Some((5, 0x20 | 0x24, _))) {
+                    MSC_CACHE = 4;
+                    crate::kprintln!("[xhci] USB storage: the stick said it caches writes but refused SYNCHRONIZE CACHE: its saves cannot be confirmed");
+                    MscSync::Refused
+                } else {
+                    MscSync::Failed
+                }
+            }
+            2 => MscSync::WriteThrough,
+            4 => MscSync::Refused,
+            _ => MscSync::Unknown,
+        };
+        let r = if !sent || MSC_WERR { MscSync::Failed } else { cache };
+        MSC_WERR = false;
+        MSC_SYNCS[r as usize] += 1;
+        select(home);
+        r
+    }
+}
+
+/// `lsusb sync`: one `msc_sync` and its answer, for the test rig and a real PC alike (it writes no data, only
+/// sends the gathered writes and, on a stick that caches, SYNCHRONIZE CACHE).
+pub fn sync_cmd() {
+    let w = match msc_sync() {
+        MscSync::Flushed => "flushed (SYNCHRONIZE CACHE passed)",
+        MscSync::WriteThrough => "write-through (the stick keeps no write cache)",
+        MscSync::Unknown => "unknown (the stick did not say whether it caches): its saves cannot be confirmed",
+        MscSync::Refused => "refused (the stick said it caches but refused SYNCHRONIZE CACHE): its saves cannot be confirmed",
+        MscSync::Failed => "FAILED (a write or SYNCHRONIZE CACHE did not pass)",
+    };
+    crate::kprintln!("lsusb sync: {}", w);
 }
 
 /// At start-up: READ(10) of the first blocks in one command must equal the same blocks read one
@@ -3381,6 +3673,7 @@ unsafe fn msc_flush() -> bool {
         msc_ra_update(at + j, s, good);
         ok = ok && good;
     }
+    MSC_WERR = MSC_WERR || !ok;
     ok
 }
 
@@ -3447,7 +3740,7 @@ unsafe fn bot_inner(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
     MSC_SENSE = None;
     if MSC_UAS {
         let ok = uas_cmd(cdb, len, dir_in, buf);
-        if !ok {
+        if !ok && matches!(MSC_SENSE, None) {
             MSC_WHY = "the UAS command did not complete";
         }
         return ok;
@@ -3480,6 +3773,12 @@ unsafe fn bot_inner(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
             bot_reset();
             return false;
         }
+    }
+    // the test rig's lost answer: as a status that never came (msc_sync's MSC_DROP_STATUS)
+    if core::mem::take(&mut *addr_of_mut!(MSC_DROP_STATUS)) {
+        MSC_WHY = "no status came back (the stick was reset)";
+        bot_reset();
+        return false;
     }
     // the command status wrapper (once more after clearing a stall)
     let mut c = cc_of(msc_xfer(true, addr_of!(CSW) as u64, 13));
@@ -3574,7 +3873,8 @@ unsafe fn uas_cmd_streams(len: u32, dir_in: bool, buf: u64) -> bool {
             break 'run None;
         }
         for _ in 0..4 {
-            if !good(uas_wait(1)) {
+            // the test rig's lost answer: as a status wait that gave up (uas_flush follows)
+            if core::mem::take(&mut *addr_of_mut!(MSC_DROP_STATUS)) || !good(uas_wait(1)) {
                 break 'run None;
             }
             let (id, mine, status) = {
@@ -3584,7 +3884,7 @@ unsafe fn uas_cmd_streams(len: u32, dir_in: bool, buf: u64) -> bool {
             match id {
                 // a SENSE IU that is not GOOD may end the command before its data moved
                 3 if mine && status == 0 => break 'run if len == 0 || good(uas_wait(k)) { Some(true) } else { None },
-                3 if mine => break 'run if len == 0 { Some(false) } else { None },
+                3 if mine => break 'run if len == 0 { Some(uas_status(status)) } else { None },
                 3 => uas_queue(1, sb, 512), // an earlier command's status: wait on for ours
                 _ => break 'run None,       // a RESPONSE IU (the command refused)
             }
@@ -3599,6 +3899,18 @@ unsafe fn uas_cmd_streams(len: u32, dir_in: bool, buf: u64) -> bool {
             false
         }
     }
+}
+
+/// A SENSE IU of ours with `status`: true when GOOD. Not GOOD: its sense data (UAS 6.2.5: from byte 16, fixed
+/// format) is kept in MSC_SENSE as Bulk-Only's REQUEST SENSE keeps it, so a caller can tell ILLEGAL REQUEST
+/// (msc_sync's "no cache") from a failure.
+unsafe fn uas_status(status: u8) -> bool {
+    if status != 0 {
+        let d = &(&(*addr_of!(UAS_ST)).0)[16..];
+        MSC_WHY = "the stick refused the command";
+        MSC_SENSE = if d[0] & 0x7E == 0x70 { Some((d[2] & 0xF, d[12], d[13])) } else { None };
+    }
+    status == 0
 }
 
 /// The completion code of the next transfer on UAS pipe `k`. Events of the other three pipes
@@ -3654,7 +3966,8 @@ unsafe fn uas_cmd(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
     }
     let mut data_done = len == 0;
     for _ in 0..4 {
-        if !good(uas_wait(1)) {
+        // the test rig's lost answer: as a status wait that gave up
+        if core::mem::take(&mut *addr_of_mut!(MSC_DROP_STATUS)) || !good(uas_wait(1)) {
             MSC_RECOVERIES += 1;
             return false;
         }
@@ -3663,7 +3976,7 @@ unsafe fn uas_cmd(cdb: &[u8], len: u32, dir_in: bool, buf: u64) -> bool {
             (s[0], u16::from_be_bytes([s[2], s[3]]) == tag, s[6])
         };
         match id {
-            3 if mine => return status == 0, // SENSE IU
+            3 if mine => return uas_status(status), // SENSE IU
             6 | 7 if mine && !data_done && (id == 6) == dir_in => {
                 // READ READY / WRITE READY: the data now, and the status pipe armed for the end
                 data_done = true;
@@ -4072,6 +4385,7 @@ pub fn msc_write(n: u64, data: &[u8; 512]) -> bool {
         let Some(home) = on(DEVS[MSC_D].ctl) else {
             (MSC_WHY, MSC_SENSE) = ("the USB controller was being switched (try again)", None);
             msc_note("written", n / msc_per());
+            MSC_WERR = true;
             return false;
         };
         // the VFS saves its sectors in order, so a run of device blocks is gathered in MSC_WB
@@ -4115,6 +4429,7 @@ pub fn msc_write(n: u64, data: &[u8; 512]) -> bool {
         let ok = ok && got;
         if !ok {
             msc_note("written", n / msc_per());
+            MSC_WERR = true;
         }
         select(home);
         ok
@@ -4166,10 +4481,12 @@ unsafe fn net_setup(d: usize, port: u32, speed: u32, ncfg: u8, vid: u16, pid: u1
                         cur_class = (DBUF.0[i + 5], DBUF.0[i + 6], DBUF.0[i + 7]);
                         // RNDIS: CDC ACM with vendor protocol 0xFF (Windows-class dongles), wireless
                         // controller 0xE0/1/3 (Android), or miscellaneous 0xEF/4/1
+                        let row = crate::hwdb::usb_part(NET_BINDS, cur_class, vid, pid)
+                            .and_then(|q| NET_BINDS.iter().position(|r| r.name == q.name));
                         let is_comm = match kind {
-                            NetKind::Rndis => matches!(cur_class, (2, 2, 0xFF) | (0xE0, 1, 3) | (0xEF, 4, 1)),
-                            NetKind::Ecm => (cur_class.0, cur_class.1) == (2, 6),
-                            NetKind::Ncm => (cur_class.0, cur_class.1) == (2, 0x0D),
+                            NetKind::Ncm => row == Some(0),
+                            NetKind::Ecm => row == Some(1),
+                            NetKind::Rndis => matches!(row, Some(2..)),
                         };
                         if is_comm && comm.is_none() {
                             comm = Some(cur_if);
@@ -4683,19 +5000,9 @@ static mut SER_RX: u64 = 0;
 static mut SER_DROP: u64 = 0;
 static mut SER_ERR: u64 = 0;
 
-/// The chip's name, if `vid:pid` is an FTDI USB-serial chip.
+/// The chip's name, if `vid:pid` is an FTDI USB-serial chip (SERIAL_BINDS).
 fn ftdi_name(vid: u16, pid: u16) -> Option<&'static str> {
-    if vid != 0x0403 {
-        return None;
-    }
-    Some(match pid {
-        0x6001 => "FT232R/FT232BM",
-        0x6010 => "FT2232",
-        0x6011 => "FT4232",
-        0x6014 => "FT232H",
-        0x6015 => "FT-X",
-        _ => return None,
-    })
+    crate::hwdb::usb_part(SERIAL_BINDS, (0, 0, 0), vid, pid).map(|q| q.name)
 }
 
 /// An FTDI cable: its first interface's bulk endpoints configured, the line set to 115200 8N1
@@ -5477,6 +5784,18 @@ pub fn list() {
                     w, wm, w1, st(MSC_MULTIW)
                 );
             }
+            let cache = match MSC_CACHE {
+                1 => "on (SYNCHRONIZE CACHE at each sync)",
+                2 => "none (write-through)",
+                3 => "unknown (MODE SENSE page 8 not answered)",
+                4 => "on, but SYNCHRONIZE CACHE refused",
+                _ => "not asked",
+            };
+            let s = MSC_SYNCS;
+            crate::kprintln!(
+                "  storage write cache: {}; syncs: {} flushed, {} write-through, {} unknown, {} refused, {} failed",
+                cache, s[0], s[1], s[2], s[3], s[4]
+            );
             if MSC_RECOVERIES > 0 {
                 crate::kprintln!("  storage: {} stall/phase recoveries", { MSC_RECOVERIES });
             }
@@ -5535,7 +5854,7 @@ pub fn list() {
             crate::kprintln!("  keyboard: {} repeats while a key was held", { REPEATS });
             crate::kprintln!(
                 "  keyboard: caps lock {}, its light set {} times, {} refused",
-                if CAPS_LOCK { "on" } else { "off" }, { LED_SETS }, { LED_FAILS }
+                if crate::ps2::caps_lock() { "on" } else { "off" }, { LED_SETS }, { LED_FAILS }
             );
         }
         if MOUSE_SLOT != 0 {
@@ -6126,7 +6445,7 @@ unsafe fn bt_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> bool 
         match DBUF.0[i + 1] {
             4 if len >= 9 => {
                 let class = (DBUF.0[i + 5], DBUF.0[i + 6], DBUF.0[i + 7]);
-                in_hci = class == (0xE0, 0x01, 0x01) && DBUF.0[i + 3] == 0 && ep.is_none();
+                in_hci = crate::hwdb::usb_part(BT_BINDS, class, vid, pid).is_some() && DBUF.0[i + 3] == 0 && ep.is_none();
             }
             5 if in_hci && len >= 7 && DBUF.0[i + 3] & 3 == 3 && DBUF.0[i + 2] & 0x80 != 0 => {
                 let mps = u16::from_le_bytes([DBUF.0[i + 4], DBUF.0[i + 5]]) as u32 & 0x7FF;

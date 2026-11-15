@@ -147,8 +147,12 @@ fn u64le(b: &[u8], o: usize) -> u64 {
     u32le(b, o) as u64 | (u32le(b, o + 4) as u64) << 32
 }
 
+/// One sector of the stick. A read that fails is tried again, up to three times in all: a stick the driver had to
+/// reset answers the next read (seen on QEMU under load: "the data stage got no answer", 14 Nov 2026), and the
+/// driver names every failure in its own line. Nothing read here is trusted anyway: the header is signed and the
+/// boot file's SHA-256 checked, and staging compares the ESP's copy with it again.
 fn rd(n: u64, b: &mut [u8; 512]) -> bool {
-    crate::xhci::msc_read_only(n, b)
+    (0..3).any(|_| crate::xhci::msc_read_only(n, b))
 }
 
 // --- a READ-ONLY FAT32 reader for the stick (512-byte sector numbers throughout) ---
@@ -395,14 +399,14 @@ fn is_pe64(b: &[u8; 512]) -> bool {
 }
 
 /// The whole check. Err(reason) for a file that is refused; the outer Err for a stick that has none.
-fn check() -> Result<Result<Checked, &'static str>, &'static str> {
+fn check(cmd: &str) -> Result<Result<(Checked, Vol, u32), &'static str>, &'static str> {
     if crate::xhci::msc_read_only_capacity() == 0 {
         return Err("no USB stick; put update.afu on a FAT32 stick and plug it in");
     }
     let v = match volume() {
         Ok(v) => v,
         Err(why) => {
-            crate::kprintln!("updatecheck: the USB stick has no FAT32 file system AfriSovera can read ({})", why);
+            crate::kprintln!("{}: the USB stick has no FAT32 file system AfriSovera can read ({})", cmd, why);
             return Err("no update file read");
         }
     };
@@ -426,7 +430,7 @@ fn check() -> Result<Result<Checked, &'static str>, &'static str> {
         Err(why) => return Ok(Err(why)),
     };
     if c.version <= RELEASE {
-        crate::kprintln!("updatecheck: it is version {}; this system is version {}", c.version, RELEASE);
+        crate::kprintln!("{}: it is version {}; this system is version {}", cmd, c.version, RELEASE);
         return Ok(Err("it is not newer than this system"));
     }
     // the second read: the signed header again, the boot file through SHA-256, its first 512 bytes kept
@@ -464,15 +468,15 @@ fn check() -> Result<Result<Checked, &'static str>, &'static str> {
     if !is_pe64(&head) {
         return Ok(Err("its boot file is not an x86-64 UEFI program"));
     }
-    Ok(Ok(c))
+    Ok(Ok((c, v, clus)))
 }
 
 /// `updatecheck`: read and check update.afu on the USB stick. Reads only.
 pub fn command() {
-    match check() {
+    match check("updatecheck") {
         Err(why) => crate::kprintln!("updatecheck: {}; nothing written", why),
         Ok(Err(why)) => crate::kprintln!("updatecheck: REFUSED: {}; nothing written", why),
-        Ok(Ok(c)) => {
+        Ok(Ok((c, _, _))) => {
             let mut hex = [0u8; 64];
             sha256::to_hex(&c.boot_sha, &mut hex);
             crate::kprintln!(
@@ -486,5 +490,326 @@ pub fn command() {
             }
             crate::kprintln!("updatecheck: OK: version {} is newer than this system (version {}); nothing written", c.version, RELEASE);
         }
+    }
+}
+
+// --- `updatestage [yes <code>]` / `updatestage remove [yes <code>]` (safe updates U3, AFR-0010 section 8) ---
+//
+// The checked boot file copied from the stick into the SPARE slot of \EFI\afrisovera (the file the main entry does
+// NOT name), read back from the EFI partition and its SHA-256 compared with the signed header, then a Boot####
+// "AfriSovera trial" added at the END of BootOrder. The running system and the main entry are never touched; nothing
+// boots the spare until `updatetry` (U4). The architect's rules (ARCHITECT_REVIEWS 14 Nov 2026) are in esp/stage.rs.
+
+/// The boot file inside update.afu (from byte BODY), read from the stick in order for the EFI writer, hashed as it
+/// goes. It never gives more than the signed size, and asks the stick for each sector once.
+struct StickFile<'a> {
+    v: &'a Vol,
+    fat: Fat,
+    c: u32,      // the cluster holding the next sector to load
+    k: u64,      // that sector's place in its cluster
+    loaded: u64, // file sectors loaded so far (`cur` holds sector loaded - 1)
+    cur: [u8; 512],
+    size: u64,
+    next: u64, // the byte `fill` must be asked for next
+    sha: Sha256,
+}
+
+impl StickFile<'_> {
+    /// File sector `want` (of update.afu) into `cur`; only forward.
+    fn load(&mut self, want: u64) -> bool {
+        while self.loaded <= want {
+            if self.k == self.v.spc {
+                match self.v.next_in(self.c, &mut self.fat) {
+                    Some(n) => self.c = n,
+                    None => return false,
+                }
+                self.k = 0;
+            }
+            if !rd(self.v.sector(self.c) + self.k, &mut self.cur) {
+                return false;
+            }
+            self.k += 1;
+            self.loaded += 1;
+        }
+        self.loaded == want + 1
+    }
+}
+
+impl crate::esp::Source for StickFile<'_> {
+    fn fill(&mut self, from: usize, out: &mut [u8]) -> bool {
+        if from as u64 != self.next {
+            return false; // asked out of order: the writer never does this
+        }
+        self.next += out.len() as u64;
+        let end = (from as u64 + out.len() as u64).min(self.size);
+        let mut b = from as u64;
+        while b < end {
+            let at = BODY + b;
+            if !self.load(at / 512) {
+                return false;
+            }
+            let o = (at % 512) as usize;
+            let n = ((512 - o) as u64).min(end - b) as usize;
+            let d = (b - from as u64) as usize;
+            out[d..d + n].copy_from_slice(&self.cur[o..o + n]);
+            b += n as u64;
+        }
+        if end > from as u64 {
+            self.sha.update(&out[..(end - from as u64) as usize]);
+        }
+        true
+    }
+}
+
+/// The spare slot for the file the main entry names: Some((spare's long name, its full path)).
+fn spare_for(main: &[u8]) -> Option<(&'static str, &'static str)> {
+    if main == b"\\efi\\afrisovera\\afrisovera.efi" {
+        Some((crate::esp::stage::SLOT_B, "\\EFI\\afrisovera\\afrisovera-b.efi"))
+    } else if main == b"\\efi\\afrisovera\\afrisovera-b.efi" {
+        Some((crate::esp::stage::SLOT_A, "\\EFI\\afrisovera\\afrisovera.efi"))
+    } else {
+        None
+    }
+}
+
+/// The main entry, checked as the architect set (exactly one "AfriSovera", BootCurrent equal to it, naming one of
+/// our two files): (it, the spare's long name, the spare's path), or the line to print.
+fn main_and_spare(cmd: &str) -> Option<(crate::bootent::Main, &'static str, &'static str)> {
+    use crate::bootent::NoMain;
+    let m = match crate::bootent::main_exact() {
+        Ok(m) => m,
+        Err(NoMain::NotRead) => {
+            crate::kprintln!("{}: the firmware's boot entries could not be read at power-on; nothing written", cmd);
+            return None;
+        }
+        Err(NoMain::Count(0)) => {
+            crate::kprintln!("{}: no boot entry is named exactly \"AfriSovera\" (bootentry adds it); nothing written", cmd);
+            return None;
+        }
+        Err(NoMain::Count(n)) => {
+            crate::kprintln!("{}: {} boot entries are named exactly \"AfriSovera\", so which one is this system's is not known; nothing written", cmd, n);
+            return None;
+        }
+        Err(NoMain::NoPartition) => {
+            crate::kprintln!("{}: the \"AfriSovera\" boot entry names no GPT partition; nothing written", cmd);
+            return None;
+        }
+    };
+    if crate::bootent::current() != Some(m.num) {
+        crate::kprintln!("{}: this system was not started by AfriSovera's own boot entry (a USB stick, a trial, or another entry); nothing written", cmd);
+        return None;
+    }
+    let Some((long, path)) = spare_for(&m.file[..m.file_n]) else {
+        crate::kprintln!("{}: AfriSovera's boot entry names a file that is not one of its two boot files; nothing written", cmd);
+        return None;
+    };
+    Some((m, long, path))
+}
+
+fn kib(b: u64) -> u64 {
+    b.div_ceil(1024)
+}
+
+/// `updatestage [yes <code>]`
+pub fn stage(given: Option<&str>) {
+    const CMD: &str = "updatestage";
+    // 1: U1's whole check
+    let (c, v, clus) = match check(CMD) {
+        Err(why) => {
+            crate::kprintln!("{}: {}; nothing written", CMD, why);
+            return;
+        }
+        Ok(Err(why)) => {
+            crate::kprintln!("{}: REFUSED: {}; nothing written", CMD, why);
+            return;
+        }
+        Ok(Ok(x)) => x,
+    };
+    if c.boot_size > crate::esp::stage::STAGE_MAX {
+        crate::kprintln!("{}: REFUSED: its boot file is {} KiB; staging takes at most {} KiB; nothing written", CMD, kib(c.boot_size), kib(crate::esp::stage::STAGE_MAX));
+        return;
+    }
+    // 2: the main entry and the spare, read, not assumed
+    let Some((m, spare, path)) = main_and_spare(CMD) else { return };
+    // 3: the EFI partition the main entry names
+    let esp = match crate::esp::stage::open(&m.guid) {
+        Ok(e) => e,
+        Err(why) => {
+            crate::kprintln!("{}: {}; nothing written", CMD, why);
+            return;
+        }
+    };
+    let cb = esp.cluster_bytes();
+    let free = match esp.free() {
+        Ok(f) => f,
+        Err(why) => {
+            crate::kprintln!("{}: the EFI partition: {}; nothing written", CMD, why);
+            return;
+        }
+    };
+    let old = match esp.live(spare) {
+        Ok(o) => o,
+        Err(why) => {
+            crate::kprintln!("{}: \\EFI\\afrisovera: {}; nothing written", CMD, why);
+            return;
+        }
+    };
+    let old_clusters = old.map_or(0, |o| (o.size as u64).div_ceil(cb));
+    let need = c.boot_size.div_ceil(cb).max(1);
+    let keep = crate::esp::stage::KEEP_FREE.div_ceil(cb);
+    if free + old_clusters < need + keep {
+        crate::kprintln!(
+            "{}: the EFI partition has {} KiB free; the update needs {} KiB and 2 MiB must stay free; nothing written",
+            CMD,
+            kib((free + old_clusters) * cb),
+            kib(need * cb)
+        );
+        return;
+    }
+    let mut hex = [0u8; 64];
+    sha256::to_hex(&c.boot_sha, &mut hex);
+    crate::kprintln!(
+        "{}: version {} ({} KiB, SHA-256 {}) -> {} in the EFI partition AfriSovera's boot entry names; the running system ({}) is not touched",
+        CMD,
+        c.version,
+        kib(c.boot_size),
+        core::str::from_utf8(&hex[..16]).unwrap_or("?"),
+        path,
+        core::str::from_utf8(&m.file[..m.file_n]).unwrap_or("?")
+    );
+    if c.demo {
+        crate::kprintln!("{}: signed by the DEMO release key: a test build, never a real update", CMD);
+    }
+    match old {
+        Some(o) => crate::kprintln!(
+            "  this replaces the older system kept in the spare slot ({} KiB); after this, updateback returns to version {} once the new one is kept",
+            kib(o.size as u64),
+            RELEASE
+        ),
+        None => crate::kprintln!("  the spare slot is empty; after this, updateback returns to version {} once the new one is kept", RELEASE),
+    }
+    crate::kprintln!("  then a boot entry \"AfriSovera trial\" is added at the END of BootOrder; nothing starts it until updatetry");
+    let Some(want) = esp.code(CMD.as_bytes(), c.version, &c.boot_sha) else {
+        crate::kprintln!("{}: a read FAILED; nothing written", CMD);
+        return;
+    };
+    if !crate::esp::agreed(CMD, given, want) {
+        return;
+    }
+    // 4: no entry may point at the spare while it changes
+    if let Err(why) = crate::bootent::trial_remove() {
+        crate::kprintln!("{}: the old trial entry: {}; nothing else written", CMD, why);
+        return;
+    }
+    // a chain a power cut left behind, freed under the three rules
+    match esp.reclaim() {
+        Ok((n, k, left)) => {
+            if k > 0 {
+                crate::kprintln!("{}: freed {} KiB a cut-off earlier stage left behind ({} chain(s))", CMD, kib(n * cb), k);
+            }
+            if left > 0 {
+                crate::kprintln!("{}: {} old deleted entry(ies) of ours left alone (their clusters are not certainly ours)", CMD, left);
+            }
+        }
+        Err(why) => {
+            crate::kprintln!("{}: {}; the spare slot was not changed", CMD, why);
+            return;
+        }
+    }
+    // the old spare out
+    if let Err(why) = esp.free_file(spare) {
+        crate::kprintln!("{}: {}. The main system is untouched; the way back (updateback) is gone until a stage succeeds", CMD, why);
+        return;
+    }
+    // 5: the new spare, streamed from the stick
+    let mut src = StickFile { v: &v, fat: Fat { at: u64::MAX, s: [0; 512] }, c: clus, k: 0, loaded: 0, cur: [0; 512], size: c.boot_size, next: 0, sha: Sha256::new() };
+    crate::kprintln!("{}: writing", CMD);
+    let wrote = esp.write(spare, c.boot_size, &mut src);
+    let stick_sha = src.sha.finish();
+    if let Err(why) = wrote {
+        crate::kprintln!("{}: {}. Nothing points at the spare file; the main system is untouched; the way back (updateback) is gone until a stage succeeds", CMD, why);
+        return;
+    }
+    // 6: what is written is what was checked
+    let back = esp.read_back(spare, c.boot_size);
+    let bad = match back {
+        Err(why) => Some(why),
+        Ok((sha, _)) if sha != c.boot_sha => Some("the copy in the EFI partition does not match the SHA-256 in the signed header"),
+        Ok(_) if stick_sha != c.boot_sha => Some("the USB stick gave different bytes this time"),
+        Ok(_) => None,
+    };
+    if let Some(why) = bad {
+        let freed = esp.free_file(spare).is_ok();
+        crate::kprintln!(
+            "{}: REFUSED: {}; the spare file was {}; no boot entry points at it; the main system is untouched",
+            CMD,
+            why,
+            if freed { "taken out again" } else { "NOT taken out (updatestage remove takes it out)" }
+        );
+        return;
+    }
+    // 7: the trial entry, last in BootOrder
+    match crate::bootent::trial_add(&m, path) {
+        Ok(num) => {
+            let nm = crate::bootent::name(num);
+            let free_now = back.map_or(0, |b| b.1);
+            crate::kprintln!(
+                "{}: version {} staged in {}, read back the same ({} KiB free now); {} \"AfriSovera trial\" added at the END of BootOrder; updatetry starts it once; nothing else changed",
+                CMD,
+                c.version,
+                path,
+                kib(free_now * cb),
+                core::str::from_utf8(&nm).unwrap_or("?")
+            );
+        }
+        Err(why) => crate::kprintln!("{}: the spare file is written and read back, but the trial entry: {}; updatestage again adds it", CMD, why),
+    }
+}
+
+/// `updatestage remove [yes <code>]`: the trial entry out (BootOrder first), then the spare file, only if the main
+/// entry does not name it.
+pub fn unstage(given: Option<&str>) {
+    const CMD: &str = "updatestage remove";
+    let Some((m, spare, _)) = main_and_spare(CMD) else { return };
+    let esp = match crate::esp::stage::open(&m.guid) {
+        Ok(e) => e,
+        Err(why) => {
+            crate::kprintln!("{}: {}; nothing written", CMD, why);
+            return;
+        }
+    };
+    let old = match esp.live(spare) {
+        Ok(o) => o,
+        Err(why) => {
+            crate::kprintln!("{}: \\EFI\\afrisovera: {}; nothing written", CMD, why);
+            return;
+        }
+    };
+    let trial = crate::bootent::trial_number();
+    if old.is_none() && trial.is_none() {
+        crate::kprintln!("{}: nothing is staged (no spare file, no trial entry); nothing to do", CMD);
+        return;
+    }
+    crate::kprintln!(
+        "{}: {}{}; the running system ({}) and its entry stay",
+        CMD,
+        if trial.is_some() { "the \"AfriSovera trial\" entry is taken out" } else { "no trial entry" },
+        if old.is_some() { ", then the spare file is taken out" } else { "" },
+        core::str::from_utf8(&m.file[..m.file_n]).unwrap_or("?")
+    );
+    let Some(want) = esp.code(CMD.as_bytes(), 0, &[0; 32]) else {
+        crate::kprintln!("{}: a read FAILED; nothing written", CMD);
+        return;
+    };
+    if !crate::esp::agreed(CMD, given, want) {
+        return;
+    }
+    if let Err(why) = crate::bootent::trial_remove() {
+        crate::kprintln!("{}: {}; the spare file was not touched", CMD, why);
+        return;
+    }
+    match esp.free_file(spare) {
+        Ok(n) => crate::kprintln!("{}: done; {} KiB freed; the firmware's boot entries and \\EFI\\afrisovera are as before updatestage", CMD, kib(n * esp.cluster_bytes())),
+        Err(why) => crate::kprintln!("{}: the trial entry is out, but the spare file: {}", CMD, why),
     }
 }

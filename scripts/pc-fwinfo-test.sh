@@ -45,8 +45,8 @@ grade() { # grade <boot 1 log> <boot 2 log>
     S1="$(clean "$1")"; S2="$(clean "$2")"
     out="$(common "$S1" "boot 1"; common "$S2" "boot 2")"
     [ -n "$out" ] && { printf '%s\n' "$out"; fail=1; }
-    in1() { printf '%s\n' "$S1" | grep -aqE "$1"; }
-    in2() { printf '%s\n' "$S2" | grep -aqE "$1"; }
+    in1() { grep -aqE "$1" <<< "$S1"; }
+    in2() { grep -aqE "$1" <<< "$S2"; }
     # boot 1: the plain firmware: off or not reported, the owner's line agreeing, both lines agreeing
     if in1 '^  Secure Boot: off$'; then
         in1 '^\[pc\] Secure Boot: off, kept for fwinfo$' || { echo "  FAIL: boot 1: fwinfo and the boot line disagree"; fail=1; }

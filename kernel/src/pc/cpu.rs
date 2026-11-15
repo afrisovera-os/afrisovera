@@ -53,6 +53,7 @@ pub fn interrupts_on() -> bool {
 pub fn wfi() {
     crate::xhci::service(); // USB devices plugged in or out since the last idle moment
     crate::uvc::idle(); // a camera's new picture onto the screen, or a failed stream stopped
+    crate::ps2::service(); // the PS/2 keyboard's Caps Lock light, when Caps Lock changed
     if crate::acpi::power_button_pressed() {
         crate::acpi::power_off_pressed(); // files saved, then off
     }
@@ -149,7 +150,11 @@ pub fn load_gdt() {
         let df_top = (core::ptr::addr_of!(crate::stackinfo::DF_STACK) as u64
             + core::mem::size_of::<crate::stackinfo::DfStack>() as u64)
             & !15;
-        TSS._ist = [df_top, 0, 0, 0, 0, 0, 0];
+        // Daraja (AFR-0001 7.7): IST 2, 3 and 4 for NMI, #DB and #MC. `syscall` does not change the stack pointer,
+        // so for the few instructions before syscall_entry loads the kernel stack the CPU is on a stack ring 3
+        // chose; an NMI, a debug trap or a machine check there must never be pushed onto it.
+        TSS._ist = [df_top, ist_top(core::ptr::addr_of!(NMI_STACK)), ist_top(core::ptr::addr_of!(DB_STACK)), ist_top(core::ptr::addr_of!(MC_STACK)), 0, 0, 0];
+        SYSCALL_KSTACK = TSS.rsp0;
         let base = core::ptr::addr_of!(TSS) as u64;
         let limit = (core::mem::size_of::<Tss>() - 1) as u64;
         GDT[5] = (limit & 0xFFFF)
@@ -201,11 +206,126 @@ pub fn set_rsp0(top: u64) {
         } else {
             core::ptr::addr_of!(TRAP_STACK) as u64 + core::mem::size_of::<TrapStack>() as u64
         };
+        // the `syscall` entry switches to the same stack an `int 0x80` would land on
+        SYSCALL_KSTACK = TSS.rsp0;
     }
 }
 
-/// A second core: the same GDT and IDT as the boot core (no task register: core 1 never
-/// runs ring 3, so it needs no RSP0).
+/// One IST stack (AFR-0001 7.7: NMI, #DB, #MC each have their own).
+#[repr(align(16))]
+#[allow(dead_code)] // only its address is used
+struct IstStack([u8; 8 * 1024]);
+static mut NMI_STACK: IstStack = IstStack([0; 8 * 1024]);
+static mut DB_STACK: IstStack = IstStack([0; 8 * 1024]);
+static mut MC_STACK: IstStack = IstStack([0; 8 * 1024]);
+
+fn ist_top(s: *const IstStack) -> u64 {
+    (s as u64 + core::mem::size_of::<IstStack>() as u64) & !15
+}
+
+/// The IST entries Daraja relies on, as the CPU will read them: (TSS IST 2, 3, 4 set, the boot core's NMI, #DB and
+/// #MC gates on IST 2, 3, 4, the second core's gates on none). For `daraja selftest`.
+pub fn ist_state() -> (bool, bool, bool) {
+    // SAFETY: plain reads of tables written once at boot.
+    unsafe {
+        let ist = TSS._ist;
+        let tss = ist[1] != 0 && ist[2] != 0 && ist[3] != 0;
+        let bsp = IDT[2].ist == 2 && IDT[1].ist == 3 && IDT[18].ist == 4;
+        let ap = IDT_AP[2].ist == 0 && IDT_AP[1].ist == 0 && IDT_AP[18].ist == 0;
+        (tss, bsp, ap)
+    }
+}
+
+// ----------------------------------------------------------------------- SYSCALL --
+// Daraja (AFR-0001 7.7): the `syscall` instruction. Native programs still enter only by `int 0x80`; their `syscall`
+// is answered as an invalid opcode (proc.rs), exactly as before SCE was set. A foreign process's `syscall` goes to
+// its bridge. Written from the AMD64 APM vol. 2 (SYSCALL, STAR/LSTAR/SFMASK) and Intel SDM vol. 3 (IST).
+//
+// The entry runs on the boot core only: EFER.SCE is set on it alone (core 1 never runs ring 3, and its `syscall`
+// stays an invalid opcode), so the static scratch slot below is never shared. pc_trap checks it again on every
+// entry. If ring 3 ever runs on core 1, the scratch moves to per-CPU data reached with `swapgs`, and that change
+// goes to the architect (AFR-0001 7.7). The return is always isr_common's `iretq`, never SYSRET.
+const MSR_EFER: u32 = 0xC000_0080;
+const MSR_STAR: u32 = 0xC000_0081;
+const MSR_LSTAR: u32 = 0xC000_0082;
+const MSR_SFMASK: u32 = 0xC000_0084;
+pub const MSR_FS_BASE: u32 = 0xC000_0100;
+pub const MSR_GS_BASE: u32 = 0xC000_0101;
+/// The trap frame's vector for an entry by `syscall` (not an IDT vector).
+pub const SYSCALL_INSN_VECTOR: u64 = 0x100;
+/// #DB traps taken at syscall_entry itself (a `syscall` run with TF set), absorbed there.
+pub static DB_AT_ENTRY: AtomicU64 = AtomicU64::new(0);
+
+/// The kernel stack the next `syscall` lands on (kept equal to TSS.rsp0 by load_gdt and set_rsp0).
+static mut SYSCALL_KSTACK: u64 = 0;
+/// The user stack pointer, for the two instructions between `syscall` and the push of the frame.
+static mut SYSCALL_USER_RSP: u64 = 0;
+
+global_asm!(
+    r#"
+.global syscall_entry
+syscall_entry:
+    mov [rip + {ursp}], rsp
+    mov rsp, [rip + {kstack}]
+    push {uds}
+    push qword ptr [rip + {ursp}]
+    push r11
+    push {ucs}
+    push rcx
+    push 0
+    push {vec}
+    jmp isr_common
+"#,
+    ursp = sym SYSCALL_USER_RSP,
+    kstack = sym SYSCALL_KSTACK,
+    uds = const USER_DS,
+    ucs = const USER_CS,
+    vec = const SYSCALL_INSN_VECTOR,
+);
+extern "C" {
+    static syscall_entry: u8;
+}
+
+fn syscall_entry_addr() -> u64 {
+    // SAFETY: only the label's address is taken.
+    unsafe { &syscall_entry as *const u8 as u64 }
+}
+
+/// Switch the `syscall` instruction on, on this (the boot) core. SFMASK clears IF, TF, DF and AC on entry, and
+/// CR4.FSGSBASE is cleared so ring 3 can never set its own FS or GS base (only the kernel does, per process).
+pub fn syscall_init() {
+    // SAFETY: architectural MSRs and CR4 of an x86-64 CPU; interrupts are masked (boot), nothing uses `syscall` yet.
+    unsafe {
+        wrmsr(MSR_STAR, (0x10u64 << 48) | ((KERNEL_CS as u64) << 32)); // SYSRET bases unused (iretq), set anyway
+        wrmsr(MSR_LSTAR, syscall_entry_addr());
+        wrmsr(MSR_SFMASK, (1 << 9) | (1 << 8) | (1 << 10) | (1 << 18)); // IF, TF, DF, AC
+        let mut cr4: u64;
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+        if cr4 & (1 << 16) != 0 {
+            cr4 &= !(1 << 16);
+            asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
+        }
+        wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1); // SCE
+    }
+}
+
+/// (EFER.SCE on, CR4.FSGSBASE off, LSTAR is syscall_entry, SFMASK as set), for `daraja selftest`.
+pub fn syscall_state() -> (bool, bool, bool, bool) {
+    // SAFETY: reads only.
+    unsafe {
+        let cr4: u64;
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+        (
+            rdmsr(MSR_EFER) & 1 != 0,
+            cr4 & (1 << 16) == 0,
+            rdmsr(MSR_LSTAR) == syscall_entry_addr(),
+            rdmsr(MSR_SFMASK) & 0x4_0700 == 0x4_0700,
+        )
+    }
+}
+
+/// A second core: the same GDT as the boot core and its IDT without IST entries (IDT_AP; no task register: core 1
+/// never runs ring 3, so it needs no RSP0).
 pub fn load_gdt_ap() {
     let p = DescPtr {
         limit: (core::mem::size_of::<[u64; 7]>() - 1) as u16,
@@ -213,7 +333,7 @@ pub fn load_gdt_ap() {
     };
     let i = DescPtr {
         limit: (core::mem::size_of::<[Gate; 256]>() - 1) as u16,
-        base: core::ptr::addr_of!(IDT) as u64,
+        base: core::ptr::addr_of!(IDT_AP) as u64,
     };
     // SAFETY: the boot core's tables, complete and 'static; CS and the data segments are
     // reloaded exactly as `load_gdt` does.
@@ -260,6 +380,9 @@ struct Gate {
 }
 const EMPTY: Gate = Gate { off_lo: 0, sel: 0, ist: 0, attr: 0, off_mid: 0, off_hi: 0, zero: 0 };
 static mut IDT: [Gate; 256] = [EMPTY; 256];
+/// Core 1's IDT: the boot core's, but with no IST for NMI, #DB and #MC (core 1 has no task register, so it has no
+/// IST stacks to switch to; it never runs ring 3, so it never needs them).
+static mut IDT_AP: [Gate; 256] = [EMPTY; 256];
 
 // Interrupt vector map (architect, 12 Nov 2026; pick a new vector from here):
 //   0x00-0x1F  CPU exceptions
@@ -335,6 +458,14 @@ ISR_NOERR 128
 ISR_NOERR 255
 
 isr_common:
+    // G2 part 3: ring 3 can set RFLAGS.AC itself (popfq), and neither int 0x80 nor an interrupt or exception gate
+    // clears it, so a trap would run with SMAP off. Every entry from ring 3 (int 0x80, the timer and devices, the
+    // exceptions, syscall_entry) comes through here before any kernel code runs; the stubs before it only push to
+    // the kernel's own stack. pushfq/popfq, not clac: clac is #UD on a CPU without SMAP. iretq restores the
+    // program's own flags.
+    pushfq
+    and qword ptr [rsp], -0x40001
+    popfq
     push rax
     push rcx
     push rdx
@@ -440,6 +571,14 @@ pub fn load_idt() {
         // F8: the double fault runs on IST 1 (TSS._ist[0], set in the GDT/TSS set-up), never on the stack that
         // overflowed.
         IDT[8].ist = 1;
+        IDT_AP = IDT;
+        IDT_AP[2].ist = 0;
+        IDT_AP[1].ist = 0;
+        IDT_AP[18].ist = 0;
+        // Daraja (AFR-0001 7.7): on the boot core, NMI, #DB and #MC run on IST 2, 3, 4 (load_gdt sets the stacks).
+        IDT[2].ist = 2;
+        IDT[1].ist = 3;
+        IDT[18].ist = 4;
         let p = DescPtr {
             limit: (core::mem::size_of::<[Gate; 256]>() - 1) as u16,
             base: core::ptr::addr_of!(IDT) as u64,
@@ -506,6 +645,27 @@ extern "sysv64" fn pc_trap(f: &mut TrapFrame) {
             crate::nvme::irq(); // counts it; the waiting command reads its completion itself
             lapic_eoi();
         }
+        // Daraja (AFR-0001 7.7): an entry by the `syscall` instruction (syscall_entry), boot core only
+        SYSCALL_INSN_VECTOR => {
+            if crate::smp::on_core1() {
+                crate::uart::emergency_print(format_args!(
+                    "\n[pc] syscall_entry ran on core 1, whose scratch slot it does not own (AFR-0001 7.7); halted\n"
+                ));
+                halt_forever();
+            }
+            if crate::proc::active() {
+                crate::proc::syscall_insn(f);
+            } else {
+                // the single-task ring 3 of user.rs has no foreign programs: an invalid opcode, as before SCE
+                crate::user::fault(6, 0, f.rip.wrapping_sub(2), 0);
+            }
+        }
+        // a `syscall` run with TF set: the single-step trap lands on syscall_entry's first instruction, in ring 0, on
+        // IST 3. SFMASK has already cleared TF in the flags it saved, so returning resumes the entry normally and the
+        // kernel is not stepped.
+        1 if f.cs & 3 == 0 && f.rip == syscall_entry_addr() => {
+            DB_AT_ENTRY.fetch_add(1, Ordering::Relaxed);
+        }
         SYSCALL_VECTOR if crate::proc::active() => crate::proc::syscall(f),
         SYSCALL_VECTOR => crate::user::syscall(f),
         // a page fault the kernel's own tables can serve (the demand window): retry
@@ -524,6 +684,16 @@ extern "sysv64" fn pc_trap(f: &mut TrapFrame) {
                 cr2(),
                 f.rip
             ));
+            halt_forever();
+        }
+        // G2 part 3: SMAP stopped the kernel touching a ring-3 page outside pc/uaccess.rs. Named, then halted: the
+        // code that did it skipped the one door for user memory.
+        14 if crate::uaccess::smap_violation(f.cs, f.error, cr2()) => {
+            crate::kprintln!(
+                "[pc] SMAP stopped a kernel access to ring-3 memory at {:#x} (RIP {:#x}): only pc/uaccess.rs may touch it; halted",
+                cr2(),
+                f.rip
+            );
             halt_forever();
         }
         // any other fault raised by a ring-3 program stops that program, not the machine

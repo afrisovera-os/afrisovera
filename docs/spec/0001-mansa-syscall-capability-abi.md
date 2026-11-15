@@ -264,6 +264,8 @@ Return values are signed. `0 ≤ r < 2^63` is success; `r ∈ [-4095, -1]` is an
 | -8 | `E_PEERCLOSED` | the other end of a channel is gone |
 | -9 | `E_TOOBIG` | message exceeds the channel limits |
 | -10 | `E_CANCELED` | the wait was ended by a close request on the caller's window (v0.5, §7.6) |
+| -11 | `E_NOROUTE` | no route on the local network: no address from the router, or the next hop did not answer (v0.5, §7.6; added with S4, for the architect's confirmation) |
+| -32 to -63 | file errors | reserved for AFR-0011 §11.6: file error code c is returned as `-(31 + c)` (Designed, step V6, §7.9) |
 
 Message payloads are delivered through user buffers, never through the return register, so a payload
 can no longer collide with an error.
@@ -303,7 +305,9 @@ only if it holds a channel handle to that service — that is what makes the per
 bit  0 READ       1 WRITE      2 EXECUTE    3 MAP
 bit  4 DUPLICATE  5 TRANSFER   6 SIGNAL     7 WAIT
 bit  8 SEND (≡ v0 RIGHT_SEND)   9 RECV (≡ v0 RIGHT_RECV)
-bit 10..31 reserved, MUST be 0 on input, MUST be ignored on output by v1 callers
+bit 10 CREATE (make a name in a folder, AFR-0011 §11.2)
+bit 11 LIST   (read a folder's names, AFR-0011 §11.2)
+bit 12..31 reserved, MUST be 0 on input, MUST be ignored on output by v1 callers
 ```
 
 `handle_dup` MUST NOT widen rights. A handle sent in a message is **moved** (it leaves the sender's table)
@@ -332,9 +336,14 @@ on them changes. PC first (ring 3, `pc/proc.rs`); ARM with its own plan.
 the v1 errors of §7.2 (signed; `-4095..=-1`), never v0's `EPERM`. The v0 calls keep v0's single error.
 
 **Handles.** v0.5 widens the v0 capability record (§6.1) to a handle table of 8 entries per process, each entry an
-object kind (`ENDPOINT`, `VMO`, `CELL`, `NET`, `CONN`) and v1 rights (§7.4). Handle numbers stay table indexes;
-`handle_close` (8) is in the subset. Only the kernel grants a handle at spawn, as in v0, apart from those a call
-below returns (a `VMO`, a `CONN`). v1 adds `handle_dup`, transfer and channels on the same table.
+object kind (`ENDPOINT`, `VMO`, `CELL`, `NET`, `CONN`) and v1 rights (§7.4). Handle numbers stay table indexes.
+Only the kernel grants a handle at spawn, as in v0, apart from those a call below returns (a `VMO`, a `CONN`). v1
+adds `handle_close`, `handle_dup`, transfer and channels on the same table. **v0.5 has no `handle_close`:** number 8
+is `SYS_GETPID` on the PC in v0 (§5.2), and §9 never reuses a number within a version, so in v0.5 a `VMO` handle is
+closed by its `vmo_unmap` and a `CONN` by `tcp_close`. (Correction while building S1, 14 Nov; v1's table gives 8 to
+`handle_close` in the new version.) A `VMO` created but never mapped keeps its handle and its reservation against the
+caps until the process exits, since nothing else can close it in v0.5; the table of 8 and the 32 MiB cap bound that,
+and pc-vmo checks the reservation is back after such a process ends.
 
 **What each program is given at spawn.** Only the kernel grants, at spawn; no call asks for a handle. A program not in
 this table is spawned as today's userland, with neither CELL nor NET.
@@ -342,7 +351,21 @@ this table is spawned as today's userland, with neither CELL nor NET.
 | Program | Spawned by | Handles | Rights | NET class bits |
 |---|---|---|---|---|
 | Dira (`userland/dira`) | the kernel's `dira` shell command only | CELL, NET | CELL: READ, WRITE, WAIT; NET: SEND, RECV, WAIT | 0, 1, 2 (public, private networks, link-local); bit 3 (127/8) only when the kernel is started with the test rig's flag |
+| the `cell` test program (pc/proc.rs), **test-only** | the kernel's `celltest3` command, which refuses unless the test rig set fw_cfg `opt/afrisovera/test-grants` (a shipped image grants CELL to nothing but Dira) | CELL, titled "celltest3 (test)" | READ, WRITE, WAIT | none |
 | rustapp, niavm and every other user program today | their shell commands, as in v0 | their v0 endpoints only | v0 SEND/RECV | none (no NET handle) |
+
+**What `dira` gives Dira at spawn (S4), besides its handles.** All of it kernel-made, like a grant; nothing the
+process writes is read back:
+- a start block at the start of its data page: the mode (bit 0 text, bit 1 the test rig), which handle is the CELL
+  and which the NET, the address as typed (at most 512 bytes; a longer one is refused at the shell, never cut), the
+  TSC frequency (Dira reads `rdtsc` for its timings), and, written by the kernel when it ends one of Dira's waits with
+  `E_CANCELED`, the TSC when it saw the stop and which stop it was (a close request, or Ctrl+C on the console);
+- for `dira file NAME`, the store file's bytes (at most 16 KiB) mapped read-only and never executable at
+  `USER_BASE + 0x2_4000`;
+- up to 128 KiB of code (a spawn with grants; one without keeps 64 KiB). The bytes are userland/dira built by
+  scripts/build-dira.sh; the kernel holds their SHA-256, the source's SHA-256 and the toolchain
+  (kernel/src/pc/dira_bin.rs), records the hash in the boot's integrity manifest and starts no other bytes; suite
+  dira-bin rebuilds them and fails if the committed ones differ.
 
 A process can create a VMO (`vmo_create`) and a connection (`tcp_dial`, from a NET handle it holds); it can never
 create CELL or NET.
@@ -352,9 +375,16 @@ create CELL or NET.
 | # | Name | Arguments | Result | Errors |
 |---|---|---|---|---|
 | 32 | `vmo_create` | size (bytes, a multiple of 4 KiB, at least 4 KiB) | `VMO` handle (READ, WRITE, MAP) | `E_INVAL` size; `E_NOMEM` past the caps below or no frames |
-| 33 | `vmo_map` | vmo h, offset (0), len (the whole object), prot (READ\|WRITE) | user address | `E_BADHANDLE`; `E_PERM` without MAP, or prot with EXECUTE; `E_INVAL` offset, len or prot; `E_NOMEM` no room in the map area |
-| 34 | `vmo_unmap` | addr, len (as mapped) | 0 | `E_INVAL` not a whole mapping |
-| 8 | `handle_close` | h | 0 | `E_BADHANDLE` |
+| 33 | `vmo_map` | vmo h, offset (0), len (the whole object), prot (READ\|WRITE) | user address | `E_BADHANDLE`; `E_PERM` without MAP, or prot with EXECUTE, or a CPU without NX; `E_INVAL` offset, len or prot; `E_NOMEM` no room in the map area or no frames |
+| 34 | `vmo_unmap` | addr, len (as mapped) | 0, and the object's handle is closed | `E_INVAL` not a whole mapping |
+
+**A v0.5 object's pages exist while it is mapped** (correction while building S1, 14 Nov). With one whole mapping per
+object, `vmo_create` reserves the size against the caps and returns the handle; `vmo_map` takes the frames from the
+frame pool, zeroes and maps them; `vmo_unmap` unmaps them, gives them back and closes the handle. So the frames an
+object holds are exactly the pages of its mapping, recorded in the process's own page tables and nowhere else (no
+frame list in a static), and `mmu::free_space` returns them at exit as it returns code and stack. v1, with several
+mappings of one object, keeps the frames in the object from `vmo_create`; a program that creates, maps once and
+unmaps (as Dira does) sees no difference.
 
 Requirements (the architect's conditions on S1):
 - every page is zeroed before it is mapped, and is never executable (NX set; a test jumps into one and must trap);
@@ -367,8 +397,16 @@ Requirements (the architect's conditions on S1):
   accepts one between `USER_BASE` and the stack top today; a buffer that crosses a guard page is `E_FAULT`;
 - per process at most 32 MiB in all objects, and at most 128 MiB for all processes together; past either cap
   `vmo_create` returns `E_NOMEM` and nothing is half made;
-- the frames go back to the frame pool when the last handle closes or the process ends, and on every failed spawn;
+- the frames go back to the frame pool at `vmo_unmap`, when the process ends, and on every failed spawn; a `vmo_map`
+  that runs out of frames gives back the ones it took and returns `E_NOMEM`, with nothing mapped;
 - `ps` shows each process's object memory.
+
+**Known limit in this release (PC):** the PC's frame pool is a 64 MiB block in the kernel image (`MAX_FRAMES` in
+pc/shims.rs, `mansa_pc_frame_pool`), shared with the kernel's own page tables and heap growth. So the frames run out
+before the 128 MiB total cap, and often before a process's 32 MiB: `vmo_map` then returns `E_NOMEM` with nothing
+half made, as specified. The caps stay as written. Taking the pool from the free RAM the UEFI map reports (so its
+size costs only the bitmap) is the performance engineer's own item, with its design to the architect first. Until
+then, Dira starts at about 1 MiB a tab.
 
 **The cell window (S2), the service calls of v0.5.** In v1 the cell window is a channel protocol to the desk
 (Tonga) service; until then these five calls carry the same arguments and results as Nia's (afriui.md §25,
@@ -394,11 +432,11 @@ machine (127/8). No handle reaches 0/8, 224/3 or 255.255.255.255, whatever its b
 
 | # | Name | Arguments | Result | Errors |
 |---|---|---|---|---|
-| 72 | `tcp_dial` | net h, IPv4 (u32, big-endian), port, timeout_ms | `CONN` handle | `E_PERM` the class is not on the handle, or never allowed; `E_WOULDBLOCK` the process has a connection open (one at a time); `E_PEERCLOSED` refused or no answer in time |
+| 72 | `tcp_dial` | net h, IPv4 (u32, big-endian), port, timeout_ms | `CONN` handle | `E_PERM` the class is not on the handle, or never allowed; `E_WOULDBLOCK` the process has a connection open (one at a time); `E_PEERCLOSED` refused or no answer in time; `E_NOROUTE` no route on the local network |
 | 73 | `tcp_send` | conn h, ptr, len (at most 512) | bytes sent | `E_FAULT`; `E_INVAL`; `E_PEERCLOSED` |
 | 74 | `tcp_recv` | conn h, ptr, cap, timeout_ms | bytes received; 0 = the peer closed | `E_FAULT`; `E_WOULDBLOCK` nothing in time; `E_TOOBIG` past 4 MiB on this connection (it is then closed) |
-| 75 | `tcp_close` | conn h | 0 | `E_BADHANDLE` |
-| 76 | `dns_a` | net h, name_ptr, name_len, timeout_ms | the IPv4 address (u32, big-endian, as a non-negative value) | `E_FAULT`; `E_INVAL` not a name; `E_PEERCLOSED` no checked answer (pc/dnscheck.rs) |
+| 75 | `tcp_close` | conn h, how (bit 0: reset at once, for a load the person stopped; 0: FIN, then a reset after at most 200 ms) | 0 | `E_BADHANDLE` |
+| 76 | `dns_a` | net h, name_ptr, name_len, timeout_ms | the IPv4 address (u32, big-endian, as a non-negative value) | `E_FAULT`; `E_INVAL` not a name; `E_PEERCLOSED` no checked answer (pc/dnscheck.rs); `E_NOROUTE` no route to the name server |
 
 **The stop rule (the kernel's job now that Dira is a process).** A close request on the process's window (the close
 box, Alt+F4, Ctrl+\\ on the serial line), or the window closing, ends a blocked `tcp_dial`, `tcp_recv` or `dns_a`
@@ -425,6 +463,160 @@ reset on exit, the `[net]` line; a close request while `tcp_recv` waits on a ser
 within 100 ms and the connection reset (in the capture); the same for `tcp_dial` and `dns_a`; pc-dira-net and dira
 against the process.
 
+### 7.7 v0.5: the Daraja subset (Designed, 14 Nov 2026)
+
+The calls and rules a compatibility bridge (Daraja, docs/06) needs to run one foreign program, taken from v1 or added
+beside it, so that a bridge built on them does not change when v1 lands. The plan is COMPAT_STAGE0_PLAN.md; the
+architect's verdict is ARCHITECT_REVIEWS 14 Nov "compatibility stage 0". PC first (`pc/proc.rs`); ARM with its own plan.
+Entry, errors and the handle table are those of §7.6. Written from: the System V AMD64 ABI (process start, auxiliary
+vector), the AMD64 APM vol. 2 (SYSCALL, MSRs, IST), the ELF specification, and the Linux manual pages (`syscall(2)`,
+`arch_prctl(2)`) for facts. No Linux kernel source was read.
+
+**Personality.** Every process has a personality, fixed at spawn:
+
+| Value | Name | Status |
+|---|---|---|
+| 0 | `NATIVE` | every process before this section; the Mansa call table |
+| 1 | `LINUX_X86_64` | v0.5 |
+| 2 | `WINDOWS_X86_64` | reserved; the kernel refuses to spawn it until its own plan |
+| 3 | `DARWIN_X86_64` | reserved; as 2 |
+
+The kernel never reads a foreign program's file (ELF, PE, Mach-O). The bridge loads it with the calls below.
+
+**Entry.** `SYSCALL` is enabled (EFER.SCE, STAR, LSTAR, and SFMASK clearing IF, TF, DF and AC). One stub saves the
+caller's registers into the same trap frame as `int 0x80`, then:
+- **`NATIVE`:** a `syscall` instruction is handled as an invalid opcode (§4.4), exactly as before this section.
+  (v1's native `SYSCALL` entry, §7.1, is a later step and dispatches on the same field.)
+- **foreign:** the call is never looked up in the Mansa table. It is forwarded to the process's bridge (below).
+- The return is always by `iretq`. `SYSRET` MUST NOT be used until a measured reason and its own review.
+- NMI, #DB and #MC MUST have their own IST stacks before `SYSCALL` is enabled, because `SYSCALL` does not change the
+  stack pointer and the stub runs briefly on a stack the user chose.
+  The NMI handler MUST stay short (report, then end the process or halt): a #DB or #MC taken inside it, and that
+  exception's `iretq`, re-open NMIs while IST 2 is still in use, so a second NMI would reuse the same stack. An NMI
+  handler that does more needs its own plan for nested NMIs first.
+- The stub uses one static scratch slot and is valid only while ring 3 runs on the boot processor. It MUST assert that
+  in its own path. If ring 3 ever runs on other processors, the stub moves to per-CPU data reached with `swapgs`, and
+  that change comes to the architect.
+- `int 0x80` from a foreign process MUST NOT reach the Mansa table: the process ends and its bridge gets a FAULT
+  message. A foreign process holds **no handles**, so no native call could act for it anyway.
+- **FS and GS base** are saved and restored by the kernel on a switch to or from a foreign process. CR4.FSGSBASE stays
+  off, so ring 3 cannot change them itself; they change only through `fproc_set_tls`.
+
+**Spawn.** Only the kernel grants, at spawn (§7.6). In a test build (feature `compat0`), the shell command
+`linux <name> [args]` makes an empty foreign process (a new address space with no user pages, not yet runnable,
+preemptible) and its bridge, a native program, with exactly these handles:
+
+| Handle | Kind | Rights | What it names |
+|---|---|---|---|
+| 0 | `FPROC` | READ, WRITE, MAP, EXECUTE, SIGNAL | that one foreign process; this handle exists only in its bridge |
+| 1 | `CHANNEL` (kernel-peered) | READ, WRITE, WAIT | the foreign process's call channel; the kernel is the other end |
+| 2 | `VMO` | READ, MAP | the bundle: a header (below), then a cpio "newc" archive of the program and its files |
+
+The bundle header is per spawn, 48 bytes (the architect's layout, 15 Nov 2026): bytes 0..8 magic `DARAJA02`; 8..16
+the archive's length in bytes, little-endian, written by the kernel from the bytes it copied, never from the archive;
+16..32 `AT_RANDOM`, filled from `drbg::fill_secret` for that spawn and never reused (fail closed: no secret bytes, no
+bridge); 32..40 the mapped page count, written by the kernel from the frames it mapped; 40..48 reserved 0. The bridge
+copies the header once onto its own stack and refuses the bundle, by name, unless the magic is `DARAJA02`, bytes 40..48
+are 0, and 48 + the length is at most the page count times 4096; its cpio reader is bounded by that length on every
+read, and fuzz-host's `daraja_bundle` target checks it on any bytes. No `NET` or `CELL` handle is granted.
+
+**Calls.**
+
+| # | Name | Arguments | Result | Errors |
+|---|---|---|---|---|
+| 17 | `channel_write` | ch h, bytes_ptr, bytes_len, 0, 0 | 0 | `E_PERM` no WRITE; `E_FAULT`; `E_INVAL` not a valid reply (below), or handles given; `E_PEERCLOSED` |
+| 18 | `channel_read` | ch h, bytes_ptr, bytes_cap, 0, 0 | 0 | `E_PERM` no READ; `E_FAULT`; `E_TOOBIG` as §7.5; `E_WOULDBLOCK` empty; `E_PEERCLOSED` empty and the foreign process gone |
+| 24 | `wait_one` | h, signals (bit 0 READABLE, bit 2 PEER_CLOSED), timeout_ns (negative: no limit) | observed signals; 0 when the time ran out | `E_BADHANDLE`; `E_PERM` no WAIT |
+| 49 | `fproc_map` | fproc h, foreign addr, len, prot (bit 0 READ, 1 WRITE; READ or READ\|WRITE) | 0 | `E_PERM` no MAP right, or this CPU has no NX; `E_INVAL` EXECUTE asked, prot not R or RW, not page-aligned, outside the foreign area, or overlapping a mapping; `E_NOMEM` past the caps or no frames (nothing half made) |
+| 50 | `fproc_unmap` | fproc h, foreign addr, len | 0 | `E_INVAL` not a whole mapping |
+| 51 | `fproc_read` | fproc h, foreign addr, my ptr, len | bytes copied | `E_FAULT` any page on either side not mapped (all checked before the first byte moves) |
+| 52 | `fproc_write` | fproc h, foreign addr, my ptr, len | bytes copied | `E_FAULT` as 51, or any foreign page in the range not WRITE (so never one that is EXECUTE, or sealed) |
+| 53 | `fproc_start` | fproc h, rip, rsp | 0 | `E_INVAL` already started, rip not in an EXECUTE mapping, or rsp not in a WRITE mapping |
+| 54 | `fproc_set_tls` | fproc h, which (0 FS, 1 GS), value | 0 | `E_INVAL` which, or value not canonical or not in the foreign area |
+| 55 | `fproc_kill` | fproc h, exit code | 0 | `E_BADHANDLE` |
+| 56 | `fproc_protect` | fproc h, foreign addr, len, prot (READ, or READ\|EXECUTE) | 0 | `E_PERM` EXECUTE without the right, or EXECUTE after `fproc_start`; `E_INVAL` WRITE asked, not a whole mapping, or EXECUTE on a page that is not currently WRITE (it must come straight from RW) |
+
+Channel numbers and their semantics are v1's (§7.3, §7.5). In v0.5 they act only on the kernel-peered call channel,
+and any other handle kind is `E_BADHANDLE`. When v1 channels land, nothing a bridge calls changes.
+
+**Number 24 on the PC (the architect's ruling, 14 Nov 2026).** On the PC under v0.5, number 24 is `wait_one` for a
+bridge process and `WIN_GETKEY` (§5.2) for every other process. A process is a bridge from its spawn and stays one.
+Bridges have no v0 window calls (20 to 23 are `E_NOSYS`). At v1 the window calls leave and 24 is `wait_one` for all.
+Test vectors: a bridge's 24 after its foreign process has ended gives PEER_CLOSED; a plain process's 24 is still
+`WIN_GETKEY` (pc-ring3 and pc-userland unchanged); a bridge's 20 gives `E_NOSYS`.
+
+**Memory.**
+- The **foreign area** is PML4 slot 2, `USER_BASE` (`0x0000_0100_0000_0000`) up to `USER_BASE + 2^40`. A foreign
+  process has none of §6.3's native layout.
+- **Foreign memory is not a VMO** (amended 14 Nov 2026 to fit §7.6 as built, where a VMO holds frames only while
+  it is mapped). `fproc_map` takes fresh zeroed frames and maps them into the foreign process only, R or RW, never
+  EXECUTE. The bridge fills them with `fproc_write`, then `fproc_protect` drops WRITE. The bridge holds no handle for
+  foreign memory; the bundle (handle 2) is a VMO mapped only in the bridge, never in the foreign process.
+- **Counting:** the frames are counted on the **foreign process's own** §7.6 count (`vmo_pages`, and the total), so
+  the foreign process ending gives the frames and the reservation back together, as for any process. The per-process
+  cap (32 MiB) applies to the bridge and its foreign process together, checked at both doors: the bridge's
+  `vmo_map` counts its foreign process's pages too, and `fproc_map` counts the bridge's. They go back to the frame pool when the
+  foreign process ends, and pc-daraja checks that the frame pool's used count and the total reservation are back at
+  their starting values with the foreign process dead and the bridge still alive.
+- **No NX, no foreign memory:** on a CPU without NX, `fproc_map` is `E_PERM`, as `vmo_map` is (§7.6).
+- **Write or execute, never both, and the seal is one way, per page.** A page is RW (no-execute), R (no-execute) or
+  RX. `fproc_protect` may turn RW into R or RX. Nothing ever turns R or RX back into WRITE: `fproc_map` never maps over
+  an existing page, and no call adds WRITE. `fproc_write` refuses any page that is not WRITE.
+- **EXECUTE only before the start.** `fproc_protect` may add EXECUTE only before `fproc_start`. Stage 0 and L1 need no
+  code generated at run time; a program that needs a JIT is its own plan, because "write, then execute" is what W^X
+  exists to stop. After the start, `fproc_protect` may still drop WRITE (to R), never add EXECUTE.
+- **Stale TLB entries.** When `fproc_protect` (or `fproc_unmap`) changes a page of a foreign address space, no TLB
+  entry may keep the old permission. On one core the bridge is running during its call, so the foreign space is not
+  the loaded one, and the next CR3 load into it drops its non-global entries (user pages are never global). The kernel
+  still runs `invlpg` on each changed page when the foreign root is the loaded one, so this stays true if that ever
+  changes (another core, or a call made with the foreign space loaded).
+- **The limit:** the low 1 TiB (slot 0, the kernel's 1:1 map) cannot hold foreign pages. Programs linked at fixed low
+  addresses (non-PIE, for example at `0x400000`) cannot run under v0.5. Position-independent programs, and ours
+  linked high, can. Lifting this is its own plan to the architect before stage L1 claims "programs as downloaded".
+
+**The call message** (kernel to bridge, on the call channel), 96 bytes, little-endian:
+
+| Offset | Size | Field | Value |
+|---|---|---|---|
+| 0 | 2 | version | 1 |
+| 2 | 2 | kind | 1 CALL; 2 FAULT (the process is already stopped); 3 EXITED (ended by the kernel, e.g. `fproc_kill` or a refusal) |
+| 4 | 2 | personality | as above |
+| 6 | 2 | thread | 0 (one thread in v0.5) |
+| 8 | 8 | seq | starts at 1, one more per message for this process |
+| 16 | 8 | nr | CALL: `rax`; FAULT: the vector; EXITED: the exit code |
+| 24 | 48 | args[6] | CALL: `rdi rsi rdx r10 r8 r9`; FAULT: error code, then the faulting address (CR2) for #PF; otherwise 0 |
+| 72 | 8 | rip | of the call or fault |
+| 80 | 8 | rsp | of the call or fault |
+| 88 | 8 | reserved | 0 |
+
+**The reply** (bridge to kernel, `channel_write`), exactly 24 bytes: u16 version 1, u16 kind (1 RESULT: `value` goes
+in `rax` and the process runs on; 2 EXIT: the process ends with `value` as its code), u32 reserved 0, u64 seq (that of
+the CALL waiting), u64 value. A reply of another size, kind or version, with a reserved field not 0, with the wrong
+seq, or with no CALL waiting, is `E_INVAL` and changes nothing. The kernel consumes a valid reply at once; replies never
+queue. FAULT and EXITED messages take no reply.
+
+**Rules.**
+- One CALL in flight per foreign process. While it waits, the process is blocked and is not scheduled.
+- A foreign process's fault is always a FAULT message to its bridge, never a kernel panic and at most one console line.
+- **The bridge ending ends its foreign process** (the call channel's peer is gone); the foreign process ending gives
+  the bridge a last EXITED or FAULT message, then `E_PEERCLOSED`. Both are freed as any process is (kernel stack,
+  address space, VMOs), and the frame pool's free count returns to its starting value.
+- Each foreign process's start and end is one `[daraja]` console line: the process, its bridge, the personality, the
+  exit code or the fault.
+
+**Test vectors (suite `pc-daraja`, with each step).** A foreign process that runs `int 0x80` ends, with the refusal
+line and a FAULT to its bridge. `fproc_map` with EXECUTE is `E_INVAL`; `fproc_protect` adding EXECUTE to a page that is
+not RW is `E_INVAL`, asking for WRITE is `E_INVAL`, and adding EXECUTE after `fproc_start` is `E_PERM`. `fproc_write`
+into an R or RX page is `E_FAULT`; after the seal, `fproc_map` over an R or RX page is `E_INVAL` (the other half of
+"nothing returns to WRITE"); `fproc_read` across the end of a mapping is `E_FAULT` and copies nothing. With the
+foreign process dead and the bridge alive, the frame pool's used count and the total reservation are back at their
+starting values. A reply with the wrong seq is `E_INVAL`, the process still waits, and the right reply then works. Killing the
+bridge while its process waits ends both and returns every frame. A native program's `syscall` ends as an invalid
+opcode (`pc-ring3` unchanged). A foreign `syscall` with TF set does not single-step the kernel. The IST entries for
+NMI, #DB and #MC are set at boot. The end-to-end proof: `hello0` and `fault0`, built from source with musl 1.2.5, give
+the same stdout, stderr and exit code on Linux and through the bridge, and the forwarded call numbers equal `strace`'s
+list.
+
 ## 8. Security considerations
 
 ### 8.1 What v0 already guarantees
@@ -441,8 +633,11 @@ against the process.
    This is a privilege-escalation primitive. Required fix: the x86 `user_range()` check — the whole range
    in `[USER_ENTRY, USER_STACK_TOP)`, no overflow, every page user-mapped in the caller's tables — before
    any access. **Severity: high.**
-2. **x86 user pages are never marked NX** (`map_user_in` sets PRESENT|USER|WRITE only): the stack and
-   data pages are executable. Fix: set bit 63 when EFER.NXE is enabled. **Severity: medium.**
+2. **x86 user pages and NX: closed.** `mmu::map_user_in` marks every writable ring-3 page NX (bit 63) once
+   EFER.NXE is set at boot, so stack, data and v0.5 memory objects are not executable; pc-vmo jumps into an object
+   and the CPU faults. On a CPU without NX (none made since about 2004) the boot line says so, and those pages are
+   writable but not guaranteed non-executable, and `vmo_map` refuses every v0.5 object there (`E_PERM`, never `E_NOMEM`: freeing memory cannot help), so §7.6's
+   "never executable" holds wherever an object is mapped. (Corrected 14 Nov with S1; it said user pages were never NX.)
 3. Window, AI, speech, time and putc calls are **ambient** — any process may call them. In v1 they are
    capability-gated by moving behind channels (§7.3).
 4. x86 SEND ignores the endpoint the handle names (one global endpoint, and a blocked receiver is matched
@@ -503,3 +698,5 @@ against the process.
 - seL4 Reference Manual (capabilities, IPC); Fuchsia Zircon syscall and handle documentation (the v1
   channel/VMO/rights model is deliberately close to Zircon's so its literature applies).
 - AMD64 APM vol. 2 §6.1 (SYSCALL/SYSRET register use); Arm ARM D1.10 (exception entry, ESR_EL1.EC).
+- System V Application Binary Interface, AMD64 Architecture Processor Supplement (process start, auxiliary
+  vector); the ELF specification; Linux manual pages `syscall(2)`, `arch_prctl(2)` (facts only, §7.7).

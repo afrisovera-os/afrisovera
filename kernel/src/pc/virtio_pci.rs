@@ -208,6 +208,15 @@ static mut EMU_CFG: [u8; 64] = [0; 64];
 static mut EMU_BASE: u64 = 0;
 static mut EMU_RX: u64 = 0;
 static mut EMU_TX: u64 = 0;
+/// One `emu_poll` at a time. It runs from the driver's RX doorbell (mainline) and from the timer interrupt; since
+/// Dira S4 the network waits run with interrupts open, so the timer could land inside a doorbell's poll. The inner one
+/// moved frames and the ring's `last`, then the outer one went on from its stale `last`: it wrote new frames into
+/// buffers the driver had not read yet, posted their ids a second time and set `last` back. Frames were lost and
+/// buffers double-counted until the card went deaf (big.html at 30 s on e1000 and rtl, then the next DNS step failed:
+/// os4 43689283411, the cloud runner 15 Nov; virtio-net, which has no emulation, never did it).
+static EMU_POLLING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Polls skipped because one was already running (`lsvirtio`).
+static EMU_SKIPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 unsafe fn emu_r(off: u64) -> u32 {
     let e = &*core::ptr::addr_of!(EMU);
@@ -329,9 +338,21 @@ unsafe fn emu_tx() {
 /// from the local-APIC timer interrupt and on the driver's RX doorbell; does nothing until
 /// the driver has set the device up (DRIVER_OK).
 pub fn emu_poll() {
-    // SAFETY: single core. It runs either in the driver's own context (the RX doorbell) or
-    // in the timer interrupt; the driver only READS the used ring this writes, and writes
-    // the avail ring entry before its index, so whatever index is read here is complete.
+    use core::sync::atomic::Ordering;
+    // the timer landed inside a doorbell's poll (or the other way round): that one finishes the work, and frames left
+    // waiting are moved by the next tick or doorbell
+    if EMU_POLLING.swap(true, Ordering::Acquire) {
+        EMU_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    emu_poll_once();
+    EMU_POLLING.store(false, Ordering::Release);
+}
+
+fn emu_poll_once() {
+    // SAFETY: single core, and never two at once (EMU_POLLING). It runs either in the driver's own context (the RX
+    // doorbell) or in the timer interrupt; the driver only READS the used ring this writes, and writes the avail ring
+    // entry before its index, so whatever index is read here is complete.
     unsafe {
         if EMU_BASE == 0 {
             return;
@@ -545,4 +566,8 @@ pub fn lsvirtio() {
         }
     }
     crate::kprintln!("lsvirtio: {} virtio device(s) present", n);
+    let skipped = EMU_SKIPPED.load(core::sync::atomic::Ordering::Relaxed);
+    if skipped > 0 {
+        crate::kprintln!("lsvirtio: emulated RX polls skipped while one was running: {}", skipped);
+    }
 }

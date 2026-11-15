@@ -25,8 +25,8 @@ grade() { # grade <boot1 log> <boot2 log>
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqxE "$1"; }
-    hasB() { printf '%s\n' "$B" | grep -aqxE "$1"; }
+    hasA() { grep -aqxE "$1" <<< "$A"; }
+    hasB() { grep -aqxE "$1" <<< "$B"; }
     # the block of output one command printed, so a line is graded against the command that asked
     blk() { printf '%s\n' "$1" | awk -v c="afrisovera> $2" '$0==c{on=1;next} /^afrisovera>/{on=0} on'; }
     in_blk() { grep -aqxE "$2" <<< "$1"; }
@@ -37,14 +37,14 @@ grade() { # grade <boot1 log> <boot2 log>
         _f "boot 1: installplan 8 did not place 8 MiB in the GPT's 9 MiB gap as entry 5"
     in_blk "$A16" "  plan: the largest free space holds 9 MiB, less than the 16 MiB asked; $ROOM" ||
         _f "boot 1: installplan 16 did not say the 9 MiB gap is too small"
-    printf '%s\n' "$A16" | grep -aq "AfriSovera's partition would be" && _f "boot 1: installplan 16 planned a partition that does not fit"
+    grep -aq "AfriSovera's partition would be" <<< "$A16" && _f "boot 1: installplan 16 planned a partition that does not fit"
     in_blk "$(printf '%s\n' "$A8" | sed -n '/^lsparts: sata port 2/,/^lsparts: /p')" "  plan: no free space of 1 MiB or more; $ROOM" ||
         _f "boot 1: the full MBR disk on SATA port 2 was not seen as having no free MiB"
     in_blk "$A8" 'installplan: a plan only; installing will ask for the owner.s word and back up the table first' ||
         _f "boot 1: installplan did not end with its plan-only line"
     in_blk "$(printf '%s\n' "$B0" | sed -n '/^lsparts: nvme/,/^lsparts: /p')" '  plan: none; a damaged table is never changed' ||
         _f "boot 2: the damaged GPT was not refused"
-    printf '%s\n' "$B0" "$B32" | sed -n '/^lsparts: nvme/,/^lsparts: s/p' | grep -aq "would be LBA" && _f "boot 2: a plan was made on the damaged GPT"
+    grep -aq "would be LBA" <<< "$(sed -n '/^lsparts: nvme/,/^lsparts: s/p' <<< "$B0"$'\n'"$B32")" && _f "boot 2: a plan was made on the damaged GPT"
     in_blk "$B0" "  plan: the largest free space holds 47 MiB, less than the 1024 MiB asked; $ROOM" ||
         _f "boot 2: installplan (1024 MiB default) did not say the MBR disk's 47 MiB is too small"
     in_blk "$B32" "  plan: AfriSovera's partition would be LBA 34816-100351 \(32 MiB\) in the free space LBA 34816-131071, as MBR slot 2; no other partition moves or shrinks" ||
@@ -54,10 +54,10 @@ grade() { # grade <boot1 log> <boot2 log>
     in_blk "$BX" 'installplan: give the size in MiB, 1 to 1048576 \(default 1024\), e.g. installplan 8192' ||
         _f "boot 2: a bad size did not get the usage line"
     for L in "$A" "$B"; do
-        printf '%s\n' "$L" | grep -aqx 'lsparts: read only; nothing was written' || _f "installplan did not finish in a boot"
-        printf '%s\n' "$L" | grep -aqx 'harness: disk images unchanged' || _f "a disk image changed during a boot (or the check is missing)"
+        grep -aqx 'lsparts: read only; nothing was written' <<< "$L" || _f "installplan did not finish in a boot"
+        grep -aqx 'harness: disk images unchanged' <<< "$L" || _f "a disk image changed during a boot (or the check is missing)"
     done
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)' <<< "$A"$'\n'"$B"; then
         _f "the kernel panicked or a disk command failed"
     fi
     return "$fail"

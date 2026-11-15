@@ -88,6 +88,8 @@ static mut N_CTRL: usize = 0;
 static mut DRIVES: [Drive; 8] = [NONE; 8];
 static mut N_DRIVES: usize = 0;
 static mut DISK: Option<usize> = None; // the drive holding the VFS
+/// AFR-0011 V2: a write that failed since the last `blk_flush` (sticky, the architect's rule 1).
+static mut WERR: bool = false;
 static mut BLANK: Option<usize> = None; // the first blank ATA drive (claimdisk ide)
 static mut STATS: (u64, u64, u64) = (0, 0, 0); // sectors read, written, cache flushes
 /// AfriSovera's partition on DISK: (first sector, sectors); sectors 0 = the whole disk.
@@ -392,6 +394,9 @@ unsafe fn send(i: usize) -> bool {
         };
         ra_update(at + j as u64, s, good);
         ok = ok && good;
+    }
+    if !ok {
+        WERR = true;
     }
     ok
 }
@@ -721,7 +726,34 @@ pub fn write_sector(n: u64, data: &[u8; 512]) -> bool {
         if last || WB_N >= cap {
             ok = send(i) && ok;
         }
-        ok && (!last || flush(i))
+        let r = ok && (!last || flush(i));
+        if !r {
+            WERR = true;
+        }
+        r
+    }
+}
+
+/// AFR-0011 V2 `blk_flush`: the gathered writes out, then FLUSH CACHE (EXT on LBA48) when the drive reports a write
+/// cache, which waits up to 30 s; a drive still busy after that gets the channel reset (SRST) before its next
+/// command, as after any command that did not finish. False when any write failed since the last call (sticky).
+/// The test rig's `blkflush-hang` makes the flush wait out its 30 s unanswered.
+pub fn blk_flush() -> bool {
+    // SAFETY: single core, kernel context, one command at a time.
+    unsafe {
+        let Some(i) = DISK else { return false };
+        let sent = send(i);
+        let cached = if crate::virtio::flush_hang_test() {
+            let _ = wait(30_000, || false);
+            let d = DRIVES[i];
+            crate::kprintln!("[ide] {}: the cache flush got no answer in 30 s (test rig)", name(&d));
+            false
+        } else {
+            flush(i)
+        };
+        let ok = sent && cached && !WERR;
+        WERR = false;
+        ok
     }
 }
 

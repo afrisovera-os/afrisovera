@@ -31,8 +31,13 @@ struct Raw {
 }
 
 fn raw() -> Raw {
+    // an update cycle lasts at most 2 ms (UIP up to 244 us before it plus the update): 10 ms is ample; the spin
+    // count is the fallback before the TSC rate is known
+    const UIP_WAIT_US: u64 = 10_000;
+    const UIP_SPIN_CAP: u32 = 100_000;
+    let until = crate::timer::deadline_us(UIP_WAIT_US);
     let mut spins = 0u32;
-    while updating() && spins < 100_000 {
+    while updating() && spins < UIP_SPIN_CAP && !crate::timer::past(until) {
         spins += 1;
     }
     Raw { s: reg(0), m: reg(2), h: reg(4), d: reg(7), mo: reg(8), y: reg(9), c: reg(0x32) }

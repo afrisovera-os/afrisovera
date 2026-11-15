@@ -830,11 +830,13 @@ impl Disk {
 
     /// The end of an install step that wrote this disk (12 Nov 2026, architect's follow-up to NVMe slice 1):
     /// what the disk acknowledged is put on the medium, not left in its volatile write cache, before the
-    /// step says it is done. An NVMe Flush when the controller has a write cache; the other disks already
-    /// flush in their own write paths or have no cache step here yet. Once per step, not once per write.
+    /// step says it is done. An NVMe Flush when the controller has a write cache, a SATA FLUSH CACHE EXT when the
+    /// drive has one on (14 Nov 2026); the other disks already flush in their own write paths or have no cache
+    /// step here yet. Once per step, not once per write.
     pub(crate) fn settle(self) -> bool {
         match self {
             Disk::Nvme => crate::nvme::settle(),
+            Disk::Sata(p) => crate::ahci::settle(p),
             _ => true,
         }
     }

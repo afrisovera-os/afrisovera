@@ -270,6 +270,20 @@ pub fn map_user_in(root: u64, va: u64, pa: u64, writable: bool) -> bool {
     }
 }
 
+/// A read-only page ring 3 can read but never run (NX when the CPU has it): data the kernel hands a process, such as
+/// the store file of `dira file` (Dira M3 S4).
+pub fn map_user_ro_nx_in(root: u64, va: u64, pa: u64) -> bool {
+    match entry_in(root, va & !0xFFF, 1, true) {
+        Some(e) => {
+            *e = (pa & ADDR) | PRESENT | USER | if nx() { NX } else { 0 };
+            // SAFETY: drops any stale translation of this one page.
+            unsafe { asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags)) };
+            true
+        }
+        None => false,
+    }
+}
+
 /// A new address space: a PML4 that shares the kernel's mappings (the 1:1 map and the
 /// demand window, none of them open to ring 3) and has nothing of its own yet. Ring-3
 /// pages added with `map_user_in` are private to it: two spaces can hold different memory
@@ -315,12 +329,92 @@ pub fn free_space(root: u64) -> usize {
     n + 1
 }
 
+/// Unmap one ring-3 page of the address space `root` (a memory object's, AFR-0001 7.6) and return the frame it
+/// held, for the caller to give back. The TLB entry goes too when `root` is the space in use. None when nothing is
+/// mapped there for ring 3.
+pub fn unmap_user_in(root: u64, va: u64) -> Option<u64> {
+    let mut t = root;
+    for l in (1..=4).rev() {
+        let e = &mut table(t)[index(va, l)];
+        if *e & PRESENT == 0 || *e & USER == 0 {
+            return None;
+        }
+        if l == 1 {
+            let pa = *e & ADDR;
+            *e = 0;
+            if cr3() & ADDR == root & ADDR {
+                // SAFETY: invlpg only drops a TLB entry; the page is no longer mapped.
+                unsafe { core::arch::asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags)) };
+            }
+            return Some(pa);
+        }
+        t = *e & ADDR;
+    }
+    None
+}
+
+/// Daraja (AFR-0001 7.7): map one ring-3 page of the space `root` with exactly these permissions: readable always,
+/// writable if `write`, executable only if `exec` (no-execute set otherwise, so a read-only page is NX too). Write and
+/// execute together are refused (false), whatever the caller asks. Replaces an existing entry for `va` (the seal
+/// re-maps a page with fewer rights). The TLB entry is dropped only when `root` is the loaded space: an unloaded
+/// space keeps no TLB entries of its own, and its next CR3 load starts clean (user pages are never global).
+pub fn map_user_prot_in(root: u64, va: u64, pa: u64, write: bool, exec: bool) -> bool {
+    if write && exec {
+        return false;
+    }
+    match entry_in(root, va & !0xFFF, 1, true) {
+        Some(e) => {
+            let nx_bit = if !exec && nx() { NX } else { 0 };
+            *e = (pa & ADDR) | PRESENT | USER | if write { WRITE } else { 0 } | nx_bit;
+            if cr3() & ADDR == root & ADDR {
+                // SAFETY: invlpg only drops a TLB entry for this one page.
+                unsafe { asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags)) };
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// The physical frame behind the ring-3 page `va` in the space `root` (Daraja's fproc_read and fproc_write copy
+/// through the kernel's 1:1 map). None when `va` is not mapped for ring 3 there.
+pub fn user_frame_in(root: u64, va: u64) -> Option<u64> {
+    let mut t = root;
+    for l in (1..=4).rev() {
+        let e = table(t)[index(va, l)];
+        if e & PRESENT == 0 || e & USER == 0 {
+            return None;
+        }
+        if l == 1 {
+            return Some(e & ADDR);
+        }
+        t = e & ADDR;
+    }
+    None
+}
+
 /// True if `va` is mapped for ring 3 (present and user at every level) in the space `root`.
 pub fn user_mapped_in(root: u64, va: u64) -> bool {
     let mut t = root;
     for l in (1..=4).rev() {
         let e = table(t)[index(va, l)];
         if e & PRESENT == 0 || e & USER == 0 {
+            return false;
+        }
+        if l == 1 {
+            return true;
+        }
+        t = e & ADDR;
+    }
+    false
+}
+
+/// As `user_mapped_in`, and the page is also writable from ring 3 (WRITE at all four levels).
+pub fn user_writable_in(root: u64, va: u64) -> bool {
+    let mut t = root;
+    for l in (1..=4).rev() {
+        let e = table(t)[index(va, l)];
+        if e & PRESENT == 0 || e & USER == 0 || e & WRITE == 0 {
             return false;
         }
         if l == 1 {

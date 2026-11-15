@@ -40,8 +40,8 @@ grade_boot() { # grade_boot <serial capture> <used b:d.f> <left-off b:d.f> <used
     [ "$kc" = "$U:" ] || _f "lsusb did not list the keyboard under $U (got '${kc:-none}')"
     has '^\[xhci\] port [0-9]+: USB keyboard [0-9a-f]{4}:[0-9a-f]{4} \((full|low|high) speed\), slot [0-9]+' ||
         _f "no USB keyboard was enumerated"
-    printf '%s\n' "$S" | grep -aqE "^afrisovera> echo $WORD$" || _f "the command typed did not reach the shell"
-    printf '%s\n' "$S" | grep -aqE "^$WORD$" || _f "the shell did not run the typed command"
+    grep -aqE "^afrisovera> echo $WORD$" <<< "$S" || _f "the command typed did not reach the shell"
+    grep -aqE "^$WORD$" <<< "$S" || _f "the shell did not run the typed command"
     has "^usb: xHCI controller ${U//./\\.}, " || _f "lsusb did not name $U"
     local k
     k="$(printf '%s\n' "$S" | grep -aoE '^  keyboard: slot [0-9]+, [0-9]+ reports, [0-9]+ keys typed$' | tail -1 | awk '{print $6}')"

@@ -21,8 +21,8 @@ wait "$QPID" 2>/dev/null
 
 echo "$SER" | grep -iE "CAP_RANDOM|wasm app|DENIED|capability|TRAP" | sed 's/^/  /'
 
-echo "$SER" | grep -q "CAP_RANDOM GRANTED" \
+grep -q "CAP_RANDOM GRANTED" <<< "$SER" \
     || { echo "RAND-CAP TEST FAILED (granted run did not execute)"; exit 1; }
-echo "$SER" | grep -q "app called host 'random' without the capability" \
+grep -q "app called host 'random' without the capability" <<< "$SER" \
     || { echo "RAND-CAP TEST FAILED (un-capable app was NOT denied)"; exit 1; }
 echo "RAND-CAP TEST PASSED  (CAP_RANDOM granted app drew values; un-capable app was denied)"

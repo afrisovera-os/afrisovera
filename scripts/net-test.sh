@@ -26,16 +26,16 @@ SER="$(python3 scripts/shell-demo.py 4496 4497 "${TMPDIR:-/tmp}/net-test.png" "n
 kill "$QPID" 2>/dev/null
 wait "$QPID" 2>/dev/null
 echo "$SER" | grep -iE "virtio-net|ping OK" || true
-echo "$SER" | grep -q "round-trip OK" \
+grep -q "round-trip OK" <<< "$SER" \
     && echo "DRIVER RX: the ARP reply was received in the driver (round-trip OK)" \
     || { echo "NET TEST FAILED (driver did not receive the ARP reply)"; exit 1; }
-echo "$SER" | grep -q "ping OK" \
+grep -q "ping OK" <<< "$SER" \
     && echo "PING: ICMP echo reply received (IPv4 + ICMP round-trip OK)" \
     || { echo "NET TEST FAILED (no ICMP echo reply)"; exit 1; }
-echo "$SER" | grep -q "UDP round-trip OK" \
+grep -q "UDP round-trip OK" <<< "$SER" \
     && echo "DNS: resolved example.com over UDP (UDP/DNS round-trip OK)" \
     || { echo "NET TEST FAILED (no DNS response)"; exit 1; }
-echo "$SER" | grep -q "app called host 'net' without the capability" \
+grep -q "app called host 'net' without the capability" <<< "$SER" \
     && echo "CAP: a WASM app without CAP_NET was refused network access (capability gate works)" \
     || { echo "NET TEST FAILED (capability gate did not deny net access)"; exit 1; }
 

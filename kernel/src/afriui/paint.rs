@@ -32,6 +32,27 @@ pub(super) mod shape; // Arabic shaped by the font's lookups, laid out by bidi
 /// face either way until step 3.
 pub(super) static VECTOR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
+/// While set, the text being measured or drawn is prose (`shape::Text::Prose`: notices), so the explicit bidi
+/// embeddings and overrides inside it work. Unset, every string is an identity string (titles, names), and those
+/// controls are dropped (the architect's rule, SHAPING_C2_PLAN C2b). Mainline only; set only by `prose`.
+static PROSE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn text_kind() -> shape::Text {
+    if PROSE.load(core::sync::atomic::Ordering::Relaxed) {
+        shape::Text::Prose
+    } else {
+        shape::Text::Identity
+    }
+}
+
+/// Measure or draw prose inside `f` (notices).
+fn prose<R>(f: impl FnOnce() -> R) -> R {
+    PROSE.store(true, core::sync::atomic::Ordering::Relaxed);
+    let r = f();
+    PROSE.store(false, core::sync::atomic::Ordering::Relaxed);
+    r
+}
+
 fn vector_on() -> bool {
     VECTOR.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -98,30 +119,99 @@ static mut CLIP: Option<(i32, i32, i32, i32, i32)> = None;
 /// The whole screen when a full frame is drawn. Mainline only.
 static mut DCLIP: Rect = (0, 0, i32::MAX / 2, i32::MAX / 2);
 
-fn rect(x: i32, y: i32, w: i32, h: i32, c: u32) {
+// ---- The scale (afriui.md section 29 and its amendment). The desk lays out in logical pixels; these primitives are
+// the only place a logical edge becomes a physical one, u(v) = ceil(v * Q / 4), Q = 4 * S. Every edge is the u() of
+// one logical coordinate, so shapes that share an edge share it exactly, and the pointer's floor(P * 4 / Q) lands in
+// x..x+w exactly when P lies in u(x)..u(x+w). At Q = 4 every function here is the identity, so S = 1 draws the same
+// pixels with the same calls as before.
+
+/// The desk's scale in quarters (4 = 1x, 8 = 2x).
+fn q() -> i64 {
+    crate::canvas::q() as i64
+}
+/// A logical coordinate's physical pixel: ceil(v * Q / 4).
+pub(super) fn u(v: i32) -> i32 {
+    let q = q();
+    if q == 4 {
+        return v;
+    }
+    (v as i64 * q + 3).div_euclid(4).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+/// The logical row or column a physical pixel lies in: floor(p * 4 / Q).
+fn lfloor(p: i32) -> i32 {
+    let q = q();
+    if q == 4 {
+        return p;
+    }
+    (p as i64 * 4).div_euclid(q) as i32
+}
+/// The logical coordinate at or after a physical one: ceil(p * 4 / Q) (where text drawn at physical sizes ends).
+fn lceil(p: i32) -> i32 {
+    let q = q();
+    if q == 4 {
+        return p;
+    }
+    (p as i64 * 4 + q - 1).div_euclid(q) as i32
+}
+/// A size (a corner, a cap height) at the scale, rounded to the nearest pixel.
+fn sz(k: i32) -> i32 {
+    let q = q();
+    if q == 4 {
+        return k;
+    }
+    (k as i64 * q + 2).div_euclid(4) as i32
+}
+/// The canvas in physical pixels.
+fn pw() -> i32 {
+    crate::canvas::width() as i32
+}
+fn ph() -> i32 {
+    crate::canvas::height() as i32
+}
+/// The box being redrawn, in physical pixels.
+pub(super) fn dclip_p() -> Rect {
     // SAFETY: DCLIP is set and reset around a partial frame, in mainline only.
     let (dx, dy, dw, dh) = unsafe { DCLIP };
-    let (x0c, y0c) = (x.max(dx), y.max(dy));
-    let (w, h) = ((x + w).min(dx + dw) - x0c, (y + h).min(dy + dh) - y0c);
-    if w <= 0 || h <= 0 {
+    let (x0, y0) = (u(dx), u(dy));
+    (x0, y0, u(dx.saturating_add(dw)) - x0, u(dy.saturating_add(dh)) - y0)
+}
+/// A logical box in physical pixels: (x, y, w, h) with each edge the u() of its logical edge.
+fn pbox(x: i32, y: i32, w: i32, h: i32) -> Rect {
+    let (x0, y0) = (u(x), u(y));
+    (x0, y0, u(x + w) - x0, u(y + h) - y0)
+}
+
+/// A logical rectangle, clipped to the box being redrawn, the screen and an app's window with its cut corner.
+fn rect(x: i32, y: i32, w: i32, h: i32, c: u32) {
+    fill_p(u(x), u(y), u(x.saturating_add(w)), u(y.saturating_add(h)), c);
+}
+/// A physical rectangle (look.rs and text at physical sizes).
+pub(super) fn prect(x: i32, y: i32, w: i32, h: i32, c: u32) {
+    fill_p(x, y, x.saturating_add(w), y.saturating_add(h), c);
+}
+/// The physical pixels [x0, x1) x [y0, y1), clipped as `rect` clips. An app window's bottom-right cut is worked out
+/// per logical row (row j of the cut is inset by j + 1 logical pixels), so its steps scale with the window.
+fn fill_p(x0: i32, y0: i32, x1: i32, y1: i32, c: u32) {
+    let (dx, dy, dw, dh) = dclip_p();
+    let (mut x0, mut y0) = (x0.max(dx).max(0), y0.max(dy).max(0));
+    let (mut x1, mut y1) = (x1.min(dx + dw).min(pw()), y1.min(dy + dh).min(ph()));
+    if x1 <= x0 || y1 <= y0 {
         return;
     }
-    let (x, y) = (x0c, y0c);
-    let (mut x0, mut y0) = (x.max(0), y.max(0));
-    let (mut x1, mut y1) = ((x + w).min(W()), (y + h).min(H()));
     // SAFETY: CLIP is set and cleared around an app's body drawing, in mainline only.
     if let Some((cx, cy, cw, ch, k)) = unsafe { CLIP } {
-        x0 = x0.max(cx);
-        y0 = y0.max(cy);
-        x1 = x1.min(cx + cw);
-        y1 = y1.min(cy + ch);
-        let zone = cy + ch - k; // the rows the bottom-right cut runs through
-        if k > 0 && y1 > zone && x1 > cx + cw - k && x1 > x0 {
+        x0 = x0.max(u(cx));
+        y0 = y0.max(u(cy));
+        x1 = x1.min(u(cx + cw));
+        y1 = y1.min(u(cy + ch));
+        let lzone = cy + ch - k; // the logical rows the bottom-right cut runs through
+        let zone = u(lzone);
+        if k > 0 && y1 > zone && x1 > u(cx + cw - k) && x1 > x0 {
             if y0 < zone {
                 crate::canvas::fill_rect(x0 as usize, y0 as usize, (x1 - x0) as usize, (zone - y0) as usize, c);
             }
             for yy in y0.max(zone)..y1 {
-                let r = (cx + cw - (yy - zone)).min(x1); // row j of the cut is inset by j + 1
+                let r = u(cx + cw - (lfloor(yy) - lzone)).min(x1); // row j of the cut is inset by j + 1
                 if r > x0 {
                     crate::canvas::fill_rect(x0 as usize, yy as usize, (r - x0) as usize, 1, c);
                 }
@@ -143,18 +233,22 @@ fn cut_inset(j: i32, h: i32, tl: i32, tr: i32, br: i32, bl: i32) -> (i32, i32) {
 /// A filled shape with its corners in the current style (afriui.md sections 3 and 27): cut at 45 degrees (hard, as
 /// before, or smooth), or round.
 fn cut(x: i32, y: i32, w: i32, h: i32, tl: i32, tr: i32, br: i32, bl: i32, c: u32) {
-    look::shape(x, y, w, h, tl, tr, br, bl, c, 255);
+    let (x, y, w, h) = pbox(x, y, w, h);
+    look::shape(x, y, w, h, sz(tl), sz(tr), sz(br), sz(bl), c, 255);
 }
 
 /// The same shape at alpha a over what is there (the see-through panels).
 fn cut_a(x: i32, y: i32, w: i32, h: i32, tl: i32, tr: i32, br: i32, bl: i32, c: u32, a: u8) {
-    look::shape(x, y, w, h, tl, tr, br, bl, c, a);
+    let (x, y, w, h) = pbox(x, y, w, h);
+    look::shape(x, y, w, h, sz(tl), sz(tr), sz(br), sz(bl), c, a);
 }
 
 /// The one-pixel outline of a shape. The hard style is drawn exactly as before step 2.
 fn cut_frame(x: i32, y: i32, w: i32, h: i32, tl: i32, tr: i32, br: i32, bl: i32, c: u32) {
     if look::corners() != look::Corners::Hard {
-        look::frame(x, y, w, h, tl, tr, br, bl, c);
+        // one physical pixel wide at every scale, as a hairline should be
+        let (x, y, w, h) = pbox(x, y, w, h);
+        look::frame(x, y, w, h, sz(tl), sz(tr), sz(br), sz(bl), c);
         return;
     }
     for j in 0..h {
@@ -174,7 +268,10 @@ fn shadow(x: i32, y: i32, w: i32, h: i32, tl: i32, tr: i32, br: i32, bl: i32, ha
         return;
     }
     if look::soft() {
-        look::shadow(x, y, w, h, tl, tr, br, bl, reach);
+        // the shadow's profile stays in physical pixels (7 out, 4 down) for now: a finer shadow at 2x, never a
+        // blockier one
+        let (x, y, w, h) = pbox(x, y, w, h);
+        look::shadow(x, y, w, h, sz(tl), sz(tr), sz(br), sz(bl), reach);
     } else {
         cut(x + hard, y + hard, w, h, tl, tr, br, bl, SHADOW);
     }
@@ -286,11 +383,20 @@ fn text_w(s: &[u8], scale: i32) -> i32 {
     ((w - 1) * scale).max(0)
 }
 
-/// The width of UTF-8 text in the outline face at a cap height, in whole pixels (rounded up).
+/// The width of UTF-8 text in the outline face at a cap height, in whole logical pixels (rounded up). The text is
+/// measured at its physical size, as it is drawn (section 29).
 pub(super) fn vtext_w(s: &[u8], cap: i32) -> i32 {
+    if q() == 4 {
+        return vtext_w_p(s, cap);
+    }
+    lceil(vtext_w_p(s, sz(cap)))
+}
+
+/// `vtext_w` in physical pixels.
+fn vtext_w_p(s: &[u8], cap: i32) -> i32 {
     if shape::needed(s) {
         // the same decision as vtext, so a measured width always matches the drawn one
-        return (shape::layout(s, cap, None, &mut |_, _, _| {}) + 255) >> 8;
+        return (shape::layout_as(s, cap, None, text_kind(), &mut |_, _, _| {}) + 255) >> 8;
     }
     let mut pen = 0;
     let mut i = 0;
@@ -304,9 +410,18 @@ pub(super) fn vtext_w(s: &[u8], cap: i32) -> i32 {
     (pen + 255) >> 8
 }
 
-/// UTF-8 text in the outline face, (x0, y0) the top of the capitals, `cap` the cap height in pixels. Each glyph is
-/// placed to a quarter pixel; a character the font does not have draws as a box. Returns the end x.
+/// UTF-8 text in the outline face, (x0, y0) the top of the capitals, `cap` the cap height, all logical. Each glyph is
+/// placed to a quarter of a physical pixel at the physical cap height, so text is sharp at every scale (section
+/// 29); a character the font does not have draws as a box. Returns the end x, logical.
 pub(super) fn vtext(x0: i32, y0: i32, s: &[u8], c: u32, cap: i32) -> i32 {
+    if q() == 4 {
+        return vtext_p(x0, y0, s, c, cap);
+    }
+    lceil(vtext_p(u(x0), u(y0), s, c, sz(cap)))
+}
+
+/// `vtext` in physical pixels.
+fn vtext_p(x0: i32, y0: i32, s: &[u8], c: u32, cap: i32) -> i32 {
     let cap = vector::clamp_cap(cap);
     if shape::needed(s) {
         return vshaped(x0, y0, s, c, cap);
@@ -332,10 +447,10 @@ pub(super) fn vtext(x0: i32, y0: i32, s: &[u8], c: u32, cap: i32) -> i32 {
             None => {
                 let (bw, adv) = vector::box_size(cap);
                 let bx = (pen >> 8) + (adv - bw) / 2;
-                rect(bx, y0, bw, 1, c);
-                rect(bx, base - 1, bw, 1, c);
-                rect(bx, y0, 1, cap, c);
-                rect(bx + bw - 1, y0, 1, cap, c);
+                prect(bx, y0, bw, 1, c);
+                prect(bx, base - 1, bw, 1, c);
+                prect(bx, y0, 1, cap, c);
+                prect(bx + bw - 1, y0, 1, cap, c);
                 pen += adv * 256;
             }
         }
@@ -350,15 +465,15 @@ fn vshaped(x0: i32, y0: i32, s: &[u8], c: u32, cap: i32) -> i32 {
     let base = y0 + cap;
     let gamma = vector::gamma_for(c);
     let start = x0 * 256;
-    let w = shape::layout(s, cap, None, &mut |g, x, y| {
+    let w = shape::layout_as(s, cap, None, text_kind(), &mut |g, x, y| {
         let p = start + x;
         if g.boxed {
             let (bw, adv) = vector::box_size(cap);
             let bx = (p >> 8) + (adv - bw) / 2;
-            rect(bx, y0, bw, 1, c);
-            rect(bx, base - 1, bw, 1, c);
-            rect(bx, y0, 1, cap, c);
-            rect(bx + bw - 1, y0, 1, cap, c);
+            prect(bx, y0, bw, 1, c);
+            prect(bx, base - 1, bw, 1, c);
+            prect(bx, y0, 1, cap, c);
+            prect(bx + bw - 1, y0, 1, cap, c);
         } else {
             let px = p >> 8;
             vector::glyph_in(g.face, g.g, cap, (p >> 6) & 3, &mut |l, t, w, h, cov| cover(px + l, base + y + t, w, h, cov, c, gamma));
@@ -522,18 +637,27 @@ fn cover(x: i32, y: i32, w: usize, h: usize, cov: &[u8], c: u32, gamma: &[u8; 25
 /// One pixel of colour c at alpha a (1 to 254), clipped as `rect` clips (the box redrawn, the screen, an app's window
 /// and its cut corner): the edge pixels of corners and outlines, without `cover`'s slices.
 fn mix1(x: i32, y: i32, a: u8, c: u32) {
-    // SAFETY: mainline only.
-    let (dx, dy, dw, dh) = unsafe { DCLIP };
-    if x < dx.max(0) || y < dy.max(0) || x >= (dx + dw).min(W()) || y >= (dy + dh).min(H()) {
+    for yy in u(y)..u(y + 1) {
+        for xx in u(x)..u(x + 1) {
+            mix_p(xx, yy, a, c);
+        }
+    }
+}
+
+/// `mix1` for one physical pixel (look.rs's edge pixels), clipped as `fill_p` clips.
+pub(super) fn mix_p(x: i32, y: i32, a: u8, c: u32) {
+    let (dx, dy, dw, dh) = dclip_p();
+    if x < dx.max(0) || y < dy.max(0) || x >= (dx + dw).min(pw()) || y >= (dy + dh).min(ph()) {
         return;
     }
     // SAFETY: mainline only.
     if let Some((cx, cy, cw, ch, k)) = unsafe { CLIP } {
-        if x < cx || y < cy || x >= cx + cw || y >= cy + ch {
+        if x < u(cx) || y < u(cy) || x >= u(cx + cw) || y >= u(cy + ch) {
             return;
         }
         let zone = cy + ch - k;
-        if k > 0 && y >= zone && x >= cx + cw - (y - zone) {
+        let ly = lfloor(y);
+        if k > 0 && ly >= zone && x >= u(cx + cw - (ly - zone)) {
             return;
         }
     }
@@ -542,19 +666,19 @@ fn mix1(x: i32, y: i32, a: u8, c: u32) {
 
 /// `cover` with the coverage `stride` bytes a row; a stride of 0 reads the same row for every row (a flat alpha).
 fn cover_stride(x: i32, y: i32, w: usize, h: usize, cov: &[u8], stride: usize, c: u32, gamma: &[u8; 256]) {
+    // physical pixels: its callers are text at its physical size and look.rs (section 29)
     let (w, h, st) = (w as i32, h as i32, stride as i32);
-    // SAFETY: mainline only.
-    let (dx, dy, dw, dh) = unsafe { DCLIP };
+    let (dx, dy, dw, dh) = dclip_p();
     let (mut x0, mut y0) = (x.max(dx).max(0), y.max(dy).max(0));
-    let (mut x1, mut y1) = ((x + w).min(dx + dw).min(W()), (y + h).min(dy + dh).min(H()));
+    let (mut x1, mut y1) = ((x + w).min(dx + dw).min(pw()), (y + h).min(dy + dh).min(ph()));
     let mut cutk = None;
     // SAFETY: mainline only.
     if let Some((cx, cy, cw, ch, k)) = unsafe { CLIP } {
-        x0 = x0.max(cx);
-        y0 = y0.max(cy);
-        x1 = x1.min(cx + cw);
-        y1 = y1.min(cy + ch);
-        if k > 0 && y1 > cy + ch - k && x1 > cx + cw - k {
+        x0 = x0.max(u(cx));
+        y0 = y0.max(u(cy));
+        x1 = x1.min(u(cx + cw));
+        y1 = y1.min(u(cy + ch));
+        if k > 0 && y1 > u(cy + ch - k) && x1 > u(cx + cw - k) {
             cutk = Some((cx + cw, cy + ch - k));
         }
     }
@@ -574,9 +698,10 @@ fn cover_stride(x: i32, y: i32, w: usize, h: usize, cov: &[u8], stride: usize, c
     match cutk {
         None => put(x0 as usize, y0 as usize, (x1 - x0) as usize, (y1 - y0) as usize, &cov[at(x0, y0)..]),
         Some((right, zone)) => {
-            // row j of the cut is inset by j + 1, as in `rect`
+            // row j of the cut is inset by j + 1 logical pixels, as in `fill_p`
             for yy in y0..y1 {
-                let r = if yy >= zone { x1.min(right - (yy - zone)) } else { x1 };
+                let ly = lfloor(yy);
+                let r = if ly >= zone { x1.min(u(right - (ly - zone))) } else { x1 };
                 if r > x0 {
                     put(x0 as usize, yy as usize, (r - x0) as usize, 1, &cov[at(x0, yy)..]);
                 }
@@ -656,7 +781,7 @@ pub(super) fn lintel_min_w_in(l: lang::Lang) -> i32 {
     let bw = if touch { 44 } else { 22 };
     let uw = text_w(lang::text_in(l, lang::Msg::TitleUnsigned), ts) + 10 * ts;
     let dots = text_w(b"..", ts) + ts;
-    let buttons = if touch { bw + 4 } else { 2 * bw + 8 };
+    let buttons = if touch { 2 * bw + 8 } else { 3 * bw + 12 }; // minimise (both), maximise (pointer), close
     12 + isz + 8 + dots + 8 * ts + uw + 6 * ts + anyway_w(l, ts) + 8 * ts + buttons
 }
 
@@ -885,6 +1010,11 @@ fn spine() {
             let focus = foc == Some(a);
             let bh = if focus { ts - 8 } else if w.min { 4 } else { 10 };
             chip(0, ty + (ts - bh) / 2, 3, bh, 1, if focus { GOLD } else { GOLD_DEEP });
+            if w.min {
+                // minimised: a gold dot on the tile's corner says the window is kept here (section 33)
+                chip(tx + ts - 6, ty + ts - 6, 7, 7, 2, NIGHT);
+                chip(tx + ts - 5, ty + ts - 5, 5, 5, 1, GOLD);
+            }
         }
     }
 
@@ -900,7 +1030,7 @@ fn spine() {
     } else {
         let h12 = if hh % 12 == 0 { 12 } else { hh % 12 };
         l.u(h12).s(b":").two(mm);
-        under.s(lang::t(if hh < 12 { lang::Msg::ClockAm } else { lang::Msg::ClockPm }));
+        under.s(if hh < 12 { locale::am(lang::current()) } else { locale::pm(lang::current()) });
     }
     rect(8, H() - 30, body - 16, 1, LINE);
     text(mid - text_w(l.get(), 1) / 2, H() - 23, l.get(), GOLD, 1);
@@ -997,7 +1127,7 @@ fn bar() {
     } else {
         let h12 = if hh % 12 == 0 { 12 } else { hh % 12 };
         l.u(h12).s(b":").two(mm);
-        under.s(lang::t(if hh < 12 { lang::Msg::ClockAm } else { lang::Msg::ClockPm }));
+        under.s(if hh < 12 { locale::am(lang::current()) } else { locale::pm(lang::current()) });
     }
     let (cx, cy, cw, _) = clock_box();
     let mid = cx + cw / 2;
@@ -1075,19 +1205,37 @@ fn window_whole(a: usize) {
     let (x, y, w, h) = win_rect(a);
     let th = title_h();
     let focus = focused() == Some(a);
-    let k = win_cut();
+    let k = win_cut(a);
     let ins = |j: i32| cut_inset(j, h, k, 0, k, 0);
     // the shadow (soft, or the hard relief of a carving), then the window over it
     // the focused window casts the full shadow; the others a short one (afriui.md section 30: they sink back, and
     // their shadows were most of the ARM frame's cost)
-    shadow(x, y, w, h, k, 0, k, 0, 4, if focus { look::REACH } else { 3 });
+    if win_fit(a) == 0 {
+        // a window filling the space or a half casts no shadow: it lies flat on the desk (section 33)
+        shadow(x, y, w, h, k, 0, k, 0, 4, if focus { look::REACH } else { 3 });
+    }
     cut(x, y, w, h, k, 0, k, 0, if focus { SURFACE } else { SURFACE_OFF });
     // the lintel (title bar), with its corner's edge pixels in the lintel's colour
-    for j in 0..th {
-        let (l, r) = ins(j);
-        let c = if focus { TITLE_ON } else { TITLE_OFF };
-        rect(x + l, y + j, w - l - r, 1, c);
-        look::edges(x, y, w, h, j, k, 0, k, 0, c, 255);
+    if q() == 4 {
+        for j in 0..th {
+            let (l, r) = ins(j);
+            let c = if focus { TITLE_ON } else { TITLE_OFF };
+            rect(x + l, y + j, w - l - r, 1, c);
+            look::edges(x, y, w, h, j, k, 0, k, 0, c, 255);
+        }
+    } else {
+        // above 1x: the window's own shape in the lintel's colour, clipped to the lintel's rows, so its corner is
+        // the same curve as the window's at the physical size (section 29)
+        // SAFETY: mainline only; restored below.
+        let keep = unsafe { DCLIP };
+        let (y0, y1) = (keep.1.max(y), (keep.1 + keep.3).min(y + th));
+        if y1 > y0 {
+            // SAFETY: mainline only.
+            unsafe { DCLIP = (keep.0, y0, keep.2, y1 - y0) };
+            cut(x, y, w, h, k, 0, k, 0, if focus { TITLE_ON } else { TITLE_OFF });
+            // SAFETY: mainline only.
+            unsafe { DCLIP = keep };
+        }
     }
     rect(x, y + th, w, 1, LINE);
     let band = 6; // the cloth: three woven rows (4 px was too thin to read focus at a glance, review S1)
@@ -1143,8 +1291,23 @@ fn window_whole(a: usize) {
         rect(cx + k, cy + k, 2, 1, c);
         rect(cx + k, cy - k, 2, 1, c);
     }
-    if !s.touch {
-        rect(mn.0 + mn.2 / 2 - 4, mn.1 + mn.3 / 2 + 2, 9, 2, c);
+    rect(mn.0 + mn.2 / 2 - 4, mn.1 + mn.3 / 2 + 2, 9, 2, c);
+    if let Some(mb) = max_button(a) {
+        // maximise: one square; restore (the window fills the space or a half): two squares, one behind the other
+        let (cx, cy) = (mb.0 + mb.2 / 2, mb.1 + mb.3 / 2);
+        let sq = |x: i32, y: i32, w: i32, h: i32| {
+            rect(x, y, w, 2, c);
+            rect(x, y + h - 1, w, 1, c);
+            rect(x, y, 1, h, c);
+            rect(x + w - 1, y, 1, h, c);
+        };
+        if win_fit(a) == 0 {
+            sq(cx - 4, cy - 4, 9, 9);
+        } else {
+            sq(cx - 2, cy - 5, 7, 7);
+            rect(cx - 5, cy - 2, 7, 7, if focus { TITLE_ON } else { TITLE_OFF });
+            sq(cx - 5, cy - 2, 7, 7);
+        }
     }
     // body: whatever the app draws stays inside the window and keeps its cut corner
     let (bx, by, bw, bh) = (x + 1, y + th + 1, w - 2, h - th - 2);
@@ -1306,7 +1469,7 @@ fn files_app(a: usize, x: i32, y: i32, w: i32, h: i32) {
             let name = crate::vfs::name_of(i);
             text(px + 10, y + 8, name.as_bytes(), GOLD, 1);
             let mut l = Line::new();
-            l.f(lang::Msg::FilesBytes, &[lang::Arg::N(crate::vfs::size_of(i) as u64)]);
+            l.f(lang::Msg::FilesBytes, &[lang::Arg::G(crate::vfs::size_of(i) as u64)]);
             text(px + 10, y + 20, l.get(), DIM, 1);
             rect(px + 10, y + 32, pw - 20, 1, LINE);
             let data = crate::vfs::read_raw(name).unwrap_or(&[]);
@@ -1391,11 +1554,7 @@ fn terminal_app(x: i32, y: i32, w: i32, h: i32) {
     if view > 0 {
         // scrolled back: say how far, and how to come back, at the top right
         let mut l = Line::new();
-        if view == 1 {
-            l.s(lang::t(lang::Msg::TermBackOne));
-        } else {
-            l.f(lang::Msg::TermBack, &[lang::Arg::N(view as u64)]);
-        }
+        l.f(lang::Msg::TermBack, &[lang::Arg::G(view as u64)]);
         let tw = text_w(l.get(), 1);
         let (cx, cy) = (x + w - tw - 22, y + 4);
         chip(cx, cy, tw + 14, face::CAP + 8, 3, GOLD_DEEP);
@@ -1486,10 +1645,10 @@ fn settings_app(a: usize, x: i32, y: i32, w: i32, _h: i32) {
 
     head(y + 220, lang::t(lang::Msg::SetSystem));
     let mut l = Line::new();
-    l.f(lang::Msg::SetCores, &[lang::Arg::N(crate::cores_found() as u64), lang::Arg::N(crate::ram_mib())]);
+    l.f(lang::Msg::SetCores, &[lang::Arg::G(crate::cores_found() as u64), lang::Arg::Mem(crate::ram_mib())]);
     label(y + 236, l.get());
     let mut l = Line::new();
-    l.f(lang::Msg::SetBooted, &[lang::Arg::N(crate::config::boots() as u64), lang::Arg::N(now_ticks() / 100)]);
+    l.f(lang::Msg::SetBooted, &[lang::Arg::G(crate::config::boots() as u64), lang::Arg::G(now_ticks() / 100)]);
     text(x + 14, y + 250, l.get(), DIM, 1);
     note_uptime(a, y + 250);
     let _ = (w, a);
@@ -1538,9 +1697,9 @@ fn about_app(x: i32, y: i32, w: i32, h: i32) {
     ];
     rows[0].1.s(lang::t(lang::Msg::AboutKernelIs));
     rows[1].1.s(lang::t(lang::Msg::AboutDesktopIs));
-    rows[2].1.f(lang::Msg::AboutDeviceIs, &[lang::Arg::S(arch), lang::Arg::N(crate::cores_found() as u64)]);
+    rows[2].1.f(lang::Msg::AboutDeviceIs, &[lang::Arg::S(arch), lang::Arg::G(crate::cores_found() as u64)]);
     // the machine's memory, as Settings shows it (it showed the kernel's 64 MiB page pool here; the owner's HP, 14 Nov)
-    rows[3].1.f(lang::Msg::AboutMemoryIs, &[lang::Arg::N(crate::ram_mib()), lang::Arg::N(now_ticks() / 100)]);
+    rows[3].1.f(lang::Msg::AboutMemoryIs, &[lang::Arg::Mem(crate::ram_mib()), lang::Arg::G(now_ticks() / 100)]);
     let vx = rows.iter().map(|(k, _)| 30 + text_w(k, 1) + 14).max().unwrap_or(100).max(100);
     for (r, (k, v)) in rows.iter().enumerate() {
         if yy + face::LINE_H > y + h {
@@ -1561,12 +1720,17 @@ fn about_app(x: i32, y: i32, w: i32, h: i32) {
 pub(super) fn fit_report(l: lang::Lang, bad: &mut dyn FnMut(&str, i32, i32)) {
     let name = |m: lang::Msg| lang::IDS[m as usize];
     let w_of = |m: lang::Msg| text_w(lang::text_in(l, m), 1);
+    // the widest of the text's plural forms (stage 5), each filled with the same numbers
     let filled = |m: lang::Msg, args: &[lang::Arg]| {
-        let mut line = Line::new();
-        lang::fill_text(lang::text_in(l, m), args, &mut |b: &[u8]| {
-            line.s(b);
-        });
-        text_w(line.get(), 1)
+        let mut widest = 0;
+        for i in 0..lang::form_count(l, m) {
+            let mut line = Line::new();
+            lang::fill_form_in(l, m, i, args, &mut |b: &[u8]| {
+                line.s(b);
+            });
+            widest = widest.max(text_w(line.get(), 1));
+        }
+        widest
     };
     let mut check = |id: &str, w: i32, room: i32| {
         if w > room {
@@ -1600,8 +1764,8 @@ pub(super) fn fit_report(l: lang::Lang, bad: &mut dyn FnMut(&str, i32, i32)) {
     }
     check(name(lang::Msg::SetPixels), filled(lang::Msg::SetPixels, &[lang::Arg::N(3840), lang::Arg::N(2160)]), sw - 28);
     check(name(lang::Msg::SetConnected), filled(lang::Msg::SetConnected, &[lang::Arg::S(b"255.255.255.255")]), sw - 28);
-    check(name(lang::Msg::SetCores), filled(lang::Msg::SetCores, &[lang::Arg::N(64), lang::Arg::N(65536)]), sw - 28);
-    check(name(lang::Msg::SetBooted), filled(lang::Msg::SetBooted, &[lang::Arg::N(99999), lang::Arg::N(9999999)]), sw - 28);
+    check(name(lang::Msg::SetCores), filled(lang::Msg::SetCores, &[lang::Arg::G(64), lang::Arg::Mem(1046118)]), sw - 28);
+    check(name(lang::Msg::SetBooted), filled(lang::Msg::SetBooted, &[lang::Arg::G(99999), lang::Arg::G(9999999)]), sw - 28);
     // About
     let aw = HOME[App::About as usize].2;
     check(name(lang::Msg::AboutMotto), w_of(lang::Msg::AboutMotto), aw - 20);
@@ -1611,9 +1775,9 @@ pub(super) fn fit_report(l: lang::Lang, bad: &mut dyn FnMut(&str, i32, i32)) {
     check(name(lang::Msg::AboutDesktopIs), w_of(lang::Msg::AboutDesktopIs), aw - vx - 10);
     for arch in [lang::Msg::AboutArm, lang::Msg::AboutPc] {
         let a = lang::text_in(l, arch);
-        check(name(lang::Msg::AboutDeviceIs), filled(lang::Msg::AboutDeviceIs, &[lang::Arg::S(a), lang::Arg::N(64)]), aw - vx - 10);
+        check(name(lang::Msg::AboutDeviceIs), filled(lang::Msg::AboutDeviceIs, &[lang::Arg::S(a), lang::Arg::G(64)]), aw - vx - 10);
     }
-    check(name(lang::Msg::AboutMemoryIs), filled(lang::Msg::AboutMemoryIs, &[lang::Arg::N(16384), lang::Arg::N(999999)]), aw - vx - 10);
+    check(name(lang::Msg::AboutMemoryIs), filled(lang::Msg::AboutMemoryIs, &[lang::Arg::Mem(1046118), lang::Arg::G(999999)]), aw - vx - 10);
     // Files: the header and the preview pane
     let fw = HOME[App::Files as usize].2;
     let split = (fw * 46 / 100).max(150);
@@ -1624,7 +1788,7 @@ pub(super) fn fit_report(l: lang::Lang, bad: &mut dyn FnMut(&str, i32, i32)) {
     for m in [lang::Msg::FilesWasm, lang::Msg::FilesRunIt, lang::Msg::FilesBinary, lang::Msg::FilesSelect] {
         check(name(m), w_of(m), pane);
     }
-    check(name(lang::Msg::FilesBytes), filled(lang::Msg::FilesBytes, &[lang::Arg::N(99999999)]), pane);
+    check(name(lang::Msg::FilesBytes), filled(lang::Msg::FilesBytes, &[lang::Arg::G(99999999)]), pane);
     // the title bar's red button, the window names under the Circle's tiles and on the lintel
     // the narrowest app title (icon, a cut name, the unsigned mark, Close anyway, the buttons) in this language fits
     // the cell window's home width, so the window can always be made wide enough for the mark to stay whole
@@ -1633,17 +1797,18 @@ pub(super) fn fit_report(l: lang::Lang, bad: &mut dyn FnMut(&str, i32, i32)) {
         check(name(m), w_of(m), 84);
     }
     // the clock's second line on the Spine
-    for m in [lang::Msg::ClockUtc, lang::Msg::ClockAm, lang::Msg::ClockPm] {
-        check(name(m), w_of(m), SPINE_P - 6);
+    check(name(lang::Msg::ClockUtc), w_of(lang::Msg::ClockUtc), SPINE_P - 6);
+    for (what, t) in [("am", locale::am(l)), ("pm", locale::pm(l))] {
+        check(what, text_w(t, 1), SPINE_P - 6);
     }
     // the Circle's information box (on the current screen)
     let (_, _, iw, _) = circle_info_box();
-    let sum = filled(lang::Msg::CircleSummary, &[lang::Arg::S(b"192.168.10.200"), lang::Arg::N(16384), lang::Arg::N(64)]);
+    let sum = filled(lang::Msg::CircleSummary, &[lang::Arg::S(b"192.168.10.200"), lang::Arg::Mem(1046118), lang::Arg::G(64)]);
     // the summary is cut with ".." when it is too wide (launcher), so only the label is a fit error here; the
     // widest line is printed by `desk lang fit` as a note
     let _ = sum;
     check(name(lang::Msg::CircleDevice), w_of(lang::Msg::CircleDevice), iw - 28 - 60);
-    check(name(lang::Msg::CircleUp), filled(lang::Msg::CircleUp, &[lang::Arg::N(999999)]), iw - 28);
+    check(name(lang::Msg::CircleUp), filled(lang::Msg::CircleUp, &[lang::Arg::G(999999)]), iw - 28);
     // the power panel (the designer's sizes, 14 Nov: power_box and power_buttons at UI scale 1): 240 px, text 14 px
     // in, so 212 px a line; the menu's buttons are 212 px with the word centred; the confirm's two are 101 px
     for m in [lang::Msg::PowerTitle, lang::Msg::PowerOffAsk, lang::Msg::PowerRestartAsk, lang::Msg::PowerUnsaved] {
@@ -1658,8 +1823,7 @@ pub(super) fn fit_report(l: lang::Lang, bad: &mut dyn FnMut(&str, i32, i32)) {
     }
     // the Terminal's scrolled-back chip (top right, sized to its text) within the body at its home width
     let tw = HOME[App::Terminal as usize].2 - 120;
-    check(name(lang::Msg::TermBackOne), w_of(lang::Msg::TermBackOne) + 12, tw);
-    check(name(lang::Msg::TermBack), filled(lang::Msg::TermBack, &[lang::Arg::N(2048)]) + 12, tw);
+    check(name(lang::Msg::TermBack), filled(lang::Msg::TermBack, &[lang::Arg::G(2048)]) + 12, tw);
     // the notices panel
     let nw = 280;
     for m in [lang::Msg::NotesTitle, lang::Msg::NotesNone, lang::Msg::NoteWelcome] {
@@ -1736,7 +1900,7 @@ fn launcher() {
     }
     let files = (0..crate::vfs::MAX_FILES).filter(|&i| crate::vfs::is_used(i)).count() as u64;
     let mut sum = Line::new();
-    sum.f(lang::Msg::CircleSummary, &[lang::Arg::S(l.get()), lang::Arg::N(crate::ram_mib()), lang::Arg::N(files)]);
+    sum.f(lang::Msg::CircleSummary, &[lang::Arg::S(l.get()), lang::Arg::Mem(crate::ram_mib()), lang::Arg::G(files)]);
     let l = sum;
     let x0 = text(ix + 14, iy + 10, lang::t(lang::Msg::CircleDevice), GOLD_DEEP, 1);
     // a long address and a big memory can be wider than the box on a small screen (desk lang fit found it in
@@ -1747,7 +1911,7 @@ fn launcher() {
         text(end + 1, iy + 10, b"..", DIM, 1);
     }
     let mut l = Line::new();
-    l.f(lang::Msg::CircleUp, &[lang::Arg::N(now_ticks() / 100)]);
+    l.f(lang::Msg::CircleUp, &[lang::Arg::G(now_ticks() / 100)]);
     text(ix + 14, iy + 26, l.get(), DIM, 1);
 }
 
@@ -1817,7 +1981,7 @@ fn notes_panel() {
         let i = (s.nnotes - 1 - k) % NNOTE;
         let yy = ny + 28 + k as i32 * 18;
         chip(nx + 14, yy + 2, 4, 4, 1, GOLD_DEEP);
-        text(nx + 24, yy, &s.notes[i][..s.note_len[i]], TEXT, 1);
+        prose(|| text(nx + 24, yy, &s.notes[i][..s.note_len[i]], TEXT, 1));
     }
 }
 
@@ -1852,7 +2016,7 @@ fn toast_rect() -> Option<Rect> {
         return None;
     }
     let i = (s.nnotes - 1) % NNOTE;
-    let w = text_w(&s.notes[i][..s.note_len[i]], 1) + 40;
+    let w = prose(|| text_w(&s.notes[i][..s.note_len[i]], 1)) + 40;
     // pointer: the top right corner; touch: a snackbar at the foot, never over a lintel
     // (design review D2)
     let sw = spine_w();
@@ -1869,7 +2033,7 @@ fn toast() {
     cut_a(x, y, w, 28, 6, 0, 6, 0, SURFACE2, if look::glass() { look::GLASS_ALPHA } else { 255 });
     cut_frame(x, y, w, 28, 6, 0, 6, 0, GOLD_DARK);
     chip(x + 12, y + 10, 8, 8, 2, GOLD);
-    text(x + 28, y + 10, msg, TEXT, 1);
+    prose(|| text(x + 28, y + 10, msg, TEXT, 1));
 }
 
 /// Draw the whole desktop into the shared framebuffer.
@@ -1890,6 +2054,11 @@ pub(super) fn draw() {
     }
     if s.lang_list {
         lang_list();
+    }
+    // the resize or snap outline (section 33): where the window goes on release
+    if let Some(g) = ghost() {
+        cut_frame(g.0, g.1, g.2, g.3, 0, 0, 0, 0, GOLD);
+        cut_frame(g.0 + 1, g.1 + 1, g.2 - 2, g.3 - 2, 0, 0, 0, 0, GOLD);
     }
     // the power panel last, opaque: its words are never under glass (the architect, 14 Nov)
     if s.power > 0 {
@@ -1942,6 +2111,11 @@ pub(super) fn draw_damage(boxes: &[Rect]) {
         if s.lang_list && touches(panel_box(lang_list_box()), r) {
             lang_list();
         }
+        // the resize or snap outline (section 33): where the window goes on release
+        if let Some(g) = ghost() {
+            cut_frame(g.0, g.1, g.2, g.3, 0, 0, 0, 0, GOLD);
+            cut_frame(g.0 + 1, g.1 + 1, g.2 - 2, g.3 - 2, 0, 0, 0, 0, GOLD);
+        }
         // the power panel last, opaque: its words are never under glass (the architect, 14 Nov)
         if s.power > 0 && touches(panel_box(power_box()), r) {
             power_panel();
@@ -1964,7 +2138,7 @@ fn fnv(h: u64, b: &[u8]) -> u64 {
 
 /// A hash of the screen's pixels in (x, y, w, h), leaving out those `skip` says.
 fn screen_hash(x: i32, y: i32, w: i32, h: i32, skip: &dyn Fn(i32, i32) -> bool) -> u64 {
-    let (cw, ch) = (W(), H());
+    let (cw, ch) = (pw(), ph()); // physical pixels: the probes' boxes are the same at 1x
     let p = crate::canvas::pixels();
     let mut hsh = 0xcbf2_9ce4_8422_2325u64;
     for yy in y.max(0)..(y + h).min(ch) {
@@ -1982,12 +2156,12 @@ fn screen_hash(x: i32, y: i32, w: i32, h: i32, skip: &dyn Fn(i32, i32) -> bool) 
 /// The visual order of a line as `desk shape hex` prints it (SHAPING_PLAN.md C1): characters after the explicit
 /// controls are dropped, the paragraph level, each character's level (x for a boundary-neutral one), the order left
 /// to right, the width at cap 9 and the oracle hash.
-pub(super) fn shape_report(b: &[u8]) {
+pub(super) fn shape_report(b: &[u8], kind: shape::Text) {
     let mut cps = [0u32; bidi::MAX];
     let (mut n, mut i, mut dropped) = (0, 0, 0);
     while i < b.len() {
         let cp = vector::next_char(b, &mut i);
-        if bidi::is_explicit(cp) {
+        if kind == shape::Text::Identity && bidi::is_embedding(cp) {
             dropped += 1;
         } else if n < bidi::MAX {
             cps[n] = cp;
@@ -1997,7 +2171,7 @@ pub(super) fn shape_report(b: &[u8]) {
     let mut levels = [0u8; bidi::MAX];
     let para = bidi::resolve(&cps[..n], None, &mut levels[..n]);
     let mut order = [0u16; bidi::MAX];
-    let m = bidi::reorder(&levels[..n], &mut order[..n]);
+    let m = bidi::reorder_by(&levels[..n], &mut order[..n], &|k| bidi::class(cps[k]) == bidi::B);
     crate::kprint!("[desk] shape: {} chars, {} dropped, paragraph {}, levels", n, dropped, para);
     for &lv in &levels[..n] {
         if lv == bidi::REMOVED {

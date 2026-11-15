@@ -34,7 +34,7 @@ grade() { # grade <boot1> <boot2> <boot3> <block bytes> <host check log>
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     C="$(tr -d '\r' < "$3" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     if [ "$bs" = 512 ]; then nb=32768; k=128; c=32; p=127; else nb=4096; k=16; c=4; p=15; fi
-    has() { printf '%s\n' "$2" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$2"; }
     has "^\[nvme\] namespace 1: $nb blocks of $bs B \(16 MiB\), ours \(AFRIVFS1\): used for storage$" "$A" || _f "boot 1: the disk was not taken as ours"
     has "^\[nvme\] multi-block reads on \(up to $k blocks per read, $c per command; the first $k equal one at a time\)$" "$A" ||
         _f "boot 1: 64 KiB reads were not checked and switched on ($k blocks per read, $c per command)"
@@ -75,7 +75,7 @@ grade() { # grade <boot1> <boot2> <boot3> <block bytes> <host check log>
     has "^KEEP-$bs$" "$C" || _f "boot 3: keep.txt is missing"
     has '^ *\[wasm app\] print\(90\) = 0x5a$' "$C" || _f "boot 3: big.wasm no longer runs to its last byte"
     [ -r "$5" ] && grep -aqx 'mkvfs-big: check OK' "$5" || _f "host: the original files' sectors are not exactly as written ($(head -1 "$5" 2> /dev/null))"
-    if printf '%s\n%s\n%s\n' "$A" "$B" "$C" | grep -aqE "$BAD"; then
+    if grep -aqE "$BAD" <<< "$A"$'\n'"$B"$'\n'"$C"; then
         _f "$(printf '%s\n%s\n%s\n' "$A" "$B" "$C" | grep -aE "$BAD" | head -1)"
     fi
     return "$fail"

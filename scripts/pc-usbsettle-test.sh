@@ -29,8 +29,8 @@ grade() { # grade <serial>
     if [ -z "$line" ]; then
         _f "no power-on wait line at boot"
     else
-        printf '%s\n' "$line" | grep -aq '^\[xhci\] ports steady after' || _f "the ports did not end steady: $line"
-        printf '%s\n' "$line" | grep -aqE ': 2 of [0-9]+ with a device$' || _f "the wait did not count the 2 devices: $line"
+        grep -aq '^\[xhci\] ports steady after' <<< "$line" || _f "the ports did not end steady: $line"
+        grep -aqE ': 2 of [0-9]+ with a device$' <<< "$line" || _f "the wait did not count the 2 devices: $line"
         ms="$(printf '%s\n' "$line" | sed -E 's/.* after ([0-9]+) ms.*/\1/')"
         { [ "$ms" -ge 150 ] && [ "$ms" -le 1000 ]; } || _f "the wait took $ms ms (150 to 1000 expected)"
     fi

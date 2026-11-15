@@ -49,7 +49,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log>
         _f "boot 1: a wrong code was not refused"
     has "$(blk "$A" 'installpart nvme')" 'installpart: say the disk and the size in MiB, .*' || _f "boot 1: no usage line without a size"
     has "$A" 'harness: disk images unchanged' || _f "boot 1: a disk image changed before the code was typed"
-    printf '%s\n' "$A" | grep -aqE 'partition written' && _f "boot 1: something was written"
+    grep -aqE 'partition written' <<< "$A" && _f "boot 1: something was written"
     local B1 B2 B3 B4
     B1="$(blk "$B" "installpart nvme 8 yes $CODE")"
     has "$B1" "installpart: AfriSovera's partition written as GPT entry 5, LBA 100352-116735 \(8 MiB\), in both GPT copies, read back OK; no other partition was changed" ||
@@ -67,7 +67,7 @@ grade() { # grade <boot1 log> <boot2 log> <boot3 log>
     has "$B" 'harness: other disk images unchanged' || _f "boot 2: another disk image changed"
     has "$(blk "$C" 'lsparts')" '  part 5: AfriSovera, LBA 100352-116735 \(8 MiB\), "AfriSovera"' || _f "boot 3: entry 5 is gone after a fresh boot"
     has "$C" 'harness: nvme image unchanged by the boot' || _f "boot 3: the firmware or kernel changed the disk on a fresh boot"
-    if printf '%s\n' "$A" "$B" "$C" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci|xhci)\] .*(failed|timed out)|FAILED'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci|xhci)\] .*(failed|timed out)|FAILED' <<< "$A"$'\n'"$B"$'\n'"$C"; then
         _f "the kernel panicked or a disk command failed"
     fi
     return "$fail"

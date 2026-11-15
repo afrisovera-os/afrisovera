@@ -33,8 +33,8 @@ grade() { # grade <boot1 log> <boot2 log> <blocks> <block bytes> <blocks per com
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqE "$1"; }
-    hasB() { printf '%s\n' "$B" | grep -aqE "$1"; }
+    hasA() { grep -aqE "$1" <<< "$A"; }
+    hasB() { grep -aqE "$1" <<< "$B"; }
     hasA "^\[nvme\] namespace 1: $nb blocks of $bs B \(8 MiB\), blank: not used unless claimed \(claimdisk nvme\)$" ||
         _f "boot 1: the blank $bs-byte-block NVMe drive was not identified (and kept unused until claimed)"
     hasA '^claimdisk: the blank nvme disk now holds AfriSovera.s files$' || _f "boot 1: claimdisk nvme did not take the blank drive"
@@ -66,7 +66,7 @@ grade() { # grade <boot1 log> <boot2 log> <blocks> <block bytes> <blocks per com
     hasA '^\[vfs\] synced [0-9]+ files to disk$' || _f "boot 1: the VFS never synced to the NVMe drive"
     hasB '^\[vfs\] VFS restored from disk: [0-9]+ files$' || _f "boot 2: the VFS was not restored from the NVMe drive"
     hasB "^$word$" || _f "boot 2: notes.txt did not come back from the NVMe drive"
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE "$BAD"; then
+    if grep -aqE "$BAD" <<< "$A"$'\n'"$B"; then
         _f "$(printf '%s\n%s\n' "$A" "$B" | grep -aE "$BAD" | head -1)"
     fi
     return "$fail"

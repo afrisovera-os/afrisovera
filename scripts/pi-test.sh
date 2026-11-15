@@ -78,7 +78,7 @@ wait "$QPID" 2>/dev/null
 # of when each grep ran (2.770 measured a MISS following a HIT on a still-growing
 # log in `smp`; see scripts/smp-test.sh).
 SNAP="$(cat "$OUT")"
-have() { printf '%s\n' "$SNAP" | grep -qE "$1"; }
+have() { grep -qE "$1" <<< "$SNAP"; }
 
 have "Pi MMU on" || { echo "PI TEST FAILED (MMU/boot)"; exit 1; }
 have "hardware timebase OK" || { echo "PI TEST FAILED (polled timebase)"; exit 1; }

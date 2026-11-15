@@ -27,7 +27,7 @@ grade() { # grade <boot1> <boot2>
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$2" | grep -aqE "$1"; }
+    has() { grep -aqE "$1" <<< "$2"; }
     # the part of boot 1 before `nvmetest lose`, and the part after it
     local A1 A2
     A1="$(printf '%s\n' "$A" | awk '/^afrisovera> nvmetest lose/{exit} {print}')"
@@ -53,7 +53,7 @@ grade() { # grade <boot1> <boot2>
     has '^MSIX-ON$' "$B" || _f "boot 2: a.txt (saved with MSI-X on) did not come back"
     has '^MSIX-LOST$' "$B" || _f "boot 2: b.txt (saved after the interrupt was lost) did not come back"
     has "$ON_RE" "$B" || _f "boot 2: MSI-X is not on again at the new start"
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE "$BAD"; then
+    if grep -aqE "$BAD" <<< "$A"$'\n'"$B"; then
         _f "$(printf '%s\n%s\n' "$A" "$B" | grep -aE "$BAD" | head -1)"
     fi
     return "$fail"

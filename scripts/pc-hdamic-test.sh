@@ -45,14 +45,14 @@ grade() { # grade <serial log>
     has "\[hda\] recorded .*: peak ([0-9]|[1-5][0-9]|6[0-3]) of 32767, average [0-9]+" || _f "the silent recording has a loud peak"
     has '\[mic\] done; .mic play. plays it back' || _f "mic record did not finish"
     has '\[mic\] playing back 44100 samples recorded at 44100 Hz' || _f "mic play did not start with the 44100 samples"
-    printf '%s\n' "$S" | sed -n '/^\[mic\] playing back/,$p' | grep -aqE "^\[hda\] played 44100 samples \(44 periods, ~1000 ms\) at 44100 Hz through $P\$" ||
+    grep -aqE "^\[hda\] played 44100 samples \(44 periods, ~1000 ms\) at 44100 Hz through $P\$" <<< "$(sed -n '/^\[mic\] playing back/,$p' <<< "$S")" ||
         _f "the recording was not played back in full through the output path"
     has '\[mic\] played back' || _f "mic play did not finish"
-    if printf '%s\n' "$S" | grep -aqE '^\[hda\] (the (input|output) stream|no microphone input|HD Audio controller found but not usable)|^mic: no '; then
+    if grep -aqE '^\[hda\] (the (input|output) stream|no microphone input|HD Audio controller found but not usable)|^mic: no ' <<< "$S"; then
         _f "a stream stuck, or the microphone or controller was refused"
     fi
-    if printf '%s\n' "$S" | grep -aqE 'fell behind'; then _f "the recorder fell behind the DMA"; fi
-    if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
+    if grep -aqE 'fell behind' <<< "$S"; then _f "the recorder fell behind the DMA"; fi
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$S"; then _f "the kernel panicked"; fi
     return "$fail"
 }
 

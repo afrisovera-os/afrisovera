@@ -21,7 +21,7 @@ grade() { # grade <serial log>
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    has() { printf '%s\n' "$S" | grep -qE -e "$1"; }
+    has() { grep -qE -e "$1" <<< "$S"; }
     has '^wifi selftest: the Wi-Fi crypto against its published test vectors \(nothing is sent or changed\)' || _f "wifi selftest did not start"
     IFS='|' read -ra fam <<< "$COUNTS"
     for c in "${fam[@]}"; do

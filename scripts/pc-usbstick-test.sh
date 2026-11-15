@@ -19,25 +19,35 @@ grade() { # grade <boot1 log> <boot2 log>
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqE "$1"; }
-    hasB() { printf '%s\n' "$B" | grep -aqE "$1"; }
+    hasA() { grep -aqE "$1" <<< "$A"; }
+    hasB() { grep -aqE "$1" <<< "$B"; }
+    # boot 1 before its first test switch: the counters the switches raise must be zero there (the closing lsusb
+    # of the V2 sync check shows them raised, after the switches, which is right)
+    PRE="$(printf '%s\n' "$A" | sed '/^afrisovera> lsusb late/,$d')"
+    hasPre() { grep -aqE "$1" <<< "$PRE"; }
     hasA '^\[xhci\] port [0-9]+: USB storage [0-9a-f]{4}:[0-9a-f]{4} ".*", 16384 blocks of 512 B \(8 MiB\), blank or ours: used for storage$' ||
         _f "boot 1: the blank USB stick was not identified and chosen for storage"
     hasA '^\[ahci\] port 0: SATA disk, [0-9]+ sectors .*left alone$' || _f "boot 1: the boot disk was not found, or not left alone"
     hasA '^  storage: slot [0-9]+, 16384 blocks of 512 B  <- storage$' || _f "lsusb does not list the stick as storage"
     hasA '^lsusb late: 2 answers were left unread; the next read of block 0 passed \(same data\), 2 late event\(s\) set aside, 0 recoveries: OK$' ||
         _f "lsusb late: a late answer was taken as a later transfer's, or the check did not run"
-    hasA '^  storage: [0-9]+ late transfer event' && _f "a late transfer event was seen before the test switch ran"
+    hasPre '^  storage: [0-9]+ late transfer event' && _f "a late transfer event was seen before the test switch ran"
     hasA '^lsusb late0: an answer was left unread on endpoint 0; the next request passed \(descriptor of 18 bytes, type 1\), took its own answer, 1 late event\(s\) set aside: OK$' ||
         _f "lsusb late0: a late endpoint 0 answer was taken as a later request's, or the check did not run"
-    hasA '^  control: [0-9]+ late endpoint 0 answer' && _f "a late endpoint 0 answer was seen before the test switch ran"
+    hasPre '^  control: [0-9]+ late endpoint 0 answer' && _f "a late endpoint 0 answer was seen before the test switch ran"
     hasA '^lsusb stall0: a request the device refuses was refused \(completion code 6\); endpoint 0 was reset 1 time\(s\); the next request passed \(descriptor of 18 bytes, type 1\): OK$' ||
         _f "lsusb stall0: endpoint 0 was left halted after a STALL, or the check did not run"
-    hasA '^  control: endpoint 0 reset [0-9]+ time' && _f "endpoint 0 was halted and reset before the test switch ran"
+    hasPre '^  control: endpoint 0 reset [0-9]+ time' && _f "endpoint 0 was halted and reset before the test switch ran"
     hasA '^\[vfs\] synced [0-9]+ files to disk$' || _f "boot 1: the VFS never synced to the stick"
+    # AFR-0011 V2 (14 Nov 2026): QEMU's stick says WCE in MODE SENSE page 8, so a sync sends SYNCHRONIZE CACHE
+    hasA '^\[xhci\] port [0-9]+: USB storage write cache: on \(MODE SENSE page 8, WCE\): a sync ends with SYNCHRONIZE CACHE$' ||
+        _f "boot 1: the stick's write cache was not found on (QEMU's scsi-disk reports WCE)"
+    hasA '^lsusb sync: flushed \(SYNCHRONIZE CACHE passed\)$' || _f "boot 1: lsusb sync did not flush the stick"
+    hasA '^  storage write cache: on \(SYNCHRONIZE CACHE at each sync\); syncs: 1 flushed, 0 write-through, 0 unknown, 0 refused, 0 failed$' ||
+        _f "boot 1: lsusb does not count one flushed sync"
     hasB '^\[vfs\] VFS restored from disk: [0-9]+ files$' || _f "boot 2: the VFS was not restored from the stick"
     hasB '^HELLO-USB-STICK-5NOV$' || _f "boot 2: notes.txt did not come back from the stick"
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|did not report its capacity|^\[xhci\] .*(failed|timed out)'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|did not report its capacity|^\[xhci\] .*(failed|timed out)' <<< "$A"$'\n'"$B"; then
         _f "$(printf '%s\n%s\n' "$A" "$B" | grep -aE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|did not report its capacity|^\[xhci\] .*(failed|timed out)' | head -1)"
     fi
     return "$fail"
@@ -55,7 +65,16 @@ lsusb late0: an answer was left unread on endpoint 0; the next request passed (d
 afrisovera> lsusb stall0
 lsusb stall0: a request the device refuses was refused (completion code 6); endpoint 0 was reset 1 time(s); the next request passed (descriptor of 18 bytes, type 1): OK
 afrisovera> write notes.txt HELLO-USB-STICK-5NOV
-[vfs] synced 18 files to disk"
+[vfs] synced 18 files to disk
+afrisovera> lsusb sync
+lsusb sync: flushed (SYNCHRONIZE CACHE passed)
+afrisovera> lsusb
+  storage: slot 1, 16384 blocks of 512 B  <- storage
+  storage write cache: on (SYNCHRONIZE CACHE at each sync); syncs: 1 flushed, 0 write-through, 0 unknown, 0 refused, 0 failed
+  storage: 2 late transfer event(s) set aside, not taken as a later transfer's
+  control: 1 late endpoint 0 answer(s) set aside, not taken as a later request's
+  control: endpoint 0 reset 1 time(s) after the controller halted it"
+B1="$(printf '%s\n%s\n' '[xhci] port 1: USB storage write cache: on (MODE SENSE page 8, WCE): a sync ends with SYNCHRONIZE CACHE' "$B1")"
 B2="[vfs] VFS restored from disk: 18 files
 afrisovera> cat notes.txt
 HELLO-USB-STICK-5NOV"
@@ -90,9 +109,12 @@ selftest() {
     arm stall0-halted red "$(printf '%s\n' "$B1" | sed 's/^lsusb stall0: .*/lsusb stall0: a request the device refuses was refused (completion code 6); endpoint 0 was reset 0 time(s); the next request FAILED (descriptor of 0 bytes, type 0): WRONG/')" "$B2"
     arm no-stall0-check red "$(printf '%s\n' "$B1" | grep -v '^lsusb stall0')" "$B2"
     arm stall0-at-boot red "$(printf '%s\n' "$B1" | sed 's/^  storage: slot.*/&\n  control: endpoint 0 reset 1 time(s) after the controller halted it/')" "$B2"
+    arm cache-unknown red "$(printf '%s\n' "$B1" | sed 's/write cache: on (MODE SENSE page 8, WCE).*/write cache: unknown (MODE SENSE page 8 not answered): treated as write-through, its saves cannot be confirmed/')" "$B2"
+    arm sync-failed red "$(printf '%s\n' "$B1" | sed 's/^lsusb sync: .*/lsusb sync: FAILED (a write or SYNCHRONIZE CACHE did not pass)/')" "$B2"
+    arm no-sync-count red "$(printf '%s\n' "$B1" | sed 's/syncs: 1 flushed/syncs: 0 flushed/')" "$B2"
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 19 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 22 ]
 }
 
 echo "== PC USBSTICK disk (PC track step 3) =="
@@ -127,10 +149,10 @@ boot() { # boot <serial port> <log> <shell commands...>
     wait "$q" 2> /dev/null
 }
 echo "  --- boot 1: lsusb, lsusb late, lsusb late0, lsusb stall0, write notes.txt, sync ---"
-boot 4824 "$W/boot1.log" "lsusb" "lsusb late" "lsusb late0" "lsusb stall0" "write notes.txt HELLO-USB-STICK-5NOV" "sync"
+boot 4824 "$W/boot1.log" "lsusb" "lsusb late" "lsusb late0" "lsusb stall0" "write notes.txt HELLO-USB-STICK-5NOV" "sync" "lsusb sync" "lsusb"
 echo "  --- boot 2: the same disk, cat notes.txt ---"
 boot 4826 "$W/boot2.log" "cat notes.txt"
-cat "$W/boot1.log" "$W/boot2.log" | tr -d '\r' | grep -aE 'USB storage|^  storage:|^  control:|^lsusb late|^\[vfs\]|HELLO' | sed 's/^/  | /'
+cat "$W/boot1.log" "$W/boot2.log" | tr -d '\r' | grep -aE 'USB storage|^  storage|^  control:|^lsusb (late|sync)|^\[vfs\]|HELLO' | sed 's/^/  | /'
 
 echo "  --- grading ---"
 if grade "$W/boot1.log" "$W/boot2.log"; then

@@ -33,8 +33,8 @@ grade() { # grade <boot1 log> <boot2 log> <word>
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqE "$1"; }
-    hasB() { printf '%s\n' "$B" | grep -aqE "$1"; }
+    hasA() { grep -aqE "$1" <<< "$A"; }
+    hasB() { grep -aqE "$1" <<< "$B"; }
     hasA '^\[ahci\] port 0: SATA disk, [0-9]+ sectors .*left alone$' || _f "boot 1: the boot disk on port 0 was not found, or not left alone"
     hasA '^\[ahci\] port 2: SATA disk, 16384 sectors \(8 MiB\), blank: not used unless claimed \(claimdisk sata\)$' ||
         _f "boot 1: the blank 8 MiB disk on port 2 was not identified (and kept unused until claimed)"
@@ -69,7 +69,7 @@ grade() { # grade <boot1 log> <boot2 log> <word>
     hasA '^\[vfs\] synced [0-9]+ files to disk$' || _f "boot 1: the VFS never synced to the SATA disk"
     hasB '^\[vfs\] VFS restored from disk: [0-9]+ files$' || _f "boot 2: the VFS was not restored from the SATA disk"
     hasB "^$word$" || _f "boot 2: notes.txt did not come back from the SATA disk"
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE "$BAD"; then
+    if grep -aqE "$BAD" <<< "$A"$'\n'"$B"; then
         _f "$(printf '%s\n%s\n' "$A" "$B" | grep -aE "$BAD" | head -1)"
     fi
     return "$fail"

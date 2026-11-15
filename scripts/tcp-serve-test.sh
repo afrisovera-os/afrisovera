@@ -154,13 +154,13 @@ for want in "state LISTEN" \
             "serve: exchange 3" \
             "serve: exchange $EXCHANGES" \
             "serve: $EXCHANGES exchange(s) on one connection"; do
-    if ! echo "$SER" | grep -qF "$want"; then
+    if ! grep -qF "$want" <<< "$SER"; then
         echo "  serial is missing: $want"
         FAIL=1
     fi
 done
 # The peer FINs once its exchanges are done, so this end closes from CLOSE_WAIT.
-if ! echo "$SER" | grep -qE "state (CLOSE_WAIT|LAST_ACK|TIME_WAIT)"; then
+if ! grep -qE "state (CLOSE_WAIT|LAST_ACK|TIME_WAIT)" <<< "$SER"; then
     echo "  serial never shows the connection closing (CLOSE_WAIT/LAST_ACK/TIME_WAIT)"
     FAIL=1
 fi
@@ -169,7 +169,7 @@ for bad in "usage: net tcp serve" \
            "no SYN arrived on port" \
            "serve: RX starved" \
            "did NOT close cleanly"; do
-    if echo "$SER" | grep -qF "$bad"; then
+    if grep -qF "$bad" <<< "$SER"; then
         echo "  serial reports a failed serve: $bad"
         FAIL=1
     fi

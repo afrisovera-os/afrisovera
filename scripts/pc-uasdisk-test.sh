@@ -24,20 +24,27 @@ grade() { # grade <boot1 log> <boot2 log> <the image's first 8 bytes after boot 
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqE "$1"; }
-    hasB() { printf '%s\n' "$B" | grep -aqE "$1"; }
+    hasA() { grep -aqE "$1" <<< "$A"; }
+    hasB() { grep -aqE "$1" <<< "$B"; }
     hasA '^\[xhci\] port [0-9]+: USB disk [0-9a-f]{4}:[0-9a-f]{4} speaks only UAS: driven over USB Attached SCSI \(high speed, four pipes, no streams\)$' ||
         _f "boot 1: the UAS-only disk was not driven over UAS"
     hasA '^\[xhci\] port [0-9]+: USB storage [0-9a-f]{4}:[0-9a-f]{4} ".*", 16384 blocks of 512 B \(8 MiB\), blank or ours: used for storage$' ||
         _f "boot 1: the blank UAS disk was not identified (INQUIRY, READ CAPACITY) and chosen for storage"
     hasA '^  storage: slot [0-9]+, 16384 blocks of 512 B  <- storage$' || _f "lsusb does not list the UAS disk as storage"
-    hasA '^  storage transport: UAS \(USB Attached SCSI, four pipes, no streams\), 0 recoveries$' ||
+    hasA '^  storage transport: UAS \(USB Attached SCSI, four pipes, no streams\), 0 recoveries$' &&
+        ! grep -aqE '^  storage transport: .*, [1-9][0-9]* recoveries$' <<< "$A" ||
         _f "lsusb does not show the UAS transport with no recoveries"
     hasA '^\[vfs\] synced [0-9]+ files to disk$' || _f "boot 1: the VFS never synced to the UAS disk"
+    # AFR-0011 V2 (14 Nov 2026): MODE SENSE page 8 and SYNCHRONIZE CACHE over UAS
+    hasA '^\[xhci\] port [0-9]+: USB storage write cache: on \(MODE SENSE page 8, WCE\): a sync ends with SYNCHRONIZE CACHE$' ||
+        _f "boot 1: the UAS disk's write cache was not found on (QEMU's scsi-disk reports WCE)"
+    hasA '^lsusb sync: flushed \(SYNCHRONIZE CACHE passed\)$' || _f "boot 1: lsusb sync did not flush the UAS disk"
+    hasA '^  storage write cache: on \(SYNCHRONIZE CACHE at each sync\); syncs: 1 flushed, 0 write-through, 0 unknown, 0 refused, 0 failed$' ||
+        _f "boot 1: lsusb does not count one flushed sync"
     hasB '^\[vfs\] VFS restored from disk: [0-9]+ files$' || _f "boot 2: the VFS was not restored from the UAS disk"
     hasB '^HELLO-UAS-DISK-12NOV$' || _f "boot 2: notes.txt did not come back from the UAS disk"
     [ "$3" = AFRIVFS1 ] || _f "the UAS disk's image does not start with AFRIVFS1 after boot 1 (it holds '$3')"
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|did not report its capacity|UAS only: needs streams|^\[xhci\] .*(failed|timed out)'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|did not report its capacity|UAS only: needs streams|^\[xhci\] .*(failed|timed out)' <<< "$A"$'\n'"$B"; then
         _f "$(printf '%s\n%s\n' "$A" "$B" | grep -aE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|did not report its capacity|UAS only: needs streams|^\[xhci\] .*(failed|timed out)' | head -1)"
     fi
     return "$fail"
@@ -50,7 +57,15 @@ afrisovera> lsusb
   storage: slot 1, 16384 blocks of 512 B  <- storage
   storage transport: UAS (USB Attached SCSI, four pipes, no streams), 0 recoveries
 afrisovera> write notes.txt HELLO-UAS-DISK-12NOV
-[vfs] synced 18 files to disk"
+[vfs] synced 18 files to disk
+afrisovera> lsusb sync
+lsusb sync: flushed (SYNCHRONIZE CACHE passed)
+afrisovera> lsusb
+  storage: slot 1, 16384 blocks of 512 B  <- storage
+  storage transport: UAS (USB Attached SCSI, four pipes, no streams), 0 recoveries
+  storage write cache: on (SYNCHRONIZE CACHE at each sync); syncs: 1 flushed, 0 write-through, 0 unknown, 0 refused, 0 failed"
+B1="$(printf '%s\n' "$B1" | sed '2a\
+[xhci] port 1: USB storage write cache: on (MODE SENSE page 8, WCE): a sync ends with SYNCHRONIZE CACHE')"
 B2="[vfs] VFS restored from disk: 18 files
 afrisovera> cat notes.txt
 HELLO-UAS-DISK-12NOV"
@@ -78,10 +93,13 @@ selftest() {
     arm file-missing red "$B1" "$(printf '%s\n' "$B2" | grep -v '^HELLO')" AFRIVFS1
     arm image-not-ours red "$B1" "$B2" "zeros"
     arm xhci-failed red "$(printf '%s\n%s\n' "$B1" '[xhci] port 1: configure endpoint failed')" "$B2" AFRIVFS1
+    arm cache-unknown red "$(printf '%s\n' "$B1" | sed 's/write cache: on (MODE SENSE page 8, WCE).*/write cache: unknown (MODE SENSE page 8 not answered): treated as write-through, its saves cannot be confirmed/')" "$B2" AFRIVFS1
+    arm sync-failed red "$(printf '%s\n' "$B1" | sed 's/^lsusb sync: .*/lsusb sync: FAILED (a write or SYNCHRONIZE CACHE did not pass)/')" "$B2" AFRIVFS1
+    arm sync-recovered red "$(printf '%s\n' "$B1" | sed '$s/$/\n  storage transport: UAS (USB Attached SCSI, four pipes, no streams), 1 recoveries/')" "$B2" AFRIVFS1
     arm empty red "" "" ""
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 13 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 16 ]
 }
 
 echo "== PC UASDISK driven (PC track step 3) =="
@@ -118,11 +136,11 @@ boot() { # boot <serial port> <log> <shell commands...>
     wait "$q" 2> /dev/null
 }
 echo "  --- boot 1: lsusb, write notes.txt, sync ---"
-boot 7342 "$W/boot1.log" "lsusb" "write notes.txt HELLO-UAS-DISK-12NOV" "sync"
+boot 7342 "$W/boot1.log" "lsusb" "write notes.txt HELLO-UAS-DISK-12NOV" "sync" "lsusb sync" "lsusb"
 head8="$(head -c 8 "$IMG" | tr -c 'A-Za-z0-9' '.')"
 echo "  --- boot 2: the same disk, cat notes.txt ---"
 boot 7344 "$W/boot2.log" "cat notes.txt"
-cat "$W/boot1.log" "$W/boot2.log" | tr -d '\r' | grep -aE '^\[xhci\] .*(port|storage|UAS)|^  storage|^\[vfs\]|HELLO' | sed 's/^/  | /'
+cat "$W/boot1.log" "$W/boot2.log" | tr -d '\r' | grep -aE '^\[xhci\] .*(port|storage|UAS)|^  storage|^lsusb sync|^\[vfs\]|HELLO' | sed 's/^/  | /'
 echo "  UAS disk image starts with: $head8"
 
 echo "  --- grading ---"

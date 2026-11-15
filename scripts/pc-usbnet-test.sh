@@ -28,7 +28,7 @@ grade() { # grade <serial> <peer log>
     has '^\[net\] DHCP: IP 10\.0\.2\.15, mask 255\.255\.255\.0, gw 10\.0\.2\.2' || _f "no DHCP lease over the USB adapter"
     has '^\[net\] ICMP echo reply from 10\.0\.2\.2 \(ping OK\)$' || _f "no ping reply over the USB adapter"
     has "^\[net\] TCP data round-trip OK" || _f "the TCP data round-trip did not complete"
-    printf '%s\n' "$P" | grep -qF "peer received ${#PAYLOAD} bytes: $PAYLOAD" ||
+    grep -qF "peer received ${#PAYLOAD} bytes: $PAYLOAD" <<< "$P" ||
         _f "the host peer did not receive the exact ${#PAYLOAD}-byte payload"
     local c1 c2
     c1="$(printf '%s\n' "$S" | grep -aoE '^lsvirtio: slot [0-9]+ \(emulated over usb-ecm\) id 1 \(virtio-net\), [0-9]+ frames in, [0-9]+ out$' | sed -n 1p | sed -E 's/.*, ([0-9]+) frames in, ([0-9]+) out$/\1 \2/' | awk '{print $1+$2}')"

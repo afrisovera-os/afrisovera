@@ -75,7 +75,7 @@ EOF
 grade_wav() { # grade_wav <stats line>
     local fail=0 L="$1" tf hz vl vd
     _w() { echo "  FAIL: $*"; fail=1; }
-    printf '%s\n' "$L" | grep -qE '^wav: frames=' || { echo "  FAIL: no sound file to grade ($L)"; return 1; }
+    grep -qE '^wav: frames=' <<< "$L" || { echo "  FAIL: no sound file to grade ($L)"; return 1; }
     tf="$(printf '%s\n' "$L" | sed -nE 's/.* tone_frames=([0-9]+) .*/\1/p')"
     hz="$(printf '%s\n' "$L" | sed -nE 's/.* tone_hz=([0-9]+)\.[0-9] .*/\1/p')"
     vl="$(printf '%s\n' "$L" | sed -nE 's/.* voice_loud=([0-9]+) .*/\1/p')"
@@ -105,11 +105,11 @@ grade() { # grade <serial log>
     has '\[usb-audio\] played 16384 samples \(~371 ms\) as 1783[0-9] frames at 48000 Hz in 37[0-9] packets' || _f "the tone was not played in full (16384 samples -> ~17834 frames, ~372 packets)"
     has '\[audio\] done.*' || _f "audio tone did not finish"
     has '\[say\] speaking: "hello"' || _f "say did not start"
-    printf '%s\n' "$S" | sed -n '/^\[say\] speaking: "hello"$/,$p' | grep -aqE '^\[usb-audio\] played ([5-9][0-9]{3}|[1-9][0-9]{4,}) samples \(~[0-9]+ ms\) as [0-9]+ frames at 48000 Hz in [0-9]+ packets$' ||
+    grep -aqE '^\[usb-audio\] played ([5-9][0-9]{3}|[1-9][0-9]{4,}) samples \(~[0-9]+ ms\) as [0-9]+ frames at 48000 Hz in [0-9]+ packets$' <<< "$(sed -n '/^\[say\] speaking: "hello"$/,$p' <<< "$S")" ||
         _f "say was not played through USB audio"
     has 'usb-audio +[a-z]+ +0x0+ +OK' || _f "usb-audio is not in devices"
-    if printf '%s\n' "$S" | grep -aqE '^\[xhci\] audio: the device stopped|^\[xhci\] port [0-9]+: USB audio .*(not driven|do not fit)'; then _f "the USB audio stream stuck or the device was refused"; fi
-    if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
+    if grep -aqE '^\[xhci\] audio: the device stopped|^\[xhci\] port [0-9]+: USB audio .*(not driven|do not fit)' <<< "$S"; then _f "the USB audio stream stuck or the device was refused"; fi
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$S"; then _f "the kernel panicked"; fi
     return "$fail"
 }
 

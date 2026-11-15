@@ -68,15 +68,15 @@ grade() { # grade <serial capture> <pixel line>
     [ -n "$ks" ] || _f "no USB keyboard was enumerated"
     [ -n "$ms" ] || _f "no USB mouse was enumerated"
     [ -n "$ks" ] && [ -n "$ms" ] && [ "$ks" = "$ms" ] && _f "keyboard and mouse share slot $ks"
-    printf '%s\n' "$S" | grep -aqE '^afrisovera> lsusb$' || _f "lsusb typed on the USB keyboard did not reach the shell"
-    printf '%s\n' "$S" | grep -aqE '^  port [0-9]+: connected, enabled, speed [0-9]+  <- mouse$' || _f "lsusb does not show the mouse's port"
+    grep -aqE '^afrisovera> lsusb$' <<< "$S" || _f "lsusb typed on the USB keyboard did not reach the shell"
+    grep -aqE '^  port [0-9]+: connected, enabled, speed [0-9]+  <- mouse$' <<< "$S" || _f "lsusb does not show the mouse's port"
     local m
     m="$(printf '%s\n' "$S" | grep -aoE '^  mouse: slot [0-9]+, [0-9]+ reports, pointer at [0-9]+,[0-9]+, buttons [01]{3}, [0-9]+ clicks$' | tail -1)"
     if [ -z "$m" ]; then
         _f "lsusb did not report the mouse"
     else
-        printf '%s\n' "$m" | grep -qE 'pointer at 420,300,' || _f "the pointer is not at 420,300: $m"
-        printf '%s\n' "$m" | grep -qE 'buttons 000, 2 clicks$' || _f "expected 2 clicks and no button held: $m"
+        grep -qE 'pointer at 420,300,' <<< "$m" || _f "the pointer is not at 420,300: $m"
+        grep -qE 'buttons 000, 2 clicks$' <<< "$m" || _f "expected 2 clicks and no button held: $m"
     fi
     case "$P" in *"tip=000000 "*) ;; *) _f "no black pointer tip at 420,300 on the screen ($P)" ;; esac
     case "$P" in *"fill=ffffff "*) ;; *) _f "no white pointer fill at 422,305 on the screen ($P)" ;; esac

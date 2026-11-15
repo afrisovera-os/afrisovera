@@ -7,6 +7,9 @@
 # sector), the blank disk is NOT taken on its own (an internal disk is used only once the
 # owner types `claimdisk sata`; after that it carries our marker and boot 2 uses it), and
 # `lsahci` lists both.
+# 14 Nov 2026 (architect's A5 note): QEMU's SATA disk has a volatile write cache, so the driver must say so at boot
+# and end every save with FLUSH CACHE EXT; the closing lsahci of boot 1 must count at least one flush and at most
+# one per save (none would leave the save in the drive's cache when power goes).
 # Runs the same in an ARM walk and a PC walk: it builds the PC kernel and puts the PC shim
 # (scripts/lib/pc-arch) on PATH itself.
 #   scripts/pc-ahci-test.sh              # grader selftest, then the two QEMU boots
@@ -21,8 +24,8 @@ grade() { # grade <boot1 log> <boot2 log>
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqE "$1"; }
-    hasB() { printf '%s\n' "$B" | grep -aqE "$1"; }
+    hasA() { grep -aqE "$1" <<< "$A"; }
+    hasB() { grep -aqE "$1" <<< "$B"; }
     hasA '^\[ahci\] controller [0-9a-f]{2}:[0-9a-f]{2}\.[0-7] \(AHCI [0-9]+\.[0-9]+\), [0-9]+ port\(s\), 2 disk\(s\)$' ||
         _f "boot 1: the controller line does not report 2 disks"
     hasA '^\[ahci\] port 0: SATA disk, [0-9]+ sectors .*left alone$' ||
@@ -34,21 +37,36 @@ grade() { # grade <boot1 log> <boot2 log>
     hasA '^  port 2: 16384 sectors \(8 MiB\)  \(blank: claimdisk sata to use it\)$' ||
         _f "lsahci does not show port 2 as blank and unclaimed"
     hasA '^claimdisk: the blank sata disk now holds AfriSovera.s files$' || _f "boot 1: claimdisk sata did not take the blank disk"
+    hasA '^\[ahci\] port 2: the drive has a volatile write cache: every save and install step ends with FLUSH CACHE EXT$' ||
+        _f "boot 1: the driver did not find port 2's write cache (QEMU's SATA disk has one, and FLUSH CACHE EXT)"
+    local fl sy
+    fl="$(printf '%s\n' "$A" | sed -nE 's/^  volatile write cache: yes, ([0-9]+) Flush\(es\) sent \(one at the end of every save and every install step; FLUSH CACHE EXT on port 2\)$/\1/p' | tail -1)"
+    sy="$(printf '%s\n' "$A" | grep -acE '^\[vfs\] synced [0-9]+ files to disk$')"
+    if [ -z "$fl" ]; then
+        _f "boot 1: lsahci shows no flush count for port 2"
+    elif [ "$fl" -lt 1 ] || [ "$fl" -gt "$sy" ]; then
+        _f "boot 1: $fl cache flushes for $sy saves (want 1 to $sy: one at the end of a save, not one per write)"
+    fi
+    if grep -aqE '^  cache flushes the drive refused: |^\[ahci\] port [0-9]+: the cache flush .* failed' <<< "$A"; then
+        _f "boot 1: the drive refused a cache flush"
+    fi
     hasA '^\[vfs\] synced [0-9]+ files to disk$' || _f "boot 1: the VFS never synced to the SATA disk"
     hasB '^\[ahci\] port 2: SATA disk, 16384 sectors \(8 MiB\), ours \(AFRIVFS1\): used for storage$' ||
         _f "boot 2: the claimed disk was not recognised as ours"
     hasB '^HELLO-SATA-5NOV$' || _f "boot 2: notes.txt did not come back from the SATA disk"
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE '^\[ahci\] .*(failed|busy)'; then
+    if grep -aqE '^\[ahci\] .*(failed|busy)' <<< "$A"$'\n'"$B"; then
         _f "an AHCI command failed: $(printf '%s\n%s\n' "$A" "$B" | grep -aE '^\[ahci\] .*(failed|busy)' | head -1)"
     fi
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$A"$'\n'"$B"; then
         _f "the kernel panicked or took an exception"
     fi
     return "$fail"
 }
 
 B1="[ahci] port 0: SATA disk, 1032192 sectors (504 MiB), holds other data (boot disk?): left alone
+[ahci] port 0: the drive has a volatile write cache: every save and install step ends with FLUSH CACHE EXT
 [ahci] port 2: SATA disk, 16384 sectors (8 MiB), blank: not used unless claimed (claimdisk sata)
+[ahci] port 2: the drive has a volatile write cache: every save and install step ends with FLUSH CACHE EXT
 [ahci] controller 00:1f.2 (AHCI 1.0), 6 port(s), 2 disk(s)
 afrisovera> lsahci
 ahci: controller 00:1f.2 ABAR 0x81084000, AHCI 1.0, ports implemented 0x3f
@@ -58,7 +76,9 @@ afrisovera> claimdisk sata
 claimdisk: the blank sata disk now holds AfriSovera's files
 [vfs] synced 17 files to disk
 afrisovera> write notes.txt HELLO-SATA-5NOV
-[vfs] synced 18 files to disk"
+[vfs] synced 18 files to disk
+afrisovera> lsahci
+  volatile write cache: yes, 2 Flush(es) sent (one at the end of every save and every install step; FLUSH CACHE EXT on port 2)"
 B2="[ahci] port 2: SATA disk, 16384 sectors (8 MiB), ours (AFRIVFS1): used for storage
 afrisovera> cat notes.txt
 HELLO-SATA-5NOV"
@@ -87,10 +107,15 @@ selftest() {
     arm echoed-only red "$B1" "$(printf '%s\n' "$B2" | sed 's/^HELLO-SATA-5NOV$/afrisovera> cat notes.txt HELLO-SATA-5NOV/')"
     arm command-failed red "$B1" "$(printf '%s\n[ahci] port 2 command 0x25 lba 3 failed (IS 0x40000000, TFD 0x451)' "$B2")"
     arm lsahci-missing red "$(printf '%s\n' "$B1" | grep -v '^  port')" "$B2"
+    arm no-cache-found red "$(printf '%s\n' "$B1" | grep -v '^\[ahci\] port 2: the drive has')" "$B2"
+    arm no-flush red "$(printf '%s\n' "$B1" | sed 's/yes, 2 Flush/yes, 0 Flush/')" "$B2"
+    arm flush-per-sector red "$(printf '%s\n' "$B1" | sed 's/yes, 2 Flush/yes, 30 Flush/')" "$B2"
+    arm no-flush-line red "$(printf '%s\n' "$B1" | grep -v 'volatile write cache: yes')" "$B2"
+    arm flush-refused red "$(printf '%s\n  cache flushes the drive refused: 1' "$B1")" "$B2"
     arm empty red "" ""
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 14 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 19 ]
 }
 
 echo "== PC AHCI / SATA disk (PC track step 3) =="
@@ -125,10 +150,10 @@ boot() { # boot <serial port> <log> <shell commands...>
     wait "$q" 2> /dev/null
 }
 echo "  --- boot 1: lsahci, claimdisk sata, write notes.txt, sync ---"
-boot 4994 "$W/boot1.log" "lsahci" "claimdisk sata" "write notes.txt HELLO-SATA-5NOV" "sync"
+boot 4994 "$W/boot1.log" "lsahci" "claimdisk sata" "write notes.txt HELLO-SATA-5NOV" "sync" "lsahci"
 echo "  --- boot 2: the same disk, cat notes.txt ---"
 boot 4996 "$W/boot2.log" "cat notes.txt"
-cat "$W/boot1.log" "$W/boot2.log" | tr -d '\r' | grep -aE '^\[ahci\]|^ahci:|^  port|^\[vfs\]|HELLO' | sed 's/^/  | /'
+cat "$W/boot1.log" "$W/boot2.log" | tr -d '\r' | grep -aE '^\[ahci\]|^ahci:|^  port|^  volatile|^\[vfs\]|HELLO' | sed 's/^/  | /'
 
 echo "  --- grading ---"
 if grade "$W/boot1.log" "$W/boot2.log"; then

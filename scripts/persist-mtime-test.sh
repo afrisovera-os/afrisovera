@@ -31,7 +31,7 @@ boot() { # $1 = serial/qmp base port, rest = shell commands
 
 echo "[boot 1] writing persistmt.txt, syncing, and stat-ing..."
 B1="$(boot 4534 "write persistmt.txt hi" "sync" "stat persistmt.txt")"
-echo "$B1" | grep -q "synced" || { echo "PERSIST-MTIME TEST FAILED (sync did not run in boot 1)"; exit 1; }
+grep -q "synced" <<< "$B1" || { echo "PERSIST-MTIME TEST FAILED (sync did not run in boot 1)"; exit 1; }
 
 echo "[boot 2] fresh boot on the same disk -- stat persistmt.txt (mtime from disk)..."
 B2="$(boot 4536 "stat persistmt.txt")"

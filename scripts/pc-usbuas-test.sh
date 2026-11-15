@@ -23,7 +23,7 @@ grade() { # grade <boot log> <"same" or "changed": the UAS disk's image after th
     _f() { echo "  FAIL: $*"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqE "$1"; }
+    hasA() { grep -aqE "$1" <<< "$A"; }
     hasA '^\[xhci\] port [0-9]+: device [0-9a-f]{4}:[0-9a-f]{4} \(mass storage, UAS only: needs streams, which this port or controller lacks\) is not one this driver uses$' ||
         _f "the UAS-only disk was not named as UAS only"
     [ "$(printf '%s\n' "$A" | grep -acE '^\[xhci\] .*\(mass storage(, | of )')" -eq 1 ] ||
@@ -32,7 +32,7 @@ grade() { # grade <boot log> <"same" or "changed": the UAS disk's image after th
         _f "the Bulk-Only stick beside it was not chosen for storage"
     hasA '^  storage: slot [0-9]+, 16384 blocks of 512 B  <- storage$' || _f "lsusb does not list the stick as storage"
     [ "$2" = same ] || _f "the UAS disk's image changed"
-    if printf '%s\n' "$A" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[xhci\] .*(failed|timed out)'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[xhci\] .*(failed|timed out)' <<< "$A"; then
         _f "$(printf '%s\n' "$A" | grep -aE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[xhci\] .*(failed|timed out)' | head -1)"
     fi
     return "$fail"

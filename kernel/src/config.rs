@@ -66,6 +66,48 @@ pub fn lang() -> &'static str {
     "en"
 }
 
+/// The person's clock this boot, once they choose (Settings, `desk clock`): 0 none yet (the file says), 1 12-hour,
+/// 2 24-hour. Kept here so the next config write carries it.
+static CLOCK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// What a `clock24=` line says (LANGUAGES_PLAN.md stage 5b, the architect's Q3): Some(true) for `1`, Some(false) for
+/// `0`, None when there is no line. Anything else is Err(the value): strict like `lang=`, and the clock then follows
+/// the language.
+pub fn clock24_in(text: &str) -> Result<Option<bool>, &str> {
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("clock24=") {
+            return match v.trim() {
+                "1" => Ok(Some(true)),
+                "0" => Ok(Some(false)),
+                other => Err(other),
+            };
+        }
+    }
+    Ok(None)
+}
+
+/// The person's clock: Some(true) 24-hour, Some(false) 12-hour, None when they have not chosen (or the saved line
+/// is damaged): the desk then uses the language's usual clock.
+pub fn clock24() -> Option<bool> {
+    match CLOCK.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => Some(false),
+        2 => Some(true),
+        _ => crate::vfs::read_str(CONF).and_then(|s| clock24_in(s).ok().flatten()),
+    }
+}
+
+/// A saved `clock24=` value that is not 0 or 1, if there is one (the desk says so at the first gui).
+pub fn clock24_damaged() -> Option<&'static str> {
+    crate::vfs::read_str(CONF).and_then(|s| clock24_in(s).err())
+}
+
+/// The person chose a clock (Settings, `desk clock 24|12`): keep it, like the language, through the same
+/// allocation-free path. From now on it beats the language's default.
+pub fn set_clock24(on: bool) -> Result<(), &'static str> {
+    CLOCK.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+    persist(saved_boots(), lang())
+}
+
 /// Render the configuration text into a caller-owned buffer — **pure**, and the whole
 /// of what used to be a `format!`.
 ///
@@ -80,16 +122,23 @@ pub fn render<'a>(
     dns: [u8; 4],
     boots: u32,
     lang: &str,
+    clock24: Option<bool>,
 ) -> Result<&'a str, &'static str> {
     let lang = if lang_ok(lang) { lang } else { "en" };
+    // the clock's line only once the person has chosen; until then the file is exactly what it was
+    let clock = match clock24 {
+        Some(true) => "clock24=1\n",
+        Some(false) => "clock24=0\n",
+        None => "",
+    };
     fmtbuf::render(
         buf,
         format_args!(
-            "hostname=afrisovera\nip={}.{}.{}.{}\ngw={}.{}.{}.{}\ndns={}.{}.{}.{}\nboots={}\nlang={}\n",
+            "hostname=afrisovera\nip={}.{}.{}.{}\ngw={}.{}.{}.{}\ndns={}.{}.{}.{}\nboots={}\nlang={}\n{}",
             ip[0], ip[1], ip[2], ip[3],
             gw[0], gw[1], gw[2], gw[3],
             dns[0], dns[1], dns[2], dns[3],
-            boots, lang
+            boots, lang, clock
         ),
     )
 }
@@ -109,6 +158,7 @@ fn persist(boots: u32, lang: &str) -> Result<(), &'static str> {
         crate::virtio::dhcp_dns(),
         boots,
         lang,
+        clock24(),
     )?;
     // Checked rather than dropped: `vfs::write` has always returned whether it took the
     // file, and a config that was never written is exactly the state the next boot would
@@ -201,7 +251,7 @@ pub fn selftest() {
     let mut buf = [0u8; CONF_MAX];
     // The baseline: the fixed buffer produces exactly the bytes `format!` used to.
     // Byte-for-byte, because the next boot re-reads and parses this text.
-    let exact = match render(&mut buf, IP, GW, DNS, 7, "en") {
+    let exact = match render(&mut buf, IP, GW, DNS, 7, "en", None) {
         Ok(s) => {
             let n = s.len();
             case_ok(&mut pass, &mut total, s == EXPECT,
@@ -218,16 +268,16 @@ pub fn selftest() {
     // The boundary, on both sides — the whole reason the check is a refusal and not a
     // truncation. One byte short must lose the WHOLE write, not the last character:
     // "boots=7\n" cut to "boots=" parses on the next boot, and lies.
-    let fits = matches!(render(&mut buf[..exact], IP, GW, DNS, 7, "en"), Ok(s) if s == EXPECT);
+    let fits = matches!(render(&mut buf[..exact], IP, GW, DNS, 7, "en", None), Ok(s) if s == EXPECT);
     case_ok(&mut pass, &mut total, exact > 0 && fits,
         "a buffer of exactly the rendered length is served, to the last byte");
     case_ok(&mut pass, &mut total,
-        exact > 0 && render(&mut buf[..exact - 1], IP, GW, DNS, 7, "en") == Err(fmtbuf::BOUND_BUF),
+        exact > 0 && render(&mut buf[..exact - 1], IP, GW, DNS, 7, "en", None) == Err(fmtbuf::BOUND_BUF),
         "one byte short is REFUSED by name — never written short, never half a key=value");
     // ...and every smaller buffer likewise: no length below the fit may report success.
     let mut all_refuse = exact > 0;
     for n in 0..exact {
-        all_refuse &= render(&mut buf[..n], IP, GW, DNS, 7, "en").is_err();
+        all_refuse &= render(&mut buf[..n], IP, GW, DNS, 7, "en", None).is_err();
     }
     case_ok(&mut pass, &mut total, all_refuse,
         "EVERY buffer below the fit refuses; none reports a partial render as a success");
@@ -237,11 +287,23 @@ pub fn selftest() {
     // still fits the buffer with room to spare. If this case ever fails, the boot path
     // has acquired a bound it can actually hit.
     let mut wide = [0u8; CONF_MAX];
-    let widest = render(&mut wide, [255; 4], [255; 4], [255; 4], u32::MAX, "abcdefgh")
+    let widest = render(&mut wide, [255; 4], [255; 4], [255; 4], u32::MAX, "abcdefgh", Some(true))
         .map(|s| s.len())
         .unwrap_or(usize::MAX);
     case_ok(&mut pass, &mut total, widest <= CONF_MAX,
-        "the WIDEST config the kernel can produce (255.255.255.255 x3, u32::MAX boots, an 8-letter language) fits");
+        "the WIDEST config the kernel can produce (255.255.255.255 x3, u32::MAX boots, an 8-letter language, a clock24 line) fits");
+
+    // the clock's line (stage 5b): written only once chosen, read back as written, anything else refused by name
+    let mut cb = [0u8; CONF_MAX];
+    let chosen = render(&mut cb, IP, GW, DNS, 7, "en", Some(false)).unwrap_or("");
+    case_ok(&mut pass, &mut total,
+        chosen.ends_with("lang=en\nclock24=0\n") && clock24_in(chosen) == Ok(Some(false))
+            && clock24_in(EXPECT) == Ok(None) && clock24_in("clock24=1\n") == Ok(Some(true)),
+        "a clock24 line is written only once chosen, and reads back as written");
+    case_ok(&mut pass, &mut total,
+        clock24_in("clock24=yes\n") == Err("yes") && clock24_in("clock24=\n") == Err("")
+            && clock24_in("clock24=10\n") == Err("10"),
+        "a clock24 line that is not 0 or 1 is refused by name, and the clock follows the language");
     // And what fits the buffer fits the file: `vfs::write` silently truncates past its
     // own per-file limit, so the buffer must not be the larger of the two.
     case_ok(&mut pass, &mut total, CONF_MAX <= crate::vfs::MAX_FILE_BYTES,

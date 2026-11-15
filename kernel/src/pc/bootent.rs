@@ -341,6 +341,8 @@ struct Entry {
     dn: usize,
     file: [u8; 64],
     file_n: usize,
+    /// the GPT partition its first device path names: (entry, start, size, unique GUID)
+    hd: Option<(u32, u64, u64, [u8; 16])>,
 }
 
 /// Whose a Boot#### is: AfriSovera's main entry, its trial entry (safe updates, AFR-0010: the description is
@@ -372,7 +374,7 @@ fn parse(d: &[u8]) -> Option<Entry> {
         return None;
     }
     let fpl = u16le(d, 4) as usize;
-    let mut e = Entry { desc: [0; 64], dn: 0, file: [0; 64], file_n: 0 };
+    let mut e = Entry { desc: [0; 64], dn: 0, file: [0; 64], file_n: 0, hd: None };
     let mut i = 6;
     while i + 1 < d.len() {
         let c = u16le(d, i);
@@ -386,20 +388,79 @@ fn parse(d: &[u8]) -> Option<Entry> {
         }
     }
     if i + fpl <= d.len() {
-        path(&mut Line::new(), &d[i..i + fpl], &mut e.file, &mut e.file_n);
+        let p = &d[i..i + fpl];
+        path(&mut Line::new(), p, &mut e.file, &mut e.file_n);
+        // the first HD node of the first path, a GPT one
+        let mut j = 0;
+        while j + 4 <= p.len() {
+            let (ty, sub, len) = (p[j], p[j + 1], u16le(p, j + 2) as usize);
+            if len < 4 || j + len > p.len() || ty == 0x7F {
+                break;
+            }
+            if (ty, sub) == (4, 1) && len >= 42 && p[j + 41] == 2 && p[j + 40] == 2 {
+                let mut g = [0u8; 16];
+                g.copy_from_slice(&p[j + 24..j + 40]);
+                e.hd = Some((u32le(p, j + 4), u64le(p, j + 8), u64le(p, j + 16), g));
+                break;
+            }
+            j += len;
+        }
     }
     Some(e)
 }
 
-/// For `updatestage` (safe updates U3): AfriSovera's main entry and the file its device path names (lower-case,
-/// such as `\efi\afrisovera\afrisovera.efi`), as read at power-on or after the last change; None if there is none.
-#[allow(dead_code)] // its caller, updatestage, is the next change (architect: this refactor merges first)
-pub(crate) fn main_file() -> Option<(u16, [u8; 64], usize)> {
-    find(Kind::Main).map(|(n, e)| (n, e.file, e.file_n))
+/// AfriSovera's main entry as `updatestage` (safe updates U3) needs it: the one Boot#### whose description is
+/// exactly "AfriSovera", the file its device path names (lower-case, such as `\efi\afrisovera\afrisovera.efi`) and
+/// its GPT partition.
+pub(crate) struct Main {
+    pub num: u16,
+    pub file: [u8; 64],
+    pub file_n: usize,
+    pub ent: u32,
+    pub start: u64,
+    pub size: u64,
+    pub guid: [u8; 16],
+}
+
+/// Why there is no single main entry: how many entries are named exactly "AfriSovera" (not 1), or the one there is
+/// names no GPT partition.
+pub(crate) enum NoMain {
+    NotRead,
+    Count(usize),
+    NoPartition,
+}
+
+/// The architect's rule (14 Nov 2026): the main entry is the description EXACTLY "AfriSovera", and there must be
+/// exactly one. `Kind::Main` stays broad for `numbers()`; a hand-made "AfriSovera backup" is never taken here.
+pub(crate) fn main_exact() -> Result<Main, NoMain> {
+    let bv = uefi::boot_vars();
+    if !bv.read {
+        return Err(NoMain::NotRead);
+    }
+    let (mut count, mut found) = (0usize, None);
+    for k in 0..bv.n {
+        if let Some(e) = parse(&bv.data[k][..bv.len[k]]) {
+            if e.desc[..e.dn] == *DESC.as_bytes() {
+                count += 1;
+                found = Some((bv.num[k], e));
+            }
+        }
+    }
+    match (count, found) {
+        (1, Some((num, e))) => match e.hd {
+            Some((ent, start, size, guid)) => Ok(Main { num, file: e.file, file_n: e.file_n, ent, start, size, guid }),
+            None => Err(NoMain::NoPartition),
+        },
+        (c, _) => Err(NoMain::Count(c)),
+    }
+}
+
+/// The Boot#### the firmware started this time (BootCurrent, read at power-on).
+pub(crate) fn current() -> Option<u16> {
+    uefi::boot_vars().current
 }
 
 /// For `updatestage`: AfriSovera's trial entry, if there is one.
-#[allow(dead_code)] // as main_file
 pub(crate) fn trial_number() -> Option<u16> {
     find(Kind::Trial).map(|(n, _)| n)
 }
@@ -624,7 +685,6 @@ pub fn name(n: u16) -> [u8; 8] {
 
 const DESC: &str = "AfriSovera";
 /// The trial entry's description (safe updates, AFR-0010): told apart from the main entry by this exact text.
-#[allow(dead_code)] // its user, updatestage, is the next change
 pub(crate) const TRIAL_DESC: &str = "AfriSovera trial";
 /// Room for the longest option: a 16-character description and a 40-character file path.
 const OPT_CAP: usize = 6 + 2 * (16 + 1) + 42 + 4 + 2 * (40 + 1) + 4;
@@ -999,4 +1059,77 @@ pub fn next(given: Option<&str>) {
     }
     uefi::reread_boot_entries();
     crate::kprintln!("bootnext: BootNext = {} written and read back; the next power-on starts AfriSovera from its own entry, once", nms);
+}
+
+// --- the trial entry (safe updates U3, AFR-0010 section 8): written only by `updatestage`, on its owner's code ---
+
+/// Adds Boot#### "AfriSovera trial" -> `file` on the main entry's partition, at the END of BootOrder, read back;
+/// on any failure it is taken out again. Ok(its number).
+pub(crate) fn trial_add(m: &Main, file: &str) -> Result<u16, &'static str> {
+    let Some((free, _, _)) = numbers() else { return Err("the firmware's boot entries could not be read at power-on") };
+    let Some(num) = free else { return Err("no free Boot number below Boot0100") };
+    let nm = name(num);
+    let mut probe = [0u8; uefi::OPT_MAX];
+    if !matches!(uefi::get_global(&nm, &mut probe), Err(uefi::ERR_NOT_FOUND)) {
+        return Err("the firmware now has a Boot number that was not there at power-on");
+    }
+    let (order, n) = order_now()?;
+    if n >= uefi::ORDER_MAX || order[..n].contains(&num) {
+        return Err("BootOrder is full or already names the free number");
+    }
+    let (opt, ol) = option(TRIAL_DESC, file, m.ent as u64, m.start, m.size, &m.guid);
+    let opt = &opt[..ol];
+    let mut ob = [0u8; uefi::ORDER_MAX * 2];
+    let olen = order_bytes(&order[..n], &mut ob);
+    let mut new = order;
+    new[n] = num;
+    let mut nb = [0u8; uefi::ORDER_MAX * 2];
+    let nlen = order_bytes(&new[..n + 1], &mut nb);
+    if uefi::set_global(&nm, opt) != uefi::SUCCESS || !reads_back(&nm, opt) {
+        uefi::set_global(&nm, &[]);
+        uefi::reread_boot_entries();
+        return Err("the firmware did not keep the trial entry as written, so it was taken out again");
+    }
+    let st = uefi::set_global(b"BootOrder", &nb[..nlen]);
+    if st != uefi::SUCCESS || !reads_back(b"BootOrder", &nb[..nlen]) {
+        uefi::set_global(&nm, &[]);
+        if st == uefi::SUCCESS && olen > 0 {
+            uefi::set_global(b"BootOrder", &ob[..olen]);
+        }
+        uefi::reread_boot_entries();
+        return Err("BootOrder could not be written, so the trial entry was taken out again");
+    }
+    uefi::reread_boot_entries();
+    Ok(num)
+}
+
+/// Takes the trial entry out: BootOrder without it first, then the Boot#### deleted (the order the architect set
+/// for every entry removal). Ok(None) when there was none.
+pub(crate) fn trial_remove() -> Result<Option<u16>, &'static str> {
+    let Some(num) = trial_number() else { return Ok(None) };
+    let nm = name(num);
+    let (order, n) = order_now()?;
+    let mut new = [0u16; uefi::ORDER_MAX];
+    let mut k = 0;
+    for &v in &order[..n] {
+        if v != num {
+            new[k] = v;
+            k += 1;
+        }
+    }
+    if k != n {
+        let mut nb = [0u8; uefi::ORDER_MAX * 2];
+        let nlen = order_bytes(&new[..k], &mut nb);
+        let st = uefi::set_global(b"BootOrder", &nb[..nlen]);
+        if st != uefi::SUCCESS || !reads_back(b"BootOrder", &nb[..nlen]) {
+            uefi::reread_boot_entries();
+            return Err("BootOrder could not be written, so the trial entry is kept");
+        }
+    }
+    let st = uefi::set_global(&nm, &[]);
+    uefi::reread_boot_entries();
+    if st != uefi::SUCCESS || !reads_back(&nm, &[]) {
+        return Err("the firmware did not delete the trial entry, but it is out of BootOrder");
+    }
+    Ok(Some(num))
 }

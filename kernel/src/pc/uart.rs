@@ -50,12 +50,21 @@ fn write_byte(b: u8) {
     if !PRESENT.load(Ordering::Relaxed) {
         return;
     }
+    // Bounded: a port with nothing behind it must not hang the kernel. TX_WAIT_US is about 20 characters at
+    // 115200 baud; the spin count is the fallback before the TSC rate is known (the first boot lines).
+    const TX_WAIT_US: u64 = 2_000;
+    const TX_SPIN_CAP: u32 = 100_000;
     // SAFETY: polling the line-status register, then writing the data register.
     unsafe {
-        let mut spins = 0u32;
-        // Bounded: a port with nothing behind it must not hang the kernel.
-        while inb(COM1 + 5) & 0x20 == 0 && spins < 100_000 {
-            spins += 1;
+        // the fast path first: the holding register is almost always empty, and then no deadline is worked out
+        // (one inb per byte, as before the time-waits rule; the performance engineer, 15 Nov 2026: a TSC read and a
+        // division for every byte of every boot line cost about 110 ms of a debug boot)
+        if inb(COM1 + 5) & 0x20 == 0 {
+            let until = crate::timer::deadline_us(TX_WAIT_US);
+            let mut spins = 0u32;
+            while inb(COM1 + 5) & 0x20 == 0 && spins < TX_SPIN_CAP && !crate::timer::past(until) {
+                spins += 1;
+            }
         }
         outb(COM1, b);
     }
@@ -320,9 +329,24 @@ pub fn idle_wfi_count() -> u64 {
 
 /// COM1 and the framebuffer console (shown on the GOP screen by screen.rs), as the ARM
 /// kernel's `uart::Tee` sends every print to the PL011 and its ramfb console.
+/// True when the last character printed ended a line: a message from the idle loop (a driver giving up, say) can
+/// then start on a fresh line instead of in the middle of what the person is typing (fresh_line).
+static AT_LINE_START: AtomicBool = AtomicBool::new(true);
+
+/// Start a new line unless the console is already at the start of one. For messages printed while the person may
+/// be typing (15 Nov 2026: the PS/2 light's give-up line came out glued to a half-typed command).
+pub fn fresh_line() {
+    if !AT_LINE_START.load(Ordering::Relaxed) {
+        _print(format_args!("\n"));
+    }
+}
+
 struct Tee;
 impl Write for Tee {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        if let Some(&b) = s.as_bytes().last() {
+            AT_LINE_START.store(b == b'\n', Ordering::Relaxed);
+        }
         crate::conback::live(); // a scrolled-back console comes back first (conback.rs)
         crate::conback::feed(s);
         crate::report::feed(s); // kept for `report` (the boot log and the latest lines)

@@ -37,6 +37,13 @@ release = []
 # Test only (pc-releaseguard): a release build with one planted row, the demo update key's bytes marked
 # `demo: false`, to prove the byte check catches it. Never for a real build.
 releaseguard-plant = ["release"]
+# Test images only: the bundled test apps tone.wasm (sound, N-A1a) and filetest.wasm (files, A2). The suites that
+# use them build into target/test-apps; a shipped image never carries them (the architect, A2 change 2).
+test-apps = []
+# Test images only (Daraja stage 0 step 3, suite pc-compat0): the Linux bridge program and three bundles (hello0, fault0,
+# bench0), built by the cloud job and found through DARAJA_BRIDGE_BIN and DARAJA_BUNDLE_DIR at compile time; the shell
+# command `linux <name>` runs one. A shipped image never carries them.
+compat0 = []
 
 [dependencies]
 # ADR 0007 (kernel dependencies): third-party crates for CRYPTOGRAPHIC PRIMITIVES only, exact `=` pins, no

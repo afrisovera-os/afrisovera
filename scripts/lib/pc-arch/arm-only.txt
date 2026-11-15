@@ -59,3 +59,9 @@ stackwater     -- `stack`: paint high-water of the ARM boot and secondary stacks
 stackguard     -- `stack guards` / `stack overflow-test`: the ARM boot-stack guards (paging::init L2K/L3S)
 perf           -- the ARM benchmark rig (qemu-system-aarch64 -kernel); pc-perf is its PC twin
 perf-release   -- the ARM benchmark rig, release build; pc-perf-release is its PC twin
+#
+# Gap G2's probe (added 14 Nov 2026, security engineer): the test program is AArch64 machine code
+# (kernel/src/process.rs user_ptr_start) and the graded lines are the ARM syscall layer's own words.
+# The PC checks every user pointer in kernel/src/pc/proc.rs user_range; pc-vmo step 4 proves a refusal
+# at a guard page. A PC twin that hands SYS_AI and SYS_SPEAK a kernel address is planned (pc-userptr).
+el0-ptr        -- an AArch64 EL0 program and the ARM SYS_AI / SYS_SPEAK refusal lines

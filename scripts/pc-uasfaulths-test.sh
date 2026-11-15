@@ -28,8 +28,8 @@ grade() { # grade <boot1 log> <boot2 log> <the image's first 8 bytes after boot 
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqE "$1"; }
-    hasB() { printf '%s\n' "$B" | grep -aqE "$1"; }
+    hasA() { grep -aqE "$1" <<< "$A"; }
+    hasB() { grep -aqE "$1" <<< "$B"; }
     hasA '^\[xhci\] port [0-9]+: USB disk [0-9a-f]{4}:[0-9a-f]{4} speaks only UAS: driven over USB Attached SCSI \(high speed, four pipes, no streams\)$' ||
         _f "boot 1: the UAS-only disk was not driven over UAS without streams"
     hasA '^\[xhci\] port [0-9]+: USB storage [0-9a-f]{4}:[0-9a-f]{4} ".*", 16384 blocks of 512 B \(8 MiB\), blank or ours: used for storage$' ||
@@ -46,7 +46,15 @@ grade() { # grade <boot1 log> <boot2 log> <the image's first 8 bytes after boot 
     hasB '^  storage transport: UAS \(USB Attached SCSI, four pipes, no streams\), 0 recoveries$' ||
         _f "boot 2: lsusb does not show 0 recoveries after reading the file back"
     [ "$3" = AFRIVFS1 ] || _f "the UAS disk's image does not start with AFRIVFS1 after boot 1 (it holds '$3')"
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|did not report its capacity|^\[xhci\] .*(failed|timed out)'; then
+    # AFR-0011 V2 (14 Nov 2026): blkdebug fails the first flush (once), so boot 2's first SYNCHRONIZE CACHE is
+    # refused with MEDIUM ERROR (not ILLEGAL REQUEST): msc_sync says Failed, and the stick goes on, so the
+    # second sync flushes, with no reset (the recovery count above stays as it was)
+    local syncs
+    syncs="$(printf '%s\n' "$B" | sed -n 's/^lsusb sync: \([A-Za-z-]*\).*/\1/p' | tr '\n' ' ')"
+    [ "$syncs" = "FAILED flushed " ] || _f "boot 2: the two syncs said '$syncs', want 'FAILED flushed ' (the injected flush error, then a good flush)"
+    hasB '^  storage write cache: on \(SYNCHRONIZE CACHE at each sync\); syncs: 1 flushed, 0 write-through, 0 unknown, 0 refused, 1 failed$' ||
+        _f "boot 2: lsusb does not count one failed and one flushed sync"
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|did not report its capacity|^\[xhci\] .*(failed|timed out)' <<< "$A"$'\n'"$B"; then
         _f "$(printf '%s\n%s\n' "$A" "$B" | grep -aE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|did not report its capacity|^\[xhci\] .*(failed|timed out)' | head -1)"
     fi
     return "$fail"
@@ -66,7 +74,13 @@ B2="[xhci] USB storage: multi-block reads off (the device refused one): one bloc
 afrisovera> cat notes.txt
 HELLO-UAS-FAULTHS-12NOV
 afrisovera> lsusb
-  storage transport: UAS (USB Attached SCSI, four pipes, no streams), 0 recoveries"
+  storage transport: UAS (USB Attached SCSI, four pipes, no streams), 0 recoveries
+afrisovera> lsusb sync
+lsusb sync: FAILED (a write or SYNCHRONIZE CACHE did not pass)
+afrisovera> lsusb sync
+lsusb sync: flushed (SYNCHRONIZE CACHE passed)
+afrisovera> lsusb
+  storage write cache: on (SYNCHRONIZE CACHE at each sync); syncs: 1 flushed, 0 write-through, 0 unknown, 0 refused, 1 failed"
 
 selftest() {
     local D pass=0 bad=0
@@ -95,10 +109,13 @@ selftest() {
     arm image-not-ours red "$B1" "$B2" "zeros"
     arm xhci-timed-out red "$(printf '%s\n%s\n' "$B1" '[xhci] port 5: USB storage command timed out')" "$B2" AFRIVFS1
     arm read-failed red "$B1" "$(printf '%s\n%s\n' "$B2" '[xhci] USB storage: a multi-block read at block 0 failed: one block per command from now on')" AFRIVFS1
+    arm flush-fault-missed red "$B1" "$(printf '%s\n' "$B2" | sed 's/^lsusb sync: FAILED.*/lsusb sync: flushed (SYNCHRONIZE CACHE passed)/')" AFRIVFS1
+    arm flush-fault-refused-as-no-cache red "$B1" "$(printf '%s\n' "$B2" | sed 's/^lsusb sync: FAILED.*/lsusb sync: refused (the stick said it caches but refused SYNCHRONIZE CACHE): its saves cannot be confirmed/')" AFRIVFS1
+    arm stick-lost-after-flush red "$B1" "$(printf '%s\n' "$B2" | sed 's/^lsusb sync: flushed.*/lsusb sync: FAILED (a write or SYNCHRONIZE CACHE did not pass)/')" AFRIVFS1
     arm empty red "" "" ""
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 17 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 20 ]
 }
 
 echo "== PC UASFAULTHS refused read without streams (PC track step 3) =="
@@ -129,6 +146,10 @@ event = "read_aio"
 errno = "5"
 sector = "8"
 once = "on"
+[inject-error]
+event = "flush_to_os"
+errno = "5"
+once = "on"
 EOF
 
 boot() { # boot <serial port> <log> <shell commands...>
@@ -137,7 +158,7 @@ boot() { # boot <serial port> <log> <shell commands...>
     qemu-system-aarch64 -M virt -m 256M -display none \
         -device qemu-xhci,id=xhci,p3=0 \
         -drive "file=blkdebug:$W/fault.cfg:$IMG,if=none,format=raw,id=ud" -device usb-uas,id=uas,bus=xhci.0 \
-        -device scsi-hd,bus=uas.0,scsi-id=0,lun=0,drive=ud,rerror=report \
+        -device scsi-hd,bus=uas.0,scsi-id=0,lun=0,drive=ud,rerror=report,werror=report \
         -serial "tcp:127.0.0.1:$sp,server,nowait" -qmp "tcp:127.0.0.1:$((sp+1)),server,nowait" &
     local q=$!
     AFRISH_BOOT_GRACE="${AFRISH_BOOT_GRACE:-10}" python3 scripts/shell-demo.py "$sp" "$((sp+1))" "$W/shot.png" "$@" > "$log" 2>&1
@@ -148,8 +169,8 @@ echo "  --- boot 1: one read refused, then lsusb, write notes.txt, sync ---"
 boot 7360 "$W/boot1.log" "lsusb" "write notes.txt HELLO-UAS-FAULTHS-12NOV" "sync"
 head8="$(head -c 8 "$IMG" | tr -c 'A-Za-z0-9' '.')"
 echo "  --- boot 2: the same disk and fault, cat notes.txt, lsusb ---"
-boot 7362 "$W/boot2.log" "cat notes.txt" "lsusb"
-cat "$W/boot1.log" "$W/boot2.log" | tr -d '\r' | grep -aE '^\[xhci\] .*(port|storage|UAS)|^  storage|^\[vfs\]|HELLO' | sed 's/^/  | /'
+boot 7362 "$W/boot2.log" "cat notes.txt" "lsusb sync" "lsusb sync" "lsusb"
+cat "$W/boot1.log" "$W/boot2.log" | tr -d '\r' | grep -aE '^\[xhci\] .*(port|storage|UAS)|^  storage|^lsusb sync|^\[vfs\]|HELLO' | sed 's/^/  | /'
 echo "  UAS disk image starts with: $head8"
 
 echo "  --- grading ---"

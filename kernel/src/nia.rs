@@ -45,6 +45,7 @@ const CAP_AI: u32 = 1 << 6; // host on-device AI (Asili AI)
 const CAP_VOICE: u32 = 1 << 7; // host voice / text-to-speech (Asili Voice)
 const CAP_NET: u32 = 1 << 8; // host networking (virtio-net: ping / DNS)
 const CAP_RANDOM: u32 = 1 << 9; // host random number generator
+const CAP_AUDIO: u32 = 1 << 10; // host sound stream (N-A1a): bundled and manifest apps only, never CAP_SIDELOAD
 /// What an app outside the integrity manifest gets (appget's sideloaded apps, architect's change B,
 /// claude/appget): no file, net, AI or voice. Manifest apps keep CAP_ALL.
 pub const CAP_SIDELOAD: u32 = CAP_PRINT | CAP_PUTC | CAP_DRAW | CAP_TIME | CAP_INPUT | CAP_RANDOM;
@@ -57,7 +58,8 @@ const CAP_ALL: u32 = CAP_PRINT
     | CAP_AI
     | CAP_VOICE
     | CAP_NET
-    | CAP_RANDOM;
+    | CAP_RANDOM
+    | CAP_AUDIO;
 
 // Host function ids resolved from import names.
 const HOST_PRINT: u8 = 0;
@@ -85,6 +87,13 @@ const HOST_CELL_SIZE: u8 = 20; // cell_size(win) -> cols << 14 | rows, or an err
 const HOST_CELL_EVENT: u8 = 21; // cell_event(timeout_ms) -> an event, 0 (no event in time) or an error
 // win_text_run(win, x, y, ptr, len, color): one row of text in one call (OS_REQUESTS item 10 A3).
 const HOST_WIN_TEXT_RUN: u8 = 22;
+// The sound stream (N-A1a, NIA_AUDIO_PLAN.md): permission audio.
+const HOST_AUDIO_OPEN: u8 = 23; // audio_open(rate, channels) -> 1, or -1 busy, -2 no device, -3 a bad argument
+const HOST_AUDIO_WRITE: u8 = 24; // audio_write(id, ptr, frames) -> frames taken now (never waits), -1 wrong id
+const HOST_AUDIO_LEVEL: u8 = 25; // audio_level(id) -> frames still queued, -1 wrong id
+const HOST_AUDIO_CLOSE: u8 = 26; // audio_close(id) -> 0 after the queue played out, -1 wrong id
+// file_list(buf, cap) -> bytes written, or -(bytes all names need) (A5, Andika's Open dialog): permission file.
+const HOST_FILE_LIST: u8 = 27;
 /// The most characters win_text_run draws: one row of the widest window (CW / 8); a longer run is cut, not refused.
 const TEXT_RUN_MAX: usize = 30;
 const HOST_UNKNOWN: u8 = 255;
@@ -415,7 +424,10 @@ const STOP_KEY: u8 = 0x03;
 const POLL_EVERY: u32 = 4096;
 const KEYQ_CAP: usize = 16;
 const STOPPED: &str = "stopped by Ctrl+C";
-static mut KEYQ: [u8; KEYQ_CAP] = [0; KEYQ_CAP];
+/// A4: the queue holds key codes (cell_abi.rs's layout: a byte as before, or KEY_BASE + n with the modifier bits),
+/// decoded from the console's bytes by keyseq.rs; Ctrl+C is taken from the raw byte before decoding.
+static mut KEYQ: [u32; KEYQ_CAP] = [0; KEYQ_CAP];
+static mut KEYSEQ: crate::keyseq::Seq = crate::keyseq::Seq::new();
 static mut KEYQ_HEAD: usize = 0;
 static mut KEYQ_LEN: usize = 0;
 static mut LOOP_BRANCHES: u32 = 0;
@@ -428,10 +440,35 @@ fn keyq_reset() {
         KEYQ_LEN = 0;
         LOOP_BRANCHES = 0;
         KEYS_QUEUED = 0;
+        (*addr_of_mut!(KEYSEQ)).reset();
     }
 }
 
-fn keyq_pop() -> Option<u8> {
+fn keyq_push(k: u32) {
+    // SAFETY: single-threaded interpreter; indexes stay below KEYQ_CAP.
+    unsafe {
+        if KEYQ_LEN < KEYQ_CAP {
+            (*addr_of_mut!(KEYQ))[(KEYQ_HEAD + KEYQ_LEN) % KEYQ_CAP] = k;
+            KEYQ_LEN += 1;
+            KEYS_QUEUED += 1;
+        }
+    }
+}
+
+/// What the decoder gave: a key, or bytes given back one by one.
+fn keyq_take(o: crate::keyseq::Out) {
+    match o {
+        crate::keyseq::Out::None => {}
+        crate::keyseq::Out::Key(k) => keyq_push(k),
+        crate::keyseq::Out::Bytes(b, n) => b[..n].iter().for_each(|&c| keyq_push(c as u32)),
+    }
+}
+
+fn now_ms() -> u64 {
+    crate::timer::cycles() / (crate::timer::hz() / 1000).max(1)
+}
+
+fn keyq_pop() -> Option<u32> {
     // SAFETY: single-threaded interpreter; indexes stay below KEYQ_CAP.
     unsafe {
         if KEYQ_LEN == 0 {
@@ -564,18 +601,15 @@ fn console_key() -> Result<(), &'static str> {
         }
         return cell_forced_check();
     }
-    // SAFETY: single-threaded interpreter; indexes stay below KEYQ_CAP.
-    unsafe {
-        if let Some(c) = crate::uart::getc() {
-            if c == STOP_KEY {
-                return Err(STOPPED);
-            }
-            if KEYQ_LEN < KEYQ_CAP {
-                (*addr_of_mut!(KEYQ))[(KEYQ_HEAD + KEYQ_LEN) % KEYQ_CAP] = c;
-                KEYQ_LEN += 1;
-                KEYS_QUEUED += 1;
-            }
+    // SAFETY: single-threaded interpreter; KEYSEQ is touched only here and in keyq_reset.
+    let seq = unsafe { &mut *addr_of_mut!(KEYSEQ) };
+    let now = now_ms();
+    keyq_take(seq.tick(now)); // an ESC that waited ESC_MS alone is Esc
+    if let Some(c) = crate::uart::getc() {
+        if c == STOP_KEY {
+            return Err(STOPPED);
         }
+        keyq_take(seq.feed(c, now));
     }
     Ok(())
 }
@@ -588,7 +622,7 @@ fn host_pollkey() -> Result<i32, &'static str> {
         return Ok(-1); // its keys are cell events (afriui.md section 25)
     }
     Ok(match keyq_pop() {
-        Some(c) => c as i32,
+        Some(k) => k as i32,
         None => -1,
     })
 }
@@ -617,10 +651,343 @@ fn host_sleep_ms(ms: i32) -> Result<i32, &'static str> {
             cell_forced_check()?;
             crate::desk::app_tick(); // the desk keeps drawing while the app sleeps (only with a cell window)
             console_key()?;
+            audio_pump(); // at most one chunk a millisecond step: the app's own wait moves its sound (N-A1a)
         }
         core::hint::spin_loop();
     }
     Ok((elapsed * 1000 / hz).min(i32::MAX as u64) as i32)
+}
+
+// --- The sound stream (N-A1a, NIA_AUDIO_PLAN.md, the architect's OK of 14 Nov) ---------------------------------
+// One app owns the sound device at a time. audio_write only copies into AUDIO_BUF (never waits); the samples move to
+// the device only while the app waits (sleep_ms, cell_event, audio_close), one chunk at a time, through the same
+// driver calls `say` uses (mono, 44,100 Hz). Integer only: a Q16 linear resampler; stereo is mixed down to mono,
+// (l + r) >> 1, until N-A1b. The pump keeps the device at most AUDIO_AHEAD_MS ahead of the clock. When the device
+// has run dry with nothing queued (a pause), it plays one chunk of silence and ends the stream, so a cyclic device
+// (HDA) never loops the last period; the next write begins the stream again.
+
+const AUDIO_BUF_LEN: usize = 12_000; // 250 ms at 48 kHz, the most a stream holds
+const AUDIO_OUT_HZ: u64 = 44_100; // what the drivers take (virtio RATE_HZ, voice.rs SR)
+const AUDIO_CHUNK: usize = 256; // samples a pump step hands the device, about 5.8 ms
+const AUDIO_AHEAD_MS: u64 = 100; // how far the device may be ahead of the clock
+const AUDIO_WIN: i32 = 1; // the one stream id
+
+struct Audio {
+    open: bool,
+    rate: u64,
+    channels: usize,
+    cap: usize,  // rate / 4 frames: 250 ms at the app's rate
+    head: usize, // index into AUDIO_BUF of the oldest queued frame
+    len: usize,  // frames queued (mono, the app's rate)
+    frac: u64,   // Q16 position between AUDIO_BUF[head] and the next frame
+    live: bool,  // the driver stream is begun
+    t0: u64,     // timer cycles when the device stream (re)began
+    sent: u64,   // output samples handed to the device since t0
+    played: u64, // app frames played (consumed by the resampler)
+    underruns: u32,
+    failed: bool,     // a driver call returned false: the rest of the stream is dropped
+    overrun_us: u64,  // the longest a cell_event wait ran past its timeout (condition 3: one chunk at most)
+}
+
+static mut AUDIO: Audio = Audio {
+    open: false,
+    rate: 0,
+    channels: 1,
+    cap: 0,
+    head: 0,
+    len: 0,
+    frac: 0,
+    live: false,
+    t0: 0,
+    sent: 0,
+    played: 0,
+    underruns: 0,
+    failed: false,
+    overrun_us: 0,
+};
+static mut AUDIO_BUF: [i16; AUDIO_BUF_LEN] = [0; AUDIO_BUF_LEN];
+/// A cell event the audio_close drain took from the desk, given to the app's next cell_event (never lost).
+static mut AUDIO_HELD_EVENT: i32 = 0;
+
+fn au() -> &'static mut Audio {
+    // SAFETY: single-threaded interpreter; only the functions below touch AUDIO.
+    unsafe { &mut *addr_of_mut!(AUDIO) }
+}
+
+/// Whether an app owns the sound device. Every sound starter (voice.rs `say`, the shell's `audio tone`, the PC's
+/// `audio` and `mic`) checks it first: the architect's N-A1 condition 1. A later sound feature adds the same check.
+pub fn audio_owned() -> bool {
+    au().open
+}
+
+/// For a sound starter: true (with one line) when an app owns the sound device, so the caller does nothing.
+pub fn sound_busy(who: &str) -> bool {
+    if audio_owned() {
+        crate::kprintln!("[{}] busy: an app owns the sound device", who);
+        return true;
+    }
+    false
+}
+
+fn audio_open(rate: i32, channels: i32) -> i32 {
+    if !(8_000..=48_000).contains(&rate) || !(1..=2).contains(&channels) {
+        return -3;
+    }
+    if au().open {
+        return -1;
+    }
+    if !crate::virtio::sound_present() {
+        return -2;
+    }
+    let a = au();
+    *a = Audio {
+        open: true,
+        rate: rate as u64,
+        channels: channels as usize,
+        cap: rate as usize / 4,
+        head: 0,
+        len: 0,
+        frac: 0,
+        live: false,
+        t0: 0,
+        sent: 0,
+        played: 0,
+        underruns: 0,
+        failed: false,
+        overrun_us: 0,
+    };
+    crate::kprintln!("[nia] audio: stream open, {} Hz, {} channel(s), {} frames queued at most", rate, channels, a.cap);
+    AUDIO_WIN
+}
+
+/// audio_write(id, ptr, frames): the frame count is cut to a quarter of the stream first, then the bytes are
+/// checked (past the app's memory is a TRAP), then what fits is copied. Never waits.
+fn audio_write(id: i32, ptr: i32, frames: i32) -> Result<i32, &'static str> {
+    if id != AUDIO_WIN || !au().open {
+        return Ok(-1);
+    }
+    let a = au();
+    let n = ulen(frames, a.cap / 4);
+    let fb = 2 * a.channels;
+    let p = mem_range(ptr, n * fb)?;
+    let take = n.min(a.cap - a.len);
+    for i in 0..take {
+        let s = if a.channels == 1 {
+            mem_read16(p + i * fb) as i16
+        } else {
+            let l = mem_read16(p + i * fb) as i16 as i32;
+            let r = mem_read16(p + i * fb + 2) as i16 as i32;
+            ((l + r) >> 1) as i16
+        };
+        // SAFETY: single-threaded; the index is below AUDIO_BUF_LEN.
+        unsafe { (*addr_of_mut!(AUDIO_BUF))[(a.head + a.len) % AUDIO_BUF_LEN] = s };
+        a.len += 1;
+    }
+    Ok(take as i32)
+}
+
+/// Output samples the device has played since the stream (re)began, by the clock.
+fn audio_done(a: &Audio) -> u64 {
+    let hz = crate::timer::hz().max(1);
+    crate::timer::cycles().wrapping_sub(a.t0) * AUDIO_OUT_HZ / hz
+}
+
+/// Output samples the device has not played yet, by the clock (0 when it has run dry).
+fn audio_ahead(a: &Audio) -> u64 {
+    if !a.live {
+        return 0;
+    }
+    a.sent.saturating_sub(audio_done(a))
+}
+
+fn audio_level(id: i32) -> i32 {
+    if id != AUDIO_WIN || !au().open {
+        return -1;
+    }
+    let a = au();
+    (a.len as u64 + audio_ahead(a) * a.rate / AUDIO_OUT_HZ) as i32
+}
+
+/// One pump step: hand the device at most one chunk. Returns true when it wrote something.
+fn audio_pump() -> bool {
+    let a = au();
+    if !a.open || a.failed {
+        return false;
+    }
+    let ahead = audio_ahead(a);
+    // Dry means starved for more than one chunk by the clock. With nothing queued (a pause, or an app that fell
+    // behind) it is an underrun, the app's to avoid (condition 6): one chunk of silence, then the stream ends, so
+    // nothing old is replayed (condition 2). With frames queued it is the pump's own timing (the driver holds a
+    // whole period before the device sees it): the clock is set again, nothing is counted.
+    if a.live && a.sent > 0 && audio_done(a) >= a.sent + AUDIO_CHUNK as u64 {
+        if a.len == 0 {
+            a.underruns += 1;
+            crate::kprintln!(
+                "[nia] audio: underrun after {} frames, nothing queued, the device {} ms dry",
+                a.played,
+                (audio_done(a) - a.sent) * 1000 / AUDIO_OUT_HZ
+            );
+            let z = [0i16; AUDIO_CHUNK];
+            let ok = crate::virtio::sound_stream_write(&z) && crate::virtio::sound_stream_end();
+            a.live = false;
+            a.failed |= !ok;
+            return true;
+        }
+        a.t0 = crate::timer::cycles();
+        a.sent = 0;
+    } else if ahead * 1000 >= AUDIO_AHEAD_MS * AUDIO_OUT_HZ {
+        return false; // far enough ahead: the wait goes on without touching the device
+    }
+    if a.len == 0 {
+        return false;
+    }
+    if !a.live {
+        if !crate::virtio::sound_stream_begin() {
+            a.failed = true;
+            return false;
+        }
+        a.live = true;
+        a.t0 = crate::timer::cycles();
+        a.sent = 0;
+    }
+    // Resample to 44,100 Hz: linear between two queued frames, Q16 step rate / 44,100.
+    let step = (a.rate << 16) / AUDIO_OUT_HZ;
+    let mut out = [0i16; AUDIO_CHUNK];
+    let mut n = 0;
+    // SAFETY: single-threaded; indices are taken modulo AUDIO_BUF_LEN.
+    let buf = unsafe { &*core::ptr::addr_of!(AUDIO_BUF) };
+    while n < AUDIO_CHUNK && a.len > 0 {
+        let s0 = i64::from(buf[a.head]);
+        let s1 = if a.len > 1 { i64::from(buf[(a.head + 1) % AUDIO_BUF_LEN]) } else { s0 };
+        out[n] = (s0 + (((s1 - s0) * a.frac as i64) >> 16)) as i16;
+        n += 1;
+        a.frac += step;
+        while a.frac >= 1 << 16 && a.len > 0 {
+            a.frac -= 1 << 16;
+            a.head = (a.head + 1) % AUDIO_BUF_LEN;
+            a.len -= 1;
+            a.played += 1;
+        }
+    }
+    if !crate::virtio::sound_stream_write(&out[..n]) {
+        a.failed = true;
+    }
+    a.sent += n as u64;
+    true
+}
+
+/// cell_event(timeout) while a stream is open: the desk is asked with timeout 0 between pump steps, so an event
+/// (a close request included) is answered at once and the wait runs at most one chunk past its end (condition 3).
+fn cell_event_with_sound(timeout_ms: i32) -> Result<i32, &'static str> {
+    // SAFETY: single-threaded interpreter.
+    let held = unsafe { core::mem::replace(&mut *addr_of_mut!(AUDIO_HELD_EVENT), 0) };
+    if held != 0 {
+        return Ok(held);
+    }
+    if !au().open || timeout_ms == 0 {
+        let e = crate::desk::app_cell_event(timeout_ms);
+        audio_pump();
+        return Ok(e);
+    }
+    let hz = crate::timer::hz().max(1);
+    let t0 = crate::timer::cycles();
+    let limit = if timeout_ms < 0 { None } else { Some(timeout_ms as u64 * hz / 1000) };
+    loop {
+        let e = crate::desk::app_cell_event(0);
+        if e != 0 {
+            return Ok(e);
+        }
+        if let Some(l) = limit {
+            let el = crate::timer::cycles().wrapping_sub(t0);
+            if el >= l {
+                let a = au();
+                a.overrun_us = a.overrun_us.max((el - l) * 1_000_000 / hz);
+                return Ok(0);
+            }
+        }
+        if !audio_pump() {
+            let t = crate::timer::cycles();
+            while crate::timer::cycles().wrapping_sub(t) < hz / 1000 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// Play out what is queued, at most 250 ms of it (plus what the device holds). The only host call that waits on
+/// the device (condition 4); it stops at Ctrl+C, at Close anyway and at a close request, which it keeps for the
+/// app's next cell_event.
+fn audio_drain(take_events: bool) -> Result<(), &'static str> {
+    let hz = crate::timer::hz().max(1);
+    let t0 = crate::timer::cycles();
+    let limit = (250 + AUDIO_AHEAD_MS + 50) * hz / 1000;
+    while crate::timer::cycles().wrapping_sub(t0) < limit {
+        let (queued, done) = {
+            let a = au();
+            (a.len, a.failed || (a.len == 0 && audio_ahead(a) == 0))
+        };
+        if done {
+            break;
+        }
+        cell_forced_check()?;
+        if take_events && crate::desk::cell_owned() {
+            let e = crate::desk::app_cell_event(0);
+            if e != 0 {
+                // SAFETY: single-threaded interpreter.
+                unsafe { AUDIO_HELD_EVENT = e };
+                break;
+            }
+        } else {
+            console_key()?;
+        }
+        if queued > 0 && !audio_pump() {
+            core::hint::spin_loop();
+        }
+    }
+    Ok(())
+}
+
+/// Free the device: end the driver stream if it is begun, print the stream's line, forget it.
+fn audio_free(why: &str) {
+    let a = au();
+    if !a.open {
+        return;
+    }
+    let ok = !a.live || crate::virtio::sound_stream_end();
+    crate::kprintln!(
+        "[nia] audio: stream closed ({}), {} frames played, {} underrun(s), waits {} us past their end at most{}; the sound device is free",
+        why,
+        a.played,
+        a.underruns,
+        a.overrun_us,
+        if ok && !a.failed { "" } else { ", a driver call failed" }
+    );
+    a.open = false;
+    a.live = false;
+    a.len = 0;
+}
+
+fn audio_close(id: i32) -> Result<i32, &'static str> {
+    if id != AUDIO_WIN || !au().open {
+        return Ok(-1);
+    }
+    let r = audio_drain(true);
+    audio_free("audio_close");
+    r.map(|_| 0)
+}
+
+/// From run_app_body, on every way out of a run: a clean return plays out what is queued; a TRAP, Ctrl+C, the
+/// close box's end or Close anyway drop it at once.
+fn audio_app_ended(why: &str, drain: bool) {
+    if !au().open {
+        return;
+    }
+    if drain {
+        let _ = audio_drain(false);
+    }
+    audio_free(why);
+    // SAFETY: single-threaded interpreter.
+    unsafe { AUDIO_HELD_EVENT = 0 };
 }
 
 // --- Module globals (2.92) --------------------------------------------------
@@ -724,21 +1091,85 @@ fn read_name<'a>(ptr: i32, len: i32, buf: &'a mut [u8; 32]) -> Result<&'a str, &
 }
 
 /// Host `file_write(name_ptr, name_len, data_ptr, data_len)` → bytes written / -1.
+/// The most file_list ever writes (A5): 24 names of at most 24 bytes, each ended by a newline.
+const FILE_LIST_MAX: usize = crate::vfs::MAX_FILES * 25;
+
+/// file_list(buf, cap) (A5): the VFS's file names, one per line, each ended by `\n`, in slot order. The cap is cut to
+/// 600 first, then the buffer is checked (past the app's memory is a TRAP). If the names do not all fit, nothing is
+/// written and the answer is -(the bytes all names need), so a name is never cut and the app can ask again. Apps that
+/// live only in the kernel image are not files and are not listed; a damaged file is (file_read gives it -5). A name
+/// is the person's bytes: the app draws it as text (a cell app through cell_put), never as a command.
+fn host_file_list(bptr: i32, cap: i32) -> Result<i32, &'static str> {
+    let cap = ulen(cap, FILE_LIST_MAX);
+    let b = mem_range(bptr, cap)?;
+    let names = (0..crate::vfs::MAX_FILES).filter(|&i| crate::vfs::is_used(i)).map(crate::vfs::name_of);
+    let need: usize = names.clone().map(|n| n.len() + 1).sum();
+    if need > cap {
+        crate::kprintln!("    [wasm app] file_list({} bytes) -> {} needed, nothing written", cap, need);
+        return Ok(-(need as i32));
+    }
+    let mut at = b;
+    for n in names {
+        for &c in n.as_bytes() {
+            mem_write8(at, c);
+            at += 1;
+        }
+        mem_write8(at, b'\n');
+        at += 1;
+    }
+    crate::kprintln!("    [wasm app] file_list -> {} bytes", need);
+    Ok(need as i32)
+}
+
+/// The most a file holds, and so the most file_write and file_read move (A2): the VFS's 16 KiB.
+const FILE_IO_MAX: usize = crate::vfs::MAX_BIG_FILE_BYTES;
+
+/// The system's files, which no app and no shell redirect may replace: the config, every bundled app's name, and
+/// every name the integrity manifest or appget owns (A2 change 2, the same rule as the shell's `> name`).
+pub fn is_system_file(name: &str) -> bool {
+    name == "afrisovera.conf" || bundled(name).is_some() || crate::integrity::expected(name).is_some()
+}
+
+/// file_write(name, nlen, data, dlen) (A2): the whole file, up to 16 KiB, then saved to the disk.
+/// Returns the bytes written, or:
+/// - -1 the VFS could not take it (no free slot, a bad name);
+/// - -2 written in memory but the save to the disk failed;
+/// - -3 more than 16 KiB: refused, nothing written, the old file stays (change 1, never cut);
+/// - -4 the system's file (change 2).
+/// The bytes go straight from the app's memory to the VFS (no stack buffer); past the memory is a TRAP.
 fn host_file_write(nptr: i32, nlen: i32, dptr: i32, dlen: i32) -> Result<i32, &'static str> {
     let mut nb = [0u8; 32];
     let name = read_name(nptr, nlen, &mut nb)?;
-    let mut db = [0u8; 512];
-    let dn = ulen(dlen, 512);
-    let d = mem_range(dptr, dn)?;
-    for i in 0..dn {
-        db[i] = mem_read8(d + i);
+    let want = dlen as u32 as usize;
+    if want > FILE_IO_MAX {
+        crate::kprintln!("    [wasm app] file_write('{}', {} bytes) -> refused: over {} bytes, nothing written", name, want, FILE_IO_MAX);
+        return Ok(-3);
     }
-    if crate::vfs::write(name, &db[..dn]) {
-        crate::kprintln!("    [wasm app] file_write('{}', {} bytes) -> ok", name, dn);
-        Ok(dn as i32)
-    } else {
+    let d = mem_range(dptr, want)?;
+    if is_system_file(name) {
+        crate::kprintln!("    [wasm app] file_write('{}') -> refused: the system's file", name);
+        return Ok(-4);
+    }
+    // SAFETY: single-threaded interpreter; d + want is inside WASM_MEM (mem_range).
+    let bytes = unsafe { &(&*core::ptr::addr_of!(WASM_MEM))[d..d + want] };
+    if !crate::vfs::write_full(name, bytes) {
         crate::kprintln!("    [wasm app] file_write('{}') -> failed", name);
-        Ok(-1)
+        return Ok(-1);
+    }
+    if !crate::virtio::blk_present() {
+        crate::kprintln!("    [wasm app] file_write('{}', {} bytes) -> ok (no disk: kept in memory)", name, want);
+        return Ok(want as i32);
+    }
+    let hz = crate::timer::hz().max(1);
+    let t0 = crate::timer::cycles();
+    let saved = crate::vfs::sync_file(name);
+    let us = crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / hz;
+    if saved {
+        crate::kprintln!("    [wasm app] file_write('{}', {} bytes) -> ok, on disk in {} us", name, want, us);
+        Ok(want as i32)
+    } else {
+        crate::kprintln!("    [wasm app] file_write('{}', {} bytes) -> in memory, the save to disk FAILED", name, want);
+        Ok(-2)
     }
 }
 
@@ -1771,13 +2202,19 @@ fn host_ai(pptr: i32, plen: i32, optr: i32, ocap: i32) -> Result<i32, &'static s
     Ok(n as i32)
 }
 
-/// Host `file_read(name_ptr, name_len, buf_ptr, buf_cap)` → bytes read / -1.
+/// file_read(name, nlen, buf, cap) (A2): up to min(the file, cap, 16 KiB) bytes. -1 when there is no such file;
+/// -5 when the file was damaged by a cut during a save (its bytes are kept, `ls` marks it; nothing is copied, so an
+/// app never takes a mix of old and new for the file; a fresh file_write replaces it).
 fn host_file_read(nptr: i32, nlen: i32, bptr: i32, cap: i32) -> Result<i32, &'static str> {
     let mut nb = [0u8; 32];
     let name = read_name(nptr, nlen, &mut nb)?;
-    match crate::vfs::read_raw(name) {
+    if crate::vfs::is_damaged(name) {
+        crate::kprintln!("    [wasm app] file_read('{}') -> damaged by a cut during a save", name);
+        return Ok(-5);
+    }
+    match crate::vfs::read_full(name) {
         Some(bytes) => {
-            let n = bytes.len().min(cap as u32 as usize);
+            let n = bytes.len().min(ulen(cap, FILE_IO_MAX));
             let b = mem_range(bptr, n)?;
             for i in 0..n {
                 mem_write8(b + i, bytes[i]);
@@ -1851,6 +2288,7 @@ fn perm_bit(name: &[u8]) -> Option<u32> {
         b"voice" => CAP_VOICE,
         b"net" => CAP_NET,
         b"random" => CAP_RANDOM,
+        b"audio" => CAP_AUDIO,
         _ => return None,
     })
 }
@@ -2224,13 +2662,206 @@ pub fn rand_wasm() -> &'static [u8] {
 }
 
 /// Andika, the text editor (native apps engineer, nia-apps): the first bundled app over 16 KiB, so it runs only from
-/// these bytes (A7). Built by nia-apps tools/build.sh at a334eb1 (branch andika) on nightly-2026-11-10 with
-/// immediate-abort panics; 29,238 bytes, SHA-256 c1568f5a1727baefc971b4fb6b0f9628cd10f0e8421418d7a4f7f86748043a90.
-/// Its afri.permissions section is exactly what it uses: draw (the five cell calls) and file (file_read and
-/// file_write). Not input or time, which the 12 Nov condition named: its keys come as cell events, under draw.
+/// these bytes (A7). Built by nia-apps tools/build.sh at eaf2c4f on nightly-2026-11-10 with immediate-abort panics,
+/// on A2's 16 KiB files and A4's key codes (it no longer decodes escape sequences itself); 28,841 bytes, SHA-256
+/// ffe957fe55e2a2cea6491184661d045caf8302e36a08ea264eda44c61f5bd29c. Its afri.permissions section is exactly what it
+/// uses: draw (the five cell calls) and file (file_read and file_write). Not input or time, which the 12 Nov condition
+/// named: its keys come as cell events, under draw.
 static WASM_ANDIKA: &[u8] = include_bytes!("andika.wasm");
 pub fn andika_wasm() -> &'static [u8] {
     WASM_ANDIKA
+}
+
+/// Ngoma, the drum machine (native apps engineer, nia-apps N1): the first app on the sound stream (N-A1a). Built by
+/// nia-apps tools/build.sh at eaf2c4f on nightly-2026-11-10, on A4's key codes; 11,438 bytes, SHA-256
+/// 5f7b1e83a7cddd7f3b656263ed2807c4116806171114ff594c9db3b2bd207f36. Permissions draw and audio.
+static WASM_NGOMA: &[u8] = include_bytes!("ngoma.wasm");
+pub fn ngoma_wasm() -> &'static [u8] {
+    WASM_NGOMA
+}
+
+/// Hati, the documents app (native apps engineer, nia-apps office step O2): Markdown with a write view and a read view,
+/// saves and an export, on Andika's engine. Built by nia-apps tools/build.sh at eaf2c4f on nightly-2026-11-10, on A2's
+/// 16 KiB files and A4's key codes; 44,358 bytes (under the architect's 48 KiB per bundled app), SHA-256
+/// 34c42dccd7885ce41de47715c13a4bec82cc6c2407dd6e8003c7f08dfc3368f7. Permissions draw and file.
+static WASM_HATI: &[u8] = include_bytes!("hati.wasm");
+pub fn hati_wasm() -> &'static [u8] {
+    WASM_HATI
+}
+
+/// filetest.wasm, A2's test app (scripts/lib/file-wasm.py): files up to 16 KiB, saves on the disk, a cut save.
+/// In test images only (feature test-apps); it writes only big.txt and cut.txt.
+// scripts/lib/file-wasm.py --rust (890 bytes)
+#[cfg(feature = "test-apps")]
+static WASM_FILETEST: [u8; 890] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x20, 0x06, 0x60, 0x01, 0x7F, 0x00, 0x60,
+    0x00, 0x01, 0x7F, 0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, 0x60, 0x00, 0x00, 0x60, 0x03,
+    0x7F, 0x7F, 0x7F, 0x00, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, 0x02, 0x5C, 0x06, 0x04, 0x61, 0x66,
+    0x72, 0x69, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x00, 0x00, 0x04, 0x61, 0x66, 0x72, 0x69, 0x06,
+    0x67, 0x65, 0x74, 0x6B, 0x65, 0x79, 0x00, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0x0A, 0x66, 0x69,
+    0x6C, 0x65, 0x5F, 0x77, 0x72, 0x69, 0x74, 0x65, 0x00, 0x02, 0x04, 0x61, 0x66, 0x72, 0x69, 0x09,
+    0x66, 0x69, 0x6C, 0x65, 0x5F, 0x72, 0x65, 0x61, 0x64, 0x00, 0x02, 0x04, 0x61, 0x66, 0x72, 0x69,
+    0x04, 0x70, 0x75, 0x74, 0x63, 0x00, 0x00, 0x04, 0x61, 0x66, 0x72, 0x69, 0x09, 0x66, 0x69, 0x6C,
+    0x65, 0x5F, 0x6C, 0x69, 0x73, 0x74, 0x00, 0x05, 0x03, 0x04, 0x03, 0x03, 0x04, 0x05, 0x05, 0x03,
+    0x01, 0x00, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x06, 0x0A, 0xC9, 0x04, 0x03,
+    0xDE, 0x03, 0x01, 0x03, 0x7F, 0x10, 0x01, 0x21, 0x00, 0x20, 0x00, 0x41, 0xF7, 0x00, 0x46, 0x04,
+    0x40, 0x41, 0x80, 0x20, 0x41, 0x80, 0x80, 0x01, 0x41, 0x01, 0x10, 0x07, 0x41, 0x00, 0x41, 0x07,
+    0x41, 0x80, 0x20, 0x41, 0x80, 0x80, 0x01, 0x10, 0x02, 0x10, 0x00, 0x41, 0x00, 0x41, 0x07, 0x41,
+    0x80, 0xC0, 0x01, 0x41, 0x80, 0x80, 0x01, 0x10, 0x03, 0x10, 0x00, 0x41, 0x80, 0xC0, 0x01, 0x41,
+    0x80, 0x80, 0x01, 0x10, 0x08, 0x10, 0x00, 0x0F, 0x0B, 0x20, 0x00, 0x41, 0xF8, 0x00, 0x46, 0x04,
+    0x40, 0x41, 0x00, 0x41, 0x07, 0x41, 0x80, 0x20, 0x41, 0x81, 0x80, 0x01, 0x10, 0x02, 0x10, 0x00,
+    0x41, 0x00, 0x41, 0x07, 0x41, 0x80, 0xC0, 0x01, 0x41, 0x80, 0x80, 0x01, 0x10, 0x03, 0x10, 0x00,
+    0x41, 0x80, 0xC0, 0x01, 0x41, 0x80, 0x80, 0x01, 0x10, 0x08, 0x10, 0x00, 0x0F, 0x0B, 0x20, 0x00,
+    0x41, 0xEF, 0x00, 0x46, 0x04, 0x40, 0x41, 0x20, 0x41, 0x06, 0x41, 0x80, 0xC0, 0x01, 0x41, 0x80,
+    0x80, 0x01, 0x10, 0x03, 0x10, 0x00, 0x41, 0x00, 0x41, 0x07, 0x41, 0x80, 0xC0, 0x01, 0x41, 0x00,
+    0x10, 0x03, 0x10, 0x00, 0x41, 0x00, 0x41, 0x07, 0x41, 0x80, 0xC0, 0x01, 0x41, 0xD8, 0x04, 0x10,
+    0x03, 0x10, 0x00, 0x41, 0x30, 0x41, 0x0F, 0x41, 0x80, 0x20, 0x41, 0x0A, 0x10, 0x02, 0x10, 0x00,
+    0x41, 0xD0, 0x00, 0x41, 0x0A, 0x41, 0x80, 0x20, 0x41, 0x0A, 0x10, 0x02, 0x10, 0x00, 0x41, 0x00,
+    0x41, 0x07, 0x41, 0xE0, 0xD4, 0x03, 0x41, 0x90, 0xCE, 0x00, 0x10, 0x02, 0x1A, 0x41, 0xE3, 0x00,
+    0x10, 0x00, 0x0F, 0x0B, 0x20, 0x00, 0x41, 0xF2, 0x00, 0x46, 0x04, 0x40, 0x41, 0x00, 0x41, 0x07,
+    0x41, 0x80, 0xC0, 0x01, 0x41, 0x80, 0x80, 0x01, 0x10, 0x03, 0x10, 0x00, 0x41, 0x80, 0xC0, 0x01,
+    0x41, 0x80, 0x80, 0x01, 0x10, 0x08, 0x10, 0x00, 0x0F, 0x0B, 0x20, 0x00, 0x41, 0xF6, 0x00, 0x46,
+    0x04, 0x40, 0x03, 0x40, 0x41, 0x80, 0x20, 0x41, 0x80, 0x80, 0x01, 0x41, 0x01, 0x10, 0x07, 0x41,
+    0x10, 0x41, 0x07, 0x41, 0x80, 0x20, 0x41, 0x80, 0x80, 0x01, 0x10, 0x02, 0x1A, 0x41, 0x80, 0x20,
+    0x41, 0x80, 0x80, 0x01, 0x41, 0x02, 0x10, 0x07, 0x41, 0x10, 0x41, 0x07, 0x41, 0x80, 0x20, 0x41,
+    0x80, 0x80, 0x01, 0x10, 0x02, 0x1A, 0x0C, 0x00, 0x0B, 0x0F, 0x0B, 0x20, 0x00, 0x41, 0xEB, 0x00,
+    0x46, 0x04, 0x40, 0x41, 0x10, 0x41, 0x07, 0x41, 0x80, 0xC0, 0x01, 0x41, 0x80, 0x80, 0x01, 0x10,
+    0x03, 0x10, 0x00, 0x41, 0x80, 0xC0, 0x01, 0x41, 0x80, 0x80, 0x01, 0x10, 0x08, 0x10, 0x00, 0x0F,
+    0x0B, 0x20, 0x00, 0x41, 0xEC, 0x00, 0x46, 0x04, 0x40, 0x41, 0x80, 0xC0, 0x02, 0x41, 0xD5, 0x00,
+    0x3A, 0x00, 0x00, 0x41, 0x80, 0xC8, 0x02, 0x41, 0xD8, 0x04, 0x10, 0x05, 0x21, 0x01, 0x20, 0x01,
+    0x10, 0x00, 0x41, 0x00, 0x21, 0x02, 0x02, 0x40, 0x03, 0x40, 0x20, 0x02, 0x20, 0x01, 0x4F, 0x0D,
+    0x01, 0x41, 0x80, 0xC8, 0x02, 0x20, 0x02, 0x6A, 0x2D, 0x00, 0x00, 0x10, 0x04, 0x20, 0x02, 0x41,
+    0x01, 0x6A, 0x21, 0x02, 0x0C, 0x00, 0x0B, 0x0B, 0x41, 0x80, 0xC0, 0x02, 0x20, 0x01, 0x41, 0x01,
+    0x6B, 0x10, 0x05, 0x10, 0x00, 0x41, 0x80, 0xC0, 0x02, 0x2D, 0x00, 0x00, 0x10, 0x00, 0x41, 0xFA,
+    0xFF, 0x03, 0x41, 0xD8, 0x04, 0x10, 0x05, 0x1A, 0x41, 0xE3, 0x00, 0x10, 0x00, 0x0F, 0x0B, 0x0B,
+    0x32, 0x01, 0x01, 0x7F, 0x41, 0x00, 0x21, 0x03, 0x02, 0x40, 0x03, 0x40, 0x20, 0x03, 0x20, 0x01,
+    0x4F, 0x0D, 0x01, 0x20, 0x00, 0x20, 0x03, 0x6A, 0x20, 0x03, 0x41, 0x07, 0x6C, 0x20, 0x02, 0x6A,
+    0x41, 0xFF, 0x01, 0x71, 0x3A, 0x00, 0x00, 0x20, 0x03, 0x41, 0x01, 0x6A, 0x21, 0x03, 0x0C, 0x00,
+    0x0B, 0x0B, 0x0B, 0x34, 0x01, 0x02, 0x7F, 0x41, 0x00, 0x21, 0x02, 0x41, 0x00, 0x21, 0x03, 0x02,
+    0x40, 0x03, 0x40, 0x20, 0x02, 0x20, 0x01, 0x4F, 0x0D, 0x01, 0x20, 0x03, 0x41, 0x1F, 0x6C, 0x20,
+    0x00, 0x20, 0x02, 0x6A, 0x2D, 0x00, 0x00, 0x6A, 0x21, 0x03, 0x20, 0x02, 0x41, 0x01, 0x6A, 0x21,
+    0x02, 0x0C, 0x00, 0x0B, 0x0B, 0x20, 0x03, 0x0B, 0x0B, 0x66, 0x01, 0x00, 0x41, 0x00, 0x0B, 0x60,
+    0x62, 0x69, 0x67, 0x2E, 0x74, 0x78, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x63, 0x75, 0x74, 0x2E, 0x74, 0x78, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x6E, 0x6F, 0x66, 0x69, 0x6C, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x61, 0x66, 0x72, 0x69, 0x73, 0x6F, 0x76, 0x65, 0x72, 0x61, 0x2E, 0x63, 0x6F, 0x6E, 0x66, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x68, 0x65, 0x6C, 0x6C, 0x6F, 0x2E, 0x77, 0x61, 0x73, 0x6D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x28, 0x10, 0x61, 0x66, 0x72, 0x69, 0x2E, 0x70, 0x65, 0x72, 0x6D, 0x69, 0x73, 0x73, 0x69,
+    0x6F, 0x6E, 0x73, 0x04, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x04, 0x70, 0x75, 0x74, 0x63, 0x05,
+    0x69, 0x6E, 0x70, 0x75, 0x74, 0x04, 0x66, 0x69, 0x6C, 0x65,
+];
+#[cfg(feature = "test-apps")]
+pub fn filetest_wasm() -> &'static [u8] {
+    &WASM_FILETEST
+}
+
+/// keytest.wasm, A4's test app (scripts/lib/keys-wasm.py): prints every key it gets. Test images only.
+// scripts/lib/keys-wasm.py --rust (268 bytes)
+#[cfg(feature = "test-apps")]
+static WASM_KEYTEST: [u8; 268] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x17, 0x05, 0x60, 0x01, 0x7F, 0x00, 0x60,
+    0x00, 0x01, 0x7F, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, 0x60, 0x01, 0x7F, 0x01, 0x7F, 0x60, 0x00,
+    0x00, 0x02, 0x3F, 0x04, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x00,
+    0x00, 0x04, 0x61, 0x66, 0x72, 0x69, 0x06, 0x67, 0x65, 0x74, 0x6B, 0x65, 0x79, 0x00, 0x01, 0x04,
+    0x61, 0x66, 0x72, 0x69, 0x09, 0x63, 0x65, 0x6C, 0x6C, 0x5F, 0x6F, 0x70, 0x65, 0x6E, 0x00, 0x02,
+    0x04, 0x61, 0x66, 0x72, 0x69, 0x0A, 0x63, 0x65, 0x6C, 0x6C, 0x5F, 0x65, 0x76, 0x65, 0x6E, 0x74,
+    0x00, 0x03, 0x03, 0x02, 0x01, 0x04, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x04, 0x0A,
+    0x76, 0x01, 0x74, 0x01, 0x03, 0x7F, 0x41, 0x14, 0x41, 0x04, 0x10, 0x02, 0x41, 0x01, 0x46, 0x04,
+    0x40, 0x03, 0x40, 0x41, 0x7F, 0x10, 0x03, 0x21, 0x00, 0x20, 0x00, 0x41, 0x1C, 0x76, 0x41, 0x07,
+    0x71, 0x21, 0x01, 0x20, 0x01, 0x41, 0x03, 0x46, 0x04, 0x40, 0x41, 0x7D, 0x10, 0x00, 0x0F, 0x0B,
+    0x20, 0x01, 0x41, 0x04, 0x46, 0x04, 0x40, 0x0F, 0x0B, 0x20, 0x01, 0x41, 0x01, 0x46, 0x04, 0x40,
+    0x20, 0x00, 0x41, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x71, 0x21, 0x02, 0x20, 0x02, 0x10, 0x00, 0x20,
+    0x02, 0x41, 0xF1, 0x00, 0x46, 0x04, 0x40, 0x0F, 0x0B, 0x0B, 0x0C, 0x00, 0x0B, 0x0F, 0x0B, 0x03,
+    0x40, 0x10, 0x01, 0x21, 0x00, 0x20, 0x00, 0x10, 0x00, 0x20, 0x00, 0x41, 0xF1, 0x00, 0x46, 0x04,
+    0x40, 0x0F, 0x0B, 0x0C, 0x00, 0x0B, 0x0B, 0x00, 0x23, 0x10, 0x61, 0x66, 0x72, 0x69, 0x2E, 0x70,
+    0x65, 0x72, 0x6D, 0x69, 0x73, 0x73, 0x69, 0x6F, 0x6E, 0x73, 0x03, 0x05, 0x70, 0x72, 0x69, 0x6E,
+    0x74, 0x05, 0x69, 0x6E, 0x70, 0x75, 0x74, 0x04, 0x64, 0x72, 0x61, 0x77,
+];
+#[cfg(feature = "test-apps")]
+pub fn keytest_wasm() -> &'static [u8] {
+    &WASM_KEYTEST
+}
+
+/// tone.wasm, the sound demo and N-A1a's test app (scripts/lib/audio-wasm.py): square waves through the sound
+/// stream, one key picks the mode (read the generator). Bundled because a disk app never gets the audio permission; in test images only (feature test-apps).
+// scripts/lib/audio-wasm.py --rust (1115 bytes)
+#[cfg(feature = "test-apps")]
+static WASM_TONE: [u8; 1115] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x30, 0x09, 0x60, 0x01, 0x7F, 0x00, 0x60,
+    0x00, 0x01, 0x7F, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, 0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F,
+    0x60, 0x01, 0x7F, 0x01, 0x7F, 0x60, 0x02, 0x7F, 0x7F, 0x00, 0x60, 0x00, 0x00, 0x60, 0x03, 0x7F,
+    0x7F, 0x7F, 0x00, 0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x00, 0x02, 0xA7, 0x01, 0x0A, 0x04, 0x61,
+    0x66, 0x72, 0x69, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x00, 0x00, 0x04, 0x61, 0x66, 0x72, 0x69,
+    0x06, 0x67, 0x65, 0x74, 0x6B, 0x65, 0x79, 0x00, 0x01, 0x04, 0x61, 0x66, 0x72, 0x69, 0x0A, 0x61,
+    0x75, 0x64, 0x69, 0x6F, 0x5F, 0x6F, 0x70, 0x65, 0x6E, 0x00, 0x02, 0x04, 0x61, 0x66, 0x72, 0x69,
+    0x0B, 0x61, 0x75, 0x64, 0x69, 0x6F, 0x5F, 0x77, 0x72, 0x69, 0x74, 0x65, 0x00, 0x03, 0x04, 0x61,
+    0x66, 0x72, 0x69, 0x0B, 0x61, 0x75, 0x64, 0x69, 0x6F, 0x5F, 0x6C, 0x65, 0x76, 0x65, 0x6C, 0x00,
+    0x04, 0x04, 0x61, 0x66, 0x72, 0x69, 0x0B, 0x61, 0x75, 0x64, 0x69, 0x6F, 0x5F, 0x63, 0x6C, 0x6F,
+    0x73, 0x65, 0x00, 0x04, 0x04, 0x61, 0x66, 0x72, 0x69, 0x08, 0x73, 0x6C, 0x65, 0x65, 0x70, 0x5F,
+    0x6D, 0x73, 0x00, 0x04, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05, 0x73, 0x70, 0x65, 0x61, 0x6B, 0x00,
+    0x05, 0x04, 0x61, 0x66, 0x72, 0x69, 0x09, 0x63, 0x65, 0x6C, 0x6C, 0x5F, 0x6F, 0x70, 0x65, 0x6E,
+    0x00, 0x02, 0x04, 0x61, 0x66, 0x72, 0x69, 0x0A, 0x63, 0x65, 0x6C, 0x6C, 0x5F, 0x65, 0x76, 0x65,
+    0x6E, 0x74, 0x00, 0x04, 0x03, 0x05, 0x04, 0x06, 0x07, 0x08, 0x06, 0x05, 0x03, 0x01, 0x00, 0x01,
+    0x06, 0x06, 0x01, 0x7F, 0x01, 0x41, 0x00, 0x0B, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00,
+    0x0A, 0x0A, 0x8D, 0x06, 0x04, 0xE0, 0x03, 0x01, 0x02, 0x7F, 0x41, 0x14, 0x41, 0x04, 0x10, 0x08,
+    0x41, 0x01, 0x46, 0x04, 0x40, 0x10, 0x0D, 0x0F, 0x0B, 0x10, 0x01, 0x21, 0x00, 0x20, 0x00, 0x41,
+    0xE1, 0x00, 0x46, 0x04, 0x40, 0x41, 0xA2, 0xAC, 0x01, 0x41, 0x01, 0x10, 0x02, 0x21, 0x01, 0x20,
+    0x01, 0x41, 0x91, 0xD6, 0x00, 0x41, 0x32, 0x41, 0x01, 0x10, 0x0C, 0x41, 0xF4, 0x03, 0x10, 0x06,
+    0x1A, 0x20, 0x01, 0x41, 0x91, 0xD6, 0x00, 0x41, 0x32, 0x41, 0x01, 0x10, 0x0C, 0x20, 0x01, 0x10,
+    0x05, 0x1A, 0x41, 0x01, 0x10, 0x00, 0x0F, 0x0B, 0x20, 0x00, 0x41, 0xE2, 0x00, 0x46, 0x04, 0x40,
+    0x41, 0x80, 0xF7, 0x02, 0x41, 0x02, 0x10, 0x02, 0x21, 0x01, 0x20, 0x01, 0x41, 0x80, 0xF7, 0x02,
+    0x41, 0xE4, 0x00, 0x41, 0x02, 0x10, 0x0C, 0x20, 0x01, 0x10, 0x05, 0x1A, 0x41, 0x02, 0x10, 0x00,
+    0x0F, 0x0B, 0x20, 0x00, 0x41, 0xE5, 0x00, 0x46, 0x04, 0x40, 0x41, 0xBF, 0x3E, 0x41, 0x01, 0x10,
+    0x02, 0x10, 0x00, 0x41, 0x81, 0xF7, 0x02, 0x41, 0x01, 0x10, 0x02, 0x10, 0x00, 0x41, 0xA2, 0xAC,
+    0x01, 0x41, 0x00, 0x10, 0x02, 0x10, 0x00, 0x41, 0xA2, 0xAC, 0x01, 0x41, 0x03, 0x10, 0x02, 0x10,
+    0x00, 0x41, 0xA2, 0xAC, 0x01, 0x41, 0x01, 0x10, 0x02, 0x21, 0x01, 0x20, 0x01, 0x10, 0x00, 0x41,
+    0xA2, 0xAC, 0x01, 0x41, 0x01, 0x10, 0x02, 0x10, 0x00, 0x20, 0x01, 0x41, 0x80, 0x08, 0x41, 0xA0,
+    0x8D, 0x06, 0x10, 0x03, 0x10, 0x00, 0x20, 0x01, 0x41, 0x80, 0x08, 0x41, 0xA0, 0x8D, 0x06, 0x10,
+    0x03, 0x10, 0x00, 0x20, 0x01, 0x41, 0x80, 0x08, 0x41, 0xA0, 0x8D, 0x06, 0x10, 0x03, 0x10, 0x00,
+    0x20, 0x01, 0x41, 0x80, 0x08, 0x41, 0xA0, 0x8D, 0x06, 0x10, 0x03, 0x10, 0x00, 0x20, 0x01, 0x41,
+    0x80, 0x08, 0x41, 0xA0, 0x8D, 0x06, 0x10, 0x03, 0x10, 0x00, 0x41, 0x09, 0x41, 0x80, 0x08, 0x41,
+    0x0A, 0x10, 0x03, 0x10, 0x00, 0x20, 0x01, 0x10, 0x04, 0x10, 0x00, 0x20, 0x01, 0x10, 0x05, 0x10,
+    0x00, 0x20, 0x01, 0x10, 0x04, 0x10, 0x00, 0x0F, 0x0B, 0x20, 0x00, 0x41, 0xF4, 0x00, 0x46, 0x04,
+    0x40, 0x41, 0xA2, 0xAC, 0x01, 0x41, 0x01, 0x10, 0x02, 0x21, 0x01, 0x20, 0x01, 0x41, 0xE2, 0x0A,
+    0x41, 0x32, 0x41, 0x01, 0x10, 0x0C, 0x20, 0x01, 0x41, 0xFA, 0xFF, 0x03, 0x41, 0x1E, 0x10, 0x03,
+    0x1A, 0x41, 0xE3, 0x00, 0x10, 0x00, 0x0F, 0x0B, 0x20, 0x00, 0x41, 0xE3, 0x00, 0x46, 0x04, 0x40,
+    0x41, 0xA2, 0xAC, 0x01, 0x41, 0x01, 0x10, 0x02, 0x21, 0x01, 0x20, 0x01, 0x41, 0xE2, 0x0A, 0x41,
+    0x32, 0x41, 0x01, 0x10, 0x0C, 0x03, 0x40, 0x0C, 0x00, 0x0B, 0x0F, 0x0B, 0x20, 0x00, 0x41, 0xF2,
+    0x00, 0x46, 0x04, 0x40, 0x41, 0xA2, 0xAC, 0x01, 0x41, 0x01, 0x10, 0x02, 0x21, 0x01, 0x20, 0x01,
+    0x41, 0xBA, 0x22, 0x41, 0x32, 0x41, 0x01, 0x10, 0x0C, 0x41, 0x04, 0x10, 0x00, 0x0F, 0x0B, 0x20,
+    0x00, 0x41, 0xF3, 0x00, 0x46, 0x04, 0x40, 0x41, 0xA2, 0xAC, 0x01, 0x41, 0x01, 0x10, 0x02, 0x21,
+    0x01, 0x41, 0x00, 0x41, 0x04, 0x10, 0x07, 0x41, 0xA2, 0xAC, 0x01, 0x41, 0x01, 0x10, 0x02, 0x10,
+    0x00, 0x20, 0x01, 0x10, 0x05, 0x1A, 0x41, 0x08, 0x41, 0x04, 0x10, 0x07, 0x41, 0x05, 0x10, 0x00,
+    0x0F, 0x0B, 0x20, 0x00, 0x41, 0xEE, 0x00, 0x46, 0x04, 0x40, 0x41, 0xA2, 0xAC, 0x01, 0x41, 0x01,
+    0x10, 0x02, 0x10, 0x00, 0x0F, 0x0B, 0x0B, 0x61, 0x01, 0x03, 0x7F, 0x41, 0x00, 0x21, 0x03, 0x02,
+    0x40, 0x03, 0x40, 0x20, 0x03, 0x20, 0x00, 0x4F, 0x0D, 0x01, 0x41, 0xC0, 0x41, 0x21, 0x04, 0x23,
+    0x00, 0x20, 0x01, 0x70, 0x20, 0x01, 0x41, 0x01, 0x76, 0x49, 0x04, 0x40, 0x41, 0xC0, 0x3E, 0x21,
+    0x04, 0x0B, 0x41, 0x80, 0x08, 0x20, 0x03, 0x20, 0x02, 0x6C, 0x41, 0x01, 0x74, 0x6A, 0x21, 0x05,
+    0x20, 0x05, 0x20, 0x04, 0x3B, 0x01, 0x00, 0x20, 0x02, 0x41, 0x02, 0x46, 0x04, 0x40, 0x20, 0x05,
+    0x41, 0x00, 0x3B, 0x01, 0x02, 0x0B, 0x23, 0x00, 0x41, 0x01, 0x6A, 0x24, 0x00, 0x20, 0x03, 0x41,
+    0x01, 0x6A, 0x21, 0x03, 0x0C, 0x00, 0x0B, 0x0B, 0x0B, 0x70, 0x01, 0x03, 0x7F, 0x02, 0x40, 0x03,
+    0x40, 0x20, 0x01, 0x41, 0x00, 0x4C, 0x0D, 0x01, 0x41, 0x80, 0x04, 0x21, 0x04, 0x20, 0x01, 0x41,
+    0x80, 0x04, 0x48, 0x04, 0x40, 0x20, 0x01, 0x21, 0x04, 0x0B, 0x20, 0x04, 0x20, 0x02, 0x20, 0x03,
+    0x10, 0x0B, 0x41, 0x00, 0x21, 0x05, 0x02, 0x40, 0x03, 0x40, 0x20, 0x05, 0x20, 0x04, 0x4E, 0x0D,
+    0x01, 0x20, 0x00, 0x41, 0x80, 0x08, 0x20, 0x05, 0x20, 0x03, 0x6C, 0x41, 0x01, 0x74, 0x6A, 0x20,
+    0x04, 0x20, 0x05, 0x6B, 0x10, 0x03, 0x21, 0x06, 0x20, 0x05, 0x20, 0x06, 0x6A, 0x21, 0x05, 0x20,
+    0x06, 0x45, 0x04, 0x40, 0x41, 0x0A, 0x10, 0x06, 0x1A, 0x0B, 0x0C, 0x00, 0x0B, 0x0B, 0x20, 0x01,
+    0x20, 0x04, 0x6B, 0x21, 0x01, 0x0C, 0x00, 0x0B, 0x0B, 0x0B, 0x56, 0x01, 0x04, 0x7F, 0x41, 0xA2,
+    0xAC, 0x01, 0x41, 0x01, 0x10, 0x02, 0x21, 0x00, 0x41, 0x7F, 0x10, 0x09, 0x41, 0xFF, 0xFF, 0xFF,
+    0xFF, 0x00, 0x71, 0x21, 0x01, 0x03, 0x40, 0x41, 0x14, 0x10, 0x09, 0x21, 0x02, 0x20, 0x02, 0x41,
+    0x1C, 0x76, 0x41, 0x07, 0x71, 0x21, 0x03, 0x20, 0x03, 0x41, 0x03, 0x46, 0x20, 0x01, 0x41, 0xF7,
+    0x00, 0x46, 0x71, 0x04, 0x40, 0x0F, 0x0B, 0x20, 0x00, 0x10, 0x04, 0x41, 0xC4, 0x15, 0x48, 0x04,
+    0x40, 0x20, 0x00, 0x41, 0xE2, 0x0A, 0x41, 0x32, 0x41, 0x01, 0x10, 0x0C, 0x0B, 0x0C, 0x00, 0x0B,
+    0x0B, 0x0B, 0x12, 0x01, 0x00, 0x41, 0x00, 0x0B, 0x0C, 0x62, 0x75, 0x73, 0x79, 0x00, 0x00, 0x00,
+    0x00, 0x66, 0x72, 0x65, 0x65, 0x00, 0x34, 0x10, 0x61, 0x66, 0x72, 0x69, 0x2E, 0x70, 0x65, 0x72,
+    0x6D, 0x69, 0x73, 0x73, 0x69, 0x6F, 0x6E, 0x73, 0x06, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x05,
+    0x69, 0x6E, 0x70, 0x75, 0x74, 0x04, 0x64, 0x72, 0x61, 0x77, 0x04, 0x74, 0x69, 0x6D, 0x65, 0x05,
+    0x76, 0x6F, 0x69, 0x63, 0x65, 0x05, 0x61, 0x75, 0x64, 0x69, 0x6F,
+];
+#[cfg(feature = "test-apps")]
+pub fn tone_wasm() -> &'static [u8] {
+    &WASM_TONE
 }
 
 // rand.wasm: run() { print(random()); print(random()); } — draws twice from the
@@ -3006,34 +3637,48 @@ pub fn dice_demo(n: usize) {
 
 /// The bundled apps: one table for seeding the VFS, recording the integrity manifest (from these
 /// compiled-in bytes) and restoring them after a disk load, so the lists cannot drift apart. appget refuses
-/// these names. Since A7 a bundled name always RUNS from these bytes (run_file), never from a VFS file, and an
-/// app over 16 KiB (the VFS's biggest file) is never written into the VFS: 16 KiB for disk apps, larger for
-/// bundled apps.
-pub const BUNDLED: [(&str, fn() -> &'static [u8]); 13] = [
-    ("hello.wasm", hello_wasm),
-    ("sum.wasm", sum_wasm),
-    ("draw.wasm", draw_wasm),
-    ("fileapp.wasm", file_wasm),
-    ("clock.wasm", clock_wasm),
-    ("type.wasm", type_wasm),
-    ("ai.wasm", ai_wasm),
-    ("chat.wasm", chat_wasm),
-    ("notify.wasm", notify_wasm),
-    ("notify2.wasm", notify2_wasm),
-    ("net.wasm", net_wasm),
-    ("rand.wasm", rand_wasm),
-    ("andika.wasm", andika_wasm),
-];
+/// these names. Since A7 a bundled name always RUNS from these bytes (run_file), never from a VFS file, and only
+/// the classic small apps (512 bytes or less) get a VFS copy at all: 16 KiB for disk apps, larger for bundled apps.
+/// The list, with any test apps after it (a macro, so the two tables below cannot drift apart).
+macro_rules! bundled_list {
+    ($($extra:expr),*) => {
+        [
+            ("hello.wasm", hello_wasm),
+            ("sum.wasm", sum_wasm),
+            ("draw.wasm", draw_wasm),
+            ("fileapp.wasm", file_wasm),
+            ("clock.wasm", clock_wasm),
+            ("type.wasm", type_wasm),
+            ("ai.wasm", ai_wasm),
+            ("chat.wasm", chat_wasm),
+            ("notify.wasm", notify_wasm),
+            ("notify2.wasm", notify2_wasm),
+            ("net.wasm", net_wasm),
+            ("rand.wasm", rand_wasm),
+            ("andika.wasm", andika_wasm),
+            ("ngoma.wasm", ngoma_wasm),
+            ("hati.wasm", hati_wasm)
+            $(, $extra)*
+        ]
+    };
+}
+#[cfg(not(feature = "test-apps"))]
+pub const BUNDLED: [(&str, fn() -> &'static [u8]); 15] = bundled_list!();
+/// Test images (feature test-apps) add tone.wasm (N-A1a), filetest.wasm (A2) and keytest.wasm (A4).
+#[cfg(feature = "test-apps")]
+pub const BUNDLED: [(&str, fn() -> &'static [u8]); 18] =
+    bundled_list!(("tone.wasm", tone_wasm), ("filetest.wasm", filetest_wasm), ("keytest.wasm", keytest_wasm));
 
 /// A bundled app's compiled-in bytes (A7): what `nia NAME` runs for a bundled name.
 pub fn bundled(name: &str) -> Option<&'static [u8]> {
     BUNDLED.iter().find(|(n, _)| *n == name).map(|(_, bytes)| bytes())
 }
 
-/// Whether a bundled app also gets a VFS copy (A7): only one the VFS can hold. A bigger one exists only in the
-/// kernel image; `ls` and the store list it as built in.
+/// Whether a bundled app also gets a VFS copy (A7): only the classic small ones (512 bytes or less, the twelve
+/// demos). Anything bigger (Ngoma, Andika) exists only in the kernel image, and `ls` and the store list it as built
+/// in. So a disk holding only the demos keeps the small-files format (persist-big's boot 3), byte for byte.
 fn bundled_in_vfs(bytes: &[u8]) -> bool {
-    bytes.len() <= crate::vfs::MAX_BIG_FILE_BYTES
+    bytes.len() <= crate::vfs::MAX_FILE_BYTES
 }
 
 /// At boot, before any disk load: write each bundled app the VFS can hold as a file (the one table the manifest
@@ -3063,7 +3708,7 @@ pub fn bundled_ok(name: &str) -> bool {
     bundled_index(name).is_some_and(|i| !bundled_refused(i))
 }
 
-/// A bundled app that exists only in the kernel image (over 16 KiB) and passed the boot check: what `ls` and the
+/// A bundled app that exists only in the kernel image (over 512 bytes) and passed the boot check: what `ls` and the
 /// store list as built in.
 pub fn built_in_only(name: &str) -> Option<&'static [u8]> {
     let i = bundled_index(name)?;
@@ -3090,7 +3735,7 @@ pub fn check_bundled() {
         let fault = if !matches!(crate::integrity::check(name, b), crate::integrity::Verdict::Ok) {
             Some("MISMATCH with the integrity manifest")
         } else if !bundled_in_vfs(b) && !matches!(check_module(b), Ok((_, Some(_)))) {
-            Some("over 16 KiB with no afri.permissions section")
+            Some("built in (over 512 bytes) with no afri.permissions section")
         } else {
             None
         };
@@ -3227,13 +3872,14 @@ fn host_cap(host: u8) -> (u32, &'static str) {
         HOST_PUTC => (CAP_PUTC, "putc"),
         HOST_WIN_CREATE | HOST_WIN_FILL | HOST_WIN_PRESENT | HOST_WIN_TEXT | HOST_WIN_TEXT_RUN => (CAP_DRAW, "draw"),
         HOST_CELL_OPEN | HOST_CELL_PUT | HOST_CELL_CURSOR | HOST_CELL_SIZE | HOST_CELL_EVENT => (CAP_DRAW, "draw"),
-        HOST_FILE_WRITE | HOST_FILE_READ => (CAP_FILE, "file"),
+        HOST_FILE_WRITE | HOST_FILE_READ | HOST_FILE_LIST => (CAP_FILE, "file"),
         HOST_TIME | HOST_SLEEP => (CAP_TIME, "time"),
         HOST_GETKEY | HOST_POLLKEY => (CAP_INPUT, "input"),
         HOST_AI => (CAP_AI, "AI"),
         HOST_SPEAK => (CAP_VOICE, "voice"),
         HOST_NET => (CAP_NET, "net"),
         HOST_RANDOM => (CAP_RANDOM, "random"),
+        HOST_AUDIO_OPEN | HOST_AUDIO_WRITE | HOST_AUDIO_LEVEL | HOST_AUDIO_CLOSE => (CAP_AUDIO, "audio"),
         _ => (0, "unknown"),
     }
 }
@@ -3247,6 +3893,7 @@ pub fn print_caps(label: &str, mask: u32, none: &str) {
     let names = [
         (CAP_PRINT, "print"), (CAP_PUTC, "putc"), (CAP_DRAW, "draw"), (CAP_FILE, "file"), (CAP_TIME, "time"),
         (CAP_INPUT, "input"), (CAP_AI, "AI"), (CAP_VOICE, "voice"), (CAP_NET, "net"), (CAP_RANDOM, "random"),
+        (CAP_AUDIO, "audio"),
     ];
     let mut line = [0u8; 96];
     let mut n = 0;
@@ -3318,6 +3965,9 @@ fn run_app_body(label: &str, bytes: &[u8], caps: u32, from_file: bool) {
             crate::kprintln!("[nia] executing 'run' in the sandbox...");
             let mut st = Stack::new();
             let r = m.invoke(m.run_index, &mut st);
+            // The sound stream closes on every way out (N-A1a): a clean return plays out what is queued, anything
+            // else drops it at once.
+            audio_app_ended(if r.is_ok() { "the app returned" } else { "the app stopped" }, r.is_ok());
             crate::desk::cell_app_ended(); // its cell window closes, on the clean return and on the TRAP alike
             finish_putc(); // the app's last putc line ends before the run's own line, whichever way it ended
             match r {
@@ -3485,6 +4135,11 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
                                 b"cell_size" => HOST_CELL_SIZE,
                                 b"cell_event" => HOST_CELL_EVENT,
                                 b"win_text_run" => HOST_WIN_TEXT_RUN,
+                                b"audio_open" => HOST_AUDIO_OPEN,
+                                b"audio_write" => HOST_AUDIO_WRITE,
+                                b"audio_level" => HOST_AUDIO_LEVEL,
+                                b"audio_close" => HOST_AUDIO_CLOSE,
+                                b"file_list" => HOST_FILE_LIST,
                                 _ => HOST_UNKNOWN,
                             };
                             md.import_type[md.import_count] = desc; // type index
@@ -3705,6 +4360,11 @@ impl<'a> Module<'a> {
             HOST_CELL_SIZE => (CAP_DRAW, "cell_size"),
             HOST_CELL_EVENT => (CAP_DRAW, "cell_event"),
             HOST_WIN_TEXT_RUN => (CAP_DRAW, "win_text_run"),
+            HOST_AUDIO_OPEN => (CAP_AUDIO, "audio_open"),
+            HOST_AUDIO_WRITE => (CAP_AUDIO, "audio_write"),
+            HOST_AUDIO_LEVEL => (CAP_AUDIO, "audio_level"),
+            HOST_AUDIO_CLOSE => (CAP_AUDIO, "audio_close"),
+            HOST_FILE_LIST => (CAP_FILE, "file_list"),
             _ => (0xFFFF_FFFF, "unknown"),
         };
         if host == HOST_UNKNOWN || (self.caps & req) == 0 {
@@ -3726,6 +4386,7 @@ impl<'a> Module<'a> {
             HOST_FILE_WRITE => {
                 result = Some(host_file_write(a[0], a[1], a[2], a[3])?);
             }
+            HOST_FILE_LIST => result = Some(host_file_list(a[0], a[1])?),
             HOST_FILE_READ => {
                 result = Some(host_file_read(a[0], a[1], a[2], a[3])?);
             }
@@ -3740,25 +4401,26 @@ impl<'a> Module<'a> {
                 if crate::desk::cell_owned() {
                     result = Some(crate::desk::cell_abi::ERR_NO_WINDOW);
                 } else {
-                    let k = match keyq_pop() {
-                        Some(c) => c,
-                        None => loop {
-                            cell_forced_check()?;
-                            if let Some(c) = crate::uart::getc() {
-                                break c;
-                            }
-                            core::hint::spin_loop();
-                        },
+                    // A4: the console's bytes go through console_key (Ctrl+C stops the app there, before decoding)
+                    // and the decoder; getkey returns the next key code.
+                    let k = loop {
+                        cell_forced_check()?;
+                        if let Some(k) = keyq_pop() {
+                            break k;
+                        }
+                        console_key()?;
+                        core::hint::spin_loop();
                     };
-                    if k == STOP_KEY {
-                        return Err(STOPPED);
-                    }
                     result = Some(k as i32);
                 }
             }
             HOST_WIN_TEXT => {
                 crate::tonga::win_text(u(a[0]), u(a[1]), u(a[2]), a[3] as u8, a[4] as u32);
             }
+            HOST_AUDIO_OPEN => result = Some(audio_open(a[0], a[1])),
+            HOST_AUDIO_WRITE => result = Some(audio_write(a[0], a[1], a[2])?),
+            HOST_AUDIO_LEVEL => result = Some(audio_level(a[0])),
+            HOST_AUDIO_CLOSE => result = Some(audio_close(a[0])?),
             HOST_WIN_TEXT_RUN => {
                 // win_text_run(win, x, y, ptr, len, color): the length is capped at one row first, then the bytes
                 // are checked (a run past the 64 KiB is a TRAP), then each glyph goes through win_text, which
@@ -3846,7 +4508,7 @@ impl<'a> Module<'a> {
             HOST_CELL_EVENT => {
                 let deep = self.depth.get() >= MAX_CALL_DEPTH && STACK_PROBE.load(Ordering::Relaxed);
                 let mark = if deep { cell_stack_paint() } else { None };
-                result = Some(crate::desk::app_cell_event(a[0]));
+                result = Some(cell_event_with_sound(a[0])?);
                 if let Some(m) = mark {
                     cell_stack_report(m);
                 }

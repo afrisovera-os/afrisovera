@@ -48,9 +48,9 @@ the buffer is zero after every case
 EOF
     in_blk "$F" "firmware test: $NCASES of $NCASES cases as expected" || _f "firmware test: not all $NCASES cases as expected"
     grep -aq 'NOT as expected' <<< "$F" && _f "firmware test: a case was NOT as expected"
-    printf '%s\n' "$A" | grep -aqx 'harness: disk images unchanged' || _f "a disk image changed during the boot (or the check is missing)"
-    printf '%s\n' "$A" | grep -aqx 'harness: fwtool check passed, and failed on each damaged copy' || _f "the MANIFEST checks did not pass (or are missing)"
-    if printf '%s\n' "$A" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)'; then
+    grep -aqx 'harness: disk images unchanged' <<< "$A" || _f "a disk image changed during the boot (or the check is missing)"
+    grep -aqx 'harness: fwtool check passed, and failed on each damaged copy' <<< "$A" || _f "the MANIFEST checks did not pass (or are missing)"
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)' <<< "$A"; then
         _f "the kernel panicked or a disk command failed"
     fi
     return "$fail"

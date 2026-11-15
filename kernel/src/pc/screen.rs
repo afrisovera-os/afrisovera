@@ -107,10 +107,11 @@ pub fn attach(base: u64, w: usize, h: usize, stride: usize, bgr: bool) {
     );
 }
 
-/// The pointer's range: the desktop canvas while the desktop is shown, else the console.
+/// The pointer's range: the desktop's logical size while it is shown (afriui.md section 29: the pointer moves in
+/// logical pixels, so a touchpad feels the same at every scale), else the console.
 pub fn pointer_area() -> (i32, i32) {
     if crate::desk::shown() {
-        (crate::canvas::width() as i32, crate::canvas::height() as i32)
+        (crate::canvas::logical_w() as i32, crate::canvas::logical_h() as i32)
     } else {
         (W as i32, H as i32)
     }
@@ -122,21 +123,44 @@ fn ui_command(arg: &str) {
         crate::kprintln!("screen: no GOP framebuffer, so the desktop has no screen to fill (serial console only)");
         return;
     }
+    // the desk at the screen's own pixels and scale S (afriui.md section 29), in quarters
+    let native = match arg {
+        "1" => Some(4),
+        "1.25" => Some(5),
+        "1.5" => Some(6),
+        "1.75" => Some(7),
+        "2" => Some(8),
+        _ => None,
+    };
     let s = match arg {
         "" => {
-            crate::kprintln!(
-                "screen: the desktop is {}x{} logical pixels at UI scale {}x; type: screen ui 1, 2, 3, 4 or auto",
-                crate::canvas::width(), crate::canvas::height(), crate::canvas::scale()
-            );
+            if crate::canvas::q() == 4 {
+                crate::kprintln!(
+                    "screen: the desktop is {}x{} logical pixels at UI scale {}x; type: screen ui 1, 1.25, 1.5, 1.75, 2, 2x-blocks, 3x-blocks, 4x-blocks or auto",
+                    crate::canvas::width(), crate::canvas::height(), crate::canvas::scale()
+                );
+            } else {
+                ui_native_line("");
+            }
             return;
         }
         "auto" => 0,
-        "1" | "2" | "3" | "4" => (arg.as_bytes()[0] - b'0') as usize,
+        _ if native.is_some() => 0,
+        "2x-blocks" | "3x-blocks" | "4x-blocks" => (arg.as_bytes()[0] - b'0') as usize,
         other => {
-            crate::kprintln!("screen: unknown UI scale {}; use: screen ui 1, 2, 3, 4 or auto", other);
+            crate::kprintln!("screen: unknown UI scale {}; use: screen ui 1, 1.25, 1.5, 1.75, 2, 2x-blocks, 3x-blocks, 4x-blocks or auto", other);
             return;
         }
     };
+    if let Some(q) = native {
+        crate::canvas::set_native(q);
+        crate::desk::relayout();
+        clear(FRAME);
+        FULL.store(true, Ordering::Relaxed);
+        mark();
+        ui_native_line("now ");
+        return;
+    }
     crate::canvas::set_scale(s);
     crate::desk::relayout();
     clear(FRAME);
@@ -145,6 +169,21 @@ fn ui_command(arg: &str) {
     crate::kprintln!(
         "screen: the desktop is now {}x{} logical pixels at UI scale {}x",
         crate::canvas::width(), crate::canvas::height(), crate::canvas::scale()
+    );
+}
+
+/// The desk at its own scale on the screen's pixels (section 29).
+fn ui_native_line(now: &str) {
+    let q = crate::canvas::q();
+    crate::kprintln!(
+        "screen: the desktop is {}{}x{} logical pixels at scale {}.{:02} on the screen's own {}x{} pixels",
+        now,
+        crate::canvas::logical_w(),
+        crate::canvas::logical_h(),
+        q / 4,
+        q % 4 * 25,
+        crate::canvas::width(),
+        crate::canvas::height()
     );
 }
 
@@ -423,6 +462,8 @@ pub fn flush() {
 static FULL: AtomicBool = AtomicBool::new(true);
 /// Where the pointer was drawn by the last desktop copy (its rows are put back next time).
 static mut LAST_PTR: Option<(usize, usize)> = None;
+/// The arrow's dot size when it was last drawn (section 29: about the desk's scale on the screen's own pixels).
+static mut LAST_DOT: usize = 1;
 /// The desktop copy's time in microseconds: the last one and the worst one (`desk perf`).
 static mut COPY_US: (u64, u64) = (0, 0);
 
@@ -446,7 +487,9 @@ unsafe fn present_canvas(g: Gop) {
     let (dw, dh) = ((cw * s).min(g.w).min(LINE_MAX), (ch * s).min(g.h));
     let (vw, vh) = (dw / s, dh / s); // the canvas pixels that fit
     let (ox, oy) = ((g.w - vw * s) / 2, (g.h - vh * s) / 2);
-    let ptr = crate::xhci::pointer();
+    // the pointer moves in logical pixels (section 29): its place on the canvas, and its arrow's dot size
+    let ptr = crate::xhci::pointer().map(|(x, y)| (crate::canvas::to_phys(x), crate::canvas::to_phys(y)));
+    let dot = if s == 1 { (crate::canvas::q() + 2) / 4 } else { 1 };
     // the rows drawn (up to canvas::NSPAN spans, architect's N4) and the pointer's old and new rows
     let mut drawn = [(0, 0); crate::canvas::NSPAN];
     let n = crate::canvas::take_damage(&mut drawn);
@@ -456,10 +499,10 @@ unsafe fn present_canvas(g: Gop) {
     } else {
         spans[..n].copy_from_slice(&drawn[..n]);
         if let Some((_, y)) = LAST_PTR {
-            spans[n] = (y, y + ARROW.len());
+            spans[n] = (y, y + ARROW.len() * LAST_DOT);
         }
         if let Some((_, y)) = ptr {
-            spans[n + 1] = (y, y + ARROW.len());
+            spans[n + 1] = (y, y + ARROW.len() * dot);
         }
     }
     let mut rows = 0;
@@ -472,18 +515,26 @@ unsafe fn present_canvas(g: Gop) {
     }
     COPY_ROWS = rows;
     LAST_PTR = ptr;
+    LAST_DOT = dot;
     if let Some((px, py)) = ptr {
         let dst = g.base as *mut u32;
         for (r, row) in ARROW.iter().enumerate() {
             for (c, &b) in row.iter().enumerate() {
-                let (x, y) = (px + c, py + r);
-                if b == b'.' || x >= vw || y >= vh {
+                if b == b'.' {
                     continue;
                 }
                 let v = if b == b'#' { 0 } else { POINTER_FILL };
-                for sy in 0..s {
-                    for sx in 0..s {
-                        write_volatile(dst.add((oy + y * s + sy) * g.stride + ox + x * s + sx), v);
+                for dy in 0..dot {
+                    for dx in 0..dot {
+                        let (x, y) = (px + c * dot + dx, py + r * dot + dy);
+                        if x >= vw || y >= vh {
+                            continue;
+                        }
+                        for sy in 0..s {
+                            for sx in 0..s {
+                                write_volatile(dst.add((oy + y * s + sy) * g.stride + ox + x * s + sx), v);
+                            }
+                        }
                     }
                 }
             }

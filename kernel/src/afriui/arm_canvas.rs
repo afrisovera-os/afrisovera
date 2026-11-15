@@ -20,6 +20,16 @@ pub fn height() -> usize {
 pub fn scale() -> usize {
     1
 }
+/// The desk's scale in quarters: always 1x on the phone (afriui.md section 29).
+pub fn q() -> usize {
+    4
+}
+pub fn logical_w() -> usize {
+    width()
+}
+pub fn logical_h() -> usize {
+    height()
+}
 
 /// The canvas pixels, `width()` to a row: the framebuffer itself.
 pub fn pixels() -> *const u32 {

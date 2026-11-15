@@ -23,9 +23,9 @@ grade() { # grade <serial>
     has() { grep -aqE "$1" <<< "$S"; }
     has '^\[desk\] desktop opened' || _f "desk (typed on the USB keyboard) did not open the desktop"
     if has '\[desk\] [a-z]+ profile, hidden;'; then _f "desk alone printed the hidden desktop's status instead of opening it"; fi
-    printf '%s\n' "$S" | sed -n '/^\[desk\] desktop opened/,$p' | grep -aqE '\[desk\] open files$' ||
+    grep -aqE '\[desk\] open files$' <<< "$(sed -n '/^\[desk\] desktop opened/,$p' <<< "$S")" ||
         _f "the Files tile did not open the Files window"
-    if printf '%s\n' "$S" | sed -n '/^\[desk\] desktop opened/,$p' | grep -aqE '^afrisovera> clear$'; then
+    if grep -aqE '^afrisovera> clear$' <<< "$(sed -n '/^\[desk\] desktop opened/,$p' <<< "$S")"; then
         _f "the dock click left the desktop for the console"
     fi
     has '^  mouse: 1 dock click\(s\) on the desktop$' || _f "lsusb does not count exactly one dock click"

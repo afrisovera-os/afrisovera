@@ -34,7 +34,7 @@ grade() { # grade <serial log>
     [ "$shown" -ge 2 ] || _f "fewer than two entries shown ($shown)"
     [ "$(printf '%s\n' "$E" | grep -ac '  <- started this time$')" = 1 ] ||
         _f "not exactly one entry marked as the one the PC started from"
-    printf '%s\n' "$E" | grep -a '  <- started this time$' | grep -aqE '"  PciRoot/Pci\([0-9a-f]{2}\.[0-9]+\)/' ||
+    grep -aqE '"  PciRoot/Pci\([0-9a-f]{2}\.[0-9]+\)/' <<< "$(grep -a '  <- started this time$' <<< "$E")" ||
         _f "the entry started from does not point through PCI to a device"
     n="$(printf '%s\n' "$S" | sed -nE 's/^  ([0-9]+) entries; the next free number is Boot[0-9A-F]{4}$/\1/p' | head -1)"
     if [ -z "$n" ]; then _f "bootentries did not give the count and the next free number"

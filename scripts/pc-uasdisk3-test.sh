@@ -26,8 +26,8 @@ grade() { # grade <boot1 log> <boot2 log> <the image's first 8 bytes after boot 
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqE "$1"; }
-    hasB() { printf '%s\n' "$B" | grep -aqE "$1"; }
+    hasA() { grep -aqE "$1" <<< "$A"; }
+    hasB() { grep -aqE "$1" <<< "$B"; }
     hasA '^\[xhci\] port [0-9]+: USB disk [0-9a-f]{4}:[0-9a-f]{4} speaks only UAS: driven over USB Attached SCSI \(SuperSpeed, four pipes, streams 1 and 2\)$' ||
         _f "boot 1: the UAS-only disk was not driven over UAS with streams"
     hasA '^\[xhci\] port [0-9]+: USB storage [0-9a-f]{4}:[0-9a-f]{4} ".*", 16384 blocks of 512 B \(8 MiB\), blank or ours: used for storage$' ||
@@ -41,7 +41,7 @@ grade() { # grade <boot1 log> <boot2 log> <the image's first 8 bytes after boot 
     hasB '^\[vfs\] VFS restored from disk: [0-9]+ files$' || _f "boot 2: the VFS was not restored from the UAS disk"
     hasB '^HELLO-UAS3-DISK-12NOV$' || _f "boot 2: notes.txt did not come back from the UAS disk"
     [ "$3" = AFRIVFS1 ] || _f "the UAS disk's image does not start with AFRIVFS1 after boot 1 (it holds '$3')"
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|did not report its capacity|UAS only: needs streams|^\[xhci\] .*(failed|timed out)'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|did not report its capacity|UAS only: needs streams|^\[xhci\] .*(failed|timed out)' <<< "$A"$'\n'"$B"; then
         _f "$(printf '%s\n%s\n' "$A" "$B" | grep -aE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|did not report its capacity|UAS only: needs streams|^\[xhci\] .*(failed|timed out)' | head -1)"
     fi
     return "$fail"

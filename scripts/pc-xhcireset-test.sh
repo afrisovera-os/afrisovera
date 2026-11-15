@@ -28,7 +28,7 @@ grade() { # grade <boot1 log> <boot2 log>
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqE "$1"; }
+    hasA() { grep -aqE "$1" <<< "$A"; }
     cntA() { printf '%s\n' "$A" | grep -acE "$1"; }
     hasA '^\[xhci\] port [0-9]+: USB storage [0-9a-f]{4}:[0-9a-f]{4} .*used for storage$' || _f "boot 1: the USB stick was not taken for storage"
     hasA '^\[xhci\] port [0-9]+: USB keyboard [0-9a-f]{4}:[0-9a-f]{4} ' || _f "boot 1: the USB keyboard was not taken"
@@ -62,8 +62,8 @@ grade() { # grade <boot1 log> <boot2 log>
     hasA '^  storage: slot [0-9]+, 16384 blocks of 512 B  <- storage$' || _f "lsusb does not list the stick as storage after the reset"
     hasA '^afrisovera> sync$' || _f "sync was not typed after the reset (the keyboard was not found again)"
     hasA '^\[vfs\] synced [0-9]+ files to disk$' || _f "boot 1: the VFS never synced to the stick"
-    printf '%s\n' "$B" | grep -aqE '^xhci-reset-12nov$' || _f "boot 2: the file written after the reset did not come back from the stick"
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|did not come back|stopped working again|did not come out of reset|^\[xhci\] .*(failed|timed out)'; then
+    grep -aqE '^xhci-reset-12nov$' <<< "$B" || _f "boot 2: the file written after the reset did not come back from the stick"
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|did not come back|stopped working again|did not come out of reset|^\[xhci\] .*(failed|timed out)' <<< "$A"$'\n'"$B"; then
         _f "$(printf '%s\n%s\n' "$A" "$B" | grep -aE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|did not come back|stopped working again|did not come out of reset|^\[xhci\] .*(failed|timed out)' | head -1)"
     fi
     return "$fail"

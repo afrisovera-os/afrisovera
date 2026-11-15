@@ -44,10 +44,10 @@ grade() { # grade <serial log>
     has 'wifi: USB devices AfriSovera does not use: 1' || _f "the USB card reader was not counted as the one unused USB device"
     has '  usb 08e6:4433 \(class [0-9a-f]{2}/[0-9a-f]{2}\) not a Wi-Fi stick in AfriSovera.s list; tell us this id if it is one' ||
         _f "the USB card reader (08e6:4433) was not listed as not a Wi-Fi stick"
-    printf '%s\n' "$S" | grep -aqE '^  usb [0-9a-f]{4}:[0-9a-f]{4} Wi-Fi stick:' && _f "a USB Wi-Fi stick was listed on a PC that has none"
+    grep -aqE '^  usb [0-9a-f]{4}:[0-9a-f]{4} Wi-Fi stick:' <<< "$S" && _f "a USB Wi-Fi stick was listed on a PC that has none"
     has 'wifi: no Wi-Fi chip on PCI and no USB Wi-Fi stick AfriSovera knows' || _f "no 'no Wi-Fi chip' line"
     has '  for the owner: AfriSovera has no Wi-Fi driver yet; connect with a network cable .*' || _f "no line for the owner"
-    printf '%s\n' "$S" | grep -aqE '^  [0-9a-f]{2}:[0-9a-f]{2}\.[0-7] [0-9a-f]{4}:[0-9a-f]{4} Wi-Fi' && _f "a Wi-Fi chip was listed on a PC that has none"
+    grep -aqE '^  [0-9a-f]{2}:[0-9a-f]{2}\.[0-7] [0-9a-f]{4}:[0-9a-f]{4} Wi-Fi' <<< "$S" && _f "a Wi-Fi chip was listed on a PC that has none"
     has 'wifi: 8086:2723 is Intel Wi-Fi 6 AX200 \(Wi-Fi\); Linux driver iwlwifi; needs Intel.s closed firmware file loaded first' ||
         _f "8086:2723 was not named Intel AX200 (iwlwifi)"
     has 'wifi: 168c:0036 is Qualcomm Atheros QCA9565 / AR9565 \(Wi-Fi\); Linux driver ath9k; needs NO firmware file; .*' ||
@@ -60,7 +60,7 @@ grade() { # grade <serial log>
         _f "the USB Device Manager id was not named AR9271 (ath9k_htc, open firmware)"
     has 'wifi: usb 148f:7601 is MediaTek MT7601U \(USB Wi-Fi stick\); Linux driver mt7601u; .*' || _f "148f:7601 was not named the MT7601U stick"
     has 'wifi: usb 1234:5678 is not in AfriSovera.s list of USB Wi-Fi sticks; tell us this id' || _f "an unknown USB id was not called unknown"
-    if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$S"; then _f "the kernel panicked"; fi
     return "$fail"
 }
 

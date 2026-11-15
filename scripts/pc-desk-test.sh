@@ -122,7 +122,7 @@ grade() { # grade <serial> <pixels>
     if [ "$(printf '%s\n' "$S" | grep -acE '\[desk\] launcher open$')" -gt 2 ]; then
         _f "the Circle opened more than twice (Super+Down and Super+2 must not open it)"
     fi
-    if printf '%s\n' "$S" | grep -aqE '\[desk\] window files'; then _f "Files is still open after Alt+F4"; fi
+    if grep -aqE '\[desk\] window files' <<< "$S"; then _f "Files is still open after Alt+F4"; fi
     for p in $POINTS cloth lintel tbody; do
         got="$(printf '%s\n' "$P" | sed -n "s/^$p=\([0-9A-F]\{6\}\)$/\1/p" | head -1)"
         [ "$got" = "$(want_px "$p")" ] || _f "pixel $p is ${got:-missing}, expected $(want_px "$p")"
@@ -159,12 +159,12 @@ grade() { # grade <serial> <pixels>
             ""|0A0E14|000000|outside) _f "the far corner is ${got:-missing}: the frame, not the desktop" ;;
         esac
     fi
-    printf '%s\n' "$S" | grep -aqE '^\[desk\] perf: [0-9]+x[0-9]+ at UI scale [0-9]x; draw [0-9]+ us \(worst [0-9]+ us\)' ||
+    grep -aqE '^\[desk\] perf: [0-9]+x[0-9]+ at UI scale [0-9]x; draw [0-9]+ us \(worst [0-9]+ us\)' <<< "$S" ||
         _f "desk perf did not report the draw and copy times"
     # slice 3 (afriui.md 15): the partial frames left exactly what a full redraw draws
-    printf '%s\n' "$S" | grep -aqE '^\[desk\] verify: 0 of [0-9]+ rows differ after a full redraw \([1-9][0-9]* partial frame' ||
+    grep -aqE '^\[desk\] verify: 0 of [0-9]+ rows differ after a full redraw \([1-9][0-9]* partial frame' <<< "$S" ||
         _f "desk verify did not find the desktop as a full redraw draws it after partial frames (or none were partial)"
-    if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$S"; then _f "the kernel panicked"; fi
     return "$fail"
 }
 

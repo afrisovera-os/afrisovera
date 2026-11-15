@@ -10689,6 +10689,8 @@ fn cmd_ls(line: &str, cmd: &str, rest: &str) {
                         vfs::size_of(i), name
                     );
                 }
+            } else if vfs::is_damaged(name) {
+                crate::kprintln!("{:>6}  {}  (damaged by a cut during a save)", vfs::size_of(i), name);
             } else if crate::nia::is_big_bundled(name) {
                 // A7 change 1: the person's file is kept, but the built-in app of that name is what `nia` runs.
                 crate::kprintln!("{:>6}  {}  (a file of yours; the built-in app is what runs)", vfs::size_of(i), name);

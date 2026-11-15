@@ -29,7 +29,7 @@ grade() { # grade <serial> <peer log>
     has '^\[net\] DHCP: IP 10\.0\.2\.15, mask 255\.255\.255\.0, gw 10\.0\.2\.2' || _f "no DHCP lease over the igb"
     has '^\[net\] ICMP echo reply from 10\.0\.2\.2 \(ping OK\)$' || _f "no ping reply over the igb"
     has "^\[net\] TCP data round-trip OK" || _f "the TCP data round-trip did not complete"
-    printf '%s\n' "$P" | grep -qF "peer received ${#PAYLOAD} bytes: $PAYLOAD" ||
+    grep -qF "peer received ${#PAYLOAD} bytes: $PAYLOAD" <<< "$P" ||
         _f "the host peer did not receive the exact ${#PAYLOAD}-byte payload"
     # the card's own counters: two lse1000 readings, both non-zero, the second higher
     local c1 c2

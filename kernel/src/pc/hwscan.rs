@@ -78,13 +78,24 @@ const MAX_ROOT: usize = 256;
 struct Counts {
     driven: u32,
     class: u32,
+    /// A driver that owns the device said it is off (hwdb AcpiV::Asks): not driven, and not a class driver's.
+    off: u32,
     missing: u32,
     none: u32,
 }
 
 impl Counts {
     fn total(&self) -> u32 {
-        self.driven + self.class + self.missing + self.none
+        self.driven + self.class + self.off + self.missing + self.none
+    }
+
+    /// One answer from a driver's hook, counted as itself (hook rule 2: off is never counted as class).
+    fn claim(&mut self, c: &Claim) {
+        match c {
+            Claim::Driven(_) => self.driven += 1,
+            Claim::Off(_) => self.off += 1,
+            Claim::Missing => self.missing += 1,
+        }
     }
 }
 
@@ -201,12 +212,20 @@ fn scan_usb(c: &mut Counts) {
         c.driven += 1;
         crate::kprintln!("  usb {:04x}:{:04x} {}: driven", v, p, what);
     }
-    for &(v, p, dc, ic) in &others[..no] {
-        c.missing += 1;
+    let ifs = crate::xhci::others_if();
+    for (k, &(v, p, dc, ic)) in others[..no].iter().enumerate() {
+        let cl = if dc != 0 { dc } else { ic };
         if let Some((name, fam)) = hwdb::stick(v, p) {
+            c.missing += 1;
             crate::kprintln!("  usb {:04x}:{:04x} Wi-Fi stick: missing: {}; {}", v, p, name, hwdb::fw_line(hwdb::ufam_fw(fam)));
+        } else if let Some((drv, part)) = crate::xhci::covers(ifs[k], v, p) {
+            // a driver's table covers it, and the driver refused it (a finer check in the walk: rule 2)
+            c.class += 1;
+            let (what, why) = (crate::xhci::class_name(ifs[k].0), crate::xhci::other_words(ifs[k].0));
+            let why = if why == what { "the driver's own check refused it (the boot log says why)" } else { why };
+            crate::kprintln!("  usb {:04x}:{:04x} {}: class: {} covers it ({}), not in use: {}", v, p, what, drv, part.name, why);
         } else {
-            let cl = if dc != 0 { dc } else { ic };
+            c.missing += 1;
             crate::kprintln!("  usb {:04x}:{:04x} {}: missing: no driver in AfriSovera yet", v, p, crate::xhci::class_name(cl));
         }
     }
@@ -722,11 +741,7 @@ fn scan_acpi(c: &mut Counts) {
             }
             Some((_, name, AcpiV::Asks(f))) => {
                 let claim = f();
-                match claim {
-                    Claim::Driven(_) => c.driven += 1,
-                    Claim::Off(_) => c.class += 1,
-                    Claim::Missing => c.missing += 1,
-                }
+                c.claim(&claim);
                 let (kind, detail) = hwdb::claim_words(claim);
                 crate::kprintln!("{}: {}: {}", name, kind, detail);
             }
@@ -767,7 +782,7 @@ fn unbound(say: bool) -> (u32, u32) {
                 d.name,
                 match h {
                     How::Pci(_) => "PCI, its probe decides from its own BINDS",
-                    How::UsbWalk => "USB, decided in the USB host driver's descriptor walk (not yet on BINDS: no class verdict)",
+                    How::Usb(_) => "USB, its own BINDS, asked by the USB host driver's descriptor walk",
                     How::Platform => "fixed place (CPU, firmware or legacy port): no bus id",
                 }
             ),
@@ -787,8 +802,8 @@ pub fn show() {
     let (n, bad) = unbound(false);
     crate::kprintln!("hwscan: {} registered driver(s), {} without a match table", n, bad);
     crate::kprintln!(
-        "hwscan: {} device(s): {} driven, {} class, {} missing, {} none needed",
-        c.total(), c.driven, c.class, c.missing, c.none
+        "hwscan: {} device(s): {} driven, {} class, {} off, {} missing, {} none needed",
+        c.total(), c.driven, c.class, c.off, c.missing, c.none
     );
     crate::kprintln!(
         "  for the owner: lines marked missing have no AfriSovera driver yet, with the firmware a Wi-Fi chip would need; send this list (report <ip>) so we write the right drivers first"
@@ -1050,6 +1065,20 @@ fn selftest() {
         got[k.len() + 1..n].copy_from_slice(&d[..n - k.len() - 1]);
         case(name, want, core::str::from_utf8(&got[..n]).unwrap_or("?"));
     }
+    // 12. each answer counted as itself: off is off, never class (hook rule 2)
+    let mut c = Counts::default();
+    for f in [driven as fn() -> Claim, off, off, none] {
+        c.claim(&f());
+    }
+    let r = (c.driven, c.class, c.off, c.missing, c.total());
+    case("hook: counts", "1 driven, 0 class, 2 off, 1 missing", if r == (1, 0, 2, 1, 4) { "1 driven, 0 class, 2 off, 1 missing" } else { "wrong" });
+    // 13. the USB tables (the Driver Standard rule 3 and the mask bits): an id row beats a class row, a masked
+    // field is not compared, and nothing matches nothing
+    const T: &[hwdb::Part] = &[hwdb::usb_class(8, 6, 0, 3, "class row"), hwdb::usb_id(0x1234, 0x5678, "id row")];
+    let name = |cls, v, p| hwdb::usb_part(T, cls, v, p).map_or("none", |q| q.name);
+    case("usb: id beats class", "id row", name((8, 6, 0x50), 0x1234, 0x5678));
+    case("usb: protocol masked off", "class row", name((8, 6, 0x62), 0x1111, 0x2222));
+    case("usb: no match", "none", name((3, 1, 1), 0x1111, 0x2222));
     if fails == 0 {
         crate::kprintln!("hwscan selftest: all {} cases as expected, every one ended in a line", cases);
     } else {

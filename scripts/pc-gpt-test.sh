@@ -23,8 +23,8 @@ grade() { # grade <boot1 log> <boot2 log>
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqxE "$1"; }
-    hasB() { printf '%s\n' "$B" | grep -aqxE "$1"; }
+    hasA() { grep -aqxE "$1" <<< "$A"; }
+    hasB() { grep -aqxE "$1" <<< "$B"; }
     hasA '\[nvme\] namespace 1: 131072 blocks of 512 B \(64 MiB\), holds other data: left alone' ||
         _f "boot 1: the GPT disk on NVMe was not seen as someone else's data and left alone"
     hasA 'lsparts: nvme namespace 1, 64 MiB, 512-byte blocks' || _f "boot 1: lsparts did not list the NVMe disk"
@@ -39,16 +39,16 @@ grade() { # grade <boot1 log> <boot2 log>
     hasA '  mbr 1: type 0x0c \(FAT32\), start 2048, 32768 sectors \(16 MiB\)' || _f "boot 1: MBR FAT32 partition wrong or missing"
     hasA '  mbr 2: type 0x83 \(Linux\), start 34816, 30720 sectors \(15 MiB\)' || _f "boot 1: MBR Linux partition wrong or missing"
     hasA '  mbr: 2 partition\(s\)' || _f "boot 1: the MBR disk's partition count is wrong"
-    if printf '%s\n' "$A" | grep -aq 'WARNING'; then _f "boot 1: a warning on intact tables"; fi
+    if grep -aq 'WARNING' <<< "$A"; then _f "boot 1: a warning on intact tables"; fi
     hasB '  part 1: EFI system, LBA 2048-34815 \(16 MiB\), "DFI system partition"' || _f "boot 2: the damaged entry was not read as it is on disk"
     hasB '  gpt: 4 partition\(s\), usable LBA 34-131038, primary header OK, backup header MISSING/DAMAGED, entries CRC BAD' ||
         _f "boot 2: the damaged GPT (backup header wiped, an entry changed) was not caught"
     hasB '  WARNING: this GPT is damaged; not safe to change' || _f "boot 2: no warning for the damaged GPT"
     for L in "$A" "$B"; do
-        printf '%s\n' "$L" | grep -aqx 'lsparts: read only; nothing was written' || _f "lsparts did not finish in a boot"
-        printf '%s\n' "$L" | grep -aqx 'harness: disk images unchanged' || _f "a disk image changed during a boot (or the check is missing)"
+        grep -aqx 'lsparts: read only; nothing was written' <<< "$L" || _f "lsparts did not finish in a boot"
+        grep -aqx 'harness: disk images unchanged' <<< "$L" || _f "a disk image changed during a boot (or the check is missing)"
     done
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)' <<< "$A"$'\n'"$B"; then
         _f "the kernel panicked or a disk command failed"
     fi
     return "$fail"

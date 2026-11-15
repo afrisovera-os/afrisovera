@@ -37,6 +37,11 @@ pub fn dump_table() {
         crate::heap::stacks_left(),
         crate::heap::STACK_SIZE / 1024
     );
+    // process memory objects (AFR-0001 7.6): shown only while some are held, so `ps` reads as before otherwise
+    let (pages, _, _) = crate::proc::vmo_stats();
+    if pages > 0 {
+        crate::kprintln!("    memory objects: {} KiB reserved by ring-3 processes", pages * 4);
+    }
 }
 
 /// `rustapp`: ordinary compiled Rust (userland/rustapp, the ARM app's own source built for
@@ -141,8 +146,10 @@ pub fn run_niavm() {
 }
 pub fn run_rtc_demo() { absent("userspace RTC driver (EL0)") }
 pub fn run_sgi_el0_probe() { absent("SGI probe from EL0") }
-/// `el0-ptr` (gap G2): the PC already checks every user pointer (pc/proc.rs user_range).
-pub fn run_el0_ptr_probe() { absent("EL0 user-pointer probe (the PC checks pointers in pc/proc.rs user_range)") }
+/// `el0-ptr` (gap G2): the PC checks every user pointer in pc/proc.rs user_range; its probe is `uptrtest`.
+pub fn run_cell_test() { absent("ARM cell window test (the PC's own is `celltest3` in shell_pc, suite pc-cell3)") }
+pub fn run_vmo_test() { absent("ARM process memory test (the PC's own is `vmotest` in shell_pc, suite pc-vmo)") }
+pub fn run_el0_ptr_probe() { absent("EL0 user-pointer probe (the PC's own probe is `uptrtest`, suite pc-userptr)") }
 /// `syssleep`: a ring-3 process asks the kernel, by system call, to block it ~300 ms
 /// (pc/proc.rs SYS_SLEEP), prints the measured time and exits; the shell resumes after.
 pub fn run_sleep_demo() {

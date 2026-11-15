@@ -32,6 +32,13 @@
 //! IntelliMouse knock at start-up (sample rates 200, 100, 80) turns a wheel mouse, and a
 //! touchpad that offers scrolling in its PS/2 mode, into id 3 with 4-byte packets; the 4th
 //! byte's notches scroll the console three lines each (conback.rs), not on the desktop.
+//!
+//! Caps Lock light (13 Nov 2026): Caps Lock is one state for the whole PC, shared by the PS/2
+//! keyboard and a USB one (xhci.rs), so a laptop's own keyboard and a plugged-in one agree;
+//! either key turns it. The PS/2 keyboard's light is set with 0xED and the LED byte (bit 2
+//! is Caps Lock), each answered by the keyboard's 0xFA. That is sent from `service` (the idle
+//! loop, interrupts off meanwhile so the timer's poll cannot take the answers), never from
+//! the timer interrupt; key and mouse bytes that arrive in between are handled as usual.
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -43,9 +50,25 @@ static ON: AtomicBool = AtomicBool::new(false);
 static KEYS: AtomicU64 = AtomicU64::new(0);
 static SCANCODES: AtomicU64 = AtomicU64::new(0);
 static mut SHIFT: bool = false;
-static mut CAPS: bool = false;
+/// Caps Lock for every keyboard (PS/2 and USB); `toggle_caps` turns it and asks for the lights.
+static CAPS: AtomicBool = AtomicBool::new(false);
+static LED_WANT: AtomicBool = AtomicBool::new(false);
+static LED_SETS: AtomicU64 = AtomicU64::new(0);
+static LED_FAILS: AtomicU64 = AtomicU64::new(0);
+/// The bound on the time a light command keeps interrupts off (architect, 14 Nov 2026: a keyboard that never answers
+/// must not stop the timer, the USB polls and sound for seconds), the longest it took, in microseconds, and the
+/// light commands that failed in a row: at 2 the light is left alone for the boot (LED_OFF), Caps Lock still works.
+const LED_BOUND_MS: u64 = 20;
+static LED_MAX_US: AtomicU64 = AtomicU64::new(0);
+static LED_RUN: AtomicU64 = AtomicU64::new(0);
+static LED_OFF: AtomicBool = AtomicBool::new(false);
+/// The test rig's silent keyboard (fw_cfg `opt/afrisovera/ps2-led-mute`, never reachable from the shell): the light
+/// bytes are not sent, so no answer comes and the bound is what ends the wait. 0 not read yet, 1 on, 2 off.
+static LED_MUTE: AtomicU64 = AtomicU64::new(0);
 static mut E0: bool = false;
 static mut ALT: bool = false;
+/// Either Ctrl key held (A4: read only while a Nia app runs, for Ctrl+letter).
+static mut CTRL: bool = false;
 static mut SUPER: bool = false;
 static mut SUPER_COMBO: bool = false;
 /// Key repeat (14 Nov 2026, the owner's HP: `poweroff` came out as "poweroffff"). The keyboard repeats a held
@@ -137,13 +160,30 @@ unsafe fn outb(port: u16, v: u8) {
     asm!("out dx, al", in("dx") port, in("al") v, options(nomem, nostack, preserves_flags));
 }
 
+/// How long the controller may take to empty its input buffer or fill its output buffer (200 ms, the old
+/// 200,000 status reads at about 1 us each), and that count as the fallback when the TSC rate is not known.
+const KBC_WAIT_US: u64 = 200_000;
+const KBC_SPIN_CAP: u32 = 200_000;
+
+/// The status bit `bit` set (or clear) within KBC_WAIT_US.
+fn kbc_wait(bit: u8, set: bool) -> bool {
+    let until = crate::timer::deadline_us(KBC_WAIT_US);
+    for _ in 0..KBC_SPIN_CAP {
+        // SAFETY: reads the i8042 status port.
+        if (unsafe { inb(STATUS) } & bit != 0) == set {
+            return true;
+        }
+        if crate::timer::past(until) {
+            return false;
+        }
+    }
+    false
+}
 fn wait_write() -> bool {
-    // SAFETY: reads the i8042 status port.
-    (0..200_000).any(|_| unsafe { inb(STATUS) } & 2 == 0)
+    kbc_wait(2, false)
 }
 fn wait_read() -> bool {
-    // SAFETY: as above.
-    (0..200_000).any(|_| unsafe { inb(STATUS) } & 1 != 0)
+    kbc_wait(1, true)
 }
 
 /// Find the controller and turn its keyboard port on, interrupts off (we poll).
@@ -522,57 +562,211 @@ pub fn poll() {
                 }
                 continue; // a mouse byte (port 2), not a key
             }
-            SCANCODES.fetch_add(1, Ordering::Relaxed);
-            if sc == 0xE0 {
-                E0 = true;
-                continue;
+            key_byte(sc);
+        }
+    }
+}
+
+/// One byte from the keyboard port (set 1, translated): a key pressed or released.
+/// SAFETY: callers run with interrupts off (the timer interrupt, IRQ 12, or `service`
+/// after cli), so the key state below is never touched from two places at once.
+unsafe fn key_byte(sc: u8) {
+    if sc == 0xFA || sc == 0xFE {
+        return; // a late answer to a light command (ACK, resend), not a key
+    }
+    SCANCODES.fetch_add(1, Ordering::Relaxed);
+    if sc == 0xE0 {
+        E0 = true;
+        return;
+    }
+    let ext = E0;
+    E0 = false;
+    let release = sc & 0x80 != 0;
+    let code = sc & 0x7F;
+    if repeat_dropped(code as usize | (ext as usize) << 7, release) {
+        return;
+    }
+    if code == 0x38 {
+        ALT = !release; // left Alt, or right Alt (E0 38)
+        return;
+    }
+    if ext && (code == 0x5B || code == 0x5C) {
+        // a Windows key: alone, it opens the desktop's launcher when released
+        if release {
+            if crate::desk::shown() && !SUPER_COMBO {
+                crate::desk::post_key(crate::desk::KEY_SUPER);
             }
-            let ext = E0;
-            E0 = false;
-            let release = sc & 0x80 != 0;
-            let code = sc & 0x7F;
-            if repeat_dropped(code as usize | (ext as usize) << 7, release) {
-                continue;
+            SUPER_COMBO = false;
+        }
+        SUPER = !release;
+        return;
+    }
+    if !release && crate::desk::shown() {
+        if SUPER {
+            SUPER_COMBO = true;
+        }
+        if let Some(k) = desk_key(code, ext) {
+            crate::desk::post_key(k);
+            return;
+        }
+    }
+    if code == 0x1D {
+        CTRL = !release; // left Ctrl, or right Ctrl (E0 1D)
+        return;
+    }
+    // A4: while a Nia app runs, the keys the shell drops reach the app as a terminal sends them (keyseq.rs decodes
+    // them into key codes); Super with anything stays the desk's. With no app running nothing here changes.
+    if !release && !SUPER && crate::nia::app_running() {
+        let mods = if SHIFT { crate::desk::cell_abi::SHIFT } else { 0 }
+            | if ALT { crate::desk::cell_abi::ALT } else { 0 }
+            | if CTRL { crate::desk::cell_abi::CTRL } else { 0 };
+        if let Some(n) = app_special(code, ext) {
+            if crate::keyseq::inject_special(n, mods, crate::uart::inject) {
+                KEYS.fetch_add(1, Ordering::Relaxed);
             }
-            if code == 0x38 {
-                ALT = !release; // left Alt, or right Alt (E0 38)
-                continue;
+            return;
+        }
+        if let (false, Some((plain, shifted))) = (ext, ascii(code)) {
+            // Caps Lock turns letters, as on the normal path below (the driver owner's review)
+            let up = SHIFT ^ (caps_lock() && plain.is_ascii_lowercase());
+            let c = if up { shifted } else { plain };
+            if crate::keyseq::inject_char(c, CTRL, ALT, crate::uart::inject) {
+                KEYS.fetch_add(1, Ordering::Relaxed);
+                return;
             }
-            if ext && (code == 0x5B || code == 0x5C) {
-                // a Windows key: alone, it opens the desktop's launcher when released
-                if release {
-                    if crate::desk::shown() && !SUPER_COMBO {
-                        crate::desk::post_key(crate::desk::KEY_SUPER);
-                    }
-                    SUPER_COMBO = false;
-                }
-                SUPER = !release;
-                continue;
+        }
+    }
+    match code {
+        0x2A | 0x36 => SHIFT = !release,
+        0x3A if !release => toggle_caps(),
+        0x48 | 0x50 if ext && !release => crate::uart::history_key(code == 0x48), // Up/Down: shell history
+        0x49 | 0x51 if ext && !release && SHIFT => crate::uart::console_page(code == 0x49), // Shift+PgUp/PgDn
+        _ if release || ext && code != 0x1C => {} // releases; Left/Right and the like
+        _ => {
+            if let Some((plain, shifted)) = ascii(code) {
+                let letter = plain.is_ascii_lowercase();
+                let up = SHIFT ^ (caps_lock() && letter);
+                crate::uart::inject(if up { shifted } else { plain });
+                KEYS.fetch_add(1, Ordering::Relaxed);
             }
-            if !release && crate::desk::shown() {
-                if SUPER {
-                    SUPER_COMBO = true;
-                }
-                if let Some(k) = desk_key(code, ext) {
-                    crate::desk::post_key(k);
-                    continue;
-                }
+        }
+    }
+}
+
+/// A4: a set 1 make code as a special key's number (keyseq.rs), for a running Nia app. The cursor and editing
+/// keys are the E0 ones (the keypad's own codes stay the keypad's); F1 to F10 are 3B to 44, F11 and F12 57 and 58.
+fn app_special(code: u8, ext: bool) -> Option<u32> {
+    use crate::keyseq as k;
+    Some(match (ext, code) {
+        (true, 0x48) => k::UP,
+        (true, 0x50) => k::DOWN,
+        (true, 0x4B) => k::LEFT,
+        (true, 0x4D) => k::RIGHT,
+        (true, 0x47) => k::HOME,
+        (true, 0x4F) => k::END,
+        (true, 0x49) => k::PGUP,
+        (true, 0x51) => k::PGDN,
+        (true, 0x52) => k::INS,
+        (true, 0x53) => k::DEL,
+        (false, 0x3B..=0x44) => k::F1 + (code - 0x3B) as u32,
+        (false, 0x57) => k::F1 + 10,
+        (false, 0x58) => k::F1 + 11,
+        _ => return None,
+    })
+}
+
+/// True while Caps Lock is on (for the PS/2 keyboard and the USB one alike).
+pub fn caps_lock() -> bool {
+    CAPS.load(Ordering::Relaxed)
+}
+
+/// The Caps Lock key on any keyboard: turn the shared state and ask every keyboard's light
+/// to follow. The lights are set later from the idle loop (`service` here, xhci::service).
+pub fn toggle_caps() {
+    CAPS.fetch_xor(true, Ordering::Relaxed);
+    LED_WANT.store(true, Ordering::Relaxed);
+    crate::xhci::caps_light();
+}
+
+/// The i8042 status bit `bit` set (or clear) before TSC `until`, and within 200,000 reads.
+fn wait_by(bit: u8, set: bool, until: u64) -> bool {
+    for _ in 0..KBC_SPIN_CAP {
+        // SAFETY: reads the i8042 status port.
+        if (unsafe { inb(STATUS) } & bit != 0) == set {
+            return true;
+        }
+        if crate::timer::cycles() >= until {
+            return false;
+        }
+    }
+    false
+}
+
+/// One command byte for the keyboard and its answer, interrupts off, all of it before TSC `until`. Mouse bytes
+/// and keys that come before the answer are handled as poll() would. True on the keyboard's ACK (0xFA); false on
+/// a resend or error answer, or none in time. `mute`: the test rig's silent keyboard (the byte is not sent).
+unsafe fn kbd_cmd(b: u8, until: u64, mute: bool) -> bool {
+    if !wait_by(2, false, until) {
+        return false;
+    }
+    if !mute {
+        outb(DATA, b);
+    }
+    for _ in 0..16 {
+        if !wait_by(1, true, until) {
+            return false;
+        }
+        let st = inb(STATUS);
+        let v = inb(DATA);
+        if st & 0x20 != 0 {
+            if MOUSE.load(Ordering::Relaxed) {
+                mouse_byte(v);
             }
-            match code {
-                0x2A | 0x36 => SHIFT = !release,
-                0x3A if !release => CAPS = !CAPS,
-                0x48 | 0x50 if ext && !release => crate::uart::history_key(code == 0x48), // Up/Down: shell history
-                0x49 | 0x51 if ext && !release && SHIFT => crate::uart::console_page(code == 0x49), // Shift+PgUp/PgDn
-                _ if release || ext && code != 0x1C => {} // releases; Left/Right and the like
-                _ => {
-                    if let Some((plain, shifted)) = ascii(code) {
-                        let letter = plain.is_ascii_lowercase();
-                        let up = SHIFT ^ (CAPS && letter);
-                        crate::uart::inject(if up { shifted } else { plain });
-                        KEYS.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
+            continue;
+        }
+        match v {
+            0xFA => return true,
+            0xFE | 0xFC => return false,
+            _ => key_byte(v), // a key pressed just then
+        }
+    }
+    false
+}
+
+/// From the idle loop (cpu::wfi): set the PS/2 keyboard's Caps Lock light when Caps Lock
+/// changed. Interrupts are off while the two bytes and their answers go by, so the timer's
+/// poll() cannot take an answer as a key; that time is bound at LED_BOUND_MS by the TSC. A
+/// refused or unanswered command is counted; after 2 in a row the light is left alone.
+pub fn service() {
+    if !ON.load(Ordering::Relaxed) || !LED_WANT.swap(false, Ordering::Relaxed) || LED_OFF.load(Ordering::Relaxed) {
+        return;
+    }
+    if LED_MUTE.load(Ordering::Relaxed) == 0 {
+        let m = crate::qemu::fw_cfg_file(b"opt/afrisovera/ps2-led-mute");
+        LED_MUTE.store(if m { 1 } else { 2 }, Ordering::Relaxed);
+    }
+    let mute = LED_MUTE.load(Ordering::Relaxed) == 1;
+    let hz = crate::timer::hz().max(1);
+    let was_on = crate::cpu::interrupts_on();
+    crate::cpu::cli();
+    let t0 = crate::timer::cycles();
+    let until = t0 + hz * LED_BOUND_MS / 1000;
+    // SAFETY: i8042 port I/O with interrupts off, as in late_check.
+    let ok = unsafe { kbd_cmd(0xED, until, mute) && kbd_cmd((caps_lock() as u8) << 2, until, mute) };
+    let us = crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / hz;
+    if was_on {
+        crate::cpu::sti();
+    }
+    LED_MAX_US.fetch_max(us, Ordering::Relaxed);
+    if ok {
+        LED_SETS.fetch_add(1, Ordering::Relaxed);
+        LED_RUN.store(0, Ordering::Relaxed);
+    } else {
+        LED_FAILS.fetch_add(1, Ordering::Relaxed);
+        if LED_RUN.fetch_add(1, Ordering::Relaxed) + 1 >= 2 {
+            LED_OFF.store(true, Ordering::Relaxed);
+            crate::uart::fresh_line(); // the person may be in the middle of typing a command
+            crate::kprintln!("[ps2] keyboard does not answer light commands; Caps Lock still works, its light is left alone");
         }
     }
 }
@@ -592,6 +786,18 @@ pub fn list() {
         "ps2: key repeat: {} repeats held back, {} taken (a held key repeats after 0.5 s, at most 30 a second)",
         REPEATS_HELD.load(Ordering::Relaxed),
         REPEATS_TAKEN.load(Ordering::Relaxed)
+    );
+    crate::kprintln!(
+        "ps2: keyboard caps lock {}, its light set {} times, {} refused",
+        if caps_lock() { "on" } else { "off" },
+        LED_SETS.load(Ordering::Relaxed),
+        LED_FAILS.load(Ordering::Relaxed)
+    );
+    crate::kprintln!(
+        "ps2: light commands: longest {} us with interrupts off (bound {} ms){}",
+        LED_MAX_US.load(Ordering::Relaxed),
+        LED_BOUND_MS,
+        if LED_OFF.load(Ordering::Relaxed) { ", given up for this boot" } else { "" }
     );
     // SAFETY: scalar reads of the mouse counters.
     unsafe {

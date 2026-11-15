@@ -60,7 +60,7 @@ grade() { # grade <serial> <pixel line>
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     P="$2"
-    printf '%s\n' "$S" | grep -aqE '^\[pc\] screen: the 640x480 console shown on the [0-9]+x[0-9]+ GOP screen at [1-4]x$' ||
+    grep -aqE '^\[pc\] screen: the 640x480 console shown on the [0-9]+x[0-9]+ GOP screen at [1-4]x$' <<< "$S" ||
         _f "the console was not attached to the GOP screen"
     r="$(printf '%s\n' "$S" | grep -aoE '^screen: GOP [0-9]+x[0-9]+ .*; ([0-9]+) redraws$' | tail -1 | sed -E 's/.*; ([0-9]+) redraws$/\1/')"
     [ -n "$r" ] && [ "$r" -ge 2 ] || _f "screeninfo reports ${r:-no} redraws"
@@ -68,7 +68,7 @@ grade() { # grade <serial> <pixel line>
     t="$(printf '%s' "$P" | sed -nE 's/^console=[0-9]+ text=([0-9]+).*/\1/p')"
     [ -n "$c" ] && [ "$c" -ge 60 ] || _f "the console background covers only ${c:-0}% of its area on the screenshot"
     [ -n "$t" ] && [ "$t" -ge 200 ] || _f "only ${t:-0} text pixels on the screenshot's console"
-    if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$S"; then _f "the kernel panicked"; fi
     return "$fail"
 }
 

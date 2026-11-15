@@ -64,6 +64,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# PC_CPU (optional): a PC CPU model for suites that need a feature the default lacks (pc-userptr: SMAP, -cpu max)
+[ -n "${PC_CPU:-}" ] && args+=(-cpu "$PC_CPU")
 "$REAL" "${args[@]}" &
 QPID=$!
 # the suite kills THIS process when it is done: pass that on to the real QEMU

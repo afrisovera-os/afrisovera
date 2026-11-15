@@ -18,6 +18,7 @@ Paths:
   /tometa                   302 to http://169.254.169.254/latest/ (link-local: Dira does not follow it)
   /links.html               300 links (Dira numbers 256 and says the rest are plain text)
   /badchunk                 a chunked page whose second size line is 70 bytes long (the first part stays)
+  /huge                     5 MiB of text (pc-net3: past a ring-3 connection's 4 MiB cap)
 """
 import os
 import socket
@@ -106,6 +107,12 @@ class Handler(socketserver.BaseRequestHandler):
                 s.sendall(b"5;" + b"x" * 70 + b"\r\nhello\r\n0\r\n\r\n")
             elif path.startswith("/slow"):
                 time.sleep(40)
+            elif path == "/huge":
+                # pc-net3 (Dira M3 S3): 5 MiB, past the 4 MiB a ring-3 connection may receive
+                s.sendall(answer("200 OK", [("Content-Type", "text/plain"), ("Content-Length", 5 << 20)]))
+                chunk = b"x" * 65536
+                for _ in range(80):
+                    s.sendall(chunk)
             else:
                 b = b"<h1>Not here</h1><p>No page at this address.</p>"
                 s.sendall(answer("404 Not Found", html + [("Content-Length", len(b))], b))

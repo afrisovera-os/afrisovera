@@ -273,6 +273,8 @@ fn cmd(nid: u8, verb: u32, payload: u32) -> Option<u32> {
                 continue;
             }
             let rp = (RIRB_RP + 1) % RIRB_N;
+            // the write pointer first, then the entry it covers (the ring audit, 14 Nov 2026)
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
             let e = read_volatile(addr_of!(RIRB.0[rp as usize]));
             RIRB_RP = rp;
             w8(RIRBSTS, 0x05); // response + overrun flags cleared (QEMU waits for this)
@@ -907,6 +909,8 @@ pub fn record(ms: u32) -> bool {
         let mut moved = crate::timer::cycles();
         while REC_N < want {
             let lpib = (r32(ISD + SD_LPIB) as u64).min(RING as u64);
+            // the position first, then the samples behind it (the ring audit, 14 Nov 2026)
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
             if lpib < last {
                 wraps += 1;
             }

@@ -224,7 +224,7 @@ fn paged(line: &str) -> bool {
     }
     if let Some(name) = to_file {
         // never the system's files: the config, a bundled app, anything the integrity manifest or appget owns
-        if name == "afrisovera.conf" || crate::nia::BUNDLED.iter().any(|(n, _)| *n == name) || crate::integrity::expected(name).is_some() {
+        if crate::nia::is_system_file(name) {
             crate::kprintln!("[shell] {} is the system's file; not replaced", name);
             return true;
         }
@@ -501,6 +501,14 @@ pub(crate) fn exec(line: &str) { if paged(line) { return; } pc_intercept!(line);
             crate::process::run_fault_demo();
             crate::kprintln!("[faultdemo] the offending process was killed; the OS is still running.");
         }
+        "celltest3" => {
+            // the cell window for EL0 (AFR-0001 7.6, Dira M3 S5b; suite arm-cell3); the test rig only. The PC's is shell_pc's.
+            crate::process::run_cell_test();
+        }
+        "vmotest" => {
+            // process memory for EL0 (AFR-0001 7.6, Dira M3 S5a; suite arm-vmo). The PC's `vmotest` is shell_pc's.
+            crate::process::run_vmo_test();
+        }
         "el0-ptr" => {
             // Gap G2 probe: an EL0 program passes kernel addresses to SYS_AI and SYS_SPEAK (scripts/el0-ptr-test.sh).
             crate::kprintln!("[el0-ptr] an EL0 program hands the kernel its own addresses...");
@@ -557,6 +565,17 @@ pub(crate) fn exec(line: &str) { if paged(line) { return; } pc_intercept!(line);
                 crate::virtio::blk_selftest();
             }
         }
+        "blkflush" => {
+            // AFR-0011 V2: ask the disk in use to confirm that every write so far is on its medium. Writes nothing.
+            let name = crate::virtio::blk_name();
+            if name == "none" {
+                crate::kprintln!("[blk] flush: no disk");
+            } else if crate::virtio::blk_flush() {
+                crate::kprintln!("[blk] flush: {}, ok{}", name, crate::virtio::blk_note());
+            } else {
+                crate::kprintln!("[blk] flush: {}, failed (this disk cannot confirm that saves are on it)", name);
+            }
+        }
         "net" => cmd_net(line, cmd, rest),
         "ping" => {
             // Convenience alias for `net ping` (ICMP echo to the gateway).
@@ -570,6 +589,8 @@ pub(crate) fn exec(line: &str) { if paged(line) { return; } pc_intercept!(line);
             // Report the virtio-sound device; `audio tone` streams a test tone.
             if !crate::virtio::sound_present() {
                 crate::kprintln!("[audio] no virtio-sound device (boot QEMU with -device virtio-sound-device,audiodev=snd0)");
+            } else if rest == "tone" && crate::nia::sound_busy("audio") {
+                // an app's sound stream owns the device (N-A1a)
             } else if rest == "tone" {
                 crate::kprintln!("[audio] streaming a test tone through virtio-sound...");
                 if crate::virtio::sound_play_tone() {

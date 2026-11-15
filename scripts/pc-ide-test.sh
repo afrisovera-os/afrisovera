@@ -30,8 +30,8 @@ grade() { # grade <boot1 log> <boot2 log> <word>
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqE "$1"; }
-    hasB() { printf '%s\n' "$B" | grep -aqE "$1"; }
+    hasA() { grep -aqE "$1" <<< "$A"; }
+    hasB() { grep -aqE "$1" <<< "$B"; }
     hasA '^\[ide\] controller [0-9a-f:.]+ \(IDE mode, interface 0x[0-9a-f]{2}: primary compatibility, secondary compatibility\)$' ||
         _f "boot 1: the IDE controller was not found in compatibility mode"
     hasA '^\[ide\] primary master \(0x1f0\): ATA disk, 16384 sectors \(8 MiB\), LBA(28|48), blank: not used unless claimed \(claimdisk ide\)$' ||
@@ -65,7 +65,7 @@ grade() { # grade <boot1 log> <boot2 log> <word>
     else
         _f "boot 2: lside has no 'storage: ...' line"
     fi
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE "$BAD"; then
+    if grep -aqE "$BAD" <<< "$A"$'\n'"$B"; then
         _f "$(printf '%s\n%s\n' "$A" "$B" | grep -aE "$BAD" | head -1)"
     fi
     return "$fail"

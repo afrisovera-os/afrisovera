@@ -67,18 +67,18 @@ L2="${TMPDIR:-/tmp}/afrisovera-config-boot2.log"
 echo "[boot 1] fresh disk — kernel initializes config + syncs..."
 B1="$(boot "$L1" "${CFG1_RE[@]}")"
 echo "$B1" | grep -E "\[cfg\]" | sed 's/^/  /'
-echo "$B1" | grep -qE "${CFG1_RE[0]}" \
+grep -qE "${CFG1_RE[0]}" <<< "$B1" \
     || { echo "CONFIG TEST FAILED (boot 1 did not initialize the config)"; exit 1; }
 
 echo "[boot 2] same disk — kernel restores config + advances the boot counter..."
 B2="$(boot "$L2" "${CFG2_RE[@]}")"
 echo "$B2" | grep -E "\[cfg\]" | sed 's/^/  /'
-echo "$B2" | grep -qE "${CFG2_RE[0]}" \
+grep -qE "${CFG2_RE[0]}" <<< "$B2" \
     || { echo "CONFIG TEST FAILED (boot 2 did not load the config from disk)"; exit 1; }
-echo "$B2" | grep -qE "${CFG2_RE[1]}" \
+grep -qE "${CFG2_RE[1]}" <<< "$B2" \
     || { echo "CONFIG TEST FAILED (boot counter did not persist+advance to 2)"; exit 1; }
 # Bonus: the DHCP lease acquired at boot should be persisted too.
-echo "$B2" | grep -q "ip=10.0.2.15" \
+grep -q "ip=10.0.2.15" <<< "$B2" \
     && echo "  (bonus) DHCP lease 10.0.2.15 persisted across reboot" || true
 
 echo "CONFIG TEST PASSED  (afrisovera.conf survived reboot; boot counter 1 -> 2)"

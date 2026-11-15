@@ -166,13 +166,13 @@ fi
 for want in "TCP retransmit 1/4" "sent again after 300 ms with no ACK" \
             "TCP peer ACKed our ${#PAYLOAD} bytes" "TCP data round-trip OK" \
             "state TIME_WAIT"; do
-    if ! echo "$SER" | grep -qF "$want"; then
+    if ! grep -qF "$want" <<< "$SER"; then
         echo "  serial is missing: $want"
         FAIL=1
     fi
 done
 for bad in "the peer is gone" "TCP data: timed out" "could not rebuild the segment"; do
-    if echo "$SER" | grep -qF "$bad"; then
+    if grep -qF "$bad" <<< "$SER"; then
         echo "  serial reports a failed send: $bad"
         FAIL=1
     fi

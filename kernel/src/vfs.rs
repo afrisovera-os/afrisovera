@@ -45,6 +45,40 @@ static mut FILES: [File; MAX_FILES] = [EMPTY; MAX_FILES];
 // written at runtime (e.g. a boot-seeded or disk-loaded file). In-RAM only.
 static mut FILE_MTIME: [u32; MAX_FILES] = [0; MAX_FILES];
 
+// A2 (the architect's change 3): a file whose checksum did not match at load (a save cut part way). Its bytes are
+// kept and it is named on the console, in `ls`, and to an app that reads it; a fresh write clears the mark.
+static mut FILE_DAMAGED: [bool; MAX_FILES] = [false; MAX_FILES];
+
+/// Whether `name` was found damaged at load (a cut during a save) and has not been written since.
+pub fn is_damaged(name: &str) -> bool {
+    // SAFETY: a scalar read; find gives a valid index.
+    find(name).map_or(false, |i| unsafe { addr_of_mut!(FILE_DAMAGED).cast::<bool>().add(i).read() })
+}
+
+fn set_damaged(i: usize, v: bool) {
+    // SAFETY: i < MAX_FILES (callers index the table).
+    unsafe { addr_of_mut!(FILE_DAMAGED).cast::<bool>().add(i).write(v) }
+}
+
+/// CRC-32 (IEEE, reflected, 0xEDB88320), continued from `crc` (start with 0xFFFF_FFFF, finish with `!`).
+fn crc32_more(mut crc: u32, data: &[u8]) -> u32 {
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    crc
+}
+
+/// A file's checksum on disk: its name, its length and every byte of it.
+fn file_crc(name: &[u8], data: &[u8]) -> u32 {
+    let c = crc32_more(0xFFFF_FFFF, name);
+    let c = crc32_more(c, &(data.len() as u32).to_le_bytes());
+    !crc32_more(c, data)
+}
+
 /// Current wall-clock epoch seconds from the PL031 RTC (for stamping writes).
 fn rtc_now() -> u32 {
     // The *resolved* base: identical to the compile-time constant unless a live
@@ -135,6 +169,7 @@ fn write_capped(name: &str, data: &[u8], cap: usize) -> bool {
         let n = data.len().min(cap).min(DATA_LEN);
         (&mut (*f).data)[..n].copy_from_slice(&data[..n]);
         (*f).dlen = n;
+        set_damaged(i, false); // a fresh write: whatever a cut save left is replaced
         // Stamp the last-modified time from the RTC (parallel array).
         addr_of_mut!(FILE_MTIME).cast::<u32>().add(i).write(rtc_now());
     }
@@ -198,6 +233,7 @@ pub fn remove(name: &str) -> bool {
             unsafe {
                 (*file(i)).used = false;
             }
+            set_damaged(i, false);
             true
         }
         None => false,
@@ -258,6 +294,21 @@ const DISK_MAGIC: &[u8; 8] = b"AFRIVFS1";
 const SB_FLAGS: usize = 12;
 const SB_BIG: u8 = 2;
 const META_TRUE: usize = 1 + NAME_LEN + 12;
+// A2 (the architect's change 3, 14 Nov 2026): format version 2 adds checksums. Each file's meta sector holds the
+// CRC-32 of its name, length and bytes at META_CRC, and META_SUM_MARK there says the CRC is present; the
+// superblock holds the version at SB_VER and a CRC-32 of its first 16 bytes at SB_CRC. An older image has zeros
+// there: it loads as before, unchecked. An older kernel ignores these bytes, and its next save writes none.
+const META_CRC: usize = META_TRUE + 4; // 41
+const META_SUM: usize = META_CRC + 4; // 45
+const META_SUM_MARK: u8 = 0xC1;
+/// A file found damaged keeps this mark through later saves (every boot's full sync included), so the damage is
+/// never written over with a fresh checksum of the mixed bytes; a fresh write of the file clears it.
+const META_DAMAGED_MARK: u8 = 0xDA;
+const SB_VER: usize = 13;
+const SB_VERSION: u8 = 2;
+const SB_CRC: usize = 16;
+/// The VFS's last sector: the PC disk drivers end a save's gathered writes and flush the disk's cache on it.
+const VFS_LAST: u64 = 48;
 const EXT_FIRST: u64 = 128;
 const EXT_PER: u64 = 31;
 const EXT_END: u64 = EXT_FIRST + EXT_PER * MAX_FILES as u64; // 872: sectors needed for big files
@@ -271,6 +322,110 @@ fn ext_sectors(len: usize) -> usize {
     len.saturating_sub(512).div_ceil(512)
 }
 
+/// Whether any file needs the extension (a file over 512 bytes) and the disk has room for it.
+unsafe fn big_in_use(room: bool) -> bool {
+    room && (0..MAX_FILES).any(|i| (*file(i)).used && (*file(i)).dlen.min(DATA_LEN) > 512)
+}
+
+/// Write slot `i`'s extension sectors (a file over 512 bytes, when there is room), then its first 512 bytes, then
+/// its meta sector with the checksum last, so a cut before the meta leaves the old checksum and the file is found
+/// damaged at load, never silently mixed. Returns false when a sector write failed.
+unsafe fn write_slot(i: usize, big: bool) -> bool {
+    let fp = file(i);
+    let len = (*fp).dlen.min(DATA_LEN);
+    let mut ok = true;
+    if (*fp).used && big && len > 512 {
+        for k in 0..ext_sectors(len) {
+            let mut sec = [0u8; 512];
+            let from = 512 + k * 512;
+            let to = (from + 512).min(len);
+            sec[..to - from].copy_from_slice(&(&(*fp).data)[from..to]);
+            ok &= crate::virtio::write_sector(ext_sector(i, k), &sec);
+        }
+    }
+    ok &= write_first(i);
+    ok &= write_meta(i, big);
+    ok
+}
+
+/// Slot i's first 512 bytes (sector 2 + 2i).
+unsafe fn write_first(i: usize) -> bool {
+    let fp = file(i);
+    let mut data = [0u8; 512];
+    data.copy_from_slice(&(&(*fp).data)[..512]);
+    crate::virtio::write_sector(1 + (i as u64) * 2 + 1, &data)
+}
+
+/// The full sync's order for slot i, sector by sector as before: meta (1 + 2i), then the first 512 bytes (2 + 2i).
+unsafe fn write_meta_and_first(i: usize, big: bool) -> bool {
+    write_meta(i, big) & write_first(i)
+}
+
+/// Slot i's meta sector, with the file's checksum (format version 2).
+unsafe fn write_meta(i: usize, big: bool) -> bool {
+    let fp = file(i);
+    let len = (*fp).dlen.min(DATA_LEN);
+    let mut meta = [0u8; 512];
+    if (*fp).used {
+        meta[0] = 1;
+        meta[1..1 + NAME_LEN].copy_from_slice(&(*fp).name);
+        let o = 1 + NAME_LEN;
+        let kept = if big { len } else { len.min(512) };
+        meta[o..o + 4].copy_from_slice(&((*fp).nlen as u32).to_le_bytes());
+        meta[o + 4..o + 8].copy_from_slice(&(len.min(512) as u32).to_le_bytes());
+        if big && len > 512 {
+            meta[META_TRUE..META_TRUE + 4].copy_from_slice(&(len as u32).to_le_bytes());
+        }
+        // mtime lives in the free space of this slot's meta sector, past the existing fields, so no offsets shift
+        // and an old image (zero there) loads back as mtime 0 = "unknown".
+        let mt = addr_of_mut!(FILE_MTIME).cast::<u32>().add(i).read();
+        meta[o + 8..o + 12].copy_from_slice(&mt.to_le_bytes());
+        let nm = &(&(*fp).name)[..(*fp).nlen.min(NAME_LEN)];
+        meta[META_CRC..META_CRC + 4].copy_from_slice(&file_crc(nm, &(&(*fp).data)[..kept]).to_le_bytes());
+        let damaged = addr_of_mut!(FILE_DAMAGED).cast::<bool>().add(i).read();
+        meta[META_SUM] = if damaged { META_DAMAGED_MARK } else { META_SUM_MARK };
+    }
+    crate::virtio::write_sector(1 + (i as u64) * 2, &meta)
+}
+
+/// The superblock: magic, file count, the big flag, the format version and its own checksum.
+unsafe fn write_superblock(big: bool) -> bool {
+    let mut sb = [0u8; 512];
+    sb[..8].copy_from_slice(DISK_MAGIC);
+    let count = (0..MAX_FILES).filter(|&i| (*file(i)).used).count() as u32;
+    sb[8..12].copy_from_slice(&count.to_le_bytes());
+    if big {
+        sb[SB_FLAGS] = SB_BIG;
+    }
+    sb[SB_VER] = SB_VERSION;
+    let c = !crc32_more(0xFFFF_FFFF, &sb[..SB_CRC]);
+    sb[SB_CRC..SB_CRC + 4].copy_from_slice(&c.to_le_bytes());
+    crate::virtio::write_sector(0, &sb)
+}
+
+/// Save one file (A2: an app's file_write), not the whole VFS: its extension, its first sector, its meta (with the
+/// checksum), then the superblock, then the VFS's last sector read and written back unchanged, so the PC drivers
+/// end the save and flush the disk's cache as after a full sync. Returns false with no disk, no such file, or a
+/// failed sector write. A disk too small for big files gets the full sync's rule (the first 512 bytes, a line).
+pub fn sync_file(name: &str) -> bool {
+    if !crate::virtio::blk_present() {
+        return false;
+    }
+    let Some(i) = find(name) else { return false };
+    // SAFETY: single-threaded shell or interpreter context.
+    unsafe {
+        let room = crate::virtio::blk_capacity() >= EXT_END;
+        if !room && (*file(i)).dlen > 512 {
+            crate::kprintln!("[vfs] disk too small for files over 512 bytes: {} saved as 512 bytes", name);
+        }
+        let big = big_in_use(room);
+        let mut ok = write_slot(i, big) && write_superblock(big);
+        let mut last = [0u8; 512];
+        ok &= crate::virtio::read_sector(VFS_LAST, &mut last) && crate::virtio::write_sector(VFS_LAST, &last);
+        ok
+    }
+}
+
 /// Serialize the current VFS to the disk. Returns true if written.
 pub fn sync_to_disk() -> bool {
     if !crate::virtio::blk_present() {
@@ -279,72 +434,40 @@ pub fn sync_to_disk() -> bool {
     }
     // SAFETY: single-threaded shell/boot context.
     unsafe {
-        // Big files first: their extension sectors go out BEFORE sectors 0-48, so
-        // the PC drivers' flush at the end of the VFS area still ends the save,
-        // and a cut mid-save leaves the old metadata.
+        // Big files first: their extension sectors go out BEFORE sectors 0-48, so the PC drivers' flush at the end
+        // of the VFS area still ends the save, and a cut mid-save leaves the old metadata (and, since A2, the old
+        // checksum, so the file is found damaged rather than silently mixed).
         let room = crate::virtio::blk_capacity() >= EXT_END;
-        let mut big = false;
         for i in 0..MAX_FILES {
-            let fp = file(i);
-            let len = (*fp).dlen.min(DATA_LEN);
-            if !(*fp).used || len <= 512 {
-                continue;
-            }
-            if !room {
+            if (*file(i)).used && (*file(i)).dlen.min(DATA_LEN) > 512 && !room {
                 crate::kprintln!(
                     "[vfs] disk too small for files over 512 bytes ({} sectors, {} needed): {} saved as 512 bytes",
                     crate::virtio::blk_capacity(),
                     EXT_END,
                     name_of(i)
                 );
-                continue;
-            }
-            big = true;
-            for k in 0..ext_sectors(len) {
-                let mut sec = [0u8; 512];
-                let from = 512 + k * 512;
-                let to = (from + 512).min(len);
-                sec[..to - from].copy_from_slice(&(&(*fp).data)[from..to]);
-                crate::virtio::write_sector(ext_sector(i, k), &sec);
             }
         }
-        let mut sb = [0u8; 512];
-        sb[..8].copy_from_slice(DISK_MAGIC);
-        let mut count = 0u32;
-        for i in 0..MAX_FILES {
-            if (*file(i)).used {
-                count += 1;
-            }
-        }
-        sb[8..12].copy_from_slice(&count.to_le_bytes());
-        if big {
-            sb[SB_FLAGS] = SB_BIG;
-        }
-        crate::virtio::write_sector(0, &sb);
-
+        let big = big_in_use(room);
+        // the extensions first (write_slot writes a slot's extension, then its sectors 1 + 2i and 2 + 2i: here the
+        // extensions of every slot go out before sector 0, as before)
         for i in 0..MAX_FILES {
             let fp = file(i);
-            let mut meta = [0u8; 512];
-            if (*fp).used {
-                meta[0] = 1;
-                meta[1..1 + NAME_LEN].copy_from_slice(&(*fp).name);
-                let o = 1 + NAME_LEN;
-                let len = (*fp).dlen.min(DATA_LEN);
-                meta[o..o + 4].copy_from_slice(&((*fp).nlen as u32).to_le_bytes());
-                meta[o + 4..o + 8].copy_from_slice(&(len.min(512) as u32).to_le_bytes());
-                if big && len > 512 {
-                    meta[META_TRUE..META_TRUE + 4].copy_from_slice(&(len as u32).to_le_bytes());
+            let len = (*fp).dlen.min(DATA_LEN);
+            if (*fp).used && big && len > 512 {
+                for k in 0..ext_sectors(len) {
+                    let mut sec = [0u8; 512];
+                    let from = 512 + k * 512;
+                    let to = (from + 512).min(len);
+                    sec[..to - from].copy_from_slice(&(&(*fp).data)[from..to]);
+                    crate::virtio::write_sector(ext_sector(i, k), &sec);
                 }
-                // mtime lives in the free space of this slot's meta sector, past
-                // the existing fields, so no offsets shift and an old image (zero
-                // there) loads back as mtime 0 = "unknown".
-                let mt = addr_of_mut!(FILE_MTIME).cast::<u32>().add(i).read();
-                meta[o + 8..o + 12].copy_from_slice(&mt.to_le_bytes());
             }
-            crate::virtio::write_sector(1 + (i as u64) * 2, &meta);
-            let mut data = [0u8; 512];
-            data.copy_from_slice(&(&(*fp).data)[..512]);
-            crate::virtio::write_sector(1 + (i as u64) * 2 + 1, &data);
+        }
+        write_superblock(big);
+        let count = (0..MAX_FILES).filter(|&i| (*file(i)).used).count();
+        for i in 0..MAX_FILES {
+            write_meta_and_first(i, big);
         }
         crate::kprintln!("[vfs] synced {} files to disk", count);
         true
@@ -365,6 +488,12 @@ pub fn load_from_disk() -> bool {
         }
         let flagged = sb[SB_FLAGS] == SB_BIG;
         let room = crate::virtio::blk_capacity() >= EXT_END;
+        if sb[SB_VER] == SB_VERSION {
+            let c = !crc32_more(0xFFFF_FFFF, &sb[..SB_CRC]);
+            if sb[SB_CRC..SB_CRC + 4] != c.to_le_bytes() {
+                crate::kprintln!("[vfs] the disk's superblock checksum does not match; each file is still checked by its own");
+            }
+        }
         let mut restored = 0u32;
         for i in 0..MAX_FILES {
             let mut meta = [0u8; 512];
@@ -409,8 +538,27 @@ pub fn load_from_disk() -> bool {
                         );
                     }
                 }
+                // A2: a file saved with a checksum must match it, else a save was cut part way. Keep its bytes, name
+                // it, and mark it damaged (ls, file_read); never pass a mix of old and new off as the file.
+                let marked = meta[META_SUM] == META_DAMAGED_MARK;
+                let damaged = marked || meta[META_SUM] == META_SUM_MARK && {
+                    let want = u32::from_le_bytes([meta[META_CRC], meta[META_CRC + 1], meta[META_CRC + 2], meta[META_CRC + 3]]);
+                    let nm = &(&(*fp).name)[..(*fp).nlen];
+                    file_crc(nm, &(&(*fp).data)[..(*fp).dlen]) != want
+                };
+                set_damaged(i, damaged);
+                if marked {
+                    crate::kprintln!("[vfs] {} is still marked damaged (a cut during an earlier save)", name_of(i));
+                } else if damaged {
+                    crate::kprintln!(
+                        "[vfs] {} was damaged by a cut during a save; its bytes are kept as {} and marked damaged",
+                        name_of(i),
+                        name_of(i)
+                    );
+                }
                 restored += 1;
             } else {
+                set_damaged(i, false);
                 (*fp).used = false;
                 addr_of_mut!(FILE_MTIME).cast::<u32>().add(i).write(0);
             }

@@ -41,10 +41,10 @@ grade() { # grade <boot log>
         in_blk "$PB" '  \\EFI holds: Microsoft, BOOT, ubuntu' || _f "$w bootplan: Microsoft, BOOT and ubuntu were not all seen"
         in_blk "$PB" '  plan: none; the boot file needs [1-9][0-9]* KiB here, only 64 KiB free' ||
             _f "$w bootplan: the full partition was not refused for room"
-        if printf '%s\n' "$PB" | grep -aq '^  plan: AfriSovera'; then _f "$w bootplan: a copy was planned into the full partition"; fi
-        if printf '%s\n' "$PB" | grep -aq '^bootplan: the boot file would go to'; then _f "$w bootplan: a partition was named for the boot file"; fi
+        if grep -aq '^  plan: AfriSovera' <<< "$PB"; then _f "$w bootplan: a copy was planned into the full partition"; fi
+        if grep -aq '^bootplan: the boot file would go to' <<< "$PB"; then _f "$w bootplan: a partition was named for the boot file"; fi
         in_blk "$PB" '  boot entry: none planned; no EFI system partition with room' || _f "$w bootplan: a boot entry was planned"
-        if printf '%s\n' "$PB" | grep -aq '^bootplan: sata port 2: EFI system partition'; then _f "$w bootplan: an EFI partition was found on the blank disk"; fi
+        if grep -aq '^bootplan: sata port 2: EFI system partition' <<< "$PB"; then _f "$w bootplan: an EFI partition was found on the blank disk"; fi
     done
     in_blk "$(blk bootcopy 1)" 'bootcopy: no EFI system partition can take the boot file \(bootplan says why\); nothing written' ||
         _f "bootcopy did not refuse"
@@ -52,10 +52,10 @@ grade() { # grade <boot log>
         _f "bootcopy yes 0000 did not refuse"
     in_blk "$(blk bootentry 1)" 'bootentry: no EFI system partition holds \\EFI\\afrisovera \(bootcopy puts it there first\); nothing written' ||
         _f "bootentry did not refuse"
-    if printf '%s\n' "$A" | grep -aqE '^(bootcopy|bootentry): nothing written yet\. To do it'; then _f "a code was offered for a write"; fi
-    if printf '%s\n' "$A" | grep -aqE '^bootcopy: copied to|added at the END of BootOrder and read back'; then _f "something was written"; fi
-    printf '%s\n' "$A" | grep -aqxF "$SAME" || _f "the shared disk ($NAME) was changed"
-    if printf '%s\n' "$A" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)|FAILED|refused to write|could not be written|did not read back'; then
+    if grep -aqE '^(bootcopy|bootentry): nothing written yet\. To do it' <<< "$A"; then _f "a code was offered for a write"; fi
+    if grep -aqE '^bootcopy: copied to|added at the END of BootOrder and read back' <<< "$A"; then _f "something was written"; fi
+    grep -aqxF "$SAME" <<< "$A" || _f "the shared disk ($NAME) was changed"
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)|FAILED|refused to write|could not be written|did not read back' <<< "$A"; then
         _f "the kernel panicked, a disk command or a firmware write failed, or something FAILED"
     fi
     return "$fail"

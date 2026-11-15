@@ -102,19 +102,19 @@ grade() { # grade <boot1 log> <boot2 log> [<boot3 log>, nvme4k only]
         _f "boot $DB: the EFI partition not closed cleanly was not refused"
     in_blk "$BP" "bootplan: $DN4: an old MBR disk \\(boot entries are planned on GPT disks only\\)" || _f "boot 2: the MBR disk was not left out"
     in_blk "$BP" '  boot entry: none planned; no EFI system partition with room' || _f "boot 2: an entry was planned with no partition to hold the file"
-    printf '%s\n' "$BP" | grep -aq 'would be copied to' && _f "boot 2: a boot file was planned where none fits"
+    grep -aq 'would be copied to' <<< "$BP" && _f "boot 2: a boot file was planned where none fits"
     if [ -n "$C" ]; then
         in_blk "$CP" '  boot entry: none planned; no EFI system partition with room' || _f "boot 3: an entry was planned with no partition that may be changed"
-        printf '%s\n' "$CP" | grep -aq 'would be copied to' && _f "boot 3: a boot file was planned into the partition not closed cleanly"
+        grep -aq 'would be copied to' <<< "$CP" && _f "boot 3: a boot file was planned into the partition not closed cleanly"
     fi
     for L in "$AP" "$BP" ${C:+"$CP"}; do
         in_blk "$L" "bootplan: a plan only, so nothing was written; adding it will ask for the owner's word, with the way back" ||
             _f "bootplan did not finish with its plan-only line in a boot"
     done
     for L in "$A" "$B" ${C:+"$C"}; do
-        printf '%s\n' "$L" | grep -aqx 'harness: disk images unchanged' || _f "a disk image changed during a boot (or the check is missing)"
+        grep -aqx 'harness: disk images unchanged' <<< "$L" || _f "a disk image changed during a boot (or the check is missing)"
     done
-    if printf '%s\n%s\n%s\n' "$A" "$B" "$C" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)' <<< "$A"$'\n'"$B"$'\n'"$C"; then
         _f "the kernel panicked or a disk command failed"
     fi
     return "$fail"

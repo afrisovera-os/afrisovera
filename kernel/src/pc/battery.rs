@@ -102,6 +102,89 @@ pub fn cmd(arg: &str) {
 }
 
 /// Every DSDT and SSDT walked and settled; None (said on the console) when none could be read.
+// ---- hwdb's hooks (AcpiV::Asks, ARCHITECT_REVIEWS 14 Nov: hwdb asks the owning driver). Each reports what the
+// table walk found, memory reads only: none ever touches the embedded controller (the hook rule 1). ----
+
+/// The walk without any line printed: None when no DSDT or SSDT could be read.
+fn quiet_walk() -> Option<Walk> {
+    let mut w = Walk::default();
+    let (dsdt, ssdts) = crate::hwscan::aml_tables(&mut |t: &[u8]| walk_table(t, &mut w));
+    if !dsdt && ssdts == 0 {
+        return None;
+    }
+    settle(&mut w);
+    Some(w)
+}
+
+/// The hooks' answers from one walk: for the battery, the AC adapter and the EC, (devices of that kind the walk
+/// kept, how many of them the hook can drive). Bit 31 of each word marks it filled. The tables do not change after
+/// boot, so one hwscan walks them once, not once per hook, and later runs walk them not at all (architect's
+/// aml-hwdb verdict, 14 Nov 2026).
+static HOOKS: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+const H_BAT: usize = 0;
+const H_AC: usize = 1;
+const H_EC: usize = 2;
+const H_FILLED: u32 = 1 << 31;
+
+/// (devices of the hook's kind the walk kept, how many of them it can drive)
+fn kept(h: usize) -> (usize, usize) {
+    if HOOKS[h].load(Ordering::Relaxed) & H_FILLED == 0 {
+        let mut r = [(0usize, 0usize); 3];
+        if let Some(w) = quiet_walk() {
+            let count = |kind: Kind, ok: &dyn Fn(&Dev) -> bool| {
+                let ds: Vec<&Dev> = w.devs.iter().filter(|d| d.kind == kind).collect();
+                (ds.len(), ds.iter().filter(|d| ok(d)).count())
+            };
+            r[H_BAT] = count(Kind::Battery, &|d| d.bst.is_some());
+            r[H_AC] = count(Kind::Ac, &|d| d.psr.is_some());
+            r[H_EC] = count(Kind::Ec, &|d| {
+                matches!(d.crs, Crs::Ports(p, 2) if p[0] != p[1] && !ec_port_refused(p[0]) && !ec_port_refused(p[1]))
+            });
+        }
+        for (i, (n, ok)) in r.iter().enumerate() {
+            let (n, ok) = ((*n).min(0x7FFF) as u32, (*ok).min(0x7FFF) as u32);
+            HOOKS[i].store(H_FILLED | n << 15 | ok, Ordering::Relaxed);
+        }
+    }
+    let v = HOOKS[h].load(Ordering::Relaxed);
+    (((v >> 15) & 0x7FFF) as usize, (v & 0x7FFF) as usize)
+}
+
+/// PNP0C0A: a battery whose _BST the read-only evaluator keeps.
+pub fn claim_battery() -> crate::hwdb::Claim {
+    use crate::hwdb::Claim;
+    match kept(H_BAT) {
+        (0, _) => Claim::Off("the table walk did not keep it (battery shows why)"),
+        (_, 0) => Claim::Off("its _BST is not one the read-only subset keeps"),
+        _ => Claim::Driven("battery, read only (battery ec runs its _BST)"),
+    }
+}
+
+/// ACPI0003: an AC adapter whose _PSR the read-only evaluator keeps.
+pub fn claim_ac() -> crate::hwdb::Claim {
+    use crate::hwdb::Claim;
+    match kept(H_AC) {
+        (0, _) => Claim::Off("the table walk did not keep it (battery shows why)"),
+        (_, 0) => Claim::Off("its _PSR is not one the read-only subset keeps"),
+        _ => Claim::Driven("battery, read only (battery ec runs its _PSR)"),
+    }
+}
+
+/// PNP0C0D: listed by `battery`; reading _LID and the lid's events are rung C4.
+pub fn claim_lid() -> crate::hwdb::Claim {
+    crate::hwdb::Claim::Off("battery lists it; reading _LID and lid events wait for AML rung C4")
+}
+
+/// PNP0C09: an embedded controller whose two ports its _CRS gives plainly.
+pub fn claim_ec() -> crate::hwdb::Claim {
+    use crate::hwdb::Claim;
+    match kept(H_EC) {
+        (0, _) => Claim::Off("the table walk did not keep it (battery shows why)"),
+        (_, 0) => Claim::Off("its _CRS does not give its two ports plainly"),
+        _ => Claim::Driven("battery ec, read only (command 0x80, the global lock when asked)"),
+    }
+}
+
 fn tables() -> Option<(Walk, bool, u32)> {
     let mut w = Walk::default();
     let (dsdt, ssdts) = crate::hwscan::aml_tables(&mut |t: &[u8]| walk_table(t, &mut w));
@@ -256,6 +339,10 @@ impl Ports {
 }
 
 impl EcIo for Ports {
+    fn now_us(&mut self) -> Option<u64> {
+        let hz = crate::timer::hz().max(1);
+        Some(crate::timer::cycles() / (hz / 1_000_000).max(1))
+    }
     fn inb(&mut self, port: u16) -> u8 {
         // SAFETY: the port is this embedded controller's own, from its _CRS, checked by ec_port_refused (never the
         // keyboard controller, the PICs, PCI configuration or COM1); reached only from `battery ec`.

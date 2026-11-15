@@ -44,14 +44,14 @@ grade_one() { # grade_one <serial> <kernel name>
     got="$(printf '%s\n' "$S" | sed -nE 's/^\[fbcon\] one line with a scroll: fastest ([0-9]+) us, slowest [0-9]+ us over 8 lines; the scroll alone: [0-9]+ us$/\1/p' | head -1)"
     if [ -z "$got" ]; then _f "no timing line" "$2"
     elif [ "$got" -ge "$BUDGET" ]; then _f "the fastest line took $got us, not under $BUDGET us" "$2"; fi
-    printf '%s\n' "$S" | grep -aqE '^\[fbcon\] scroll check: 8 of 8 scrolls moved every row up one text row$' ||
+    grep -aqE '^\[fbcon\] scroll check: 8 of 8 scrolls moved every row up one text row$' <<< "$S" ||
         _f "a scroll did not move every row up one text row" "$2"
-    printf '%s\n' "$S" | grep -aqE '^\[fbcon\] glyph check: 76 chars, 0 pixels differ$' ||
+    grep -aqE '^\[fbcon\] glyph check: 76 chars, 0 pixels differ$' <<< "$S" ||
         _f "the console's text does not match the font" "$2"
     got="$(printf '%s\n' "$S" | sed -nE 's/^\[fbblit\] console block 616x384: fastest ([0-9]+) us; whole screen 640x480: fastest [0-9]+ us$/\1/p' | head -1)"
     if [ -z "$got" ]; then _f "no blit timing line" "$2"
     elif [ "$got" -ge "$BBUDGET" ]; then _f "the fastest console-block blit took $got us, not under $BBUDGET us" "$2"; fi
-    printf '%s\n' "$S" | grep -aqE '^\[fbblit\] copy check: 192 of 192 pixels right; clip check: 200 of 200 inside, edge unchanged$' ||
+    grep -aqE '^\[fbblit\] copy check: 192 of 192 pixels right; clip check: 200 of 200 inside, edge unchanged$' <<< "$S" ||
         _f "a blit check failed" "$2"
     local tl t1 t2 t3
     tl="$(printf '%s\n' "$S" | sed -nE 's/^\[fbtext\] draw_string 26 chars at scale 1: fastest ([0-9]+) us; at scale 2: fastest ([0-9]+) us; draw_char 26 at scale 1: fastest ([0-9]+) us$/\1 \2 \3/p' | head -1)"
@@ -62,7 +62,7 @@ grade_one() { # grade_one <serial> <kernel name>
         [ "$t2" -lt "$TBUDGET" ] || _f "draw_string at scale 2 took $t2 us, not under $TBUDGET us" "$2"
         [ "$t3" -lt "$TBUDGET" ] || _f "draw_char x26 took $t3 us, not under $TBUDGET us" "$2"
     fi
-    printf '%s\n' "$S" | grep -aqxF '[fbtext] text check: screen hash 146c9edc133e9276, end x 1003; clip check: 90 lit in the corner, rest unchanged, far text 0' ||
+    grep -aqxF '[fbtext] text check: screen hash 146c9edc133e9276, end x 1003; clip check: 90 lit in the corner, rest unchanged, far text 0' <<< "$S" ||
         _f "the text check differs from the old code's pixels (or far text was drawn)" "$2"
     local wl c1 c2 pr want hash
     wl="$(printf '%s\n' "$S" | sed -nE 's/^\[fbwm\] win_create 240x130: fastest ([0-9]+) us; 40x20: fastest ([0-9]+) us; win_present: fastest ([0-9]+) us \(wallpaper [0-9]+, text [0-9]+, windows [0-9]+\)$/\1 \2 \3/p' | head -1)"
@@ -91,10 +91,10 @@ grade_one() { # grade_one <serial> <kernel name>
             _f "win_fill clip check: $fclip (want 1200 of 1200 inside, 100 of 100 corner, 0 from empty fills, 0 from far text, rest unchanged)" "$2"
     fi
     if [ "$2" = arm ]; then
-        printf '%s\n' "$S" | grep -aqE '^\[fbwm\] refused: [1-9] window\(s\) in use, desk hidden, console shown ' ||
+        grep -aqE '^\[fbwm\] refused: [1-9] window\(s\) in use, desk hidden, console shown ' <<< "$S" ||
             _f "fbcon wm did not refuse while app windows were in use" "$2"
     fi
-    if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked" "$2"; fi
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$S"; then _f "the kernel panicked" "$2"; fi
     return "$fail"
 }
 

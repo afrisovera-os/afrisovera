@@ -64,7 +64,7 @@ grade() { # grade <serial> <pixels>
     done
     got="$(printf '%s\n' "$P" | sed -n 's/^size=//p' | head -1)"
     [ "$got" = 768x1024 ] || _f "the screenshot is ${got:-missing}, not the 768x1024 screen asked for"
-    if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$S"; then _f "the kernel panicked"; fi
     return "$fail"
 }
 

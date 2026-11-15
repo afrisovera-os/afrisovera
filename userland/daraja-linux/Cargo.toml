@@ -1,0 +1,42 @@
+# daraja-linux: the Linux bridge of Daraja (compatibility stage 0 step 3; AFR-0001 7.7, COMPAT_STAGE0_PLAN.md
+# section 6). A sandboxed native AfriSovera program that loads one static Linux program into its foreign process and
+# answers its system calls with AfriSovera's services.
+#
+# Today: the parts that need no kernel, as a host-tested library: the bundle reader (cpio "newc") and the start-up
+# stack (argc, argv, envp, the auxiliary vector). The call table and the kernel side (fproc calls, the call channel)
+# follow with stage 0 step 2.
+#
+# no_std, no dependencies, no unsafe. Written from: the System V AMD64 psABI (3.4 Process Initialization), the
+# cpio "newc" format as published in the GNU cpio manual and the Linux kernel's documentation file
+# Documentation/driver-api/early-userspace/buffer-format.rst (a document, not source code), and the Linux manual
+# pages getauxval(3) and execve(2). No Linux kernel or C library source was read (the clean-room rule).
+#
+# The empty [workspace] table detaches this crate from the kernel workspace. Host tests: scripts/daraja-linux-test.sh
+[package]
+name = "daraja-linux"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Daraja's Linux bridge: loads one static Linux program and answers its system calls (stage 0)."
+
+[dependencies]
+afri-elf = { path = "../afri-elf" }
+
+# The bridge program (src/main.rs): only meaningful for x86_64-unknown-none; size-built, since a native program may be
+# at most 64 KiB of code (proc.rs CODE_PAGES; COMPAT_STAGE0_PLAN 16).
+[[bin]]
+name = "daraja-linux"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1
+
+[workspace]

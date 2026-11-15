@@ -21,6 +21,6 @@ SER="$(python3 scripts/shell-demo.py 4520 4521 "${TMPDIR:-/tmp}/disk-test.png" "
 kill "$QPID" 2>/dev/null
 wait "$QPID" 2>/dev/null
 echo "$SER" | grep -iE "virtio-blk|sectors" || true
-echo "$SER" | grep -q "blk self-test OK" \
+grep -q "blk self-test OK" <<< "$SER" \
     && echo "DISK TEST PASSED  (virtio-blk wrote and read back a sector)" \
     || { echo "DISK TEST FAILED"; exit 1; }

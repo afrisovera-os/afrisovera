@@ -94,7 +94,7 @@ grade() { # grade <serial capture> <pixel line>
     has '^ps2: [0-9]+ byte\(s\) waiting were kept off' && _f "bytes were waiting at a config read during boot (QEMU sends none): $(printf '%s\n' "$S" | grep -aE '^ps2: [0-9]+ byte' | head -1)"
     has '^ps2: [0-9]+ late mouse byte' && _f "late mouse bytes were dropped in normal use (QEMU sends none): $(printf '%s\n' "$S" | grep -aE '^ps2: [0-9]+ late' | head -1)"
     has '^\[xhci\] port [0-9]+: USB mouse' && _f "a USB mouse was enumerated: this boot must have none"
-    printf '%s\n' "$S" | grep -aqE '^(afrisovera> )?lsps2$' || _f "lsps2 typed on the PS/2 keyboard did not reach the shell"
+    grep -aqE '^(afrisovera> )?lsps2$' <<< "$S" || _f "lsps2 typed on the PS/2 keyboard did not reach the shell"
     has '^ps2: i8042 keyboard, polled; [0-9]+ scancodes read, [0-9]+ keys typed$' || _f "lsps2 did not report the keyboard"
     local m n
     m="$(printf '%s\n' "$S" | grep -aoE '^ps2: mouse/touchpad id 0x[0-9a-f]{2}, polled; [0-9]+ packets, buttons [01]{3}, [0-9]+ clicks$' | tail -1)"
@@ -103,17 +103,17 @@ grade() { # grade <serial capture> <pixel line>
     else
         n="$(printf '%s\n' "$m" | awk '{print $6}')"
         [ "$n" -ge 5 ] || _f "only $n packets (3 moves and 4 button changes were sent): $m"
-        printf '%s\n' "$m" | grep -qE 'buttons 000, 2 clicks$' || _f "expected 2 clicks and no button held: $m"
+        grep -qE 'buttons 000, 2 clicks$' <<< "$m" || _f "expected 2 clicks and no button held: $m"
     fi
     local q
     q="$(printf '%s\n' "$S" | grep -aoE '^ps2: rate .*' | tail -1)"
-    printf '%s\n' "$q" | grep -qE '^ps2: rate 100 samples/s, resolution 8 counts/mm; IRQ 12, [1-9][0-9]* interrupts$' ||
+    grep -qE '^ps2: rate 100 samples/s, resolution 8 counts/mm; IRQ 12, [1-9][0-9]* interrupts$' <<< "$q" ||
         _f "the mouse is not at 100 samples/s, 8 counts/mm with IRQ 12 interrupts taken: ${q:-no rate line}"
     q="$(printf '%s\n' "$S" | grep -aoE '^ps2: acceleration .*' | tail -1)"
-    printf '%s\n' "$q" | grep -qE '^ps2: acceleration on: x1\.00 at 50 mm/s, x1\.00 at 100, x1\.50 at 175, x2\.00 at 250, x3\.00 from 400; [0-9]+ packet\(s\) sped up$' ||
+    grep -qE '^ps2: acceleration on: x1\.00 at 50 mm/s, x1\.00 at 100, x1\.50 at 175, x2\.00 at 250, x3\.00 from 400; [0-9]+ packet\(s\) sped up$' <<< "$q" ||
         _f "acceleration is not on with the 1x/1.5x/2x/3x curve: ${q:-no acceleration line}"
-    printf '%s\n' "$q" | grep -qE '; 0 packet\(s\) sped up$' || _f "slow moves were sped up (the pointer cannot land exactly): $q"
-    printf '%s\n' "$S" | grep -aqE '^ps2: pointer at 420,300$' ||
+    grep -qE '; 0 packet\(s\) sped up$' <<< "$q" || _f "slow moves were sped up (the pointer cannot land exactly): $q"
+    grep -aqE '^ps2: pointer at 420,300$' <<< "$S" ||
         _f "the pointer is not at 420,300: $(printf '%s\n' "$S" | grep -aE '^ps2: (pointer|not moved)' | tail -1)"
     case "$P" in *"tip=000000 "*) ;; *) _f "no black pointer tip at 420,300 on the screen ($P)" ;; esac
     case "$P" in *"fill=ffffff "*) ;; *) _f "no white pointer fill at 422,305 on the screen ($P)" ;; esac

@@ -23,9 +23,9 @@ grade() { # grade <serial capture>
     has() { grep -aqE "$1" <<< "$S"; }
     has '^\[xhci\] port [0-9]+: USB keyboard [0-9a-f]{4}:[0-9a-f]{4} \((full|low|high) speed\), slot [0-9]+' ||
         _f "no USB keyboard was enumerated"
-    printf '%s\n' "$S" | grep -aqE "^afrisovera> echo $WORD$" ||
+    grep -aqE "^afrisovera> echo $WORD$" <<< "$S" ||
         _f "the line typed with Caps Lock did not reach the shell as echo $WORD"
-    printf '%s\n' "$S" | grep -aqE "^$WORD$" || _f "the shell did not print $WORD"
+    grep -aqE "^$WORD$" <<< "$S" || _f "the shell did not print $WORD"
     local l n r
     l="$(printf '%s\n' "$S" | grep -aoE '^  keyboard: caps lock (on|off), its light set [0-9]+ times, [0-9]+ refused$' | tail -1)"
     if [ -z "$l" ]; then

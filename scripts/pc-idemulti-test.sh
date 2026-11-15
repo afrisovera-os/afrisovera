@@ -31,8 +31,8 @@ grade() { # grade <boot1 log> <boot2 log> <word>
     [ -r "$1" ] && [ -r "$2" ] || { echo "  FAIL: missing log"; return 1; }
     A="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     B="$(tr -d '\r' < "$2" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-    hasA() { printf '%s\n' "$A" | grep -aqE "$1"; }
-    hasB() { printf '%s\n' "$B" | grep -aqE "$1"; }
+    hasA() { grep -aqE "$1" <<< "$A"; }
+    hasB() { grep -aqE "$1" <<< "$B"; }
     hasA '^\[ide\] primary master \(0x1f0\): ATA disk, 16384 sectors \(8 MiB\), LBA(28|48), blank: not used unless claimed \(claimdisk ide\)$' ||
         _f "boot 1: the blank 8 MiB disk (primary master) was not identified, or not kept unused until claimed"
     hasA '^\[ide\] secondary master \(0x170\): ATA disk, 16384 sectors \(8 MiB\), LBA(28|48), holds other data \(Windows\?\): left alone$' ||
@@ -42,7 +42,7 @@ grade() { # grade <boot1 log> <boot2 log> <word>
         _f "boot 1: multi-sector reads were not switched on at the claim"
     hasA '^\[ide\] ide0: multi-sector writes on \(up to 16 sectors per command; the first 16 read back equal\)$' ||
         _f "boot 1: multi-sector writes were not switched on at the first save"
-    printf '%s\n%s\n' "$A" "$B" | grep -aqE '^\[ide\] ide[1-9]: multi-sector' && _f "the MBR disk was checked as if it were storage"
+    grep -aqE '^\[ide\] ide[1-9]: multi-sector' <<< "$A"$'\n'"$B" && _f "the MBR disk was checked as if it were storage"
     hasB '^\[ide\] primary master \(0x1f0\): ATA disk, 16384 sectors \(8 MiB\), LBA(28|48), ours \(AFRIVFS1\): used for storage$' ||
         _f "boot 2: the claimed disk was not recognised as ours"
     hasB '^\[ide\] ide0: multi-sector reads on \(up to 16 sectors per command' || _f "boot 2: multi-sector reads were not switched on at start-up"
@@ -67,7 +67,7 @@ grade() { # grade <boot1 log> <boot2 log> <word>
     hasA '^\[vfs\] synced [0-9]+ files to disk$' || _f "boot 1: the VFS never synced to the IDE disk"
     hasB '^\[vfs\] VFS restored from disk: [0-9]+ files$' || _f "boot 2: the VFS was not restored from the IDE disk"
     hasB "^$word$" || _f "boot 2: notes.txt did not come back from the IDE disk"
-    if printf '%s\n%s\n' "$A" "$B" | grep -aqE "$BAD"; then
+    if grep -aqE "$BAD" <<< "$A"$'\n'"$B"; then
         _f "$(printf '%s\n%s\n' "$A" "$B" | grep -aE "$BAD" | head -1)"
     fi
     return "$fail"

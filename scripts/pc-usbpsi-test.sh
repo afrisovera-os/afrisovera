@@ -35,9 +35,9 @@ grade() { # grade <serial>
     has '^usb: test: controller 1 now has its own speed ID table; 5 of 5 entries read as expected$' ||
         _f "usbaddr psi did not read all 5 test entries as expected"
     k="$(printf '%s\n' "$S" | grep -aE '^  port kinds:' | tail -1)"
-    printf '%s\n' "$k" | grep -aqF '(3 speed IDs of its own: 1 full 2 low 3 high)' ||
+    grep -aqF '(3 speed IDs of its own: 1 full 2 low 3 high)' <<< "$k" ||
         _f "the last kinds line does not show the USB 2 table: $k"
-    printf '%s\n' "$k" | grep -aqF '(2 speed IDs of its own: 4 super 5 super plus)' ||
+    grep -aqF '(2 speed IDs of its own: 4 super 5 super plus)' <<< "$k" ||
         _f "the last kinds line does not show the USB 3 table: $k"
     has '(^|> )\[xhci\] port [0-9]+: USB keyboard [0-9a-f]{4}:[0-9a-f]{4} \((full|high) speed\)' || _f "the keyboard was not taken at its own (full or high) speed"
     has '(^|> )\[xhci\] port [0-9]+: USB mouse [0-9a-f]{4}:[0-9a-f]{4} \((full|high) speed\)' || _f "the mouse was not taken at its own (full or high) speed"

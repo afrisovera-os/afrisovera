@@ -25,8 +25,8 @@ grade() { # grade <serial capture>
     has '^\[xhci\] port [0-9]+: USB keyboard [0-9a-f]{4}:[0-9a-f]{4} \((full|low|high) speed\), slot [0-9]+, interrupt-IN endpoint [0-9]+' ||
         _f "no USB keyboard was enumerated"
     # the typed command and its output: the echo line, then the word alone on the next line
-    printf '%s\n' "$S" | grep -aqE "^afrisovera> echo $WORD$" || _f "the command typed on the USB keyboard did not reach the shell"
-    printf '%s\n' "$S" | grep -aqE "^$WORD$" || _f "the shell did not run the command typed on the USB keyboard"
+    grep -aqE "^afrisovera> echo $WORD$" <<< "$S" || _f "the command typed on the USB keyboard did not reach the shell"
+    grep -aqE "^$WORD$" <<< "$S" || _f "the shell did not run the command typed on the USB keyboard"
     local k
     k="$(printf '%s\n' "$S" | grep -aoE '^  keyboard: slot [0-9]+, [0-9]+ reports, [0-9]+ keys typed$' | tail -1 | awk '{print $6}')"
     if [ -z "$k" ]; then

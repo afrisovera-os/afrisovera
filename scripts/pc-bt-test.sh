@@ -117,10 +117,26 @@ gradeD() { # gradeD <serial> <qemu stderr>
     has "^bt: patch $PATCH4: refused: its sha256 is not the one listed$" || _f "D: the changed file was not refused by its hash"
     has '^bt: firmware: ROM \(the patch was not applied\)$' || _f "D: the controller is not said to run from ROM"
     grep -aq 'manufacturer mode' <<< "$Q" && _f "D: something was sent although the file's hash was wrong"
+    has '^\[xhci\] bound: 46f4:af02 bt$' || _f "D: no bound line for the controller (USB match tables slice 1)"
+    return "$fail"
+}
+
+gradeE() { # gradeE <serial> <qemu stderr>: noint=on, so bt's table matches E0/01/01 but bt refuses it (no event endpoint)
+    local fail=0 S
+    _f() { echo "  FAIL: $*"; fail=1; }
+    S="$(clean "$1")"
+    has() { grep -aqE "$1" <<< "$S"; }
+    has '^  usb 46f4:af02 wireless \(Bluetooth\): class: bt covers it \(Bluetooth HCI\), not in use: .+$' ||
+        _f "E: hwscan did not give the refused controller a class verdict for bt (USB match tables slice 1)"
+    has '^  usb 46f4:af02 .*: missing' && _f "E: the refused controller reads missing, not class"
+    has '^\[xhci\] bound: 46f4:af02 ' && _f "E: a driver took the controller that has no event endpoint"
+    has '^\[xhci\] port [0-9]+: Bluetooth controller' && _f "E: the Bluetooth driver took a controller with no event endpoint"
+    grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$S" && _f "E: the kernel panicked"
     return "$fail"
 }
 
 BOOT='[xhci] port 5: Bluetooth controller 46f4:af02 (full speed), slot 1, events on endpoint 1; nothing is sent until `bt`
+[xhci] bound: 46f4:af02 bt
 afrisovera> bt
 bt: controller 46f4:af02 (Intel 2), HCI 6 rev 0x1000, LMP 6 subversion 0x2209'
 GA="$BOOT
@@ -167,6 +183,10 @@ GD="$BOOT
 bt: patch $PATCH4: refused: its sha256 is not the one listed
 bt: firmware: ROM (the patch was not applied)"
 
+GE="[xhci] port 5: device 46f4:af02 (wireless (Bluetooth)) is not one this driver uses
+afrisovera> hwscan
+  usb 46f4:af02 wireless (Bluetooth): class: bt covers it (Bluetooth HCI), not in use: the driver's own check refused it (the boot log says why)"
+
 selftest() {
     local D pass=0 bad=0
     D="$(mktemp -d "$T/pc-bt-selftest.XXXXXX")" || return 1
@@ -198,10 +218,14 @@ selftest() {
     arm D-green green gradeD "$GD" ""
     arm D-sent red gradeD "$GD" "$QC"
     arm panic red gradeD "$(printf '%s\n[pc] PANIC: x' "$GD")" ""
+    arm D-no-bound red gradeD "$(printf '%s\n' "$GD" | grep -v 'bound:')" ""
+    arm E-green green gradeE "$GE" ""
+    arm E-missing red gradeE "$(printf '%s\n' "$GE" | sed 's/: class: bt covers it (Bluetooth HCI), not in use: .*/: missing: no driver in AfriSovera yet/')" ""
+    arm E-taken red gradeE "$(printf '%s\n[xhci] bound: 46f4:af02 bt' "$GE")" ""
     arm empty red gradeA ""
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 20 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 24 ]
 }
 
 echo "== PC Bluetooth slice 1 (HCI over USB, Intel legacy, scan) =="
@@ -241,7 +265,7 @@ boot() {
     AFRISH_BOOT_GRACE="${AFRISH_BOOT_GRACE:-10}" python3 scripts/shell-demo.py 5346 5347 "$W/$name.png" "$@" > "$W/$name.log" 2>&1
     kill "$q" 2> /dev/null
     wait "$q" 2> /dev/null
-    clean "$W/$name.log" | grep -aE '^\[xhci\] port [0-9]+: Bluetooth|^bt|^  [0-9a-f]{2}:|^      name|PANIC' | sed "s/^/  $name| /"
+    clean "$W/$name.log" | grep -aE '^\[xhci\] (port [0-9]+: Bluetooth|bound:)|^bt|^  [0-9a-f]{2}:|^      name|^  usb 46f4|PANIC' | sed "s/^/  $name| /"
     grep -a 'usb-hci-test' "$W/$name.qemu" | sed "s/^/  $name qemu| /"
     echo "  --- grading ($name) ---"
     if [ "$fn" = gradeA ]; then gradeA "$W/$name.log" || fail=1; else "$fn" "$W/$name.log" "$W/$name.qemu" || fail=1; fi
@@ -251,6 +275,7 @@ boot A "fw=3,bad=on" gradeA -fw_cfg name=opt/afrisovera/bt-names-serial,string=1
 boot B "fw=1" gradeB -- "bt" "bt scan 2"
 boot C "fw=2,mute=on" gradeC -- "bt" "bt scan 2"
 boot D "fw=4" gradeD -- "bt"
+boot E "noint=on" gradeE -- "hwscan"
 
 if [ "$fail" -eq 0 ]; then
     rm -rf "$W"

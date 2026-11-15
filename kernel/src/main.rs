@@ -23,6 +23,7 @@ mod drbg_apt;
 mod drbg_kat;
 mod ed25519;
 mod exceptions;
+mod uaccess; // G2 part 2: EL0 memory only through LDTRB/STTRB, with a link-time fault table
 mod fdt;
 mod fmtbuf;
 mod font;
@@ -37,6 +38,7 @@ mod gic;
 mod gpio;
 mod heap;
 mod nia;
+mod keyseq; // A4: terminal key sequences to app key codes (nia.rs and the desk's cell events)
 mod paging;
 mod psci;
 #[cfg(feature = "board-raspi")]
@@ -971,6 +973,7 @@ pub extern "C" fn kernel_main(dtb: u64) -> ! {
 
     // 4) Interrupts: vector table (incl. the SVC syscall path), GIC, timer.
     exceptions::init();
+    uaccess::init(); // G2 part 2: UAO off where present; says EL0 memory moves only through LDTR/STTR
     gic::init();
     timer::init();
     // Interrupt-driven console input: route the PL011 RX interrupt to this core

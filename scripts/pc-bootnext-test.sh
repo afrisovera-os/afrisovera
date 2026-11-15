@@ -130,7 +130,7 @@ grade() { # grade <boot1 log> ... <boot6 log> [<boot7 log> <boot8 log>] (boots 7
     local NUM N4 G FIRST=""
     in_blk "$(blk "$A" bootnext)" 'bootnext: AfriSovera has no boot entry \(bootentry adds it first\); nothing written' ||
         _f "boot 1: bootnext was not refused without AfriSovera's entry"
-    printf '%s\n' "$(pblk "$B" 'bootcopy yes ')" | grep -aqE "^bootcopy: copied to $NAME partition $PNO$FILE_RE, read back the same" ||
+    grep -aqE "^bootcopy: copied to $NAME partition $PNO$FILE_RE, read back the same" <<< "$(pblk "$B" 'bootcopy yes ')" ||
         _f "boot 2: bootcopy did not copy the boot file to partition $PNO"
     NUM="$(printf '%s\n' "$(pblk "$C" 'bootentry yes ')" | sed -nE 's/^bootentry: (Boot[0-9A-F]{4}) "AfriSovera" added at the END of BootOrder and read back.*/\1/p' | head -1)"
     [ -n "$NUM" ] || _f "boot 3: bootentry did not add AfriSovera's entry"
@@ -162,9 +162,9 @@ grade() { # grade <boot1 log> ... <boot6 log> [<boot7 log> <boot8 log>] (boots 7
             el="$(printf '%s\n' "$be" | grep -aE "^  $n  " | head -1)"
             case "$r" in
                 "no such entry") [ -z "$el" ] || _f "$w: $c says $n has no entry, but bootentries lists it";;
-                off) printf '%s\n' "$el" | grep -aqE "^  $n  off  " || _f "$w: $c says $n is off, but bootentries does not";;
-                hidden) printf '%s\n' "$el" | grep -aqE "^  $n  active  .*  \[hidden\]" || _f "$w: $c says $n is hidden, but bootentries does not";;
-                "a firmware app") { printf '%s\n' "$el" | grep -aqE "^  $n  active  " && ! printf '%s\n' "$el" | grep -aq '  \[hidden\]'; } ||
+                off) grep -aqE "^  $n  off  " <<< "$el" || _f "$w: $c says $n is off, but bootentries does not";;
+                hidden) grep -aqE "^  $n  active  .*  \[hidden\]" <<< "$el" || _f "$w: $c says $n is hidden, but bootentries does not";;
+                "a firmware app") { grep -aqE "^  $n  active  " <<< "$el" && ! grep -aq '  \[hidden\]' <<< "$el"; } ||
                     _f "$w: $c says $n is a firmware app, but bootentries shows it off, hidden or not at all";;
                 damaged) ;;
                 *) _f "$w: $c passes over $n for a reason it never gives ($r)";;
@@ -172,7 +172,7 @@ grade() { # grade <boot1 log> ... <boot6 log> [<boot7 log> <boot8 log>] (boots 7
         done < <(printf '%s\n' "$po" | grep -aoE 'Boot[0-9A-F]{4} \([a-z ]+\)' | sed -E 's/^(Boot[0-9A-F]{4}) \((.*)\)$/\1 \2/')
         i=$((i+1)); n="${!i:-}"
         el="$(printf '%s\n' "$be" | grep -aE "^  Boot${n:-none}  " | head -1)"
-        { printf '%s\n' "$el" | grep -aqF "  active  \"$ks\"  " && ! printf '%s\n' "$el" | grep -aq '  \[hidden\]'; } ||
+        { grep -aqF "  active  \"$ks\"  " <<< "$el" && ! grep -aq '  \[hidden\]' <<< "$el"; } ||
             _f "$w: $c says the PC keeps starting \"$ks\" first, but place $i of BootOrder (Boot${n:-none}) is not that entry, or is passed over without a word"
     }
     fp "$(blk "$C" bootentries)" "$C2" "boot 3" bootnext
@@ -195,16 +195,16 @@ grade() { # grade <boot1 log> ... <boot6 log> [<boot7 log> <boot8 log>] (boots 7
     in_blk "$EE" "bootentries: the firmware's boot entries, as read at power-on \(nothing is changed\)" || _f "boot 5: bootentries did not read at power-on"
     in_blk "$EE" "  $NUM  active  \"AfriSovera\"  HD\($PNO,GPT,$G,start $STARTL\)/$FILE_RE  <- started this time" ||
         _f "boot 5: the firmware did not start $NUM \"AfriSovera\" from the EFI partition"
-    if printf '%s\n' "$EE" | grep -aq '^  BootNext:'; then _f "boot 5: BootNext is still there after the firmware used it"; fi
+    if grep -aq '^  BootNext:' <<< "$EE"; then _f "boot 5: BootNext is still there after the firmware used it"; fi
     # boot 6: back to the usual first choice
     local FE; FE="$(blk "$F" bootentries)"
-    printf '%s\n' "$FE" | grep -a '<- started this time' | grep -aqF "\"$FIRST\"" || _f "boot 6: the PC did not go back to \"$FIRST\""
-    if printf '%s\n' "$FE" | grep -a '<- started this time' | grep -aq '"AfriSovera"'; then _f "boot 6: AfriSovera was started again"; fi
-    if printf '%s\n' "$FE" | grep -aq '^  BootNext:'; then _f "boot 6: a BootNext is there"; fi
+    grep -aqF "\"$FIRST\"" <<< "$(grep -a '<- started this time' <<< "$FE")" || _f "boot 6: the PC did not go back to \"$FIRST\""
+    if grep -aq '"AfriSovera"' <<< "$(grep -a '<- started this time' <<< "$FE")"; then _f "boot 6: AfriSovera was started again"; fi
+    if grep -aq '^  BootNext:' <<< "$FE"; then _f "boot 6: a BootNext is there"; fi
     in_blk "$FE" "  AfriSovera's own entry: $NUM" || _f "boot 6: AfriSovera's entry is gone"
     if [ "$SHARED" = 1 ]; then # the shared partition: Windows' and Ubuntu's files untouched, nothing outside it changed
-        printf '%s\n' "$F" | grep -aqxF "$INSIDE" || _f "after boot 6 the Windows-like disk changed outside its EFI partition, or not at all"
-        printf '%s\n' "$F" | grep -aqxF "$KEPT" || _f "after boot 6 the Microsoft, BOOT or ubuntu files (or their FAT entries) changed"
+        grep -aqxF "$INSIDE" <<< "$F" || _f "after boot 6 the Windows-like disk changed outside its EFI partition, or not at all"
+        grep -aqxF "$KEPT" <<< "$F" || _f "after boot 6 the Microsoft, BOOT or ubuntu files (or their FAT entries) changed"
         # the way back: the entry, then the file, each on its own code
         local F2; F2="$(blk "$F" 'bootentry remove')"
         in_blk "$F2" "bootentry remove: $NUM \"AfriSovera\" would be deleted" || _f "boot 6: bootentry remove did not say what goes"
@@ -221,28 +221,28 @@ grade() { # grade <boot1 log> ... <boot6 log> [<boot7 log> <boot8 log>] (boots 7
             _f "boot 8: bootcopy remove did not take the file out and read back"
         local HE; HE="$(blk "$H8" bootentries)"
         in_blk "$HE" "  AfriSovera's own entry: none yet \(adding one will ask for the owner's word\)" || _f "boot 8: an AfriSovera entry is still there"
-        if printf '%s\n' "$HE" | grep -aq '"AfriSovera"'; then _f "boot 8: bootentries still lists an AfriSovera entry"; fi
-        printf '%s\n' "$HE" | grep -a '<- started this time' | grep -aqF "\"$FIRST\"" || _f "boot 8: the PC did not start \"$FIRST\""
-        printf '%s\n' "$H8" | grep -aqx 'harness: bootcopy removal check PASSED' ||
+        if grep -aq '"AfriSovera"' <<< "$HE"; then _f "boot 8: bootentries still lists an AfriSovera entry"; fi
+        grep -aqF "\"$FIRST\"" <<< "$(grep -a '<- started this time' <<< "$HE")" || _f "boot 8: the PC did not start \"$FIRST\""
+        grep -aqx 'harness: bootcopy removal check PASSED' <<< "$H8" ||
             _f "after boot 8 the disk is not as it was before bootcopy (scripts/lib/check-bootcopy.py removed)"
     fi
     if [ "$UBU" = 1 ]; then # Ubuntu's own entry: there before AfriSovera came, never started, left exactly as it was
         local A1 UL BO1 UNUM=""
         A1="$(blk "$A" bootentries)"
-        printf '%s\n' "$A" | grep -aqE '^harness: Boot[0-9A-F]{4} "ubuntu" .* written to the variable store, first in BootOrder' ||
+        grep -aqE '^harness: Boot[0-9A-F]{4} "ubuntu" .* written to the variable store, first in BootOrder' <<< "$A" ||
             _f "harness: Ubuntu's entry was not written to the variable store before boot 1"
         UL="$(printf '%s\n' "$A1" | grep -aE "^  Boot[0-9A-F]{4}  active  \"ubuntu\"  HD\($PNO,GPT,$G,start $STARTL\)/$UFILE_RE\$" | head -1)"
         [ -n "$UL" ] || _f "boot 1: bootentries does not show Ubuntu's entry HD($PNO,GPT,$G,start $STARTL)/$UFILE"
         UNUM="$(printf '%s\n' "$UL" | sed -nE 's/^  (Boot[0-9A-F]{4}) .*/\1/p')"
         BO1="$(printf '%s\n' "$A1" | grep -a '^  BootOrder:' | head -1)"
-        { [ -n "$UNUM" ] && printf '%s\n' "$BO1" | grep -aqE " ${UNUM#Boot}( |\$)"; } || _f "boot 1: BootOrder does not hold Ubuntu's entry"
+        { [ -n "$UNUM" ] && grep -aqE " ${UNUM#Boot}( |\$)" <<< "$BO1"; } || _f "boot 1: BootOrder does not hold Ubuntu's entry"
         [ "$NUM" != "$UNUM" ] || _f "boot 3: bootentry took Ubuntu's number $UNUM"
         if [ -n "$UL" ]; then
-            printf '%s\n' "$EE" | grep -aqxF "$UL" || _f "boot 5: Ubuntu's entry changed, is gone or was started"
-            printf '%s\n' "$FE" | grep -aqxF "$UL" || _f "boot 6: Ubuntu's entry changed, is gone or was started"
-            printf '%s\n' "$HE" | grep -aqxF "$UL" || _f "boot 8: Ubuntu's entry is not as it was at boot 1"
+            grep -aqxF "$UL" <<< "$EE" || _f "boot 5: Ubuntu's entry changed, is gone or was started"
+            grep -aqxF "$UL" <<< "$FE" || _f "boot 6: Ubuntu's entry changed, is gone or was started"
+            grep -aqxF "$UL" <<< "$HE" || _f "boot 8: Ubuntu's entry is not as it was at boot 1"
         fi
-        { [ -n "$BO1" ] && printf '%s\n' "$HE" | grep -aqxF "$BO1"; } || _f "boot 8: BootOrder is not as it was at boot 1"
+        { [ -n "$BO1" ] && grep -aqxF "$BO1" <<< "$HE"; } || _f "boot 8: BootOrder is not as it was at boot 1"
         # bootplan names the other systems' entries and says they stay, each at its place in boot 1's BootOrder (QEMU's
         # firmware puts its own disks before them at power-on, so Ubuntu need not be first there)
         local AP UPL; AP="$(blk "$A" bootplan)"
@@ -250,7 +250,7 @@ grade() { # grade <boot1 log> ... <boot6 log> [<boot7 log> <boot8 log>] (boots 7
         UPL="$(pl "${UNUM:-Boot????}")"
         in_blk "$AP" "  stays as it is: ${UNUM:-Boot????} \"ubuntu\", partition $PNO, $UFILE_RE \(place ${UPL:-?} in BootOrder\)" ||
             _f "boot 1: bootplan does not say Ubuntu's entry ${UNUM:-?} (partition $PNO, $UFILE, place ${UPL:-?} in BootOrder) stays as it is"
-        if printf '%s\n' "$AP" | grep -aE '^  stays as it is: ' | grep -aqiE '"AfriSovera"|\\afrisovera\\'; then
+        if grep -aqiE '"AfriSovera"|\\afrisovera\\' <<< "$(grep -aE '^  stays as it is: ' <<< "$AP")"; then
             _f "boot 1: bootplan names AfriSovera's own entry as one that stays"; fi
         in_blk "$AP" '  the PC keeps starting ".+" first; AfriSovera is picked from the firmware.s boot menu' ||
             _f "boot 1: bootplan does not say which entry the PC keeps starting first"
@@ -258,17 +258,17 @@ grade() { # grade <boot1 log> ... <boot6 log> [<boot7 log> <boot8 log>] (boots 7
         # boot 8, after the way back: bootplan says what it said at boot 1 (target, entry, first choice, the others)
         local PL='^(bootplan: the boot file would go to |  boot entry: |  the PC keeps starting |  passed over before it in BootOrder: |  stays as it is: )' P1 P8
         P1="$(printf '%s\n' "$AP" | grep -aE "$PL")"; P8="$(blk "$H8" bootplan | grep -aE "$PL")"
-        { printf '%s\n' "$P1" | grep -aq '^  stays as it is: ' && [ "$P1" = "$P8" ]; } ||
+        { grep -aq '^  stays as it is: ' <<< "$P1" && [ "$P1" = "$P8" ]; } ||
             _f "boot 8: bootplan after the way back does not say what it said at boot 1 (the same entries at the same places)"
         fp "$HE" "$(blk "$H8" bootplan)" "boot 8"
         if [ "$WIN" = 1 ]; then # Windows Boot Manager's own entry too: there first, never started, left exactly as it was
             local WL WNUM=""
-            printf '%s\n' "$A" | grep -aqE '^harness: Boot[0-9A-F]{4} "Windows Boot Manager" .* written to the variable store' ||
+            grep -aqE '^harness: Boot[0-9A-F]{4} "Windows Boot Manager" .* written to the variable store' <<< "$A" ||
                 _f "harness: Windows Boot Manager's entry was not written to the variable store before boot 1"
             WL="$(printf '%s\n' "$A1" | grep -aE "^  Boot[0-9A-F]{4}  $WST\"Windows Boot Manager\"  HD\($PNO,GPT,$G,start $STARTL\)/$WFILE_RE$WTAIL_RE\$" | head -1)"
             [ -n "$WL" ] || _f "boot 1: bootentries does not show Windows Boot Manager's entry ${WST%% *} HD($PNO,GPT,$G,start $STARTL)/$WFILE$WTAIL"
             WNUM="$(printf '%s\n' "$WL" | sed -nE 's/^  (Boot[0-9A-F]{4}) .*/\1/p')"
-            { [ -n "$WNUM" ] && printf '%s\n' "$BO1" | grep -aqE " ${WNUM#Boot}( |\$)"; } || _f "boot 1: BootOrder does not hold Windows Boot Manager's entry"
+            { [ -n "$WNUM" ] && grep -aqE " ${WNUM#Boot}( |\$)" <<< "$BO1"; } || _f "boot 1: BootOrder does not hold Windows Boot Manager's entry"
             [ "$NUM" != "$WNUM" ] || _f "boot 3: bootentry took Windows Boot Manager's number $WNUM"
             [ -z "$WNUM" ] || [ "$WNUM" != "$UNUM" ] || _f "boot 1: Windows Boot Manager and Ubuntu show the same number $WNUM"
             local WP; WP="$(pl "${WNUM:-Boot????}")"
@@ -276,9 +276,9 @@ grade() { # grade <boot1 log> ... <boot6 log> [<boot7 log> <boot8 log>] (boots 7
                 _f "boot 1: bootplan does not say Windows Boot Manager's entry ${WNUM:-?} (partition $PNO, $WFILE$WPLAN, place ${WP:-?} in BootOrder) stays as it is"
             [ -z "$UPL" ] || [ -z "$WP" ] || [ "$UPL" -lt "$WP" ] || _f "boot 1: Ubuntu's entry is not before Windows Boot Manager's in BootOrder"
             if [ -n "$WL" ]; then
-                printf '%s\n' "$EE" | grep -aqxF "$WL" || _f "boot 5: Windows Boot Manager's entry changed, is gone or was started"
-                printf '%s\n' "$FE" | grep -aqxF "$WL" || _f "boot 6: Windows Boot Manager's entry changed, is gone or was started"
-                printf '%s\n' "$HE" | grep -aqxF "$WL" || _f "boot 8: Windows Boot Manager's entry is not as it was at boot 1"
+                grep -aqxF "$WL" <<< "$EE" || _f "boot 5: Windows Boot Manager's entry changed, is gone or was started"
+                grep -aqxF "$WL" <<< "$FE" || _f "boot 6: Windows Boot Manager's entry changed, is gone or was started"
+                grep -aqxF "$WL" <<< "$HE" || _f "boot 8: Windows Boot Manager's entry is not as it was at boot 1"
             fi
         fi
     fi
@@ -288,18 +288,18 @@ grade() { # grade <boot1 log> ... <boot6 log> [<boot7 log> <boot8 log>] (boots 7
         local b dl n; b="$(blk "$1" bootentries)"
         dl="$(printf '%s\n' "$b" | sed -nE 's/^  in BootOrder but no such entry \(the firmware passes over it, nothing is changed\): (.*)$/\1/p')"
         for n in $(printf '%s\n' "$dl" | grep -aoE 'Boot[0-9A-F]{4}'); do
-            printf '%s\n' "$b" | grep -a '^  BootOrder:' | grep -aqE " ${n#Boot}( |\$)" || _f "$2: bootentries calls $n an empty place, but BootOrder does not name it"
-            if printf '%s\n' "$b" | grep -aqE "^  $n  "; then _f "$2: bootentries calls $n an empty place, but lists its entry"; fi
+            grep -aqE " ${n#Boot}( |\$)" <<< "$(grep -a '^  BootOrder:' <<< "$b")" || _f "$2: bootentries calls $n an empty place, but BootOrder does not name it"
+            if grep -aqE "^  $n  " <<< "$b"; then _f "$2: bootentries calls $n an empty place, but lists its entry"; fi
         done
         # BootNext (12 Nov 2026): "no such entry" only for a number with no Boot#### line, the usual words only
         # for one with a line (QEMU's firmware deletes BootNext at power-on, so a real run shows only boot 4's)
         n="$(printf '%s\n' "$b" | sed -nE 's/^  BootNext: ([0-9A-F]{4}) \(no such entry: the firmware deletes it at the next power-on and follows BootOrder\)$/\1/p' | head -1)"
-        if [ -n "$n" ] && printf '%s\n' "$b" | grep -aqE "^  Boot$n  "; then _f "$2: bootentries says BootNext $n has no entry, but lists Boot$n"; fi
+        if [ -n "$n" ] && grep -aqE "^  Boot$n  " <<< "$b"; then _f "$2: bootentries says BootNext $n has no entry, but lists Boot$n"; fi
         n="$(printf '%s\n' "$b" | sed -nE 's/^  BootNext: ([0-9A-F]{4}) \(started ONCE at the next power-on, then the firmware deletes it\)$/\1/p' | head -1)"
-        if [ -n "$n" ] && ! printf '%s\n' "$b" | grep -aqE "^  Boot$n  |^  \([0-9]+ more entries not shown\)$"; then _f "$2: bootentries says BootNext starts $n, but lists no Boot$n"; fi
+        if [ -n "$n" ] && ! grep -aqE "^  Boot$n  |^  \([0-9]+ more entries not shown\)$" <<< "$b"; then _f "$2: bootentries says BootNext starts $n, but lists no Boot$n"; fi
     }
     dang "$A" "boot 1"; dang "$D" "boot 4"; dang "$E" "boot 5"; dang "$F" "boot 6"; dang "$H8" "boot 8"
-    if printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$A" "$B" "$C" "$D" "$E" "$F" "$G7" "$H8" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)|FAILED|refused to write|could not be written|did not read back|did not delete'; then
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)|^\[(nvme|ahci)\] .*(failed|timed out)|FAILED|refused to write|could not be written|did not read back|did not delete' <<< "$A"$'\n'"$B"$'\n'"$C"$'\n'"$D"$'\n'"$E"$'\n'"$F"$'\n'"$G7"$'\n'"$H8"; then
         _f "the kernel panicked, a disk command or a firmware write failed, or something FAILED"
     fi
     return "$fail"
@@ -509,7 +509,7 @@ selftest() {
     arm empty-place-not-in-order red "$L1" "$L2" "$L3" "$L4" "$(printf '%s\n' "$L5" | sed "s/^  BootOrder: .*/&\n$EMPTYP Boot0009/")" "$L6"
     # a BootNext with no entry behind it at boot 1: right for a number not listed, wrong for a listed one, and the
     # usual words wrong for a number not listed
-    nx1() { if printf '%s\n' "$L1" | grep -aq '^  BootOrder:'; then printf '%s\n' "$L1" | sed "s/^  BootOrder: .*/&\n$1/"
+    nx1() { if grep -aq '^  BootOrder:' <<< "$L1"; then printf '%s\n' "$L1" | sed "s/^  BootOrder: .*/&\n$1/"
         else printf '%s\n' "${L1%afrisovera>}afrisovera> bootentries
 bootentries: the firmware's boot entries, as read at power-on (nothing is changed)
   BootOrder: 0001 0002 0003 0004 0000

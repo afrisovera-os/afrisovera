@@ -1,0 +1,8 @@
+[desk] locale en: plural 0=other 1=one 2=other 3=other 5=other 11=other 21=other 101=other 1000000=other; group 1000=1,000 1234567=1,234,567; memory 512=512 MiB 3891=3.8 GiB 16384=16 GiB; am=am pm=pm; clock 24
+[desk] locale tw: plural 0=one 1=one 2=other 3=other 5=other 11=other 21=other 101=other 1000000=other; group 1000=1,000 1234567=1,234,567; memory 512=512 MiB 3891=3.8 GiB 16384=16 GiB; am=AN pm=EW; clock 12
+[desk] locale es: plural 0=other 1=one 2=other 3=other 5=other 11=other 21=other 101=other 1000000=many; group 1000=1000 1234567=1.234.567; memory 512=512 MiB 3891=3,8 GiB 16384=16 GiB; am=a. m. pm=p. m.; clock 24
+[desk] locale fr: plural 0=one 1=one 2=other 3=other 5=other 11=other 21=other 101=other 1000000=many; group 1000=1 000 1234567=1 234 567; memory 512=512 MiB 3891=3,8 GiB 16384=16 GiB; am=AM pm=PM; clock 24
+[desk] locale pt: plural 0=one 1=one 2=other 3=other 5=other 11=other 21=other 101=other 1000000=many; group 1000=1.000 1234567=1.234.567; memory 512=512 MiB 3891=3,8 GiB 16384=16 GiB; am=AM pm=PM; clock 24
+[desk] locale id: plural 0=other 1=other 2=other 3=other 5=other 11=other 21=other 101=other 1000000=other; group 1000=1.000 1234567=1.234.567; memory 512=512 MiB 3891=3,8 GiB 16384=16 GiB; am=AM pm=PM; clock 24
+[desk] locale de: plural 0=other 1=one 2=other 3=other 5=other 11=other 21=other 101=other 1000000=other; group 1000=1.000 1234567=1.234.567; memory 512=512 MiB 3891=3,8 GiB 16384=16 GiB; am=AM pm=PM; clock 24
+[desk] locale tr: plural 0=other 1=one 2=other 3=other 5=other 11=other 21=other 101=other 1000000=other; group 1000=1.000 1234567=1.234.567; memory 512=512 MiB 3891=3,8 GiB 16384=16 GiB; am=ÖÖ pm=ÖS; clock 24

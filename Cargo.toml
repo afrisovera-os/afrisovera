@@ -11,7 +11,7 @@ members = [
 ]
 # The mesh crates and the DRBG host tests are separate host-tested crates (each its own `[workspace]`); the kernel
 # uses mesh-crypto/-noise/-hpke as path dependencies, so they are excluded from auto-membership here.
-exclude = ["mesh-crypto", "mesh-noise", "mesh-hpke", "mesh-link", "drbg-host", "fuzz-host", "dira-host", "wlan-crypto"]
+exclude = ["userland/dira", "mesh-crypto", "mesh-noise", "mesh-hpke", "mesh-link", "drbg-host", "fuzz-host", "dira-host", "wlan-crypto", "afrifs", "userland/afri-elf", "userland/daraja-linux"]
 # `cargo build` at the root builds only the kernel (for the bare-metal target).
 # The host tool `afriidl` is built explicitly with `--target <host-triple>`.
 default-members = ["kernel"]
@@ -24,3 +24,6 @@ panic = "abort"
 panic = "abort"
 lto = true
 opt-level = "z"   # size-first: the design center is a $40 / 1–2 GB phone.
+# An arithmetic mistake stops at its line, as in the debug build the suites run, instead of wrapping into a wrong
+# length or index (architect, stick verdict 14 Nov 2026). Measured: PC boot +5%, desktop frame +4%, code +8%.
+overflow-checks = true

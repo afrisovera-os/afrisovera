@@ -36,14 +36,14 @@ grade1() { # grade1 <serial> <peer log> <QEMU's stderr>
         _f "boot 1: the device was not set up as CDC-NCM with its MAC (NCM must win over the ECM configuration beside it)"
     has '^\[xhci\] NCM: blocks up to 8 KiB in \(the device offers 16 KiB\), 16 KiB out, table alignment 16, frame divisor 4 remainder 2, 16-bit blocks$' ||
         _f "boot 1: no NCM block-size line with the device's layout (8 KiB asked of 16, alignment 16, divisor 4 remainder 2)"
-    printf '%s\n' "$Q" | grep -q '^usbnet:' && _f "boot 1: the device complained: $(printf '%s\n' "$Q" | grep '^usbnet:' | head -1)"
+    grep -q '^usbnet:' <<< "$Q" && _f "boot 1: the device complained: $(grep -m1 '^usbnet:' <<< "$Q")"
     has 'CDC-NCM not used' && _f "boot 1: the NCM setup failed: $(grep -aE 'CDC-NCM not used' <<< "$S" | head -1)"
     has '^\[virtio\] slot [0-9]+: virtio-net \(id=1\), emulated over the USB Ethernet adapter \(CDC-NCM\)$' ||
         _f "boot 1: the adapter was not presented to the network stack as CDC-NCM"
     has '^\[net\] DHCP: IP 10\.0\.2\.15, mask 255\.255\.255\.0, gw 10\.0\.2\.2' || _f "boot 1: no DHCP lease over NCM"
     has '^\[net\] ICMP echo reply from 10\.0\.2\.2 \(ping OK\)$' || _f "boot 1: no ping reply over NCM"
     has '^\[net\] TCP data round-trip OK' || _f "boot 1: the TCP data round-trip did not complete"
-    printf '%s\n' "$P" | grep -qF "peer received ${#PAYLOAD} bytes: $PAYLOAD" ||
+    grep -qF "peer received ${#PAYLOAD} bytes: $PAYLOAD" <<< "$P" ||
         _f "boot 1: the peer did not receive the exact ${#PAYLOAD}-byte payload"
     local c
     c="$(printf '%s\n' "$S" | grep -aoE "^lsvirtio: slot [0-9]+ \(emulated over usb-ncm\) id 1 \(virtio-net\), $FRAMES$" | tail -1 |

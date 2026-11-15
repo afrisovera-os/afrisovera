@@ -30,7 +30,7 @@ boot() { # $1 = qmp/serial base port offset, rest = shell commands
 
 echo "[boot 1] writing notes.txt and syncing to disk..."
 B1="$(boot 4530 "write notes.txt HELLO-PERSISTENT" "sync")"
-echo "$B1" | grep -q "synced" || { echo "PERSIST TEST FAILED (sync did not run)"; exit 1; }
+grep -q "synced" <<< "$B1" || { echo "PERSIST TEST FAILED (sync did not run)"; exit 1; }
 
 echo "[boot 2] fresh boot on the same disk — reading notes.txt back..."
 B2="$(boot 4532 "cat notes.txt")"
@@ -38,6 +38,6 @@ echo "$B2" | grep -i "HELLO-PERSISTENT" || true
 
 # The definitive proof: a file written+synced in boot 1 is readable in boot 2 (a
 # fresh QEMU process) with no re-write — so it came from the disk.
-echo "$B2" | grep -q "HELLO-PERSISTENT" \
+grep -q "HELLO-PERSISTENT" <<< "$B2" \
     && echo "PERSIST TEST PASSED  (notes.txt written in boot 1 survived into boot 2 via disk)" \
     || { echo "PERSIST TEST FAILED (file contents not restored)"; exit 1; }

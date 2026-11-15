@@ -1,0 +1,26 @@
+# afrifs: AFR-0011, VFS v1, the AfriSovera file system (format 3, AFRIVFS2). Step V1 (VFS_V1_PLAN.md).
+#
+# The format, mount and its checks, reads, writes, folders and the copy-on-write commit, written no_std with the
+# kernel's allocator (`alloc`) and no unsafe code, so the kernel can use it unchanged (step V3). It knows a disk only
+# through the `Disk` trait (sectors, read, write, flush), which is what lets the host tests cut the power at every
+# write (tests/crash.rs) and the fuzz targets feed it any image (src/fuzzing.rs, fuzz-host/fuzz).
+#
+# No dependencies. The empty [workspace] table detaches it from the kernel workspace, so `cargo build` at the repo
+# root still builds only the kernel and the ARM image does not change. Test from the repo root:
+#   scripts/afrifs-test.sh      (cargo test --release --manifest-path afrifs/Cargo.toml --target <host>)
+[package]
+name = "afrifs"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "AFR-0011 VFS v1: a copy-on-write file system with checksummed blocks (host-tested; no_std for the kernel)."
+publish = false
+
+[dependencies]
+
+# Overflow checks on in every profile, as in the kernel's debug image: an overflow is a finding, not a wrap.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+
+[workspace]

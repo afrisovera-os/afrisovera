@@ -73,9 +73,9 @@ grade() { # grade <serial> <pixel line>
     [ -r "$1" ] || { echo "  FAIL: missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
     P="$2"
-    printf '%s\n' "$S" | grep -aqE '^\[pc\] screen: the 640x480 console shown on the [0-9]+x[0-9]+ GOP screen at [1-4]x$' ||
+    grep -aqE '^\[pc\] screen: the 640x480 console shown on the [0-9]+x[0-9]+ GOP screen at [1-4]x$' <<< "$S" ||
         _f "the console was not attached to the GOP screen (or the default is no longer whole-number)"
-    printf '%s\n' "$S" | grep -aqE '^screen: unknown mode zz; use: screen whole \| screen fit \| screen fill$' ||
+    grep -aqE '^screen: unknown mode zz; use: screen whole \| screen fit \| screen fill$' <<< "$S" ||
         _f "an unknown mode was not refused"
     g="$(printf '%s\n' "$S" | grep -aoE '^screen: GOP [0-9]+x[0-9]+ ' | tail -1 | sed -E 's/^screen: GOP ([0-9]+)x([0-9]+) $/\1 \2/')"
     gw="${g% *}"; gh="${g#* }"
@@ -83,9 +83,9 @@ grade() { # grade <serial> <pixel line>
         if [ $((gw * 480)) -ge $((gh * 640)) ]; then dh=$gh; dw=$((640 * gh / 480)); else dw=$gw; dh=$((480 * gw / 640)); fi
         [ "$dw" -gt 2560 ] && dw=2560; [ "$dh" -gt 1920 ] && dh=1920
         ox=$(((gw - dw) / 2)); oy=$(((gh - dh) / 2))
-        printf '%s\n' "$S" | grep -aqxF "screen: mode fit: the 640x480 console now covers ${dw}x${dh} at ${ox},${oy} of the screen" ||
+        grep -aqxF "screen: mode fit: the 640x480 console now covers ${dw}x${dh} at ${ox},${oy} of the screen" <<< "$S" ||
             _f "screen fit did not report ${dw}x${dh} at ${ox},${oy} for the ${gw}x${gh} screen"
-        printf '%s\n' "$S" | grep -aqE "^screen: GOP ${gw}x${gh} .*; console 640x480 as ${dw}x${dh} at ${ox},${oy} \(fit\); [0-9]+ redraws$" ||
+        grep -aqE "^screen: GOP ${gw}x${gh} .*; console 640x480 as ${dw}x${dh} at ${ox},${oy} \(fit\); [0-9]+ redraws$" <<< "$S" ||
             _f "screeninfo does not show the fit placement"
     fi
     r="$(printf '%s\n' "$S" | grep -aoE '^screen: GOP [0-9]+x[0-9]+ .*; ([0-9]+) redraws$' | tail -1 | sed -E 's/.*; ([0-9]+) redraws$/\1/')"
@@ -98,7 +98,7 @@ grade() { # grade <serial> <pixel line>
     [ -n "$t" ] && [ "$t" -ge 200 ] || _f "only ${t:-0} text pixels on the fitted console"
     [ -n "$rt" ] && [ "$rt" -ge 60 ] || _f "the console border is on the fitted right edge on only ${rt:-0}% of rows (not stretched?)"
     [ -n "$bd" ] && [ "$bd" -ge 90 ] || _f "the band left of the fitted console is the frame colour on only ${bd:-0}% of rows"
-    if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$S"; then _f "the kernel panicked"; fi
     return "$fail"
 }
 

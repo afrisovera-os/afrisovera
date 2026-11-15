@@ -27,7 +27,7 @@ echo "== dira: the web browser, M1 (HTTP/1.1 and HTML to text in a desk window),
 HOST="$(rustc -vV | sed -n 's/^host: //p')"
 HT="$(cargo test --manifest-path dira-host/Cargo.toml --target "$HOST" 2>&1)"
 echo "$HT" | grep -E "^test |test result" | sed 's/^/  host | /'
-echo "$HT" | grep -q "test result: ok. 14 passed; 0 failed" || { echo "DIRA TEST FAILED (host tests)"; exit 1; }
+grep -q "test result: ok. 14 passed; 0 failed" <<< "$HT" || { echo "DIRA TEST FAILED (host tests)"; exit 1; }
 
 W="$(mktemp -d "$T/dira.XXXXXX")"
 $PY scripts/lib/dira-server.py "$PORT" "$PG" 2> "$W/server.log" &
@@ -87,14 +87,14 @@ grade() { # grade <serial log> <kernel> <shot dir>
     _f() { echo "  FAIL ($2): $1"; fail=1; }
     [ -r "$1" ] || { echo "  FAIL ($2): missing serial log"; return 1; }
     S="$(tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/^[[:space:]]*//')"
-    has() { printf '%s\n' "$1" | grep -aqF -- "$2" || _f "$3: no line: $2" "$K"; }
-    hasre() { printf '%s\n' "$1" | grep -aqE -- "$2" || _f "$3: no line matching: $2" "$K"; }
+    has() { grep -aqF -- "$2" <<< "$1" || _f "$3: no line: $2" "$K"; }
+    hasre() { grep -aqE -- "$2" <<< "$1" || _f "$3: no line matching: $2" "$K"; }
     same() { # same <got> <expected file> <what>
         local want; want="$(cat "$2")"
         [ "$1" = "$want" ] || { _f "$3: the text differs from $2" "$K"; diff <(printf '%s\n' "$want") <(printf '%s\n' "$1") | head -20 | sed 's/^/      /'; }
     }
     K="$2"
-    printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|panicked' && _f "the kernel panicked" "$K"
+    grep -aqE 'KERNEL PANIC|panicked' <<< "$S" && _f "the kernel panicked" "$K"
 
     has "$(run "dira" "$S")" "dira: usage: dira <address>" "usage"
     has "$(run "dira text ftp://x" "$S")" "dira: Dira opens http:// and https:// addresses only" "ftp refused"
@@ -106,7 +106,7 @@ grade() { # grade <serial log> <kernel> <shot dir>
     same "$(body "$G/index.html" "$S")" "$PG/index.expected" "index text"
     for l in "[1] $G/chunked.html" "[2] $G/about.html" "[3] $G/plain.txt" "[4] $G/redirect"; do has "$R" "dira: link $l" "index links"; done
     has "$R" "dira: done: " "index done"
-    printf '%s\n' "$R" | grep -aqE "this must not show|hidden drawing|not shown|color: red" && _f "index: script, style, comment or svg text shown" "$K"
+    grep -aqE "this must not show|hidden drawing|not shown|color: red" <<< "$R" && _f "index: script, style, comment or svg text shown" "$K"
 
     same "$(body "$G/chunked.html" "$S")" "$PG/chunked.expected" "chunked text"
     same "$(body "$G/plain.txt" "$S")" "$PG/plain.expected" "plain text"
@@ -149,7 +149,7 @@ grade() { # grade <serial log> <kernel> <shot dir>
     has "$R" "| The site sent Dira to a private address, and Dira did not go there by itself:" "private redirect not followed"
     has "$R" "| http://169.254.169.254/latest/" "private redirect named"
     has "$R" "dira: link [1] http://169.254.169.254/latest/" "private redirect offered as a link"
-    printf '%s\n' "$R" | grep -aq "dial 169.254" && _f "Dira connected to the link-local address" "$K"
+    grep -aq "dial 169.254" <<< "$R" && _f "Dira connected to the link-local address" "$K"
     R="$(run "dira text $G/links.html" "$S")"
     hasre "$R" "^dira: done: [0-9]+ letters, [0-9]+ rows, 256 links$" "256 links numbered"
     has "$R" "| [Dira: this page has more links than M1 can number; the rest are plain text]" "link table full line"

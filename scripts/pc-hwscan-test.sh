@@ -49,6 +49,8 @@ grade() { # grade <serial log>
     has "${B}1234:1111 VGA display: missing: no graphics driver; the screen runs on the firmware.s framebuffer" || _f "the VGA is not missing"
     has 'hwscan: USB \(the devices the USB host driver has seen since power-on\)' || _f "no USB section"
     has '  usb 0627:0001 keyboard \(usb-keyboard\): driven' || _f "the USB keyboard is not driven"
+    # USB match tables slice 1 (15 Nov 2026): the boot log says which driver took each USB device
+    grep -aqx '\[xhci\] bound: 0627:0001 usb-keyboard' <<< "$S" || _f "no bound line for the USB keyboard"
     has '  usb 08e6:4433 smart card: missing: no driver in AfriSovera yet' || _f "the card reader is not missing"
     has 'hwscan: ACPI tables \((XSDT|RSDT)\):( [A-Z0-9?]{4})+' || _f "no ACPI table list"
     grep -aqE '^hwscan: ACPI tables .* FACP' <<< "$H" || _f "the ACPI table list has no FACP"
@@ -60,11 +62,12 @@ grade() { # grade <serial log>
     has 'hwscan: [1-9][0-9]* registered driver\(s\), 0 without a match table' || _f "a registered driver has no match table"
     grep -aqE 'is registered but has no row' <<< "$H" && _f "a driver without a match table was named"
     local sum
-    sum="$(grep -axE 'hwscan: [0-9]+ device\(s\): [0-9]+ driven, [0-9]+ class, [0-9]+ missing, [0-9]+ none needed' <<< "$H" |
-        sed -E 's/hwscan: ([0-9]+) device\(s\): ([0-9]+) driven, ([0-9]+) class, ([0-9]+) missing, ([0-9]+) none needed/\1 \2 \3 \4 \5/')"
+    sum="$(grep -axE 'hwscan: [0-9]+ device\(s\): [0-9]+ driven, [0-9]+ class, [0-9]+ off, [0-9]+ missing, [0-9]+ none needed' <<< "$H" |
+        sed -E 's/hwscan: ([0-9]+) device\(s\): ([0-9]+) driven, ([0-9]+) class, ([0-9]+) off, ([0-9]+) missing, ([0-9]+) none needed/\1 \2 \3 \4 \5 \6/')"
     if [ -z "$sum" ]; then _f "no count line"; else
-        read -r t a b c d <<< "$sum"
-        [ "$t" -eq $((a + b + c + d)) ] || _f "the counts do not add up ($sum)"
+        read -r t a b o c d <<< "$sum"
+        [ "$t" -eq $((a + b + o + c + d)) ] || _f "the counts do not add up ($sum)"
+        [ "$o" -eq "$(grep -acE '^  acpi .*: off: ' <<< "$H")" ] || _f "the off count ($o) is not the number of off lines"
         local lines; lines="$(grep -acE '^  (pci|usb|acpi) [0-9a-f]{2}:|^  usb [0-9a-f]{4}:|^  acpi [A-Z0-9]{7,8}( x[0-9]+)? \(' <<< "$H")"
         [ "$t" -eq "$lines" ] || _f "the count ($t) is not the number of device lines ($lines)"
         [ "$b" -ge 1 ] || _f "no class verdict"
@@ -74,10 +77,10 @@ grade() { # grade <serial log>
     grep -aqiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' <<< "$H" && _f "a MAC address is in hwscan's output (A3)"
     A="$(answer "$S" "hwscan drivers")"
     grep -aqxE '  driver intel-e1000: PCI, its probe decides from its own BINDS' <<< "$A" || _f "hwscan drivers does not list intel-e1000"
-    grep -aqxE '  driver usb-keyboard: USB, decided in the USB host driver.s descriptor walk .*' <<< "$A" || _f "hwscan drivers does not list usb-keyboard"
+    grep -aqxE '  driver usb-keyboard: USB, its own BINDS, asked by the USB host driver.s descriptor walk' <<< "$A" || _f "hwscan drivers does not list usb-keyboard on its BINDS"
     grep -aqxE 'hwscan: [1-9][0-9]* registered driver\(s\), 0 without a match table' <<< "$A" || _f "hwscan drivers: a driver has no match table"
     A="$(answer "$S" "hwscan selftest")"
-    grep -aqxE 'hwscan selftest: all 17 cases as expected, every one ended in a line' <<< "$A" || _f "hwscan selftest was not all as expected"
+    grep -aqxE 'hwscan selftest: all 21 cases as expected, every one ended in a line' <<< "$A" || _f "hwscan selftest was not all as expected"
     grep -aqE 'NOT as expected' <<< "$A" && _f "a selftest case was not as expected"
     lk() { grep -aqxE "$2" <<< "$(answer "$S" "hwscan $1")" || _f "hwscan $1: $3"; }
     lk '8086:2723' 'hwscan: pci 8086:2723 is Intel Wi-Fi 6 AX200 \(Wi-Fi\): missing; family iwlwifi; firmware: a closed file, .*' "not the AX200, closed firmware"
@@ -90,11 +93,12 @@ grade() { # grade <serial log>
     lk 'PNP0303' 'hwscan: acpi PNP0303 is PS/2 keyboard: ps2-keyboard drives it' "PNP0303 not ps2-keyboard"
     lk 'usb\vid_0cf3&pid_9271&rev_0108' 'hwscan: usb 0cf3:9271 is Qualcomm Atheros AR9271 .* \(Wi-Fi stick\): missing; firmware: open source, may ship with AfriSovera' "not the AR9271, open firmware"
     lk 'zz' 'hwscan: give an id as 8086:2723, .*' "a bad id was not refused"
-    if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$S"; then _f "the kernel panicked"; fi
     return "$fail"
 }
 
-GREEN="[pc] MANSA-PC BOOT OK
+GREEN="[xhci] bound: 0627:0001 usb-keyboard
+[pc] MANSA-PC BOOT OK
 afrisovera> hwscan
 hwscan: this PC's hardware (read only, nothing is changed; ids and classes only)
 hwscan: PCI (every bus, read only)
@@ -122,16 +126,16 @@ hwscan: ACPI devices (a byte scan of 1 table(s): see hwscan help)
   acpi PNP0B00 (RTC_): real-time clock: driven by cmos-rtc
   acpi PNP0C0F x8 (LNKA): PCI interrupt link: none needed
 hwscan: 13 registered driver(s), 0 without a match table
-hwscan: 20 device(s): 10 driven, 1 class, 3 missing, 6 none needed
+hwscan: 20 device(s): 10 driven, 1 class, 0 off, 3 missing, 6 none needed
   for the owner: lines marked missing have no AfriSovera driver yet, with the firmware a Wi-Fi chip would need; send this list (report <ip>) so we write the right drivers first
 afrisovera> hwscan drivers
 hwscan: registered drivers and how each finds its device
   driver intel-e1000: PCI, its probe decides from its own BINDS
-  driver usb-keyboard: USB, decided in the USB host driver's descriptor walk (not yet on BINDS: no class verdict)
+  driver usb-keyboard: USB, its own BINDS, asked by the USB host driver's descriptor walk
 hwscan: 13 registered driver(s), 0 without a match table
 afrisovera> hwscan selftest
 hwscan selftest: good DSDT: 3 ids under KBD_ (as expected)
-hwscan selftest: all 17 cases as expected, every one ended in a line
+hwscan selftest: all 21 cases as expected, every one ended in a line
 afrisovera> hwscan 8086:2723
 hwscan: pci 8086:2723 is Intel Wi-Fi 6 AX200 (Wi-Fi): missing; family iwlwifi; firmware: a closed file, from this PC's own copy or a copy whose licence allows it
 afrisovera> hwscan PCI\\VEN_8086&DEV_10D3&SUBSYS_00008086&REV_00
@@ -176,16 +180,19 @@ selftest() {
     arm virtio-missing red "$(g 's/1af4:1005 other: driven by virtio .*/1af4:1005 other: missing: no driver in AfriSovera yet/')"
     arm bridge-missing red "$(g 's/29c0 host bridge: none needed (chipset part)/29c0 host bridge: missing: no driver in AfriSovera yet/')"
     arm usb-kbd-missing red "$(g '/usb 0627:0001/d')"
+    arm usb-kbd-unbound red "$(g '/bound: 0627:0001/d')"
     arm ccid-driven red "$(g 's/smart card: missing: .*/smart card: driven/')"
     arm no-dsdt red "$(g 's/a byte scan of 1 table/a byte scan of 0 table/')"
     arm kbd-not-ps2 red "$(g 's/PS\/2 keyboard: driven by ps2-keyboard/PS\/2 keyboard: class: ps2-keyboard did not find it at its fixed place/')"
     arm unbound-driver red "$(g 's/13 registered driver(s), 0 without/13 registered driver(s), 1 without/')"
     arm counts-off red "$(g 's/20 device(s): 10 driven/21 device(s): 10 driven/')"
+    arm old-count-line red "$(g 's/ 0 off,//')"
+    arm off-as-class red "$(g 's/^  acpi PNP0C0F (\([^)]*\)): .*/  acpi PNP0C0D \1: laptop lid: off: x/; s/1 class, 0 off/2 class, 0 off/')"
     arm counts-vs-lines red "$(g '/acpi PNP0C0F/d')"
     arm serial-shown red "$(g "s/^  usb 08e6:4433 smart card: .*/&\n  usb serial $SERIAL/")"
     arm mac-shown red "$(g "s/^  pci 00:02.0 8086:10d3 Ethernet: driven by intel-e1000 (82574L (e1000e))/& mac $MAC/")"
     arm mac-elsewhere-ok green "$(printf '[e1000] mac %s\n%s\n' "$MAC" "$GREEN")"
-    arm selftest-fail red "$(g 's/^hwscan selftest: all 17 cases.*/hwscan selftest: 1 case(s) NOT as expected/')"
+    arm selftest-fail red "$(g 's/^hwscan selftest: all 21 cases.*/hwscan selftest: 1 case(s) NOT as expected/')"
     arm table-refused red "$(g 's/^hwscan: ACPI devices .*/  acpi table DSDT at 0xfee00000: it is not in ACPI or reserved memory (UEFI memory map): not read\n&/')"
     arm ax200-wrong red "$(g 's/missing; family iwlwifi; firmware: a closed file/missing; family iwlwifi; firmware: none needed/')"
     arm cc-ignored red "$(g 's/^hwscan: pci 1234:5678 is a NVMe .*/hwscan: pci 1234:5678 is not in AfriSovera'"'"'s lists; x/')"
@@ -197,7 +204,7 @@ selftest() {
     arm empty red ""
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 29 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 32 ]
 }
 
 echo "== PC hardware inventory (hwscan, read only) =="

@@ -46,9 +46,18 @@ and, on GitHub, in the run summary.
 
 ## Moving the baseline
 
-After a change that is meant to move a number (a speed-up, or an agreed cost), copy that run's rows into
-`baseline.tsv` and append them to `history.tsv` in the same commit, and say why in `SESSION_PLAN.md`. A number
-that got worse by accident is fixed, not written into the baseline.
+**Who keeps it (OS lead's decision, 14 Nov 2026): the performance and server engineer.** Once after each day's
+merges, they:
+- run the four perf suites on master;
+- read every number that moved and name its cause (`pc-perf`'s by-module table shows which code grew);
+- move `baseline.tsv` in one commit, with the rows appended to `history.tsv` and the causes in `SESSION_PLAN.md`.
+
+So a merge does not have to move the baseline itself. A branch whose perf suite goes red only because of master's
+own growth since the last refresh is not blocked for it: the lead merges it, and the next refresh carries the
+growth.
+
+A number that got worse by accident is fixed, not written into the baseline. A speed-up or an agreed cost moves the
+baseline in its own branch, as before, and says why.
 
 ## Today's numbers and known gaps (13 Nov 2026)
 

@@ -136,14 +136,14 @@ fi
 # 2. The kernel's account, state by state.
 for want in "TCP data round-trip OK" "state FIN_WAIT_1" "state FIN_WAIT_2" \
             "TCP peer FIN received" "state TIME_WAIT"; do
-    if ! echo "$SER" | grep -qF "$want"; then
+    if ! grep -qF "$want" <<< "$SER"; then
         echo "  serial is missing: $want"
         FAIL=1
     fi
 done
 # And it must NOT report the failure states.
 for bad in "did NOT close cleanly" "never ACKed" "closed this end; the peer did not"; do
-    if echo "$SER" | grep -qF "$bad"; then
+    if grep -qF "$bad" <<< "$SER"; then
         echo "  serial reports a failed close: $bad"
         FAIL=1
     fi

@@ -220,7 +220,14 @@ m = re.search(r"^  used           (\d+) B", s, re.M)
 if not m:
     fail("`heap` does not report used bytes")
 used = int(m.group(1))
-if used == 0 or used >= heap_arena:
+# 0 B used is a live figure when every byte is back (perf engineer, 14 Nov 2026): since 59c6a9ab the PC gives a
+# finished program's kernel stack back, so a PC at rest holds no heap at all. A literal 0 is told apart from a true
+# 0 by the LIVE line: the bump cursor plus the grown bytes must all be on the list, with used 0 there too.
+def all_back():
+    m = re.search(r"^kernel heap: LIVE arena - \d+ request\(s\) served from returned memory \(\d+ B\), bump "
+                  r"cursor at (\d+) B while used is (\d+) B, (\d+) B in the list", dash(s), re.M)
+    return bool(m) and int(m.group(2)) == 0 and int(m.group(1)) + (heap_arena - heap_reserved) == int(m.group(3))
+if used >= heap_arena or (used == 0 and not all_back()):
     fail(f"the arena reports {used} B used of {heap_arena} B — not a live figure")
 
 print(f"RECLAIM ARITH TEST PASSED  (the arena's monotonicity now has both a MEASURE and "

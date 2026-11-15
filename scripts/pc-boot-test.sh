@@ -170,7 +170,7 @@ echo "  --- build ---"
 if ! cargo build -p mansa-kernel --bin mansa-pc --features pc --target x86_64-unknown-uefi 2>&1 | tail -2; then
     :
 fi
-EFI="target/x86_64-unknown-uefi/debug/mansa-pc.efi"
+EFI="${PC_EFI:-target/x86_64-unknown-uefi/debug/mansa-pc.efi}"   # PC_EFI: test another build (the release stick plan)
 [ -r "$EFI" ] || { echo "PC BOOT TEST FAILED (harness: $EFI was not built)"; exit 1; }
 # The PC link is repeatable (docs/design-pc-repro-link.md): the same commit gives the same md5. Print it for the
 # walk's record, and fail if the image has a CodeView (PDB) entry or no REPRO entry, so a toolchain or build.rs

@@ -4,6 +4,9 @@
 #![allow(dead_code)]
 
 use super::*;
+// look.rs works in physical pixels (afriui.md section 29): paint.rs's wrappers convert a shape's logical box and
+// corner sizes at the call, and these names, shadowing paint's logical ones, draw and clip physically.
+use super::{dclip_p, mix_p as mix1, prect as rect};
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// The corner style. Cut (made smooth) is the default until the owner chooses between it and Round (the architect,
@@ -277,10 +280,10 @@ pub(in super::super) fn fill(x: i32, y: i32, w: i32, h: i32, c: u32, a: u8) {
     if c == 0 {
         // black (the shadows' straight runs): the two-pixels-a-step darkening, clipped as `rect` clips (no app body
         // draws a shadow, so only the box redrawn and the screen)
-        // SAFETY: mainline only.
-        let (dx, dy, dw, dh) = unsafe { DCLIP };
+        let (dx, dy, dw, dh) = dclip_p();
         let (x0, y0) = (x.max(dx).max(0), y.max(dy).max(0));
-        let (x1, y1) = ((x + w).min(dx + dw).min(W()), (y + h).min(dy + dh).min(H()));
+        let (cw, ch) = (crate::canvas::width() as i32, crate::canvas::height() as i32);
+        let (x1, y1) = ((x + w).min(dx + dw).min(cw), (y + h).min(dy + dh).min(ch));
         if x1 > x0 && y1 > y0 {
             crate::canvas::shade_const(x0 as usize, y0 as usize, (x1 - x0) as usize, (y1 - y0) as usize, a as u32);
         }
@@ -433,8 +436,7 @@ pub(in super::super) fn shadow(x: i32, y: i32, w: i32, h: i32, tl: i32, tr: i32,
     // a shorter shadow (an unfocused window's) is the same profile squeezed into `reach` pixels
     let reach = reach.clamp(1, REACH);
     let shade = |d: i32| if d > reach { 0 } else { shade(d * REACH / reach) };
-    // SAFETY: mainline only.
-    let (cx, cy, cw, ch) = unsafe { DCLIP };
+    let (cx, cy, cw, ch) = dclip_p();
     let (r0, r1) = ((sy - reach).max(cy), (sy + h + reach).min(cy + ch));
     if r0 >= r1 || x + w + reach <= cx || x - reach >= cx + cw {
         return;

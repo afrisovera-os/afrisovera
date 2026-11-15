@@ -18,6 +18,7 @@ Everything the guest says goes to stdout, then one `cell-keys:` line per timed s
 import importlib.util
 import json
 import os
+import signal
 import socket
 import sys
 import time
@@ -105,6 +106,20 @@ def main():
     ser.settimeout(0.05)
     log = bytearray()
     notes = []
+
+    def killed(signum, _frame):
+        # a suite's `timeout` stops a hung run with SIGTERM: what the serial line said so far is the evidence, so it
+        # is written before the exit, not lost (pc-cell3 on a cloud runner, 14 Nov: an empty log after a hang)
+        try:
+            read()
+        except Exception:
+            pass
+        sys.stdout.write(log.decode("utf-8", errors="replace"))
+        sys.stdout.write("\n" + "\n".join(notes) + "\ncell-keys: stopped by signal %d\n" % signum)
+        sys.stdout.flush()
+        os._exit(124)
+
+    signal.signal(signal.SIGTERM, killed)
 
     def read():
         try:

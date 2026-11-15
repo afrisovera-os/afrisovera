@@ -185,6 +185,17 @@ def parse(text):
     m = re.search(r"\[desk\] perf: the slowest motion frame (\d+) us over (\d+)", t)
     if m and int(m.group(2)) > 0:
         r["draw.desk.motion_worst_us"] = int(m.group(1))
+    # ring-3 memory objects (`vmotest`, PC): the map of 1 MiB and 16 MiB (frames taken, zeroed, mapped), and the
+    # frames a finished program kept
+    m = re.search(r"\[vmo\] bench: map 1024 KiB: (\d+) us", t)
+    if m:
+        r["vmo.map1m_us"] = int(m.group(1))
+    m = re.search(r"\[vmo\] bench: map 16384 KiB: (\d+) us", t)
+    if m:
+        r["vmo.map16m_us"] = int(m.group(1))
+    m = re.search(r"\[vmo\] test: \d+ ended, \d+ fault\(s\), frames in use (\d+) before and (\d+) after", t)
+    if m:
+        r["mem.vmo_left_kib"] = max(0, int(m.group(2)) - int(m.group(1))) * 4
     m = re.search(r"bench: sha256 .*? in (\d+) us \((\d+) MiB/s\)", t)
     if m:
         r["cpu.sha256_us"] = int(m.group(1))
@@ -229,7 +240,9 @@ def run(arch, kernel, out_dir, ovmf=None, label=None):
         time.sleep(0.25)
     wire = open(portfile).read().strip() if os.path.exists(portfile) else ""
     net = (["-netdev", "socket,id=n0,connect=127.0.0.1:%s" % wire] if wire else [])
-    common = ["-icount", "shift=0,align=off,sleep=on", "-display", "none",
+    # PERF_NO_ICOUNT=1: the host's clock instead, so timing varies run to run as on real hardware (the soak)
+    clock = [] if os.environ.get("PERF_NO_ICOUNT") else ["-icount", "shift=0,align=off,sleep=on"]
+    common = clock + ["-display", "none",
               "-serial", "tcp:127.0.0.1:%d,server,nowait" % sport,
               "-qmp", "tcp:127.0.0.1:%d,server,nowait" % qport]
     if arch == "arm":
@@ -283,8 +296,9 @@ def run(arch, kernel, out_dir, ovmf=None, label=None):
                     return True
             return False
 
-        if not until_prompt(0, 240):
-            print("PERF HARNESS: no shell prompt within 240 s (%d serial bytes)" % len(log))
+        def stuck(what):
+            """Keep the serial log and QEMU's register dump of a guest that stopped answering."""
+            print("PERF HARNESS: %s (%d serial bytes)" % (what, len(log)))
             with open(os.path.join(out_dir, "perf-%s.serial" % label), "wb") as f:
                 f.write(bytes(log))
             # where the guest is stuck: QEMU's register dump, three times a second apart (a loop shows as RIP
@@ -302,16 +316,28 @@ def run(arch, kernel, out_dir, ovmf=None, label=None):
                         time.sleep(1)
             except OSError as e:
                 print("PERF HARNESS: no register dump (%s)" % e)
+
+        ceil = float(os.environ.get("PERF_BOOT_CEILING", "240"))
+        if not until_prompt(0, ceil):
+            stuck("no shell prompt within %g s" % ceil)
             return None
         res["boot.host_s"] = round(time.time() - t0, 1)
         boot_end = len(log)   # informational: the runner's speed, not the kernel's
         time.sleep(0.3)
-        for c in CMDS:
+        # PERF_CMDS="a;b;c": another command list (the soak's workload); in it, a command whose prompt never comes
+        # back is a hang, kept like a boot that stops. Without it, the PC alone also runs `vmotest` (ring-3 memory
+        # objects, AFR-0001 7.6): their map times, and a leak as a number (architect, stick gate verdict 14 Nov)
+        own = os.environ.get("PERF_CMDS")
+        for c in ([x.strip() for x in own.split(";") if x.strip()] if own is not None
+                  else CMDS + (["vmotest"] if arch == "pc" else [])):
             start = len(log)
             ser.sendall((c + "\r").encode())
             ceiling = SINK_SECS + 60 if c.startswith("net tcp sink") else 120
             if not until_prompt(start + len(c), ceiling):
                 print("PERF HARNESS: no prompt back after %r" % c)
+                if own is not None:
+                    stuck("no prompt back after %r" % c)
+                    return None
         ser.close()
     finally:
         q.kill()

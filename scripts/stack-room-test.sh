@@ -159,7 +159,11 @@ if len(rows) < 2:
 if s1 != s0 + 1:
     fail(f"one EL0 process was spawned between the two `ps` calls, but served went "
          f"{s0} -> {s1}; the counter does not track real stacks")
-if r1 != r0 - 1:
+# The room falls by one while the spawned program still holds its stack. A kernel that gives a
+# finished program's stack back (the PC since 59c6a9ab; ARM after S2) shows it back again by the
+# second `ps`, so the room is the same: the stack was spent and returned, and part 3 has already
+# tied the figure to the live free bytes. Any other move is still a figure that is not live.
+if r1 != r0 - 1 and r1 != r0:
     fail(f"served rose by one but the room went {r0} -> {r1}; the remaining figure is "
          f"not recomputed from the arena the spawn just spent")
 if s1 != served or r1 != room:

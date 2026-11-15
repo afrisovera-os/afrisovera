@@ -624,6 +624,20 @@ impl FreeList {
         m
     }
 
+    /// How many grants of `size`/`align` the runs could serve, each run counted on its own
+    /// (a grant never spans two runs), with padding placed as [`capacity`] places it.
+    ///
+    /// # Safety
+    /// The list must be well-formed.
+    pub unsafe fn fits(&self, size: usize, align: usize) -> usize {
+        let (mut n, mut cur) = (0usize, self.head);
+        while !cur.is_null() {
+            n = n.saturating_add(capacity(cur as usize, 0, (*cur).len, size, align));
+            cur = (*cur).next;
+        }
+        n
+    }
+
     pub fn lost(&self) -> usize {
         self.lost
     }
@@ -1301,8 +1315,17 @@ pub fn stacks_served() -> usize {
 /// because what the free list holds is the crumbs a shell command handed back. If a run
 /// ever does grow long enough to serve one, this figure will *understate* the room — and a
 /// spawn ceiling that promises fewer than it can serve is the failure that costs nothing.
+///
+/// 14 Nov 2026: that day came. Since the PC gives a finished program's kernel stack back
+/// (59c6a9ab), whole 16 KiB stacks sit on the list and `alloc` serves the next spawn from
+/// them first, so the untouched arena alone understated the room by every stack returned.
+/// The runs that can hold a stack are now counted too, each run on its own. A run that is
+/// busy (the list lock held) counts as none, the old conservative reading.
 pub fn stacks_left() -> usize {
-    capacity(base(), bump(), HEAP_SIZE, STACK_SIZE, STACK_ALIGN)
+    let untouched = capacity(base(), bump(), HEAP_SIZE, STACK_SIZE, STACK_ALIGN);
+    // SAFETY: the list under the lock is only ever built through `give_back`.
+    let returned = with_list(|l| unsafe { l.fits(STACK_SIZE, STACK_ALIGN) }).unwrap_or(0);
+    untouched.saturating_add(returned)
 }
 
 /// Allocate one kernel stack, or refuse **by name**.

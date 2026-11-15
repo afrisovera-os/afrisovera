@@ -70,7 +70,7 @@ EOF
 grade_wav() { # grade_wav <stats line>
     local fail=0 L="$1" tf hz vl vd
     _w() { echo "  FAIL: $*"; fail=1; }
-    printf '%s\n' "$L" | grep -qE '^wav: frames=' || { echo "  FAIL: no sound file to grade ($L)"; return 1; }
+    grep -qE '^wav: frames=' <<< "$L" || { echo "  FAIL: no sound file to grade ($L)"; return 1; }
     tf="$(printf '%s\n' "$L" | sed -nE 's/.* tone_frames=([0-9]+) .*/\1/p')"
     hz="$(printf '%s\n' "$L" | sed -nE 's/.* tone_hz=([0-9]+)\.[0-9] .*/\1/p')"
     vl="$(printf '%s\n' "$L" | sed -nE 's/.* voice_loud=([0-9]+) .*/\1/p')"
@@ -103,14 +103,14 @@ grade() { # grade <serial log>
     has "\[hda\] played 16384 samples \(16 periods, ~371 ms\) at 44100 Hz through $P" || _f "the tone was not played in full (16384 samples)"
     has '\[audio\] done.*' || _f "audio tone did not finish"
     has '\[say\] speaking: "hello"' || _f "say did not start"
-    printf '%s\n' "$S" | sed -n '/^\[say\] speaking: "hello"$/,$p' | grep -aqE "^\[hda\] played ([5-9][0-9]{3}|[1-9][0-9]{4,}) samples \([0-9]+ periods, ~[0-9]+ ms\) at 44100 Hz through $P\$" ||
+    grep -aqE "^\[hda\] played ([5-9][0-9]{3}|[1-9][0-9]{4,}) samples \([0-9]+ periods, ~[0-9]+ ms\) at 44100 Hz through $P\$" <<< "$(sed -n '/^\[say\] speaking: "hello"$/,$p' <<< "$S")" ||
         _f "say was not played through HD Audio"
     has 'intel-hda +[a-z]+ +0x0+ +OK' || _f "intel-hda is not in devices"
     has 'lshda late: an unread answer was left in the ring; the next command got (0x[0-9a-f]{8}), then \1 \(codec id \1\), [1-9][0-9]* dropped: OK' ||
         _f "lshda late: a late codec answer was taken as the next command's answer"
-    if printf '%s\n' "$S" | grep -aqE '^lshda: late codec answers dropped'; then _f "late codec answers came in normal use"; fi
-    if printf '%s\n' "$S" | grep -aqE '^\[hda\] (the output stream|HD Audio controller found but not usable)'; then _f "the HD Audio stream stuck or the controller was refused"; fi
-    if printf '%s\n' "$S" | grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)'; then _f "the kernel panicked"; fi
+    if grep -aqE '^lshda: late codec answers dropped' <<< "$S"; then _f "late codec answers came in normal use"; fi
+    if grep -aqE '^\[hda\] (the output stream|HD Audio controller found but not usable)' <<< "$S"; then _f "the HD Audio stream stuck or the controller was refused"; fi
+    if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$S"; then _f "the kernel panicked"; fi
     return "$fail"
 }
 

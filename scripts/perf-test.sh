@@ -28,6 +28,15 @@ PROF=debug          # what the owner's USB stick ships today (scripts/make-pc-us
 [ "${1:-}" = "--release" ] && { PROF=release; shift; }
 LABEL="$ARCH"; [ "$PROF" = release ] && LABEL="$ARCH-rel"
 CF=(); [ "$PROF" = release ] && CF=(--release)
+# Integer overflow checks are on in both profiles (release since 14 Nov 2026, Cargo.toml). PERF_OVERFLOW=off builds
+# the same kernel with them off, through Cargo's environment switch only, to keep measuring what they cost; its own
+# label, so it never compares with the shipped build. Not RUSTFLAGS: that would replace the PC's `aes_force_soft`
+# from .cargo/config.toml.
+if [ "${PERF_OVERFLOW:-}" = off ]; then
+    export CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=false CARGO_PROFILE_DEV_OVERFLOW_CHECKS=false
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/noovf}"
+    LABEL="$LABEL-noovf"
+fi
 python3 scripts/perf-bench.py --selftest | tail -1 | grep -q PASSED ||
     { python3 scripts/perf-bench.py --selftest; echo "PERF TEST FAILED (grader selftest)"; exit 1; }
 [ "${1:-}" = "--selftest" ] && { echo "PERF SELFTEST PASSED"; exit 0; }
@@ -36,11 +45,11 @@ OUT="build/perf"
 mkdir -p "$OUT"
 if [ "$ARCH" = arm ]; then
     cargo build "${CF[@]}" -p mansa-kernel 2>&1 | tail -1
-    K="target/aarch64-unknown-none/$PROF/mansa-kernel"
+    K="${CARGO_TARGET_DIR:-target}/aarch64-unknown-none/$PROF/mansa-kernel"
     OVMF=""
 else
     cargo build "${CF[@]}" -p mansa-kernel --bin mansa-pc --features pc --target x86_64-unknown-uefi 2>&1 | tail -1
-    K="target/x86_64-unknown-uefi/$PROF/mansa-pc.efi"
+    K="${CARGO_TARGET_DIR:-target}/x86_64-unknown-uefi/$PROF/mansa-pc.efi"
     QDIR="$(dirname "$(command -v qemu-system-x86_64)")"
     OVMF=""
     for f in "$QDIR/../share/qemu/edk2-x86_64-code.fd" "$QDIR/share/edk2-x86_64-code.fd" \

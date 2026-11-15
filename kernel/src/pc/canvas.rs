@@ -23,6 +23,10 @@ static mut BUF: Buf = Buf([0; MAX_W * MAX_H]);
 static WIDTH: AtomicUsize = AtomicUsize::new(crate::framebuffer::WIDTH);
 static HEIGHT: AtomicUsize = AtomicUsize::new(crate::framebuffer::HEIGHT);
 static SCALE: AtomicUsize = AtomicUsize::new(1);
+/// The desk's own scale S in quarters (afriui.md section 29): 4 is 1x (today's drawing: the canvas is the logical
+/// size, copied in SCALE x SCALE blocks), 5 to 8 are 1.25x to 2x at the screen's own pixels (SCALE 1). The desk lays
+/// out in logical pixels; its drawing primitives turn each logical edge into a physical one, ceil(v * Q / 4).
+static Q: AtomicUsize = AtomicUsize::new(4);
 /// The screen's mode, kept so `screen ui N` can lay the canvas out again.
 static SCREEN_W: AtomicUsize = AtomicUsize::new(0);
 static SCREEN_H: AtomicUsize = AtomicUsize::new(0);
@@ -44,8 +48,42 @@ pub fn setup(sw: usize, sh: usize, s: usize) {
     SCREEN_W.store(sw, Ordering::Relaxed);
     SCREEN_H.store(sh, Ordering::Relaxed);
     SCALE.store(s, Ordering::Relaxed);
+    Q.store(4, Ordering::Relaxed);
     WIDTH.store((sw / s).clamp(crate::framebuffer::WIDTH, MAX_W), Ordering::Relaxed);
     HEIGHT.store((sh / s).clamp(crate::framebuffer::HEIGHT, MAX_H), Ordering::Relaxed);
+}
+
+/// The canvas at the screen's own pixels with the desk at scale q / 4 (section 29; q is clamped to 4..8, and lowered
+/// until the desk keeps at least the 640x480 logical pixels it was designed at). False with no screen attached.
+pub fn set_native(q: usize) -> bool {
+    let (sw, sh) = (SCREEN_W.load(Ordering::Relaxed), SCREEN_H.load(Ordering::Relaxed));
+    if sw == 0 {
+        return false;
+    }
+    setup(sw, sh, 1);
+    let (w, h) = (width(), height());
+    let mut q = q.clamp(4, 8);
+    while q > 4 && (w * 4 / q < crate::framebuffer::WIDTH || h * 4 / q < crate::framebuffer::HEIGHT) {
+        q -= 1;
+    }
+    Q.store(q, Ordering::Relaxed);
+    true
+}
+
+/// The desk's scale in quarters (4 = 1x).
+pub fn q() -> usize {
+    Q.load(Ordering::Relaxed)
+}
+/// The desk's size in logical pixels: the canvas over the scale, rounded up so the layout covers every pixel.
+pub fn logical_w() -> usize {
+    (width() * 4).div_ceil(q())
+}
+pub fn logical_h() -> usize {
+    (height() * 4).div_ceil(q())
+}
+/// A logical coordinate's first physical pixel, ceil(v * Q / 4) (the one rounding rule).
+pub fn to_phys(v: usize) -> usize {
+    (v * q()).div_ceil(4)
 }
 
 /// `screen ui N`: a new UI scale for the attached screen (1..4, or 0 for automatic).

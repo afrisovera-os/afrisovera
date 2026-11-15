@@ -198,6 +198,9 @@ pub fn say(text: &[u8]) -> bool {
     if !virtio::sound_present() {
         return false;
     }
+    if crate::nia::sound_busy("voice") {
+        return false; // an app's sound stream owns the device (N-A1a)
+    }
     let ms = |m: u32| (SR * m / 1000) as usize;
     let mut n = 0usize;
     let mut lcg = 0x1234_5678u32;
