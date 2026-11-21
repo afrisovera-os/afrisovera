@@ -15,8 +15,16 @@
 #   scripts/desk-shape-test.sh --selftest   # grader selftest only
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# --release (C3b): the same run on the RELEASE build of both kernels (opt-level z, LTO), where the architect's speed
+# bars are graded: an 80-character Hindi line reshaped after a keystroke under 8 ms, and 1,000 Hindi characters from
+# nothing under 100 ms. The debug run prints the same numbers and does not grade them.
+PROF=debug
+if [ "${1:-}" = "--release" ]; then PROF=release; shift; fi
+KEY_US_MAX=8000
+PARA_US_MAX=100000
 T="${TMPDIR:-/tmp}"
 EXPECTED="${SHAPE_EXPECTED:-tools/face/shape_expected.txt}"
+EXPECTED_DEVA="${SHAPE_EXPECTED_DEVA:-tools/face/shape_expected_deva.txt}"   # C3: Devanagari
 SHAPE_HASH_9="${SHAPE_HASH_9-}"    # filled in from the first the cloud runner run; the ARM and PC values must agree anyway
 SHAPE_HASH_18="${SHAPE_HASH_18-}"
 
@@ -80,6 +88,25 @@ grade() { # grade <serial log> <kernel name>
         [ "$got" = "$want" ] || _f "oracle string $k hashes ${got:-nothing}, HarfBuzz $want" "$2"
     done < "$EXPECTED"
     [ "$n" -gt 0 ] || _f "the expected file has no lines" "$2"
+    # Devanagari's oracle (C3)
+    [ -r "$EXPECTED_DEVA" ] || { _f "no expected file $EXPECTED_DEVA" "$2"; return 1; }
+    n=0
+    while IFS=$'\t' read -r k want _; do
+        case "$k" in ''|\#*) continue ;; esac
+        n=$((n + 1))
+        got="$(sed -nE "s/^\[desk\] shape deva oracle $k ([0-9a-f]{16})$/\1/p" <<< "$S" | head -1)"
+        [ "$got" = "$want" ] || _f "Devanagari oracle string $k hashes ${got:-nothing}, HarfBuzz $want" "$2"
+    done < "$EXPECTED_DEVA"
+    [ "$n" -gt 0 ] || _f "the Devanagari expected file has no lines" "$2"
+    hasre '^\[desk\] shape: hindi 1000 characters in 4 lines: shaped from nothing [0-9]+ us, drawn warm [0-9]+ us$' "$2" "no Hindi paragraph speed line"
+    hasre '^\[desk\] shape sample hindi: a notice with 16 characters in 38 bytes$' "$2" "no Hindi sample notice"
+    got="$(sed -nE 's/^\[desk\] shape: hindi keystroke on an 80-character line: reshaped in ([0-9]+) us \(median\), worst of 8 ([0-9]+) us$/\1 \2/p' <<< "$S" | head -1)"
+    [ -n "$got" ] || _f "no Hindi keystroke line" "$2"
+    if [ "$PROF" = release ] && [ -n "$got" ]; then
+        [ "${got#* }" -lt "$KEY_US_MAX" ] || _f "an 80-character Hindi line took ${got#* } us to reshape (bar $KEY_US_MAX)" "$2"
+        p="$(sed -nE 's/^\[desk\] shape: hindi 1000 characters in 4 lines: shaped from nothing ([0-9]+) us, .*/\1/p' <<< "$S" | head -1)"
+        [ -n "$p" ] && [ "$p" -lt "$PARA_US_MAX" ] || _f "1,000 Hindi characters took ${p:-?} us from nothing (bar $PARA_US_MAX)" "$2"
+    fi
     got="$(sed -nE 's/^\[desk\] shape: coverage hash cap 9 ([0-9a-f]{16}), cap 18 ([0-9a-f]{16})$/\1 \2/p' <<< "$S" | head -1)"
     if [ -z "$got" ]; then _f "no coverage hash line" "$2"
     else
@@ -107,13 +134,18 @@ grade() { # grade <serial log> <kernel name>
 
 selftest() {
     local D pass=0 bad=0 GREEN
+    local PROF=debug   # the cases below are graded as the debug run unless they say PROF=release
     local SHAPE_HASH_9=0123456789abcdef SHAPE_HASH_18=1123456789abcdef
     D="$(mktemp -d "$T/desk-shape-selftest.XXXXXX")" || return 1
     printf '# test\n0\t00000000000000aa\td8a7\t1:2\n1\t00000000000000bb\td8a8\t3:4\n' > "$D/exp"
-    local EXPECTED="$D/exp"
+    printf '# test\n0\t00000000000000cc\te0a495\t5:6\n' > "$D/expd"
+    local EXPECTED="$D/exp" EXPECTED_DEVA="$D/expd"
     GREEN="afrisovera> desk shape probe
 [desk] shape oracle 0 00000000000000aa
 [desk] shape oracle 1 00000000000000bb
+[desk] shape deva oracle 0 00000000000000cc
+[desk] shape: hindi 1000 characters in 4 lines: shaped from nothing 41000 us, drawn warm 9000 us
+[desk] shape: hindi keystroke on an 80-character line: reshaped in 3000 us (median), worst of 8 5000 us
 [desk] shape: coverage hash cap 9 0123456789abcdef, cap 18 1123456789abcdef
 [desk] shape: widths: 8 of 8 drawn as measured
 [desk] shape: limits: 300 characters gave 44 cut and width 1290, controls dropped 2
@@ -145,6 +177,7 @@ selftest() {
 [desk] cell: 37x0 grid after resize
 [desk] cell title: window 259 wide (at least 259), mark 45..97 whole, Close anyway 105..189, buttons from 207; nothing over Close anyway; name cut
 [desk] shape sample: a notice with 28 characters in 43 bytes
+[desk] shape sample hindi: a notice with 16 characters in 38 bytes
 [desk] verify: 0 of 540 rows differ after a full redraw (5 partial frame(s) drawn before it)
 [desk] notifications open
 [desk] verify: 0 of 540 rows differ after a full redraw (6 partial frame(s) drawn before it)"
@@ -161,7 +194,15 @@ selftest() {
     case_ empty red ""
     case_ panic red "$(printf '%s\nKERNEL PANIC at shape.rs\n' "$GREEN")"
     case_ oracle-differs red "$(printf '%s\n' "$GREEN" | sed 's/oracle 1 00000000000000bb/oracle 1 00000000000000bc/')"
-    case_ oracle-missing red "$(printf '%s\n' "$GREEN" | grep -v 'oracle 0 ')"
+    case_ oracle-missing red "$(printf '%s\n' "$GREEN" | grep -v 'shape oracle 0 ')"
+    case_ deva-oracle-differs red "$(printf '%s\n' "$GREEN" | sed 's/deva oracle 0 00000000000000cc/deva oracle 0 00000000000000cd/')"
+    case_ deva-oracle-missing red "$(printf '%s\n' "$GREEN" | grep -v 'deva oracle')"
+    case_ hindi-speed-missing red "$(printf '%s\n' "$GREEN" | grep -v 'hindi 1000')"
+    case_ keystroke-missing red "$(printf '%s\n' "$GREEN" | grep -v 'hindi keystroke')"
+    case_ keystroke-slow-debug green "$(printf '%s\n' "$GREEN" | sed 's/worst of 8 5000 us/worst of 8 90000 us/')"
+    PROF=release case_ keystroke-slow-release red "$(printf '%s\n' "$GREEN" | sed 's/worst of 8 5000 us/worst of 8 9000 us/')"
+    PROF=release case_ paragraph-slow-release red "$(printf '%s\n' "$GREEN" | sed 's/shaped from nothing 41000 us/shaped from nothing 120000 us/')"
+    PROF=release case_ release-green green "$GREEN"
     case_ hash9-bad red "$(printf '%s\n' "$GREEN" | sed 's/cap 9 0123456789abcdef/cap 9 0123456789abcdee/')"
     case_ hash18-bad red "$(printf '%s\n' "$GREEN" | sed 's/cap 18 1123456789abcdef/cap 18 1123456789abcdee/')"
     case_ width-differs red "$(printf '%s\n' "$GREEN" | sed 's/8 of 8 drawn/7 of 8 drawn/')"
@@ -184,7 +225,7 @@ selftest() {
     case_ stale-rows red "$(printf '%s\n' "$GREEN" | sed '0,/verify: 0 of/s/verify: 0 of/verify: 12 of/')"
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 26 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 34 ]
 }
 
 echo "== Arabic joined and right to left (SHAPING_PLAN C1), on both kernels =="
@@ -196,8 +237,9 @@ winpath() { if command -v cygpath > /dev/null; then cygpath -m "$1"; else printf
 fails=0
 
 echo "  --- ARM kernel ---"
-BIN="target/aarch64-unknown-none/debug/mansa-kernel"
-cargo build -p mansa-kernel 2>&1 | tail -1
+BIN="target/aarch64-unknown-none/$PROF/mansa-kernel"
+CF=(); [ "$PROF" = release ] && CF=(--release)
+cargo build "${CF[@]}" -p mansa-kernel 2>&1 | tail -1
 [ -r "$BIN" ] || { echo "DESK SHAPE TEST FAILED (harness: $BIN was not built)"; exit 1; }
 qemu-system-aarch64 -M virt -cpu cortex-a72 -smp 1 -m 256M \
     -global virtio-mmio.force-legacy=false -device ramfb -display none \
@@ -217,8 +259,8 @@ command -v qemu-system-x86_64 > /dev/null || for d in "/c/Program Files/qemu" /u
     { [ -x "$d/qemu-system-x86_64" ] || [ -x "$d/qemu-system-x86_64.exe" ]; } && { PATH="$d:$PATH"; break; }
 done
 command -v qemu-system-x86_64 > /dev/null || { echo "DESK SHAPE TEST FAILED (harness: qemu-system-x86_64 not on PATH)"; exit 1; }
-cargo build -p mansa-kernel --bin mansa-pc --features pc --target x86_64-unknown-uefi 2>&1 | tail -1
-export PC_EFI="${PC_EFI:-$PWD/target/x86_64-unknown-uefi/debug/mansa-pc.efi}"
+cargo build "${CF[@]}" -p mansa-kernel --bin mansa-pc --features pc --target x86_64-unknown-uefi 2>&1 | tail -1
+export PC_EFI="${PC_EFI:-$PWD/target/x86_64-unknown-uefi/$PROF/mansa-pc.efi}"
 [ -r "$PC_EFI" ] || { echo "DESK SHAPE TEST FAILED (harness: $PC_EFI was not built)"; exit 1; }
 export AFRISH_BOOT_QUIET="${AFRISH_BOOT_QUIET:-40}"
 chmod +x scripts/lib/pc-arch/qemu-system-aarch64 2> /dev/null || true

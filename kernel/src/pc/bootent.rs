@@ -1133,3 +1133,33 @@ pub(crate) fn trial_remove() -> Result<Option<u16>, &'static str> {
     }
     Ok(Some(num))
 }
+
+// --- keep and back (safe updates U4): the main entry rewritten to name the other boot file ---
+
+/// The file the trial entry names (lower-case), if there is a trial entry.
+pub(crate) fn trial_file() -> Option<([u8; 64], usize)> {
+    find(Kind::Trial).map(|(_, e)| (e.file, e.file_n))
+}
+
+/// The main entry (exactly "AfriSovera", same number, same partition) rewritten to start `file`, read back.
+/// Nothing else changes: its place in BootOrder stays.
+pub(crate) fn main_rewrite(m: &Main, file: &str) -> Result<(), &'static str> {
+    let nm = name(m.num);
+    let (opt, ol) = option(DESC, file, m.ent as u64, m.start, m.size, &m.guid);
+    let opt = &opt[..ol];
+    let mut old = [0u8; uefi::OPT_MAX];
+    let olen = uefi::get_global(&nm, &mut old).map_err(|_| "the main entry could not be read from the firmware now")?;
+    if uefi::set_global(&nm, opt) != uefi::SUCCESS || !reads_back(&nm, opt) {
+        // put the old bytes back: the main entry must never be left half changed
+        uefi::set_global(&nm, &old[..olen]);
+        uefi::reread_boot_entries();
+        return Err("the firmware did not keep the main entry as written, so it was put back as it was");
+    }
+    uefi::reread_boot_entries();
+    Ok(())
+}
+
+/// The first entry of BootOrder the firmware really starts (as `numbers` finds it): (number, description).
+pub(crate) fn first_choice() -> Option<(u16, [u8; 64], usize)> {
+    numbers().and_then(|(_, _, f)| f)
+}

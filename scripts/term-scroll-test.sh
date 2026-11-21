@@ -28,6 +28,7 @@ PY="${PY:-python3}"
 HEAD=("gui" "desk mode pointer" "desk open terminal" "help" "desk term status")
 TAIL=("desk term bottom" "&more help" "@More:" "~1" "!more" ":20" "~2" ":71" "=" "&help | more" "@More:" ":71" "="
       "help > helpout" "more appget 10.0.2.2 80 x.wasm 00" "help > afrisovera.conf" "help > helpout" "more more help"
+      "between < > <html>hi" "grep > motd" "echo a \\> b"
       "ls -l" "desk verify" "clear" ":6563686f206162637878" ":7f" ":79" "~1" "!console-backspace" ":0d" "~1")
 ARM_MID=("desk term up" "desk term up" "desk term wheel -2" "desk verify" "!scrolled")
 PC_MID=("%shift-pgup" "desk term status" "^-3" "desk term status" "desk verify" "!scrolled" "%ret" "desk term status")
@@ -67,6 +68,10 @@ grade() { # grade <serial log> <kernel name> <arm|pc>
     grep -aqF "more: one more or > at a time" <<< "$S" || _f "more more help did not say one at a time" "$2"
     [ "$(printf '%s\n' "$S" | grep -acF "saved to helpout")" -eq 1 ] || _f "helpout was saved more than once" "$2"
     grep -aqF "saved to afrisovera.conf" <<< "$S" && _f "the system's file was written" "$2"
+    # a `>` in a command's own text is text (the architect, 15 Nov: the `between` red), and a backslash makes it text
+    grep -aqxF "between: html" <<< "$S" || _f "between < > <html>hi did not print html (its > was taken as a redirect)" "$2"
+    grep -aqE 'saved to (<html>hi|motd|b)( |$)' <<< "$S" && _f "a > in a command's own text was taken as a redirect" "$2"
+    grep -aqxF "a > b" <<< "$S" || _f "echo a \\> b did not print a > b" "$2"
     local n
     n="$(printf '%s\n' "$S" | grep -acE '^\[desk\] verify: 0 of [0-9]+ rows differ after a full redraw')"
     [ "$n" -ge 2 ] || _f "$n desk verify runs found 0 rows differ (2 wanted: scrolled back and at the end)" "$2"
@@ -88,6 +93,8 @@ more: 'appget' asks for a key, so it cannot run inside more or >
 [shell] afrisovera.conf is the system's file; not replaced
 [shell] helpout exists; not replaced (choose another name)
 more: one more or > at a time
+between: html
+a > b
  16384  2026-11-14 01:03:59  helpout
 [desk] verify: 0 of 480 rows differ after a full redraw (18 partial frame(s) drawn before it)"
 PC_GREEN="$(printf "$ST\n" 0 9 20)
@@ -101,6 +108,8 @@ more: 'appget' asks for a key, so it cannot run inside more or >
 [shell] afrisovera.conf is the system's file; not replaced
 [shell] helpout exists; not replaced (choose another name)
 more: one more or > at a time
+between: html
+a > b
  16384  2026-11-14 01:04:39  helpout
 [desk] verify: 0 of 800 rows differ after a full redraw (22 partial frame(s) drawn before it)"
 

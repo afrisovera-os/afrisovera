@@ -18,11 +18,17 @@ pub(super) mod vector; // smooth text that scales (afriui.md section 26)
 #[path = "shape_data.rs"]
 pub(super) mod shape_data; // the shaper's generated tables (SHAPING_PLAN.md C1)
 
+#[path = "shape_data_deva.rs"]
+pub(super) mod shape_data_deva; // face 2, Devanagari, and its tables (SHAPING_C3_PLAN.md)
+
 #[path = "bidi.rs"]
 pub(super) mod bidi; // right to left and mixed lines (UAX 9)
 
 #[path = "gsub.rs"]
 pub(super) mod gsub; // the font's substitution and mark lookups, compiled offline
+
+#[path = "indic.rs"]
+pub(super) mod indic; // Devanagari: syllables and reordering around the font's lookups
 
 #[path = "shape.rs"]
 pub(super) mod shape; // Arabic shaped by the font's lookups, laid out by bidi
@@ -1981,7 +1987,7 @@ fn notes_panel() {
         let i = (s.nnotes - 1 - k) % NNOTE;
         let yy = ny + 28 + k as i32 * 18;
         chip(nx + 14, yy + 2, 4, 4, 1, GOLD_DEEP);
-        prose(|| text(nx + 24, yy, &s.notes[i][..s.note_len[i]], TEXT, 1));
+        prose(|| text(nx + 24, yy, note_text(i), TEXT, 1));
     }
 }
 
@@ -2016,7 +2022,7 @@ fn toast_rect() -> Option<Rect> {
         return None;
     }
     let i = (s.nnotes - 1) % NNOTE;
-    let w = prose(|| text_w(&s.notes[i][..s.note_len[i]], 1)) + 40;
+    let w = prose(|| text_w(note_text(i), 1)) + 40;
     // pointer: the top right corner; touch: a snackbar at the foot, never over a lintel
     // (design review D2)
     let sw = spine_w();
@@ -2028,7 +2034,7 @@ fn toast() {
     let s = st();
     let Some((x, y, w, _)) = toast_rect() else { return };
     let i = (s.nnotes - 1) % NNOTE;
-    let msg = &s.notes[i][..s.note_len[i]];
+    let msg = note_text(i);
     shadow(x, y, w, 28, 6, 0, 6, 0, 3, look::REACH);
     cut_a(x, y, w, 28, 6, 0, 6, 0, SURFACE2, if look::glass() { look::GLASS_ALPHA } else { 255 });
     cut_frame(x, y, w, 28, 6, 0, 6, 0, GOLD_DARK);
@@ -2203,6 +2209,10 @@ pub(super) fn shape_probe() {
     for (k, t) in shape_data::TESTS.iter().enumerate() {
         crate::kprintln!("[desk] shape oracle {} {:016x}", k, shape::oracle_hash(t.as_bytes()));
     }
+    // and Devanagari's (tools/face/shape_expected_deva.txt)
+    for (k, t) in shape_data_deva::TESTS.iter().enumerate() {
+        crate::kprintln!("[desk] shape deva oracle {} {:016x}", k, shape::oracle_hash_face(t.as_bytes(), vector::DEVA));
+    }
     // 2. the sample line's coverage at cap 9 and 18, hashed with each glyph's place: the same bytes on ARM and PC
     let sample = "\u{627}\u{644}\u{633}\u{644}\u{627}\u{645} \u{639}\u{644}\u{64A}\u{643}\u{645} AfriSovera \u{662}\u{660}\u{662}\u{666}".as_bytes();
     let mut hs = [0u64; 2];
@@ -2309,6 +2319,81 @@ pub(super) fn shape_probe() {
         every[si] = best;
     }
     crate::kprintln!("[desk] shape: arabic 40 characters shaped every time: cap 9 {} us, cap 18 {} us", every[0], every[1]);
+    // a Hindi paragraph of 1,000 characters (the architect's C3 measure): four lines of 250, shaped from nothing
+    // (the line cache emptied), then drawn warm. A line is at most 256 characters; breaking lines is C5's.
+    {
+        let words = "\u{0939}\u{093F}\u{0928}\u{094D}\u{0926}\u{0940} \u{092E}\u{0947}\u{0902} \u{0938}\u{0947}\u{091F}\u{093F}\u{0902}\u{0917}\u{094D}\u{0938} \u{0914}\u{0930} \u{092B}\u{093C}\u{093E}\u{0907}\u{0932}\u{0947}\u{0902} \u{0915}\u{094D}\u{0937}\u{092E}\u{093E} \u{0930}\u{094D}\u{0915} \u{0938}\u{094D}\u{0935}\u{093E}\u{0917}\u{0924} ";
+        let mut para = [0u8; 3200];
+        let mut lines = [(0usize, 0usize); 4];
+        let mut len = 0;
+        for l in lines.iter_mut() {
+            let start = len;
+            let mut chars = 0;
+            'fill: while chars < 250 {
+                for ch in words.chars() {
+                    if chars >= 250 || len + 4 > para.len() {
+                        break 'fill;
+                    }
+                    len += ch.encode_utf8(&mut para[len..]).len();
+                    chars += 1;
+                }
+            }
+            *l = (start, len);
+        }
+        let mut shaped = 0u64;
+        for &(a, b) in &lines {
+            shape::reset_cache();
+            let t0 = crate::timer::cycles();
+            let _ = vtext_w(&para[a..b], 9);
+            shaped += us(t0);
+        }
+        let mut drawn = u64::MAX;
+        for _ in 0..4 {
+            rect(10, 30, W() - 20, 60, SURFACE);
+            let t0 = crate::timer::cycles();
+            for &(a, b) in &lines {
+                vtext(14, 40, &para[a..b], TEXT, 1);
+            }
+            drawn = drawn.min(us(t0));
+        }
+        crate::kprintln!(
+            "[desk] shape: hindi 1000 characters in 4 lines: shaped from nothing {} us, drawn warm {} us",
+            shaped,
+            drawn
+        );
+        // a keystroke (C3b): an 80-character Hindi line with one more character each time, so every measure is a line
+        // the cache has not seen, as when someone types; the worst of 8 and the median
+        let (a, _) = lines[0];
+        let mut key = [0u8; 400];
+        let mut kl = 0;
+        let mut chars = 0;
+        let mut it = core::str::from_utf8(&para[a..lines[0].1]).unwrap_or("").chars();
+        while chars < 80 {
+            match it.next() {
+                Some(ch) if kl + 4 <= key.len() => {
+                    kl += ch.encode_utf8(&mut key[kl..]).len();
+                    chars += 1;
+                }
+                _ => break,
+            }
+        }
+        let typed = ['\u{0915}', '\u{093F}', '\u{0930}', '\u{094D}', '\u{0937}', '\u{0902}', '\u{0928}', '\u{0947}'];
+        let mut times = [0u64; 8];
+        for (n, ch) in typed.iter().enumerate() {
+            let mut line = key;
+            let mut ll = kl;
+            ll += ch.encode_utf8(&mut line[ll..]).len();
+            let t0 = crate::timer::cycles();
+            let _ = vtext_w(&line[..ll], 9);
+            times[n] = us(t0);
+        }
+        times.sort_unstable();
+        crate::kprintln!(
+            "[desk] shape: hindi keystroke on an 80-character line: reshaped in {} us (median), worst of 8 {} us",
+            times[4],
+            times[7]
+        );
+    }
     // SAFETY: scalar reads.
     let cs = unsafe { shape::CSTATS };
     crate::kprintln!("[desk] shape: line cache hits {}, misses {}, emptied {}", cs.0, cs.1, cs.2);

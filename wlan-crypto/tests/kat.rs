@@ -78,10 +78,15 @@ fn every_published_vector() {
                 ccm8_decrypt(&k, &nonce, &aad, &mut buf, &tag).unwrap();
                 assert_eq!(buf, plain);
             }
+            "ccmp_mpdu" => {
+                // whole CCMP frames: their AAD and nonce come from the 802.11 header, which is the kernel's ccmp.rs
+                // (checked against these in tests/stack.rs and by `wifi selftest`); here only the shape
+                assert_eq!(hx(f[5]).len(), hx(f[4]).len() + 16, "{line}");
+            }
             other => panic!("unknown vector kind {other}"),
         }
         *n.entry(f[0]).or_default() += 1;
     }
-    let want = [("aes_kw", 1), ("ccm8", 12), ("cmac", 4), ("hmac_sha1", 7), ("pbkdf2_sha1", 5), ("prf_sha1", 3), ("psk", 3)];
+    let want = [("aes_kw", 1), ("ccm8", 12), ("ccmp_mpdu", 4), ("cmac", 4), ("hmac_sha1", 7), ("pbkdf2_sha1", 5), ("prf_sha1", 3), ("psk", 3)];
     assert_eq!(n.into_iter().collect::<Vec<_>>(), want.to_vec(), "every kind, every vector");
 }

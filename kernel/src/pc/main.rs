@@ -177,12 +177,25 @@ mod tpm_tis; // the TIS protocol and its rules, generic over the bus (host-teste
 mod gpt;
 mod bootent;
 mod update;
+mod trial;
 mod esp;
 mod fwinfo;
 mod wifi;
 // Our own Wi-Fi stack (WIFI_PLAN.md, architect 14 Nov 2026); PC only, so the ARM image does not change.
 #[path = "../wlan/mod.rs"]
 mod wlan;
+// Wi-Fi as the network card, and the `wifi scan|connect|status|disconnect` commands (W4b)
+mod wifinet;
+// the radio under it: the real one (W5: the Intel 7265), or the test image's pretend radio and access point. The one
+// place feature `wifi-sim` is named; suite pc-wifi-sim checks the normal image holds none of the test radio.
+#[cfg(not(feature = "wifi-sim"))]
+#[path = "wifiradio.rs"]
+mod air;
+#[cfg(feature = "wifi-sim")]
+#[path = "wifisim.rs"]
+mod air;
+#[cfg(all(feature = "wifi-sim", feature = "release"))]
+compile_error!("wifi-sim is the Wi-Fi test image: never in a release build");
 mod cdcncm;
 mod uvc;
 mod btparse;
@@ -500,6 +513,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     unsafe { fwinfo::keep(st) };
     // which release this is, and whether it trusts a demo update key (AFR-0010)
     update::boot_line();
+    trial::early();
     match &scr {
         Some(s) => {
             kprintln!(
@@ -836,6 +850,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
         }
     };
 
+    trial::verdict(a && b && c && alias_ok && ring3_ok && ipc_ok && sched_ok && ep_ok);
     if a && b && c && alias_ok && ring3_ok && ipc_ok && sched_ok && ep_ok {
         kprintln!("[pc] MANSA-PC BOOT OK");
         if let Some(s) = &scr {
@@ -954,7 +969,10 @@ extern "sysv64" fn shell_on_kernel_stack() -> ! {
         asili::register("usb-serial", asili::Class::Console, 0, true);
     }
     asili::register("gop-display", asili::Class::Display, 0, screen::on());
-    if virtio::net_present() {
+    if virtio::net_present() && !nic::link_up() {
+        // Wi-Fi with no network joined yet: nothing to ask DHCP of until `wifi connect`
+        kprintln!("[net] Wi-Fi: no network joined yet; `wifi connect <name>` joins one and then gets an address");
+    } else if virtio::net_present() {
         // an Intel NIC's frames reach the driver from the timer interrupt (virtio_pci.rs
         // emu_poll), so DHCP runs with the local-APIC timer on
         let was_on = cpu::interrupts_on();
@@ -979,6 +997,7 @@ extern "sysv64" fn shell_on_kernel_stack() -> ! {
         vfs::load_from_disk();
     }
     nia::restore_bundled(); // a differing or missing bundled app gets its built-in copy back
+    trial::at_boot(); // safe updates U4: a trial boot is read only from here on
     config::boot_apply();
     // The manifest: each bundled app's hash from its COMPILED-IN bytes, never from the disk copy (a
     // tampered disk copy must not become "integrity OK"; claude/appget, architect's manifest decision).

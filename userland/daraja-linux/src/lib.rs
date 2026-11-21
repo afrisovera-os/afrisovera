@@ -4,6 +4,7 @@
 //! - [`bundle`]: the bundle's 48-byte header, checked before anything else (DARAJA02);
 //! - [`calls`]: the Linux calls of stage 0 over a `Host` (the kernel, or a fake one in the tests);
 //! - [`cpio`]: the bundle (the program and its files, read-only), a cpio "newc" archive;
+//! - [`limit`]: a per-number limit on a repeated console line (`[daraja] unknown call`);
 //! - [`stack`]: the stack a Linux program finds at its entry point (argc, argv, envp, the auxiliary vector).
 
 #![no_std]
@@ -12,4 +13,14 @@
 pub mod bundle;
 pub mod calls;
 pub mod cpio;
+pub mod limit;
 pub mod stack;
+
+/// The ELF reader the bridge loads programs with, re-exported so fuzz-host's `afri_elf` target reaches it through
+/// this crate (fuzz-host already depends on it; no new dependency, no lockfile change).
+pub use afri_elf;
+
+/// Where a Linux program may lie: the first GiB of the user slot (USER_BASE 0x100_0000_0000), below the map area
+/// (AFR-0001 7.7; the browser engineer's rule that foreign and native map areas never alias). The bridge loads under
+/// it; the fuzz target parses under the same range, so what is fuzzed is what the bridge accepts.
+pub const FOREIGN_AREA: core::ops::Range<u64> = 0x0000_0100_0000_0000..0x0000_0100_4000_0000;

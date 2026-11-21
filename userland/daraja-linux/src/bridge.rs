@@ -10,14 +10,15 @@
 use crate::sys;
 use core::arch::global_asm;
 use core::ops::Range;
-use daraja_linux::{bundle, calls, cpio, stack};
+use daraja_linux::{bundle, calls, cpio, limit, stack};
 
 const USER_BASE: u64 = 0x0000_0100_0000_0000;
 /// Where the kernel maps the bundle (proc.rs MAP_LO: USER_BASE + 1 GiB).
 const BUNDLE_AT: u64 = USER_BASE + 0x4000_0000;
-/// Where the program may lie: the first GiB of the user slot, below the map area (AFR-0001 7.7; the browser
-/// engineer's rule that foreign and native map areas never alias).
-const AREA: Range<u64> = USER_BASE..USER_BASE + 0x4000_0000;
+/// Where the program may lie: the first GiB of the user slot, below the map area (the library's FOREIGN_AREA, which
+/// fuzz-host's afri_elf target parses under too).
+const AREA: Range<u64> = daraja_linux::FOREIGN_AREA;
+const _: () = assert!(AREA.start == USER_BASE && AREA.end == BUNDLE_AT);
 /// The program's stack: 1 MiB ending just below the map area, with an unmapped page above it.
 const STACK_TOP: u64 = USER_BASE + 0x3FFF_F000;
 const STACK_LEN: u64 = 1 << 20;
@@ -122,6 +123,14 @@ fn the_bundle() -> &'static [u8] {
 fn load(file: &[u8]) -> afri_elf::Image {
     let img = match afri_elf::parse(file, AREA) {
         Ok(img) => img,
+        // a PT_LOAD segment below the foreign area, usually a program linked at Linux's 0x400000 (ET_EXEC as such is
+        // fine: our own builds are ET_EXEC linked high). The low range needs the upper-half kernel first
+        // (COMPAT_LOW_TIB_PLAN 6; the architect's wording)
+        Err(afri_elf::Error::OutsideArea) => fail(b"this program needs fixed addresses below 1 TiB; not supported yet"),
+        // a segment ending above the foreign area (the architect, 21 Nov: "below 1 TiB" would be wrong there)
+        Err(afri_elf::Error::AboveArea) => {
+            fail(b"this program needs addresses outside the area AfriSovera gives programs; not supported")
+        }
         Err(_) => fail(b"the program is not a static x86-64 executable inside the foreign area (afri-elf refused it)"),
     };
     for s in img.segments() {
@@ -224,10 +233,16 @@ pub extern "C" fn rust_main() -> ! {
     let mut files = calls::Files::new(ar);
     let mut host = Kernel;
     let mut msg = [0u8; 96];
+    // `[daraja] unknown call <n>`: the first few per number, then one summary line per number at the end
+    let mut unknown = limit::Limit::new();
     loop {
         match sys::wait_one() {
             Ok(s) if s & sys::SIG_READABLE != 0 => {}
-            _ => sys::exit(0), // PEER_CLOSED: the program has ended and its last message was read
+            _ => {
+                // PEER_CLOSED: the program has ended and its last message was read
+                not_shown(&mut unknown);
+                sys::exit(0)
+            }
         }
         if sys::channel_read(&mut msg).is_err() {
             continue;
@@ -243,7 +258,7 @@ pub extern "C" fn rust_main() -> ! {
                 sys::putc(b'\n');
                 let (rk, value) = match calls::handle(&mut host, &mut files, nr, a) {
                     calls::Action::Ret(v) => {
-                        if v == -calls::ENOSYS {
+                        if v == -calls::ENOSYS && unknown.note(nr) == limit::Say::Show {
                             puts(b"[daraja] unknown call ");
                             dec(nr);
                             sys::putc(b'\n');
@@ -251,6 +266,7 @@ pub extern "C" fn rust_main() -> ! {
                         (1u16, v as u64)
                     }
                     calls::Action::Exit(code) => {
+                        not_shown(&mut unknown);
                         puts(b"[daraja] exit ");
                         dec(code);
                         sys::putc(b'\n');
@@ -273,14 +289,34 @@ pub extern "C" fn rust_main() -> ! {
                     3 => 5,        // breakpoint: SIGTRAP
                     _ => 11,
                 };
+                not_shown(&mut unknown);
                 puts(b"[daraja] exit ");
                 dec(128 + sig);
                 puts(b" (fault, vector ");
                 dec(nr);
                 puts(b")\n");
             }
-            _ => {} // EXITED: already reported when the EXIT reply went out
+            // EXITED: the exit line went out with the EXIT reply; a program killed instead (fproc_kill, the kernel's
+            // clean-up) still gets its summary here. take() gives each count once, so nothing prints twice.
+            _ => not_shown(&mut unknown),
         }
+    }
+}
+
+/// The summary lines of the unknown-call limit: one per number whose lines were cut, then one for the rest. Each
+/// count is given once, so a later call prints only what came after.
+fn not_shown(l: &mut limit::Limit) {
+    while let Some((nr, n)) = l.take() {
+        match nr {
+            Some(nr) => {
+                puts(b"[daraja] unknown call ");
+                dec(nr);
+                puts(b": ");
+            }
+            None => puts(b"[daraja] unknown calls of other numbers: "),
+        }
+        dec(n as u64);
+        puts(b" more not shown\n");
     }
 }
 

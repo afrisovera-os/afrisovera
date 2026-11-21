@@ -8,6 +8,11 @@
 # and back to English.
 # Part 2, the ARM kernel on one disk image, two boots: `desk lang tw` on the first; the second reads it back from
 # afrisovera.conf before the desk draws, and `config` shows the line.
+# Stage 6 (no untranslated text): before any boot, tools/lang/pseudo.py --check (the test language qps is what the
+# English makes) and tools/lang/literals.py (every literal the desk draws is allowed with a reason; its selftest
+# plants one that must fail). Each kernel ends in qps with every app window open, so the screenshot shows any plain
+# English at a glance, and prints `desk lang fit qps` as a note. Boot 1 also switches to qps after Twi, and boot 2
+# must still read Twi: qps is never saved.
 #   scripts/desk-lang-test.sh              # grader selftest, then the boots
 #   scripts/desk-lang-test.sh --selftest   # grader selftest only
 set -uo pipefail
@@ -22,6 +27,8 @@ CMDS=(
     "desk lang en" "desk verify"
     "desk open settings" "desk lang list" "desk verify" "desk key down" "desk key enter" "desk lang pick es" "desk verify"
     "desk lang en"
+    "desk lang qps" "desk lang fit qps" "desk open terminal" "desk open files" "desk open about" "desk open settings"
+    "desk verify"
 )
 
 grade() { # grade <serial log> <kernel name>
@@ -51,6 +58,9 @@ grade() { # grade <serial log> <kernel name>
     hasre '^\[desk\] lang: list on tw$' "$2" "Down did not move the list to Twi"
     hasre '^\[desk\] lang: list closed$' "$2" "the language list did not close"
     hasre '^\[desk\] lang: es \(Español\), [1-9][0-9]* drafts, [0-9]+ in English$' "$2" "no pick of Spanish from the list"
+    # stage 6: the test language is reached, never saved, and its fit is printed as a note
+    hasre '^\[desk\] lang: qps is a test language, for this session only; not saved$' "$2" "no switch to the test language qps"
+    hasre '^\[desk\] lang fit qps: [0-9]+ place\(s\) too tight' "$2" "no fit note in qps"
     [ "$fail" -eq 0 ]
 }
 
@@ -62,6 +72,8 @@ grade_reboot() { # grade_reboot <boot 1 log> <boot 2 log>
     grep -aqE 'PANIC|panicked' <<< "$A"$'\n'"$B" && _f "the kernel panicked or faulted"
     grep -aqE '^\[desk\] lang: tw \(Twi\), [0-9]+ drafts' <<< "$A" || _f "boot 1 did not switch to Twi"
     grep -aqE '^\[desk\] lang: not saved' <<< "$A" && _f "boot 1 could not save the language"
+    grep -aqxF '[desk] lang: qps is a test language, for this session only; not saved' <<< "$A" || _f "boot 1 did not switch to qps after Twi"
+    grep -aqE '^ *lang=qps$' <<< "$B" && _f "qps was saved to afrisovera.conf"
     grep -aqxF '[desk] lang: tw (from afrisovera.conf)' <<< "$B" || _f "boot 2 did not read Twi back from afrisovera.conf"
     grep -aqE '^\[desk\] lang: tw \(Twi\), [0-9]+ strings' <<< "$B" || _f "boot 2's desk is not in Twi"
     grep -aqE '^ *lang=tw$' <<< "$B" || _f "boot 2's config has no lang=tw line"
@@ -85,8 +97,13 @@ GREEN="[desk] lang selftest: 30/30 checks held
 [desk] verify: 0 of 800 rows differ after a full redraw (3 partial frame(s) drawn before it)
 [desk] lang: tw (Twi), 58 strings, 53 drafts, 0 checked, 5 in English
 [desk] lang: en (English), 0 drafts, 0 in English
-[desk] verify: 0 of 800 rows differ after a full redraw (1 partial frame(s) drawn before it)"
-BOOT1="[desk] lang: tw (Twi), 53 drafts, 5 in English"
+[desk] verify: 0 of 800 rows differ after a full redraw (1 partial frame(s) drawn before it)
+[desk] lang: qps (qps (test)), 63 drafts, 0 in English
+[desk] lang: qps is a test language, for this session only; not saved
+[desk] lang fit qps: 9 place(s) too tight for a third more text (a note, not a failure)"
+BOOT1="[desk] lang: tw (Twi), 53 drafts, 5 in English
+[desk] lang: qps (qps (test)), 63 drafts, 0 in English
+[desk] lang: qps is a test language, for this session only; not saved"
 BOOT2="[desk] lang: tw (from afrisovera.conf)
 [cfg] afrisovera.conf:
   lang=tw
@@ -128,14 +145,25 @@ selftest() {
     rcase not-read-back red "$BOOT1" "$(printf '%s\n' "$BOOT2" | grep -v 'from afrisovera.conf')"
     rcase no-config-line red "$BOOT1" "$(printf '%s\n' "$BOOT2" | grep -v 'lang=tw')"
     rcase not-saved red "$(printf '%s\n[desk] lang: not saved: the VFS has no slot for it' "$BOOT1")" "$BOOT2"
+    case_ no-qps red "$(printf '%s\n' "$GREEN" | grep -v 'qps is a test language')"
+    case_ no-qps-fit red "$(printf '%s\n' "$GREEN" | grep -v 'lang fit qps')"
+    rcase qps-saved red "$BOOT1" "$(printf '%s\n  lang=qps' "$BOOT2")"
+    rcase qps-never-reached red "$(printf '%s\n' "$BOOT1" | grep -v 'qps is a test')" "$BOOT2"
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 18 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 22 ]
 }
 
 echo "== the desk in the user's language: catalogue, fit, switch and reboot =="
 if ! selftest; then echo "DESK LANG TEST FAILED (grader selftest): no QEMU run spent"; exit 1; fi
 [ "${1:-}" = "--selftest" ] && { echo "DESK LANG SELFTEST ONLY: no boot run"; exit 0; }
+
+echo "  --- no untranslated text (stage 6, host side) ---"
+python3 tools/lang/pseudo.py --check | sed 's/^/  /' || { echo "DESK LANG TEST FAILED (the qps table is stale)"; exit 1; }
+python3 tools/lang/literals.py --selftest | sed 's/^/  /'
+python3 tools/lang/literals.py --selftest > /dev/null || { echo "DESK LANG TEST FAILED (the literal counter missed a planted literal)"; exit 1; }
+python3 tools/lang/literals.py | sed 's/^/  /'
+python3 tools/lang/literals.py > /dev/null || { echo "DESK LANG TEST FAILED (text drawn outside the catalogue)"; exit 1; }
 
 W="$(mktemp -d "$T/desk-lang.XXXXXX")"
 winpath() { if command -v cygpath > /dev/null; then cygpath -m "$1"; else printf '%s' "$1"; fi; }
@@ -155,7 +183,7 @@ afrish_wait_boot
 python3 scripts/shell-demo.py 5996 5997 "$(winpath "$W/arm.png")" "${CMDS[@]}" > "$W/arm.log" 2>&1
 kill "$QPID" 2> /dev/null
 wait "$QPID" 2> /dev/null
-tr -d '\r' < "$W/arm.log" | grep -aE '^\[desk\] (lang|verify)|panic|PANIC' | sed 's/^/  arm | /'
+tr -d '\r' < "$W/arm.log" | grep -aE '^\[desk\] (lang|verify)|panic|PANIC' | grep -av 'lang fit qps: [A-Z]' | sed 's/^/  arm | /'
 grade "$W/arm.log" arm || fails=$((fails + 1))
 
 echo "  --- PC kernel (1920x1080) ---"
@@ -194,7 +222,7 @@ boot_disk() { # boot_disk <log> <png> <command...>
     kill "$qpid" 2> /dev/null
     wait "$qpid" 2> /dev/null
 }
-boot_disk "$W/boot1.log" "$W/boot1.png" "gui" "desk lang tw" "desk lang"
+boot_disk "$W/boot1.log" "$W/boot1.png" "gui" "desk lang tw" "desk lang" "desk lang qps"
 boot_disk "$W/boot2.log" "$W/boot2.png" "gui" "desk lang" "config"
 tr -d '\r' < "$W/boot1.log" | grep -aE '^\[desk\] lang|^\[cfg\]|panic|PANIC' | sed 's/^/  boot 1 | /'
 tr -d '\r' < "$W/boot2.log" | grep -aE '^\[desk\] lang|^\[cfg\]|lang=|panic|PANIC' | sed 's/^/  boot 2 | /'

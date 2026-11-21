@@ -9,6 +9,7 @@
 #   after everything ran, `ls -l` still shows the stand-in at its own size;
 #   `verify andika.wasm` integrity OK, `verify andika.wasm tamper` TAMPERED;
 #   `appget ... andika.wasm ...` refused as bundled, nothing written;
+#   `nia hello.wasm` asks for and is granted putc only, its own list (item 8, C1);
 #   `nia hello.wasm` and `nia andika.wasm` at the shell: "built in", integrity OK, "from the kernel image" with the
 #   built-in size, never the stand-in's number; Andika asks for and is granted draw and file only, with every
 #   capability allowed by its kind (so net, AI and voice are withheld by its own list); with no desk its
@@ -20,6 +21,8 @@
 set -uo pipefail
 
 BIN="target/aarch64-unknown-none/debug/mansa-kernel"
+# Item 8, C1: each demo ends with exactly its own permission list (scripts/lib/demo-perms.py).
+python3 scripts/lib/demo-perms.py --check > /dev/null || { echo "BUNDLED-BIG TEST FAILED (demo lists)"; exit 1; }
 cargo build -p mansa-kernel
 
 T="${TMPDIR:-/tmp}/bundled-big"
@@ -89,6 +92,9 @@ has "[nia] 'hello.wasm' is built in: running the kernel's own copy" "$T/hello.tx
 has "[nia] integrity OK for 'hello.wasm' (matches manifest)" "$T/hello.txt"
 hasre "^\[nia\] loaded 'hello\.wasm' from the kernel image \([0-9]+ bytes\)$" "$T/hello.txt"
 has "[nia] 'run' returned cleanly" "$T/hello.txt"
+has "[nia] permissions asked: putc" "$T/hello.txt"
+has "[nia] permissions granted: putc" "$T/hello.txt"
+has "[nia] permissions withheld: nothing" "$T/hello.txt"
 
 andika() { # andika <segment file> <where>
     has "[nia] 'andika.wasm' is built in: running the kernel's own copy" "$1"

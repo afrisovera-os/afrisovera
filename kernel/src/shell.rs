@@ -127,7 +127,7 @@ pub fn paging() -> bool {
 /// Commands that wait for a key (a prompt, an app's input, "any key to return"): they cannot run inside a catch,
 /// since the person would never see the question (the architect, 14 Nov). Add each new one here as it lands; the
 /// shell's key wait ends a catch anyway (`end_catch`), so a missed name shows its output instead of hanging.
-const ASKS_KEY: [&str; 9] = ["appget", "store", "edit", "web", "dira", "nia", "wm", "rustapp", "niavm"];
+const ASKS_KEY: [&str; 10] = ["appget", "store", "edit", "web", "dira", "nia", "wm", "rustapp", "niavm", "wifi"];
 
 /// A catch ended early by a key wait: the command's output already went to the screen, so it is not paged or saved.
 static CAP_BROKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -190,22 +190,72 @@ fn caught(cmd: &str) -> (&'static [u8], bool) {
     unsafe { (&(&*core::ptr::addr_of!(CAP))[..CAP_N], CAP_CUT) }
 }
 
+/// Commands whose arguments are free text, so a `>` in them is text, never output to a file (the architect, 15 Nov:
+/// `between < > <html>hi` was being redirected into a file called "<html>hi").
+/// A hand list (the architect, 21 Nov): any new command that takes free text joins it IN THE SAME COMMIT, and the list
+/// becomes a per-command flag when the command table gains one.
+fn free_text(word: &str) -> bool {
+    matches!(word, "between" | "before" | "after") || word.starts_with("grep") || word.starts_with("replace")
+}
+
+/// `<command> > <name>`: the `>` is the second-to-last word and the name the last, a valid file name (letters,
+/// digits, '.', '_' and '-', starting with a letter or digit, at most 24 bytes), and the command does not take free
+/// text. Anything else is not a redirect.
+fn redirect(t: &str) -> Option<(&str, &str)> {
+    let i = t.rfind(" > ")?;
+    let name = t[i + 3..].trim();
+    let cmd = t[..i].trim();
+    let ok_name = !name.is_empty()
+        && name.len() <= 24
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-');
+    let word = cmd.split_whitespace().next().unwrap_or("");
+    if !ok_name || cmd.is_empty() || free_text(word) {
+        return None;
+    }
+    Some((cmd, name))
+}
+
+/// Set while a line runs with its escaped `>` turned back into text: that line is never taken as a redirect.
+static PLAIN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Run a line with each backslash before a `>` removed (the person asked for the character).
+fn run_unescaped(t: &str) -> bool {
+    let mut buf = [0u8; MAX_LINE];
+    let mut n = 0;
+    let b = t.as_bytes();
+    let mut i = 0;
+    while i < b.len() && n < buf.len() {
+        if b[i] == b'\\' && i + 1 < b.len() && b[i + 1] == b'>' {
+            i += 1;
+        }
+        buf[n] = b[i];
+        n += 1;
+        i += 1;
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[..n]) {
+        PLAIN.store(true, core::sync::atomic::Ordering::Relaxed);
+        exec(s);
+        PLAIN.store(false, core::sync::atomic::Ordering::Relaxed);
+    }
+    true
+}
+
 /// The three forms; true if `line` was one of them (and has run).
 fn paged(line: &str) -> bool {
     let t = line.trim();
-    if capturing() {
-        return false; // a command inside a caught one runs plainly
+    if capturing() || PLAIN.load(core::sync::atomic::Ordering::Relaxed) {
+        return false; // a command inside a caught one, or a line whose `>` is text, runs plainly
     }
     let (cmd, to_file) = if let Some(rest) = t.strip_prefix("more ") {
         (rest.trim(), None)
     } else if let Some(rest) = t.strip_suffix("| more") {
         (rest.trim(), None)
-    } else if let Some(i) = t.rfind(" > ") {
-        let name = t[i + 3..].trim();
-        if name.is_empty() || name.contains(' ') {
-            return false;
-        }
-        (t[..i].trim(), Some(name))
+    } else if let Some((cmd, name)) = redirect(t) {
+        (cmd, Some(name))
+    } else if t.contains("\\>") {
+        // a backslash before `>` asks for the character, not a redirect: run the line with it removed
+        return run_unescaped(t);
     } else {
         return false;
     };

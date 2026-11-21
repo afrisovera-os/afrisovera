@@ -25,9 +25,10 @@ confined() { # confined <root> -> prints every violation, returns 1 if any
     hits="$(cd "$root" && grep -rHnE --include='*.rs' "$CRATE_RE" kernel userland tools 2> /dev/null \
             | grep -v '^kernel/src/wlan/crypto\.rs:')"
     [ -n "$hits" ] && { echo "  names the Wi-Fi crypto crates outside kernel/src/wlan/crypto.rs:"; echo "$hits" | sed 's/^/    /'; bad=1; }
-    # manifests: only the kernel (the wlan-crypto line) and wlan-crypto itself
+    # manifests: only the kernel (the wlan-crypto line), wlan-crypto itself, and fuzz-host (a host-only test harness, W3)
     hits="$(cd "$root" && find . -name Cargo.toml -not -path './vendor/*' -not -path './target/*' -not -path './.claude/*' \
-            -not -path './wlan-crypto/Cargo.toml' -not -path './build/*' -print0 2> /dev/null \
+            -not -path './wlan-crypto/Cargo.toml' -not -path './build/*' -not -path './fuzz-host/Cargo.toml' \
+            -not -path './fuzz-host/fuzz/Cargo.toml' -print0 2> /dev/null \
             | xargs -0 grep -HnE "$MANIFEST_RE" 2> /dev/null | grep -v '^\./kernel/Cargo\.toml:[0-9]*:wlan-crypto = ')"
     [ -n "$hits" ] && { echo "  a manifest other than kernel/ and wlan-crypto/ depends on them:"; echo "$hits" | sed 's/^/    /'; bad=1; }
     return $bad
@@ -63,7 +64,7 @@ echo "  confined: only kernel/src/wlan/crypto.rs names the crates; only kernel/ 
 
 echo "  --- host tests (cargo test, wlan-crypto) ---"
 HOST=$(rustc -vV | sed -n 's/host: //p')
-cargo test --manifest-path wlan-crypto/Cargo.toml --target "$HOST" 2>&1 | tail -25
+cargo test --manifest-path wlan-crypto/Cargo.toml --target "$HOST" 2>&1 | grep -E "^test |test result|panicked|error" | tail -80
 [ "${PIPESTATUS[0]}" -eq 0 ] || exit 1
 trap - EXIT
 echo "WIFI-CRYPTO TEST PASSED"

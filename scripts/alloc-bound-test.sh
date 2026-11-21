@@ -171,6 +171,8 @@ for phrase in (
         # stage 5b: the clock's line, strict like lang=
         "a clock24 line is written only once chosen, and reads back as written",
         "a clock24 line that is not 0 or 1 is refused by name, and the clock follows the language",
+        # stage 6: the test language qps is never kept
+        "a config naming the test language qps is refused by name and reads as English",
         "the buffer is no larger than the VFS file limit, so nothing rendered is truncated",
         "a lossy render stops on a CHAR boundary, keeping the prefix and counting the rest",
         "a zero-length buffer writes nothing and overruns nothing, rather than faulting",

@@ -17,17 +17,23 @@ mod data;
 
 /// Face 1, the Arabic face (SHAPING_PLAN.md C1): its outlines are in the shaper's generated tables.
 use super::shape_data as f1;
+/// Face 2, Devanagari: its outlines are in shape_data_deva.rs.
+use super::shape_data_deva as f2;
 
 /// The faces (SHAPING_PLAN.md C1, the architect's Q2): face 0 is AfriSovera Sans exactly as section 26 made it; face
 /// 1 is the Arabic face, drawn at face 0's pixels per em with only the baseline on a whole pixel (it has no x-height
 /// to bend). A glyph is (face, index); `glyph` and `advance` are face 0's, as before.
 pub const LATIN: u8 = 0;
 pub const ARABIC: u8 = 1;
+/// Face 2, Devanagari (SHAPING_C3_PLAN.md): Noto Sans Devanagari, drawn at face 0's pixels per em as face 1 is.
+pub const DEVA: u8 = 2;
 
 type Rows = &'static [(u16, u32, u16, u16, u8)];
 
 fn tables(face: u8) -> (Rows, &'static [(u16, i16, i16)], &'static [(i16, i16)], &'static [u8]) {
-    if face == ARABIC {
+    if face == DEVA {
+        (&f2::GLYPHS, &f2::COMPS, &f2::PTS, &f2::KIND)
+    } else if face == ARABIC {
         (&f1::GLYPHS, &f1::COMPS, &f1::PTS, &f1::KIND)
     } else {
         (&data::GLYPHS, &data::COMPS, &data::PTS, &data::KIND)
@@ -117,14 +123,35 @@ pub fn lookup_arabic(cp: u32) -> Option<u16> {
     f1::CMAP.binary_search_by_key(&cp, |&(c, _)| c).ok().and_then(|i| f1::CMAP.get(i)).map(|&(_, g)| g)
 }
 
-/// Face 1's font units to face 0's, so both faces share one size per em.
+/// The Devanagari face's glyph for a code point (a bounded binary search of its sorted table).
+pub fn lookup_deva(cp: u32) -> Option<u16> {
+    f2::CMAP.binary_search_by_key(&cp, |&(c, _)| c).ok().and_then(|i| f2::CMAP.get(i)).map(|&(_, g)| g)
+}
+
+/// Face 1's font units to face 0's, so the faces share one size per em.
 fn to_f0(u: i64) -> i64 {
     u * data::UPEM as i64 / f1::UPEM.max(1) as i64
 }
 
+/// Face 2's font units to face 0's.
+fn to_f0_deva(u: i64) -> i64 {
+    u * data::UPEM as i64 / f2::UPEM.max(1) as i64
+}
+
+/// A face's units to face 0's.
+fn face_to_f0(face: u8, u: i64) -> i64 {
+    match face {
+        ARABIC => to_f0(u),
+        DEVA => to_f0_deva(u),
+        _ => u,
+    }
+}
+
 /// A glyph's advance in face 0's font units (1000 an em), for the shaper, which keeps positions in font units.
 pub fn units(face: u8, g: u16) -> i32 {
-    if face == ARABIC {
+    if face == DEVA {
+        to_f0_deva(f2::GLYPHS.get(g as usize).map_or(0, |r| r.0 as i64)) as i32
+    } else if face == ARABIC {
         to_f0(f1::GLYPHS.get(g as usize).map_or(0, |r| r.0 as i64)) as i32
     } else {
         data::GLYPHS.get(g as usize).map_or(0, |r| r.0 as i32)
@@ -150,10 +177,10 @@ pub fn box_units(cap: i32) -> i32 {
 
 /// A glyph's advance in a face at a cap height, in 1/256 pixel.
 pub fn advance_in(face: u8, g: u16, cap: i32) -> i32 {
-    if face != ARABIC {
+    if face != ARABIC && face != DEVA {
         return advance(g, cap);
     }
-    let adv = to_f0(f1::GLYPHS.get(g as usize).map_or(0, |r| r.0 as i64));
+    let adv = units(face, g) as i64;
     (adv * clamp_cap(cap) as i64 * ONE as i64 / data::CAP as i64) as i32
 }
 
@@ -213,6 +240,8 @@ struct Scale {
     cap: i64,
     xh: i64,
     arabic: bool,
+    /// which face's units `arabic` scales (1 or 2); the name is the first face that used it
+    face: u8,
 }
 
 impl Scale {
@@ -220,18 +249,18 @@ impl Scale {
         let cap = clamp_cap(cap) as i64;
         let (fc, fx) = (data::CAP as i64, data::XH as i64);
         let xh = ((fx * cap * 2 + fc) / (2 * fc)).clamp(1, cap - 1);
-        Scale { cap, xh, arabic: false }
+        Scale { cap, xh, arabic: false, face: 0 }
     }
     fn x(&self, u: i32) -> i32 {
         if self.arabic {
-            return (to_f0(u as i64) * self.cap * ONE as i64 / data::CAP as i64) as i32;
+            return (face_to_f0(self.face, u as i64) * self.cap * ONE as i64 / data::CAP as i64) as i32;
         }
         (u as i64 * self.cap * ONE as i64 / data::CAP as i64) as i32
     }
     /// y up in font units to y DOWN in 1/256 pixel from the baseline.
     fn y(&self, u: i32) -> i32 {
         if self.arabic {
-            return -((to_f0(u as i64) * self.cap * ONE as i64 / data::CAP as i64) as i32);
+            return -((face_to_f0(self.face, u as i64) * self.cap * ONE as i64 / data::CAP as i64) as i32);
         }
         let (fc, fx, u) = (data::CAP as i64, data::XH as i64, u as i64);
         let one = ONE as i64;
@@ -430,7 +459,8 @@ fn build(face: u8, g: u16, cap: i32, sub: i32) -> (i32, i32, usize, usize) {
     // SAFETY: mainline only.
     unsafe { NSEG = 0 };
     let mut sc = Scale::new(cap);
-    sc.arabic = face == ARABIC;
+    sc.arabic = face == ARABIC || face == DEVA;
+    sc.face = face;
     let sub = sub * (ONE / 4);
     let (rows, comps, _, _) = tables(face);
     match rows.get(g as usize) {
@@ -465,10 +495,10 @@ fn build(face: u8, g: u16, cap: i32, sub: i32) -> (i32, i32, usize, usize) {
 /// face 1 sets bit 15, which no face 0 key uses (the cap is at most 45, in bits 2 to 7).
 fn key(face: u8, g: u16, cap: i32, sub: i32) -> u32 {
     let k = ((g as u32 + 1) << 16) | ((clamp_cap(cap) as u32) << 2) | (sub as u32 & 3);
-    if face == ARABIC {
-        k | 1 << 15
-    } else {
-        k
+    match face {
+        ARABIC => k | 1 << 15,
+        DEVA => k | 1 << 14,
+        _ => k,
     }
 }
 

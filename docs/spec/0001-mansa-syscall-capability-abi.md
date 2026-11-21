@@ -265,6 +265,7 @@ Return values are signed. `0 ≤ r < 2^63` is success; `r ∈ [-4095, -1]` is an
 | -9 | `E_TOOBIG` | message exceeds the channel limits |
 | -10 | `E_CANCELED` | the wait was ended by a close request on the caller's window (v0.5, §7.6) |
 | -11 | `E_NOROUTE` | no route on the local network: no address from the router, or the next hop did not answer (v0.5, §7.6; added with S4, for the architect's confirmation) |
+| -12 | `E_NOSOURCE` | no healthy strong entropy source: the call fails closed and its buffer is left untouched (v0.5, §7.6, `random_fill`) |
 | -32 to -63 | file errors | reserved for AFR-0011 §11.6: file error code c is returned as `-(31 + c)` (Designed, step V6, §7.9) |
 
 Message payloads are delivered through user buffers, never through the return register, so a payload
@@ -336,7 +337,7 @@ on them changes. PC first (ring 3, `pc/proc.rs`); ARM with its own plan.
 the v1 errors of §7.2 (signed; `-4095..=-1`), never v0's `EPERM`. The v0 calls keep v0's single error.
 
 **Handles.** v0.5 widens the v0 capability record (§6.1) to a handle table of 8 entries per process, each entry an
-object kind (`ENDPOINT`, `VMO`, `CELL`, `NET`, `CONN`) and v1 rights (§7.4). Handle numbers stay table indexes.
+object kind (`ENDPOINT`, `VMO`, `CELL`, `NET`, `CONN`, `RANDOM`, `TIME`) and v1 rights (§7.4). Handle numbers stay table indexes.
 Only the kernel grants a handle at spawn, as in v0, apart from those a call below returns (a `VMO`, a `CONN`). v1
 adds `handle_close`, `handle_dup`, transfer and channels on the same table. **v0.5 has no `handle_close`:** number 8
 is `SYS_GETPID` on the PC in v0 (§5.2), and §9 never reuses a number within a version, so in v0.5 a `VMO` handle is
@@ -350,7 +351,7 @@ this table is spawned as today's userland, with neither CELL nor NET.
 
 | Program | Spawned by | Handles | Rights | NET class bits |
 |---|---|---|---|---|
-| Dira (`userland/dira`) | the kernel's `dira` shell command only | CELL, NET | CELL: READ, WRITE, WAIT; NET: SEND, RECV, WAIT | 0, 1, 2 (public, private networks, link-local); bit 3 (127/8) only when the kernel is started with the test rig's flag |
+| Dira (`userland/dira`) | the kernel's `dira` shell command only | CELL, NET, RANDOM, TIME | CELL: READ, WRITE, WAIT; NET: SEND, RECV, WAIT; RANDOM: READ; TIME: READ | 0, 1, 2 (public, private networks, link-local); bit 3 (127/8) only when the kernel is started with the test rig's flag |
 | the `cell` test program (pc/proc.rs), **test-only** | the kernel's `celltest3` command, which refuses unless the test rig set fw_cfg `opt/afrisovera/test-grants` (a shipped image grants CELL to nothing but Dira) | CELL, titled "celltest3 (test)" | READ, WRITE, WAIT | none |
 | rustapp, niavm and every other user program today | their shell commands, as in v0 | their v0 endpoints only | v0 SEND/RECV | none (no NET handle) |
 
@@ -421,6 +422,18 @@ transport, not its function names.
 | 66 | `cell_cursor` | cell h, col, row, shape (0..=3) | 0 | `E_INVAL`; `E_PEERCLOSED` |
 | 67 | `cell_size` | cell h | cols << 14 \| rows | `E_PEERCLOSED` |
 | 68 | `cell_event` | cell h, timeout_ms (negative: no limit) | an event as `cell_abi::event` packs it; 0 for none in time | `E_PEERCLOSED` (then every call says so) |
+| 69 | `cell_put_text` | cell h, col, row, buf_ptr, buf_len (at most 1,024 bytes) | cells used | `E_FAULT` the buffer is not the caller's; `E_INVAL` a malformed buffer (below); `E_PEERCLOSED` closed |
+
+`cell_put_text` writes one row of text from a column, for any script the desk can draw (added 21 Nov 2026 with the
+browser's text past Latin-1; the architect's verdict). The buffer is `nruns` (u16, 1 to 64), then `nruns` runs of
+(`len` u16, `role` u16), then the text as UTF-8; the runs' lengths cover the text exactly, in bytes, each run in one
+colour role as `cell_put`'s. A run boundary inside a code point's bytes is `E_INVAL`; a run boundary inside a grapheme
+cluster gives the whole cluster the role of its first code point. It comes in through the uaccess door, whole or not at all. The desk decodes the text
+(invalid UTF-8 becomes U+FFFD), segments it into grapheme clusters, shapes each through its face chain, and puts one
+cluster per cell, two for a wide one (East Asian wide and the like); a cluster no face can draw shows the box. It
+stops at the row's end and returns the cells used. Right-to-left scripts (N'Ko, Arabic, Hebrew) are drawn in logical
+order, left to right, until the desk's RTL work (C2c) lands; then this call follows it. `cell_put` (65) is unchanged
+for apps that draw bytes.
 
 The pointer in `cell_put` is checked against the caller's own mappings (as `mem_range` does for Nia). The title, its
 marks and "Close anyway" are the desk's; the title of a process spawned by the `dira` command is "Dira (built-in)",
@@ -438,6 +451,23 @@ machine (127/8). No handle reaches 0/8, 224/3 or 255.255.255.255, whatever its b
 | 75 | `tcp_close` | conn h, how (bit 0: reset at once, for a load the person stopped; 0: FIN, then a reset after at most 200 ms) | 0 | `E_BADHANDLE` |
 | 76 | `dns_a` | net h, name_ptr, name_len, timeout_ms | the IPv4 address (u32, big-endian, as a non-negative value) | `E_FAULT`; `E_INVAL` not a name; `E_PEERCLOSED` no checked answer (pc/dnscheck.rs); `E_NOROUTE` no route to the name server |
 
+**Randomness and the clock (v0.5, added 21 Nov 2026 for Dira's TLS).** Two object kinds, `RANDOM` and `TIME`, granted
+only at spawn like `CELL` and `NET`; a process can never create them. Each takes the v1 right READ and no other. In v1
+they become services over channels like 64 to 76; the numbers are retired then, never reused (§9).
+
+| # | Name | Arguments | Result | Errors |
+|---|---|---|---|---|
+| 77 | `random_fill` | random h, ptr, len (1 to 256) | 0, the buffer filled | `E_BADHANDLE`; `E_PERM` not a RANDOM handle with READ; `E_INVAL` len 0 or past 256; `E_FAULT` the buffer is not the caller's writable memory; `E_NOSOURCE` no healthy strong source, the buffer untouched |
+| 78 | `time_now` | time h, ptr (16 bytes) | 0, the buffer holds: seconds since 1970-01-01 UTC (u64), nanoseconds (u32, may be 0), flags (u32) | `E_BADHANDLE`; `E_PERM` not a TIME handle with READ; `E_FAULT` |
+
+- `random_fill` is the kernel DRBG's secret output (`rng::fill_secret` on both kernels: the known-answer test passed and
+  a fresh, health-tested reseed for this request). It fails closed: never a weaker fill. 256 bytes is below the DRBG's
+  own per-request cap, so one call is one DRBG request.
+- `time_now` reads the real-time clock (the PC's CMOS clock; ARM's PL031), UTC, no time zone. Flags bit 0: the clock
+  was never set or reads before 2026-01-01, so it is not to be trusted for dates such as a certificate's. The
+  monotonic clock stays the cycle counter a process already reads.
+- Both copy through the uaccess door, whole or not at all.
+
 **The stop rule (the kernel's job now that Dira is a process).** A close request on the process's window (the close
 box, Alt+F4, Ctrl+\\ on the serial line), or the window closing, ends a blocked `tcp_dial`, `tcp_recv` or `dns_a`
 within 100 ms. The call returns **`E_CANCELED` (-10)**, a new error added to §7.2's list for v0.5 and v1, and the
@@ -452,6 +482,17 @@ not redirect into the home network stays in Dira (url.rs), which alone knows whi
 
 **What stays for v1:** `SYSCALL`/`SYSRET`, channels and handle transfer, `process_spawn` from a memory image, and the
 window, AI, voice, cell and network services over channels (when they move, calls 64 to 76 are retired).
+
+**Test vectors for 69, 77 and 78** (a ring-3 program `rt3` under the test rig's flag, suites `pc-rt3` and `arm-rt3`):
+two 32-byte `random_fill`s differ and neither is all zero; len 0 and 257 are `E_INVAL`; a kernel address, a
+non-canonical one and the code page are `E_FAULT`; without a RANDOM handle, and with a NET handle in its place,
+`E_PERM`; a boot with no strong source gives `E_NOSOURCE` with the buffer (filled with 0xAA first) untouched.
+`time_now` within 2 s of the host's UTC; flags bit 0 set when the clock is started at 2020-01-01; bad pointers
+`E_FAULT`. `cell_put_text` with a row of Swahili, Yoruba (including a cluster with two combining marks, such as
+U+1EB9 U+0300), Amharic and one unassigned code point: the cells used, the desk's verify line and a screenshot;
+invalid UTF-8 shown as U+FFFD; runs that do not cover the text exactly `E_INVAL`; past 1,024 bytes `E_INVAL`; a run
+boundary in the middle of a two-byte code point (after the first byte of U+1EB9) `E_INVAL`; a run boundary between a base
+letter and its combining mark (U+1EB9 in one role, U+0300 in another) draws that cell in the first run's role.
 
 **Test vectors (with each step):** S1: create, map, write and read back; refused EXECUTE; the jump into a mapped page
 traps; the caps (`E_NOMEM`, nothing leaked: the frame pool's free count is the same before and after); exit frees;
@@ -626,7 +667,7 @@ list.
 - A fault in user mode kills only that process (suites `fault`, `pc-ring3`).
 - SEND/RECV check the handle and right on every call (suites `pc-ipc`; ARM Phase 0 demo).
 
-### 8.2 Known gaps in v0 (each tracked in docs/review/)
+### 8.2 Known gaps in v0 (each tracked in (a private engineering record))
 
 1. **ARM `SYS_AI` and `SYS_SPEAK` dereference user pointers without a range check.** A process can pass a
    kernel virtual address and have the kernel read (AI, SPEAK) or write (AI reply, up to 256 bytes) it.

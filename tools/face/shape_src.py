@@ -94,6 +94,102 @@ WORDS = ["السلام", "عليكم", "مرحبا", "بك", "في", "شكرا",
          "بٔ", "بٕ", "بٓ", "بّٰ", "بَٔ", "بِٕ", "سۓ", "کا", "لگ", "گا", "یک", "فی", "تا", "وا"]
 
 
+# --script dev2 (SHAPING_C3_PLAN.md): Devanagari for Hindi, Marathi and Nepali, face 2. Main swaps these in for the
+# Arabic values above; the Arabic output is byte for byte what it was.
+SCRIPT_TAG = "arab"
+FACE_LABEL = "Face 1 (Arabic)"
+DECOMP_RANGE = (0x0600, 0x0700)
+UNICODE_TABLES = True      # BIDI, JOIN, MIRROR, BRACKET live in face 1's file only
+KERN_TAGS = ("kern",)
+SIZE_LIMIT = None          # the architect's line for a face's compiled tables, checked when set
+DV = dict(
+    SOURCE="NotoSansDevanagari-v2.007, NotoSansDevanagari/unhinted/ttf/NotoSansDevanagari-Regular.ttf",
+    SOURCE_URL="https://github.com/notofonts/devanagari/releases/download/NotoSansDevanagari-v2.007/NotoSansDevanagari-v2.007.zip",
+    SOURCE_SHA256="9c7d935139ea6a1e6ad9dbac4f6d27ece1e04bca8123c8888d00a0f9df4724cd",
+    # the Hindi, Marathi and Nepali core of the block (step 1 measured it), the joiners and the dotted circle that
+    # a broken cluster is drawn on
+    CHARS=(list(range(0x0900, 0x093A)) + list(range(0x093C, 0x094E)) + [0x0950] + list(range(0x0958, 0x0970))
+           + [0x0971, 0x0972, 0x200C, 0x200D, 0x25CC, 0x0020]),
+    MASK_BITS={"all": 1, "rphf": 2, "pref": 4, "blwf": 8, "abvf": 16, "half": 32, "pstf": 64, "init": 128,
+               "cjct": 256},
+    GPOS_FEATURES=("kern", "dist", "abvm", "blwm", "mark", "mkmk"),
+    KERN_TAGS=("kern", "dist"),
+    SCRIPT_TAG="dev2",
+    FACE_LABEL="Face 2 (Devanagari)",
+    DECOMP_RANGE=(0x0900, 0x0980),
+    UNICODE_TABLES=False,
+    SIZE_LIMIT=200_000,
+)
+DV_UCD_FILES = {
+    "IndicSyllabicCategory.txt": "615f1b92ba7ec76e18c5b5c05d2e1836e4b98bc791eb9e27946c7621fc047ae7",
+    "IndicPositionalCategory.txt": "cbb9e2193e26c9b3d595a8f0ff4fd2ad956482309143ceb4ce5469c19f14feba",
+}
+# HarfBuzz's Indic plan (hb-ot-shaper-indic.cc collect_features): locl and ccmp per syllable, then each basic feature
+# its own stage, then the presentation features with the horizontal ones merged into their stage
+INDIC_BASIC = [("nukt", "all"), ("akhn", "all"), ("rphf", "rphf"), ("rkrf", "all"), ("pref", "pref"),
+               ("blwf", "blwf"), ("abvf", "abvf"), ("half", "half"), ("pstf", "pstf"), ("vatu", "all"),
+               ("cjct", "cjct")]
+INDIC_PRES = [("init", "init"), ("pres", "all"), ("abvs", "all"), ("blws", "all"), ("psts", "all"), ("haln", "all"),
+              ("calt", "all"), ("clig", "all"), ("liga", "all"), ("rclt", "all")]
+
+
+# The shaper's Indic categories and positions (indic.rs mirrors these numbers; they follow HarfBuzz's
+# hb-ot-shaper-indic.hh). The tool maps the UCD's syllabic and positional categories onto them once, offline.
+I_CAT = ["X", "C", "V", "N", "H", "ZWNJ", "ZWJ", "M", "SM", "A", "PLACEHOLDER", "DOTTEDCIRCLE", "RA", "SYMBOL"]
+I_POS = ["START", "RA_TO_BECOME_REPH", "PRE_M", "PRE_C", "BASE_C", "AFTER_MAIN", "ABOVE_C", "BEFORE_SUB", "BELOW_C",
+         "AFTER_SUB", "BEFORE_POST", "POST_C", "AFTER_POST", "SMVD", "END"]
+SYL_TO_CAT = {"Consonant": "C", "Consonant_Dead": "C", "Consonant_Placeholder": "PLACEHOLDER",
+              "Vowel_Independent": "V", "Vowel_Dependent": "M", "Virama": "H", "Nukta": "N", "Bindu": "SM",
+              "Visarga": "SM", "Avagraha": "SYMBOL", "Joiner": "ZWJ", "Non_Joiner": "ZWNJ", "Number": "PLACEHOLDER",
+              "Cantillation_Mark": "A", "Other": "X"}
+POSCAT_TO_POS = {"Bottom": "BELOW_C", "Left": "PRE_C", "NA": "END", "Right": "POST_C", "Top": "ABOVE_C"}
+RA = (0x0930,)
+
+
+def indic_props(cp, syl, posc):
+    """(category, position) as HarfBuzz's set_indic_properties gives them for Devanagari."""
+    cat = SYL_TO_CAT.get(syl, "X")
+    if cp == 0x25CC:
+        cat = "DOTTEDCIRCLE"
+    pos = POSCAT_TO_POS.get(posc.split("_And_")[0] if "_And_" in posc else posc, "END")
+    if cat in ("C", "V", "PLACEHOLDER", "DOTTEDCIRCLE"):
+        pos = "BASE_C"
+        if cp in RA:
+            cat = "RA"
+    elif cat == "M":
+        # Devanagari: a left matra is pre-base; right, top and bottom ones all sit after the subjoined forms
+        pos = "PRE_M" if posc == "Left" else "AFTER_SUB"
+    elif cat in ("SM", "A", "SYMBOL"):
+        pos = "SMVD"
+    return I_CAT.index(cat), I_POS.index(pos)
+
+
+def stages_indic(features):
+    return [[("locl", "all"), ("ccmp", "all")]] + [[f] for f in INDIC_BASIC] + [INDIC_PRES]
+
+
+DV_CONS = list(range(0x0915, 0x093A)) + list(range(0x0958, 0x0960))
+DV_MATRAS = list(range(0x093E, 0x094D)) + [0x0962, 0x0963]
+DV_WORDS = ["सेटिंग्स", "फ़ाइलें", "के बारे में", "सूचनाएँ", "फायली", "सेटिंग", "नमस्ते", "हिन्दी", "मराठी", "नेपाली",
+            "क्ष", "त्र", "ज्ञ", "श्र", "द्ध", "द्व", "ह्म", "स्त्र", "क्त", "न्न", "र्क", "र्त्य", "क्र", "ट्र", "प्र", "द्र",
+            "क्‍ष", "क्‌ष", "र्‍य", "ि", "कि", "र्कि", "क्षि", "स्त्रि", "ॐ", "।", "॥", "०१२३४५६७८९", "दुःख", "संस्कृत",
+            "चाँद", "अँग्रेज़ी", "ऋषि", "कृष्ण", "ड़", "ढ़", "क़", "ख़", "ग़", "ज़", "फ़", "य़", "ळ", "ऑफ़िस", "डॉक्टर",
+            "विद्यालय", "उद्योग", "पद्म", "शक्ति", "भ्रष्ट", "स्वागत", "धन्यवाद", "बंद करें", "फिर से शुरू करें",
+            # broken clusters, each drawn on a dotted circle (the architect's C3 condition)
+            "ु", "्", "ं", "़", "क ा", "ाु", "र्ि"]
+
+
+def tests_dv():
+    out = []
+    for c in DV_CONS:
+        out.append(chr(c))
+        out.append(chr(c) + "\u094D")
+        out.append(chr(c) + "\u093F")
+    for m in DV_MATRAS:
+        out.append("\u0915" + chr(m))
+    return [t.encode().decode("unicode_escape") if "\\u" in t else t for t in out] + DV_WORDS
+
+
 def sha256(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
@@ -137,8 +233,15 @@ class Compiler:
         key = tuple(sorted(set(glyphs)))
         if key not in self.setidx:
             self.setidx[key] = len(self.sets)
-            self.sets.append((len(self.setg), len(key)))
-            self.setg.extend(key)
+            # the set as sorted ranges of glyph ids (first, last): a class of hundreds of glyphs is a few ranges
+            ranges = []
+            for g in key:
+                if ranges and ranges[-1][1] + 1 == g:
+                    ranges[-1][1] = g
+                else:
+                    ranges.append([g, g])
+            self.sets.append((len(self.setg), len(ranges)))
+            self.setg.extend(tuple(r) for r in ranges)
         return self.setidx[key]
 
     def rule(self, back, inp, ahead, records):
@@ -147,8 +250,12 @@ class Compiler:
         for s in back + inp + ahead:
             self.match.append(self.set_of(s))
         r0 = len(self.recs)
-        self.recs.extend(records)
-        self.rules.append((m0, len(back), len(inp), len(ahead), r0, len(records)))
+        # packed (C3, the size line): a record is one u16, the sequence index in the top 4 bits and the lookup below
+        for seq, li in records:
+            assert seq < 16 and li < 4096, "a record that does not pack into a u16"
+            self.recs.append(seq << 12 | li)
+        assert m0 < 65536 and r0 < 65536, "rule offsets past a u16"
+        self.rules.append([m0, r0, len(back), len(inp), len(ahead), len(records), 0])
 
 
 def build(ttf, ucd, out, expected):
@@ -165,7 +272,7 @@ def build(ttf, ucd, out, expected):
     full_order = full.getGlyphOrder()
     feats_all = set()
     for sr in full["GSUB"].table.ScriptList.ScriptRecord:
-        if sr.ScriptTag == "arab":
+        if sr.ScriptTag == SCRIPT_TAG:
             for fi in sr.Script.DefaultLangSys.FeatureIndex:
                 feats_all.add(full["GSUB"].table.FeatureList.FeatureRecord[fi].FeatureTag)
     stage_plan = stages_for(feats_all)
@@ -175,7 +282,7 @@ def build(ttf, ucd, out, expected):
     font = TTFont(ttf)
     opts = subset.Options()
     opts.layout_features = wanted
-    opts.layout_scripts = ["arab", "DFLT"]
+    opts.layout_scripts = [SCRIPT_TAG, "DFLT"]
     opts.glyph_names = True
     opts.notdef_outline = True
     opts.hinting = False
@@ -194,7 +301,7 @@ def build(ttf, ucd, out, expected):
     # HarfBuzz decomposes them): (code point, first, second)
     have = {cp for cp, _ in pairs}
     decomp = []
-    for cp in range(0x0600, 0x0700):
+    for cp in range(*DECOMP_RANGE):
         if cp in have:
             continue
         d = unicodedata.decomposition(chr(cp))
@@ -244,12 +351,14 @@ def build(ttf, ucd, out, expected):
     def recs(r):
         return [(x.SequenceIndex, x.LookupListIndex) for x in r.SubstLookupRecord]
 
+    LOOKUP_COV = []
     for li, lk in enumerate(lookups):
         flag = lk.LookupFlag
         if flag & 0xFF00:
             sys.exit("shape_src: lookup %d uses a mark attachment type (flag 0x%x), not in C1" % (li, flag))
         mfs = getattr(lk, "MarkFilteringSet", None)
         s0 = len(SUBS)
+        rule0 = len(comp.rules)
         for typ, st in subtables(lk, 7):
             kinds_seen.add(typ)
             if typ in (1, 3):
@@ -313,7 +422,7 @@ def build(ttf, ucd, out, expected):
                             continue
                         for r in (rs.ChainSubClassRule if chain else rs.SubClassRule):
                             back = [bc.get(c, []) for c in (r.Backtrack if chain else [])]
-                            inp = [first] + [ic.get(c, []) for c in r.Input]
+                            inp = [first] + [ic.get(c, []) for c in (r.Input if chain else r.Class)]
                             ahead = [ac.get(c, []) for c in (r.LookAhead if chain else [])]
                             comp.rule(back, inp, ahead, recs(r))
                     SUBS.append((5, comp.set_of(cov), r0, len(comp.rules) - r0))
@@ -329,29 +438,60 @@ def build(ttf, ucd, out, expected):
             else:
                 sys.exit("shape_src: GSUB lookup %d is type %d, not in C1" % (li, typ))
         LK.append((lk.LookupType, flag, 0xFFFF if mfs is None else mfs, s0, len(SUBS) - s0))
+        # C3b: the lookup's coverage, every glyph one of its subtables can start on, checked before any subtable
+        first = set()
+        for kind, a, b, c in SUBS[s0:]:
+            if kind == 1:
+                first.update(r[0] for r in SINGLE[a:a + b])
+            elif kind == 2:
+                first.update(r[0] for r in MULT[a:a + b])
+            elif kind == 4:
+                first.update(r[0] for r in LIGS[a:a + b])
+            elif kind == 5:
+                sa, sn = comp.sets[a]
+                for lo, hi in comp.setg[sa:sa + sn]:
+                    first.update(range(lo, hi + 1))
+        LOOKUP_COV.append(comp.set_of(first))
+        # C3b: each rule's skip, the next rule of its subtable whose first glyph set is another (rules of one first
+        # set sit together once class rules are expanded); a failed first glyph jumps there
+        for kind, a, b, c in SUBS[s0:]:
+            if kind != 5:
+                continue
+            for r in range(b, b + c):
+                fs = comp.match[comp.rules[r][0] + comp.rules[r][2]]
+                nxt = r + 1
+                while nxt < b + c and comp.match[comp.rules[nxt][0] + comp.rules[nxt][2]] == fs:
+                    nxt += 1
+                comp.rules[r][6] = nxt
 
     # 2b. the stages, from the subset's own feature list
     feat_lookups = {}
     for sr in gsub.ScriptList.ScriptRecord:
-        if sr.ScriptTag == "arab":
+        if sr.ScriptTag == SCRIPT_TAG:
             for fi in sr.Script.DefaultLangSys.FeatureIndex:
                 fr = gsub.FeatureList.FeatureRecord[fi]
                 feat_lookups.setdefault(fr.FeatureTag, []).extend(fr.Feature.LookupListIndex)
-    STAGES, STAGEL = [], []
-    for st in stage_plan:
+    STAGES, STAGEL, STAGE_SYL, STAGE_FEAT = [], [], [], []
+    for si, st in enumerate(stage_plan):
         m = {}
+        present = []
         for f, mask in st:
+            if feat_lookups.get(f):
+                present.append(f)
             for li in feat_lookups.get(f, []):
                 m[li] = m.get(li, 0) | MASK_BITS[mask]
         if m:
+            for f in present:
+                STAGE_FEAT.append((len(STAGES), f))
             STAGES.append((len(STAGEL), len(m)))
+            STAGE_SYL.append(si == 0 and not UNICODE_TABLES)
             STAGEL.extend(sorted(m.items()))
 
     # 2c. GPOS mark attachment, per lookup of the mark and mkmk features, in lookup order
     gpos = font["GPOS"].table
     pos_feat = []
     for sr in gpos.ScriptList.ScriptRecord:
-        if sr.ScriptTag == "arab":
+        if sr.ScriptTag == SCRIPT_TAG:
             for fi in sr.Script.DefaultLangSys.FeatureIndex:
                 fr = gpos.FeatureList.FeatureRecord[fi]
                 if fr.FeatureTag in GPOS_FEATURES:
@@ -360,10 +500,10 @@ def build(ttf, ucd, out, expected):
     KSUB, KPAIR, KCD, KCELL = [], [], [], []
     kern_lookups = []
     for sr in gpos.ScriptList.ScriptRecord:
-        if sr.ScriptTag == "arab":
+        if sr.ScriptTag == SCRIPT_TAG:
             for fi in sr.Script.DefaultLangSys.FeatureIndex:
                 fr = gpos.FeatureList.FeatureRecord[fi]
-                if fr.FeatureTag == "kern":
+                if fr.FeatureTag in KERN_TAGS:
                     kern_lookups.extend(fr.Feature.LookupListIndex)
 
     def xadv_only(fmt, what):
@@ -538,16 +678,32 @@ def build(ttf, ucd, out, expected):
                 prev = val[cp]
         return ranges
 
-    bidi = derived("extracted/DerivedBidiClass.txt", BIDI_CLASSES, "L")
-    join = derived("extracted/DerivedJoiningType.txt", JOIN_TYPES, "U")
-    mirror = []
-    for ln in ucd_lines("BidiMirroring.txt"):
+    bidi, join, mirror, bracket, indic = [], [], [], [], []
+    if UNICODE_TABLES:
+        bidi = derived("extracted/DerivedBidiClass.txt", BIDI_CLASSES, "L")
+        join = derived("extracted/DerivedJoiningType.txt", JOIN_TYPES, "U")
+    else:
+        # the Indic categories of every character of the face, as the UCD gives them (indic.rs maps them to the
+        # shaper's own categories, as HarfBuzz does)
+        cats = {}
+        for rel, k in (("IndicSyllabicCategory.txt", 0), ("IndicPositionalCategory.txt", 1)):
+            for ln in ucd_lines(rel):
+                ln = ln.split("#")[0].strip()
+                if not ln:
+                    continue
+                rng, v = [x.strip() for x in ln.split(";")[:2]]
+                a, b = parse_range(rng)
+                for cp in range(a, b + 1):
+                    if cp in set(CHARS):
+                        cats.setdefault(cp, ["Other", "NA"])[k] = v
+        indic = sorted((cp,) + indic_props(cp, c[0], c[1]) for cp, c in cats.items())
+    for ln in (ucd_lines("BidiMirroring.txt") if UNICODE_TABLES else []):
         ln = ln.split("#")[0].strip()
         if ln:
             a, b = [int(x.strip(), 16) for x in ln.split(";")[:2]]
             mirror.append((a, b))
     bracket = []
-    for ln in ucd_lines("BidiBrackets.txt"):
+    for ln in (ucd_lines("BidiBrackets.txt") if UNICODE_TABLES else []):
         ln = ln.split("#")[0].strip()
         if ln:
             a, b, t = [x.strip() for x in ln.split(";")[:3]]
@@ -558,12 +714,13 @@ def build(ttf, ucd, out, expected):
     # 5. the oracle: HarfBuzz on the FULL font, kerning off. Hash per glyph in visual order: (our glyph id by name,
     # x where it is drawn = pen + x offset, y offset), font units.
     hbfont = hb.Font(hb.Face(hb.Blob.from_file_path(ttf)))
+    space_name = full.getBestCmap().get(0x20)
     exp_lines = []
     for k, s in enumerate(tests()):
         buf = hb.Buffer()
         buf.add_codepoints([ord(c) for c in s])
         buf.guess_segment_properties()
-        if not any(unicodedata.bidirectional(c) in ("AL", "R") for c in s):
+        if not UNICODE_TABLES or not any(unicodedata.bidirectional(c) in ("AL", "R") for c in s):
             # no Arabic letter (digits, marks, punctuation alone): the bidi algorithm lays such a line out left to
             # right, so the oracle shapes it that way too (HarfBuzz would guess right to left from the script)
             buf.direction = "ltr"
@@ -574,6 +731,10 @@ def build(ttf, ucd, out, expected):
                 pen += pos.x_advance
                 continue
             name = full_order[info.codepoint]
+            if name == space_name and pos.x_advance == 0:
+                # a joiner HarfBuzz shows as an empty space glyph inside a syllable's cluster: the kernel never
+                # draws a joiner, so the oracle leaves it out as well
+                continue
             g = gid.get(name, 0xFFFF)
             x, y = pen + pos.x_offset, pos.y_offset
             h = fnv(h, g.to_bytes(2, "little") + (x & 0xFFFFFFFF).to_bytes(4, "little") + (y & 0xFFFFFFFF).to_bytes(4, "little"))
@@ -595,7 +756,7 @@ def build(ttf, ucd, out, expected):
     w("//! The desk's text shaper tables (SHAPING_PLAN.md, phase C1). GENERATED by tools/face/shape_src.py; do not")
     w("//! edit: run the tool (in the cloud) again, and the cloud job checks it regenerates this file byte for byte.")
     w("//!")
-    w("//! Face 1 (Arabic) is a subset of %s," % SOURCE)
+    w("//! %s is a subset of %s," % (FACE_LABEL, SOURCE))
     w("//! sha256 %s." % SOURCE_SHA256)
     w("//! A Modified Version of Noto Sans Arabic, Copyright 2022 The Noto Project Authors")
     w("//! (https://github.com/notofonts/arabic). The face and layout tables are licensed under the SIL Open Font")
@@ -625,10 +786,12 @@ def build(ttf, ucd, out, expected):
     table("PTS", "(i16, i16)", pts, "(%d, %d),", 8)
     w("/// Bit 0: on the curve (else a quadratic control point). Bit 2: the first point of a contour.")
     table("KIND", "u8", kind, "%d,", 32)
-    w("/// Glyph sets: (first in SETG, count); each run in SETG is sorted. Set k for k < %d is mark filtering set k."
+    w("/// Glyph sets: (first in SETG, count of ranges); SETG holds sorted (first glyph, last glyph) ranges. Set k for k < %d is mark filtering set k."
       % len(mark_sets))
     table("SETS", "(u32, u16)", comp.sets, "(%d, %d),", 8)
-    table("SETG", "u16", comp.setg, "%d,", 20)
+    table("SETG", "(u16, u16)", comp.setg, "(%d, %d),", 10)
+    w("/// Each GSUB lookup's coverage (C3b): the glyph set of every glyph one of its subtables can start on.")
+    table("LOOKUP_COV", "u16", LOOKUP_COV, "%d,", 20)
     w("/// GSUB lookups by index: (type, flag, mark filtering set or 0xFFFF, first subtable, subtables).")
     table("LOOKUPS", "(u8, u16, u16, u16, u16)", LK, "(%d, 0x%X, 0x%X, %d, %d),", 4)
     w("/// GSUB subtables: (kind, a, b, c). Kind 1 single: SINGLE[a..a+b]. 2 multiple: MULT[a..a+b]. 4 ligature:")
@@ -642,12 +805,13 @@ def build(ttf, ucd, out, expected):
     w("/// (first glyph, first in LIGG, components after the first, ligature), by first glyph, the font's order kept.")
     table("LIGS", "(u16, u16, u8, u16)", LIGS, "(%d, %d, %d, %d),", 6)
     table("LIGG", "u16", LIGG, "%d,", 20)
-    w("/// Rules: (first in MATCH, backtrack, input, lookahead, first in RECS, records). MATCH holds glyph set")
+    w("/// Rules: (first in MATCH, first in RECS, backtrack, input, lookahead, records, the next rule with another")
+    w("/// first glyph set). MATCH holds glyph set")
     w("/// indices: the backtrack (nearest first), the input (its first included), the lookahead.")
-    table("RULES", "(u32, u8, u8, u8, u32, u8)", comp.rules, "(%d, %d, %d, %d, %d, %d),", 4)
+    table("RULES", "(u16, u16, u8, u8, u8, u8, u16)", [tuple(r) for r in comp.rules], "(%d, %d, %d, %d, %d, %d, %d),", 4)
     table("MATCH", "u16", comp.match, "%d,", 20)
-    w("/// (sequence index, lookup)")
-    table("RECS", "(u8, u16)", comp.recs, "(%d, %d),", 10)
+    w("/// Records, packed: the sequence index in the top 4 bits, the lookup in the low 12.")
+    table("RECS", "u16", comp.recs, "%d,", 16)
     w("/// The GSUB stages in HarfBuzz's Arabic order: (first in STAGEL, count); STAGEL (lookup, mask), by lookup.")
     table("STAGES", "(u16, u16)", STAGES, "(%d, %d),", 8)
     table("STAGEL", "(u16, u16)", STAGEL, "(%d, %d),", 8)
@@ -668,6 +832,20 @@ def build(ttf, ucd, out, expected):
     table("KCELL", "(u16, u16, i16, i16)", KCELL, "(%d, %d, %d, %d),", 6)
     w("/// Canonical decompositions the shaper applies when face 1 lacks the character: (code point, first, second).")
     table("DECOMP", "(u32, u32, u32)", decomp, "(0x%04X, 0x%04X, 0x%04X),", 4)
+    if not UNICODE_TABLES:
+        w("/// HarfBuzz's Indic stages that apply per syllable (locl and ccmp): one flag per stage.")
+        w("pub static STAGE_PER_SYLLABLE: [bool; %d] = [%s];" % (len(STAGE_SYL), ", ".join("true" if x else "false" for x in STAGE_SYL)))
+        w("")
+        w("/// (stage, feature tag): which features each stage holds, for the shaper's would-substitute checks.")
+        w("pub static STAGE_FEAT: [(u16, [u8; 4]); %d] = [" % len(STAGE_FEAT))
+        for si, f in STAGE_FEAT:
+            w("    (%d, *b\"%s\")," % (si, f))
+        w("];")
+        w("")
+        w("/// (code point, category, position) for every character of the face, sorted: the UCD's Indic syllabic and")
+        w("/// positional categories mapped as HarfBuzz maps them for Devanagari. Categories: %s." % " ".join(I_CAT))
+        w("/// Positions: %s." % " ".join(I_POS))
+        table("INDIC", "(u32, u8, u8)", indic, "(0x%04X, %d, %d),", 6)
     w("/// Bidi classes, in this order: %s." % " ".join(BIDI_CLASSES))
     w("/// (first code point, class) ranges over all of Unicode, sorted.")
     table("BIDI", "(u32, u8)", bidi, "(0x%X, %d),", 8)
@@ -691,10 +869,10 @@ def build(ttf, ucd, out, expected):
         f.write("# the x offset; the string as UTF-8 hex; the glyphs. HarfBuzz %s on the full font, default features.\n"
                 % hb.__version__)
         f.write("\n".join(exp_lines) + "\n")
-    nbytes = (len(pts) * 5 + len(rows) * 12 + len(pairs) * 8 + len(comps) * 6 + ng + len(comp.setg) * 2
+    nbytes = (len(pts) * 5 + len(rows) * 12 + len(pairs) * 8 + len(comps) * 6 + ng + len(comp.setg) * 4
               + len(comp.sets) * 8 + len(LK) * 10 + len(SUBS) * 16 + len(SINGLE) * 4 + len(MULT) * 6
-              + len(MULTG) * 2 + len(LIGS) * 8 + len(LIGG) * 2 + len(comp.rules) * 16 + len(comp.match) * 2
-              + len(comp.recs) * 4 + len(PMARK) * 8 + len(PBASE) * 8 + len(bidi) * 8 + len(join) * 8
+              + len(MULTG) * 2 + len(LIGS) * 8 + len(LIGG) * 2 + len(comp.rules) * 10 + len(LOOKUP_COV) * 2 + len(comp.match) * 2
+              + len(comp.recs) * 2 + len(PMARK) * 8 + len(PBASE) * 8 + len(bidi) * 8 + len(join) * 8
               + len(mirror) * 8 + len(bracket) * 12)
     print("shape_src: %d characters, %d glyphs, %d points, %d components, UPEM %d"
           % (len(pairs), ng, len(pts), len(comps), head.unitsPerEm))
@@ -707,15 +885,31 @@ def build(ttf, ucd, out, expected):
     kb = len(KSUB) * 32 + len(KPAIR) * 8 + len(KCD) * 4 + len(KCELL) * 8
     print("shape_src: kern %d subtables, %d pairs, %d class rows, %d cells, about %d bytes" % (len(KSUB), len(KPAIR), len(KCD), len(KCELL), kb))
     sizes = {"PTS/KIND (outlines)": len(pts) * 5, "BIDI": len(bidi) * 8, "JOIN": len(join) * 8, "MIRROR": len(mirror) * 8,
-             "kern": kb, "PBASE": len(PBASE) * 8, "SETG": len(comp.setg) * 2, "GLYPHS": len(rows) * 12}
+             "kern": kb, "PBASE": len(PBASE) * 8, "SETG": len(comp.setg) * 4, "GLYPHS": len(rows) * 12}
     big = max(sizes, key=sizes.get)
     print("shape_src: largest table %s, about %d bytes; all: %s" % (big, sizes[big], sizes))
     print("shape_src: BIDI %d ranges, JOIN %d, MIRROR %d, BRACKET %d" % (len(bidi), len(join), len(mirror), len(bracket)))
     print("shape_src: %d oracle strings; table bytes about %d" % (len(exp_lines), nbytes))
+    if SIZE_LIMIT is not None and nbytes > SIZE_LIMIT:
+        sys.exit("shape_src: %s compiles to about %d bytes, over the %d the architect set for a face"
+                 % (FACE_LABEL, nbytes, SIZE_LIMIT))
 
 
 def main():
+    global SOURCE, SOURCE_URL, SOURCE_SHA256, CHARS, MASK_BITS, GPOS_FEATURES, KERN_TAGS, SCRIPT_TAG, FACE_LABEL
+    global DECOMP_RANGE, UNICODE_TABLES, SIZE_LIMIT, stages_for, tests
     args = sys.argv[1:]
+    first = "--first" in args
+    args = [a for a in args if a != "--first"]
+    if args[:2] == ["--script", "dev2"]:
+        args = args[2:]
+        g = globals()
+        for k, v in DV.items():
+            g[k] = v
+        stages_for = stages_indic
+        tests = tests_dv
+        UCD_FILES.clear()
+        UCD_FILES.update(DV_UCD_FILES)
     if len(args) == 2 and args[0] == "--sha":
         print(sha256(args[1]))
         return
@@ -725,7 +919,11 @@ def main():
     pins = [(ttf, SOURCE_SHA256)] + [(os.path.join(ucd, f), s) for f, s in sorted(UCD_FILES.items())]
     for path, want in pins:
         got = sha256(path)
-        if got != want:
+        if want is None:
+            print("shape_src: sha256 %s %s (NOT PINNED YET)" % (got, path))
+            if not first:
+                sys.exit("shape_src: %s is not pinned (run with --first once, then pin it)" % path)
+        elif got != want:
             sys.exit("shape_src: %s has sha256 %s, not the pinned %s" % (path, got, want))
     build(ttf, ucd, out, expected)
 

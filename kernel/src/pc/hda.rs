@@ -57,6 +57,8 @@ const SET_STREAM: u32 = 0x706;
 const SET_PINCTL: u32 = 0x707;
 const SET_EAPD: u32 = 0x70C;
 const GET_CFG: u32 = 0xF1C;
+const SET_SENSE: u32 = 0x709; // Execute Pin Sense, for a pin that needs a trigger first
+const GET_SENSE: u32 = 0xF09; // Get Pin Sense: bit 31 set when something is plugged in
 const SET_FMT4: u32 = 0x2; // 4-bit verb, 16-bit payload
 const SET_AMP4: u32 = 0x3;
 const P_VENDOR: u32 = 0x00;
@@ -1251,6 +1253,9 @@ pub fn list() {
                 _ => {}
             }
         }
+        if CODEC_ID != 0 {
+            jacks();
+        }
         if READY {
             crate::kprintln!(
                 "lshda: sound goes out through {}, stream {}, {} 16-bit stereo",
@@ -1269,6 +1274,46 @@ pub fn list() {
         }
         if LATE > 0 {
             crate::kprintln!("lshda: late codec answers dropped before a command: {}", LATE);
+        }
+    }
+}
+
+/// The jacks that can tell whether something is plugged in, each asked once (reads only). A pin
+/// counts when its caps have presence detect (bit 2), its config says it is a jack on the board
+/// (bits 31:30 not "no physical connection" or "built in") and its "no presence detect" bit (8)
+/// is clear. Execute Pin Sense goes first when the pin needs a trigger (pin caps bit 1); then Get
+/// Pin Sense, bit 31 set means plugged in (Intel High Definition Audio Specification 1.0a: the Pin Sense verbs
+/// F09h and 709h, and the Pin Capabilities parameter 0Ch with its presence detect and trigger bits).
+fn jacks() {
+    // SAFETY: reads of boot-time state; cmd() is single core and one command at a time.
+    unsafe {
+        let mut n = 0;
+        for i in 0..NW {
+            let w = WS[i];
+            if (w.caps >> 20) & 0xF != W_PIN || w.pincaps & (1 << 2) == 0 {
+                continue;
+            }
+            if w.cfg >> 30 == 1 || w.cfg >> 30 == 2 || w.cfg & (1 << 8) != 0 {
+                continue;
+            }
+            if n == 0 {
+                crate::kprint!("lshda: jacks:");
+            }
+            crate::kprint!("{} {} (node {})", if n == 0 { "" } else { "," }, pin_kind(w.cfg), w.nid);
+            n += 1;
+            if w.pincaps & (1 << 1) != 0 {
+                let _ = cmd(w.nid, SET_SENSE, 0);
+            }
+            match cmd(w.nid, GET_SENSE, 0) {
+                Some(v) if v & (1 << 31) != 0 => crate::kprint!(" plugged in"),
+                Some(_) => crate::kprint!(" empty"),
+                None => crate::kprint!(" did not answer"),
+            }
+        }
+        if n == 0 {
+            crate::kprintln!("lshda: jacks: none on this codec can tell whether something is plugged in");
+        } else {
+            crate::kprintln!("");
         }
     }
 }

@@ -119,6 +119,8 @@ static WASM_SUM: &[u8] = &[
           0x0C,0x00,
         0x0B, 0x0B, 0x20,0x02, 0x0B,
       0x08, 0x00, 0x41,0x0A, 0x10,0x01, 0x10,0x00, 0x0B,
+    // afri.permissions (item 8, C1): print
+    0x00,0x18,0x10,b'a',b'f',b'r',b'i',b'.',b'p',b'e',b'r',b'm',b'i',b's',b's',b'i',b'o',b'n',b's',0x01,0x05,b'p',b'r',b'i',b'n',b't',
 ];
 
 // --- Module B: print a string from linear memory (needs "putc"). ------------
@@ -151,6 +153,8 @@ static WASM_STR: &[u8] = &[
         0x0B, 0x0B, 0x0B,
     0x0B,0x16,0x01, 0x00, 0x41,0x00,0x0B, 0x10,
       b'H',b'E',b'L',b'L',b'O',b' ',b'F',b'R',b'O',b'M',b' ',b'W',b'A',b'S',b'M',0x00,
+    // afri.permissions (item 8, C1): putc
+    0x00,0x17,0x10,b'a',b'f',b'r',b'i',b'.',b'p',b'e',b'r',b'm',b'i',b's',b's',b'i',b'o',b'n',b's',0x01,0x04,b'p',b'u',b't',b'c',
 ];
 
 // --- Module C: a graphical app — draws a window via the host ABI (needs draw).
@@ -173,6 +177,8 @@ static WASM_DRAW: &[u8] = &[
     0xC8, 0x00, 0x41, 0x3C, 0x41, 0xBF, 0x92, 0x9F, 0x01, 0x10, 0x01, 0x20,
     0x00, 0x41, 0xE8, 0x00, 0x41, 0x24, 0x41, 0xD0, 0x00, 0x41, 0x3C, 0x41,
     0xD6, 0xBE, 0xFD, 0x07, 0x10, 0x01, 0x10, 0x02, 0x0B,
+    // afri.permissions (item 8, C1): draw
+    0x00,0x17,0x10,b'a',b'f',b'r',b'i',b'.',b'p',b'e',b'r',b'm',b'i',b's',b's',b'i',b'o',b'n',b's',0x01,0x04,b'd',b'r',b'a',b'w',
 ];
 
 // --- Module D: file I/O — write a file, read it back, print it (needs file). -
@@ -196,6 +202,8 @@ static WASM_FILE: &[u8] = &[
     0x02, 0x00, 0x41, 0x00, 0x0B, 0x08, 0x6E, 0x6F, 0x74, 0x65, 0x2E, 0x74,
     0x78, 0x74, 0x00, 0x41, 0x10, 0x0B, 0x0D, 0x53, 0x41, 0x56, 0x45, 0x44,
     0x20, 0x42, 0x59, 0x20, 0x57, 0x41, 0x53, 0x4D,
+    // afri.permissions (item 8, C1): file, putc
+    0x00,0x1C,0x10,b'a',b'f',b'r',b'i',b'.',b'p',b'e',b'r',b'm',b'i',b's',b's',b'i',b'o',b'n',b's',0x02,0x04,b'f',b'i',b'l',b'e',0x04,b'p',b'u',b't',b'c',
 ];
 
 // --- Module E: read the clock and print it (needs time). --------------------
@@ -207,6 +215,8 @@ static WASM_CLOCK: &[u8] = &[
     0x03, 0x65, 0x6E, 0x76, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x00, 0x01,
     0x03, 0x02, 0x01, 0x02, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00,
     0x02, 0x0A, 0x08, 0x01, 0x06, 0x00, 0x10, 0x00, 0x10, 0x01, 0x0B,
+    // afri.permissions (item 8, C1): time, print
+    0x00,0x1D,0x10,b'a',b'f',b'r',b'i',b'.',b'p',b'e',b'r',b'm',b'i',b's',b's',b'i',b'o',b'n',b's',0x02,0x04,b't',b'i',b'm',b'e',0x05,b'p',b'r',b'i',b'n',b't',
 ];
 
 // --- Module F: interactive — type into a window until '~' (getkey+win_text). -
@@ -233,6 +243,8 @@ static WASM_TYPE: &[u8] = &[
     0x00, 0x20, 0x01, 0x20, 0x02, 0x20, 0x03, 0x41, 0xF0, 0xCD, 0x83, 0x07,
     0x10, 0x02, 0x20, 0x01, 0x41, 0x08, 0x6A, 0x21, 0x01, 0x10, 0x04, 0x0C,
     0x00, 0x0B, 0x0B, 0x0B,
+    // afri.permissions (item 8, C1): draw, input
+    0x00,0x1D,0x10,b'a',b'f',b'r',b'i',b'.',b'p',b'e',b'r',b'm',b'i',b's',b's',b'i',b'o',b'n',b's',0x02,0x04,b'd',b'r',b'a',b'w',0x05,b'i',b'n',b'p',b'u',b't',
 ];
 
 // --- Module G: ask the on-device AI a question (needs ai). ------------------
@@ -251,6 +263,8 @@ static WASM_AI: &[u8] = &[
     0x01, 0x41, 0x01, 0x6A, 0x21, 0x01, 0x0C, 0x00, 0x0B, 0x0B, 0x0B, 0x0B,
     0x11, 0x01, 0x00, 0x41, 0x00, 0x0B, 0x0B, 0x57, 0x48, 0x4F, 0x20, 0x41,
     0x52, 0x45, 0x20, 0x59, 0x4F, 0x55,
+    // afri.permissions (item 8, C1): ai, putc
+    0x00,0x1A,0x10,b'a',b'f',b'r',b'i',b'.',b'p',b'e',b'r',b'm',b'i',b's',b's',b'i',b'o',b'n',b's',0x02,0x02,b'a',b'i',0x04,b'p',b'u',b't',b'c',
 ];
 
 // --- Module H: MULTI-TURN interactive AI chat — ask questions, empty line quits.
@@ -275,6 +289,8 @@ static WASM_CHAT: &[u8] = &[
     0x20, 0x03, 0x2D, 0x00, 0x00, 0x10, 0x01, 0x20, 0x03, 0x41, 0x01, 0x6A,
     0x21, 0x03, 0x0C, 0x00, 0x0B, 0x0B, 0x41, 0x0A, 0x10, 0x01, 0x0C, 0x00,
     0x0B, 0x0B, 0x0B,
+    // afri.permissions (item 8, C1): input, putc, ai
+    0x00,0x20,0x10,b'a',b'f',b'r',b'i',b'.',b'p',b'e',b'r',b'm',b'i',b's',b's',b'i',b'o',b'n',b's',0x03,0x05,b'i',b'n',b'p',b'u',b't',0x04,b'p',b'u',b't',b'c',0x02,b'a',b'i',
 ];
 
 // --- Module I: speak a notification via Asili Voice (needs voice cap). -------
@@ -290,6 +306,8 @@ static WASM_NOTIFY: &[u8] = &[
     0x4F, 0x57, 0x20, 0x4F, 0x4E, 0x20, 0x42, 0x41, 0x54, 0x54, 0x45, 0x52,
     0x59, 0x2C, 0x20, 0x50, 0x4C, 0x45, 0x41, 0x53, 0x45, 0x20, 0x43, 0x48,
     0x41, 0x52, 0x47, 0x45, 0x20, 0x49, 0x54, 0x2E,
+    // afri.permissions (item 8, C1): voice
+    0x00,0x18,0x10,b'a',b'f',b'r',b'i',b'.',b'p',b'e',b'r',b'm',b'i',b's',b's',b'i',b'o',b'n',b's',0x01,0x05,b'v',b'o',b'i',b'c',b'e',
 ];
 
 // --- Module I2: the SAME app with a DIFFERENT spoken text (3.262). ----------
@@ -307,6 +325,8 @@ static WASM_NOTIFY2: &[u8] = &[
     0x41, 0x53, 0x20, 0x42, 0x4F, 0x49, 0x4C, 0x45, 0x44, 0x2C, 0x20, 0x59,
     0x4F, 0x55, 0x52, 0x20, 0x54, 0x45, 0x41, 0x20, 0x49, 0x53, 0x20, 0x52,
     0x45, 0x41, 0x44, 0x59, 0x2E,
+    // afri.permissions (item 8, C1): voice
+    0x00,0x18,0x10,b'a',b'f',b'r',b'i',b'.',b'p',b'e',b'r',b'm',b'i',b's',b's',b'i',b'o',b'n',b's',0x01,0x05,b'v',b'o',b'i',b'c',b'e',
 ];
 
 // --- Linear memory ----------------------------------------------------------
@@ -2643,6 +2663,8 @@ static WASM_NET: &[u8] = &[
     0x03, 0x02, 0x01, 0x02, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00,
     0x02, 0x0A, 0x10, 0x01, 0x0E, 0x00, 0x41, 0x00, 0x10, 0x00, 0x10, 0x01,
     0x41, 0x01, 0x10, 0x00, 0x10, 0x01, 0x0B,
+    // afri.permissions (item 8, C1): net, print
+    0x00,0x1C,0x10,b'a',b'f',b'r',b'i',b'.',b'p',b'e',b'r',b'm',b'i',b's',b's',b'i',b'o',b'n',b's',0x02,0x03,b'n',b'e',b't',0x05,b'p',b'r',b'i',b'n',b't',
 ];
 
 /// Demonstrate capability-gated networking: run the same net app twice — once with
@@ -2879,6 +2901,8 @@ static WASM_RAND: &[u8] = &[
     0x03, 0x02, 0x01, 0x02,
     0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x02,
     0x0A, 0x0C, 0x01, 0x0A, 0x00, 0x10, 0x00, 0x10, 0x01, 0x10, 0x00, 0x10, 0x01, 0x0B,
+    // afri.permissions (item 8, C1): random, print
+    0x00,0x1F,0x10,b'a',b'f',b'r',b'i',b'.',b'p',b'e',b'r',b'm',b'i',b's',b's',b'i',b'o',b'n',b's',0x02,0x06,b'r',b'a',b'n',b'd',b'o',b'm',0x05,b'p',b'r',b'i',b'n',b't',
 ];
 
 /// Demonstrate capability-gated randomness: run the same app twice — once with
@@ -2947,6 +2971,14 @@ static WASM_BENCH_B2: [u8; 123] = [
     0x21, 0x00, 0x0C, 0x00, 0x0B, 0x0B, 0x20, 0x01, 0x10, 0x00, 0x0B,
 ];
 
+// Ngoma, the media player (nia-apps branch ngoma at ecc92b4, bench/ngoma-bench; built by the core apps
+// engineer). qoa decodes one second of stereo 44.1 kHz QOA audio (9 decodes of one 5,120-sample frame, 92,160
+// samples) and prints -1598551745; drums synthesises one second of drums at 22,050 Hz in 1,050-sample refills
+// and prints 1189282394. Each imports only afri.print. The architect wants this number before any decision on
+// a kernel-side decoder (ARCHITECT_REVIEWS 14 Nov, "Ngoma media player plan", Q3).
+static NGOMA_BENCH_QOA: &[u8] = include_bytes!("bench/ngoma-bench-qoa.wasm");
+static NGOMA_BENCH_DRUMS: &[u8] = include_bytes!("bench/ngoma-bench-drums.wasm");
+
 /// One timed run of `run` in `bytes`, nothing printed by the runtime itself (only the app's own print).
 /// Returns the time in microseconds, or the TRAP or parse error.
 fn bench_once(bytes: &[u8]) -> Result<u64, &'static str> {
@@ -2999,6 +3031,20 @@ pub fn bench() {
                 );
             }
             (Err(e), _) | (_, Err(e)) => crate::kprintln!("[bench] {}: TRAP: {}", name, e),
+        }
+    }
+    // Ngoma: one second of sound per run, so under 1,000,000 us keeps up. The new way only, one run each.
+    let ngoma: [(&str, &[u8]); 2] = [
+        ("ngoma qoa 1 s stereo 44.1 kHz", NGOMA_BENCH_QOA),
+        ("ngoma drums 1 s 22.05 kHz", NGOMA_BENCH_DRUMS),
+    ];
+    for (name, bytes) in ngoma {
+        match bench_once(bytes) {
+            Ok(us) => crate::kprintln!(
+                "[bench] {}: new {} us, {}% of real time, {}",
+                name, us, us / 10_000, if us < 1_000_000 { "keeps up" } else { "too slow" }
+            ),
+            Err(e) => crate::kprintln!("[bench] {}: TRAP: {}", name, e),
         }
     }
     crate::kprintln!("[bench] done");
@@ -3674,11 +3720,30 @@ pub fn bundled(name: &str) -> Option<&'static [u8]> {
     BUNDLED.iter().find(|(n, _)| *n == name).map(|(_, bytes)| bytes())
 }
 
-/// Whether a bundled app also gets a VFS copy (A7): only the classic small ones (512 bytes or less, the twelve
-/// demos). Anything bigger (Ngoma, Andika) exists only in the kernel image, and `ls` and the store list it as built
-/// in. So a disk holding only the demos keeps the small-files format (persist-big's boot 3), byte for byte.
-fn bundled_in_vfs(bytes: &[u8]) -> bool {
-    bytes.len() <= crate::vfs::MAX_FILE_BYTES
+/// The bundled apps that are "copied": each also gets a VFS file, as before A7. Every other bundled entry is "built
+/// in": it exists only in the kernel image, and `ls` and the store list it as built in. A rule, not a size (the
+/// architect's A7 follow-up): a copied app must be 512 bytes or less, because a bigger file would turn a disk that
+/// holds only these into the big-file format (persist-big's boot 3 checks the small-files format byte for byte).
+/// The boot check refuses a copied entry over 512 bytes, and the host test bundled_entries checks the same. A new
+/// bundled app is built in unless it is added here.
+pub const COPIED: [&str; 12] = [
+    "hello.wasm",
+    "sum.wasm",
+    "draw.wasm",
+    "fileapp.wasm",
+    "clock.wasm",
+    "type.wasm",
+    "ai.wasm",
+    "chat.wasm",
+    "notify.wasm",
+    "notify2.wasm",
+    "net.wasm",
+    "rand.wasm",
+];
+
+/// Whether bundled app `name` is copied (has a VFS file too) rather than built in.
+fn bundled_in_vfs(name: &str) -> bool {
+    COPIED.contains(&name)
 }
 
 /// At boot, before any disk load: write each bundled app the VFS can hold as a file (the one table the manifest
@@ -3686,7 +3751,7 @@ fn bundled_in_vfs(bytes: &[u8]) -> bool {
 pub fn seed_bundled() {
     for (name, bytes) in BUNDLED {
         let b = bytes();
-        if bundled_in_vfs(b) {
+        if bundled_in_vfs(name) && b.len() <= crate::vfs::MAX_FILE_BYTES {
             crate::vfs::write_full(name, b);
         }
     }
@@ -3713,7 +3778,7 @@ pub fn bundled_ok(name: &str) -> bool {
 pub fn built_in_only(name: &str) -> Option<&'static [u8]> {
     let i = bundled_index(name)?;
     let b = BUNDLED[i].1();
-    if bundled_in_vfs(b) || bundled_refused(i) {
+    if bundled_in_vfs(name) || bundled_refused(i) {
         None
     } else {
         Some(b)
@@ -3722,7 +3787,7 @@ pub fn built_in_only(name: &str) -> Option<&'static [u8]> {
 
 /// Whether `name` is a bundled app the VFS cannot hold (a VFS file of that name is the person's, never run).
 pub fn is_big_bundled(name: &str) -> bool {
-    bundled(name).map_or(false, |b| !bundled_in_vfs(b))
+    bundled(name).is_some() && !bundled_in_vfs(name)
 }
 
 /// After the manifest is recorded (A7 condition 3, the architect's changes 2 and 3): every bundled app's bytes
@@ -3734,8 +3799,10 @@ pub fn check_bundled() {
         let b = bytes();
         let fault = if !matches!(crate::integrity::check(name, b), crate::integrity::Verdict::Ok) {
             Some("MISMATCH with the integrity manifest")
-        } else if !bundled_in_vfs(b) && !matches!(check_module(b), Ok((_, Some(_)))) {
-            Some("built in (over 512 bytes) with no afri.permissions section")
+        } else if bundled_in_vfs(name) && b.len() > crate::vfs::MAX_FILE_BYTES {
+            Some("copied but over 512 bytes (it would change a small-files disk's format)")
+        } else if !bundled_in_vfs(name) && !matches!(check_module(b), Ok((_, Some(_)))) {
+            Some("built in with no afri.permissions section")
         } else {
             None
         };
@@ -3757,7 +3824,7 @@ pub fn check_bundled() {
 pub fn restore_bundled() {
     for (name, bytes) in BUNDLED {
         let want = bytes();
-        if !bundled_in_vfs(want) {
+        if !bundled_in_vfs(name) || want.len() > crate::vfs::MAX_FILE_BYTES {
             continue;
         }
         match crate::vfs::read_full(name) {

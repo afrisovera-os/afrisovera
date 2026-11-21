@@ -92,6 +92,7 @@ static mut RX_TAIL: usize = 0; // next free slot
 /// A byte typed on another keyboard (the USB one, xhci.rs) joins the console input ring as
 /// if COM1 had received it. Called with interrupts off (from the timer interrupt).
 pub fn inject(b: u8) {
+    crate::trial::input(); // the person used the PC (safe updates U4: part of a trial's health)
     // a key typed on the PC's own keyboard brings the desk's Terminal back to its bottom (afriui.md section 28)
     crate::desk::term_bottom();
     // SAFETY: interrupts are off in the caller; `getc` takes the ring with them off.
@@ -321,6 +322,7 @@ pub fn rx_overrun_count() -> u64 {
 
 pub fn note_idle_wfi() {
     IDLE_WFI.fetch_add(1, Ordering::Relaxed);
+    crate::trial::idle(); // a healthy trial keeps itself here, in the shell's own loop (safe updates U4)
 }
 
 pub fn idle_wfi_count() -> u64 {

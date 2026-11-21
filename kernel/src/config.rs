@@ -53,17 +53,32 @@ fn lang_ok(c: &str) -> bool {
 /// The desk's language as saved (LANGUAGES_PLAN.md): the `lang=` line, or "en" when there is none or it is not a
 /// plain code.
 pub fn lang() -> &'static str {
-    if let Some(s) = crate::vfs::read_str(CONF) {
-        for line in s.lines() {
-            if let Some(v) = line.strip_prefix("lang=") {
-                let v = v.trim();
-                if lang_ok(v) {
-                    return v;
-                }
+    crate::vfs::read_str(CONF).map(|s| lang_in(s).unwrap_or("en")).unwrap_or("en")
+}
+
+/// The desk's test language (LANGUAGES_PLAN.md stage 6): never kept (the architect, 15 Nov).
+pub const TEST_LANG: &str = "qps";
+
+/// What a config's `lang=` line gives: Ok(the code), or Ok("en") when there is none or it is not a plain code. A line
+/// naming the test language is Err(it), refused by name, and the desk reads English.
+pub fn lang_in(text: &str) -> Result<&str, &str> {
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("lang=") {
+            let v = v.trim();
+            if v == TEST_LANG {
+                return Err(v);
+            }
+            if lang_ok(v) {
+                return Ok(v);
             }
         }
     }
-    "en"
+    Ok("en")
+}
+
+/// A `lang=` line naming the test language, if the saved config has one (the desk says so at the first gui).
+pub fn lang_refused() -> Option<&'static str> {
+    crate::vfs::read_str(CONF).and_then(|s| lang_in(s).err())
 }
 
 /// The person's clock this boot, once they choose (Settings, `desk clock`): 0 none yet (the file says), 1 12-hour,
@@ -304,6 +319,16 @@ pub fn selftest() {
         clock24_in("clock24=yes\n") == Err("yes") && clock24_in("clock24=\n") == Err("")
             && clock24_in("clock24=10\n") == Err("10"),
         "a clock24 line that is not 0 or 1 is refused by name, and the clock follows the language");
+
+    // stage 6: the test language is never kept, so a config naming it reads as English (the architect, 15 Nov)
+    case_ok(&mut pass, &mut total,
+        lang_in("hostname=afrisovera
+lang=qps
+") == Err("qps") && lang_in(EXPECT) == Ok("en")
+            && lang_in("lang=tw
+") == Ok("tw") && lang_in("lang=NOT A CODE
+") == Ok("en"),
+        "a config naming the test language qps is refused by name and reads as English");
     // And what fits the buffer fits the file: `vfs::write` silently truncates past its
     // own per-file limit, so the buffer must not be the larger of the two.
     case_ok(&mut pass, &mut total, CONF_MAX <= crate::vfs::MAX_FILE_BYTES,
@@ -347,6 +372,9 @@ pub fn save() {
 /// same allocation-free path as the boot. With a disk it is synced and survives a reboot; without one it lasts
 /// until power off. Refused by name, never half written.
 pub fn set_lang(code: &str) -> Result<(), &'static str> {
+    if code == TEST_LANG {
+        return Err("a test language is never kept");
+    }
     if !lang_ok(code) {
         return Err("not a language code (2 to 8 lowercase letters)");
     }

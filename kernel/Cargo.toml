@@ -44,6 +44,9 @@ test-apps = []
 # bench0), built by the cloud job and found through DARAJA_BRIDGE_BIN and DARAJA_BUNDLE_DIR at compile time; the shell
 # command `linux <name>` runs one. A shipped image never carries them.
 compat0 = []
+# The PC test image for Wi-Fi (W4b, suite pc-wifi-sim): a pretend radio and access point (pc/wifisim.rs) over the
+# e1000 uplink, so `wifi scan`, `wifi connect`, DHCP and traffic run in QEMU. Never in a normal or release build.
+wifi-sim = []
 
 [dependencies]
 # ADR 0007 (kernel dependencies): third-party crates for CRYPTOGRAPHIC PRIMITIVES only, exact `=` pins, no

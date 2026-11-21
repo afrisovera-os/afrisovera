@@ -83,7 +83,7 @@ real state is not drawn (no fake battery percentage, no fake Wi-Fi bars).
 | ochre | `#C27A2C` | Files icon |
 | indigo | `#3D4C8F` | Settings icon |
 
-- Kente band: two 2 px rows of 8 px blocks (gold, black, green, gold, red, black), the second row offset by half a block so it reads as woven cloth, not a dashed line (design review D1, docs/DESIGN_LOG.md).
+- Kente band: two 2 px rows of 8 px blocks (gold, black, green, gold, red, black), the second row offset by half a block so it reads as woven cloth, not a dashed line (design review D1, (a private engineering record)).
 
 ## 5. Icons
 

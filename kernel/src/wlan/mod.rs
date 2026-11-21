@@ -8,10 +8,16 @@
 //! published files by scripts/wifi-kat-fetch.sh).
 //! W2: frames (frame.rs: header, management bodies, elements, RSN), the scan table (bss.rs) and the conversion
 //! between 802.11 data frames and Ethernet frames (llc.rs).
-//! The supplicant, the station state machine and the Intel driver come in W3 to W7.
+//! W3: CCMP (ccmp.rs), EAPOL-Key frames (eapol.rs) and the WPA2-PSK supplicant (supp.rs).
+//! W4: the station (mlme.rs): choosing a network, joining it, data both ways, over a `Radio` the driver implements.
+//! The Intel driver comes in W5 to W7.
 
 pub mod bss;
+pub mod ccmp;
 pub mod crypto;
 pub mod crypto_kat;
+pub mod eapol;
 pub mod frame;
 pub mod llc;
+pub mod mlme;
+pub mod supp;

@@ -16,7 +16,7 @@ QPID=$!
 . "$(dirname "$0")/lib/afrish-boot.sh"
 afrish_wait_boot
 OUT="${TMPDIR:-/tmp}/wasm-bench.out"
-python3 scripts/lib/nia-keys.py 4624 "wasmbench" "mem" > "$OUT" 2>&1
+AFRISH_CMD_CEILING=900 python3 scripts/lib/nia-keys.py 4624 "wasmbench" "mem" > "$OUT" 2>&1
 kill "$QPID" 2>/dev/null
 wait "$QPID" 2>/dev/null
 
@@ -31,9 +31,14 @@ B1=$(grep -ac "print(200017500)" "$OUT")
 B2=$(grep -ac "print(12502500)" "$OUT")
 [ "$B1" -eq 6 ] || fail "b1 printed 200017500 $B1 times, wanted 6"
 [ "$B2" -eq 6 ] || fail "b2 printed 12502500 $B2 times, wanted 6"
+# Ngoma (the media player's bench apps): one run each, the new way, each printing its checksum once.
+Q=$(grep -ac "print(-1598551745)" "$OUT")
+D=$(grep -ac "print(1189282394)" "$OUT")
+[ "$Q" -eq 1 ] || fail "ngoma qoa printed -1598551745 $Q times, wanted 1"
+[ "$D" -eq 1 ] || fail "ngoma drums printed 1189282394 $D times, wanted 1"
 grep -aq "heap:" "$OUT" || fail "shell unresponsive after wasmbench"
 # The new way must not be slower than the old way (each app's best of three).
 while read -r old new; do
     [ "$new" -le "$old" ] || fail "new way slower: old $old us, new $new us"
 done < <(grep -a "\[bench\] b" "$OUT" | sed -E 's/.*old ([0-9]+) us, new ([0-9]+) us.*/\1 \2/')
-echo "WASM-BENCH TEST PASSED (both bench apps right both ways; block-end memo not slower)"
+echo "WASM-BENCH TEST PASSED (both bench apps right both ways; block-end memo not slower; both Ngoma apps right)"

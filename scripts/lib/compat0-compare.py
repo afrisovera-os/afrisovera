@@ -20,7 +20,7 @@ NUMBERS = {
     "read": 0, "write": 1, "open": 2, "close": 3, "fstat": 5, "lseek": 8, "mmap": 9, "brk": 12,
     "rt_sigaction": 13, "rt_sigprocmask": 14, "ioctl": 16, "readv": 19, "writev": 20, "exit": 60,
     "arch_prctl": 158, "set_tid_address": 218, "exit_group": 231, "openat": 257, "newfstatat": 262,
-    "execve": 59,
+    "execve": 59, "getpriority": 140,
 }
 NO_OUTPUT_COMPARE = {"bench0"}  # its stdout is a cycle count
 

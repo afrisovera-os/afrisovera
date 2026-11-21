@@ -20,8 +20,22 @@
 
 use crate::sha256::{self, Sha256};
 
-/// This system's own release version. An update must carry a higher one (AFR-0010 §6).
-pub const RELEASE: u32 = 1;
+/// This system's own release version. An update must carry a higher one (AFR-0010 §6). 1 unless the build sets
+/// AFRI_RELEASE (test builds of a version-2 kernel, safe updates U4; a release build refuses it, pc/trial.rs).
+pub const RELEASE: u32 = parse_u32(option_env!("AFRI_RELEASE"), 1);
+
+const fn parse_u32(s: Option<&str>, default: u32) -> u32 {
+    let Some(s) = s else { return default };
+    let b = s.as_bytes();
+    assert!(!b.is_empty() && b.len() <= 9, "AFRI_RELEASE must be a number");
+    let (mut i, mut v) = (0, 0u32);
+    while i < b.len() {
+        assert!(b[i].is_ascii_digit(), "AFRI_RELEASE must be a number");
+        v = v * 10 + (b[i] - b'0') as u32;
+        i += 1;
+    }
+    v
+}
 /// The machine an update must be made for.
 pub const TARGET: &[u8] = b"pc-x86_64";
 
@@ -574,7 +588,7 @@ fn spare_for(main: &[u8]) -> Option<(&'static str, &'static str)> {
 
 /// The main entry, checked as the architect set (exactly one "AfriSovera", BootCurrent equal to it, naming one of
 /// our two files): (it, the spare's long name, the spare's path), or the line to print.
-fn main_and_spare(cmd: &str) -> Option<(crate::bootent::Main, &'static str, &'static str)> {
+pub(crate) fn main_and_spare(cmd: &str) -> Option<(crate::bootent::Main, &'static str, &'static str)> {
     use crate::bootent::NoMain;
     let m = match crate::bootent::main_exact() {
         Ok(m) => m,
@@ -748,6 +762,10 @@ pub fn stage(given: Option<&str>) {
         );
         return;
     }
+    // the record (advice only): the spare's version and SHA, and the running file's own
+    let run_long = if spare == crate::esp::stage::SLOT_B { crate::esp::stage::SLOT_A } else { crate::esp::stage::SLOT_B };
+    let running = esp.live(run_long).ok().flatten().and_then(|l| esp.read_back(run_long, l.size as u64).ok()).map(|b| b.0);
+    crate::trial::note_staged(if spare == crate::esp::stage::SLOT_B { 1 } else { 0 }, c.version, &c.boot_sha, running);
     // 7: the trial entry, last in BootOrder
     match crate::bootent::trial_add(&m, path) {
         Ok(num) => {

@@ -70,6 +70,9 @@ include!("locale_data.rs");
 
 /// A language's data: LOCS follows the order of lang::LANGS, checked by `probe`.
 pub fn loc(l: Lang) -> &'static Loc {
+    if l.is_test() {
+        return &LOCS[0]; // the test language counts and writes numbers like English
+    }
     &LOCS[(l as usize).min(LOCS.len() - 1)]
 }
 

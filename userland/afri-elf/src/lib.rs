@@ -100,8 +100,12 @@ pub enum Error {
     BadAlignment,
     /// a segment, the TLS template or the header table would wrap around the address space
     Overflow,
-    /// a segment lies outside the allowed area
+    /// a segment starts below the allowed area (a program linked at fixed low addresses, such as Linux's 0x400000)
     OutsideArea,
+    /// a segment ends above the allowed area
+    AboveArea,
+    /// a loadable segment of no size (p_memsz 0)
+    EmptySegment,
     /// a segment both writable and executable (W^X)
     WriteAndExecute,
     /// an executable stack was asked for (PT_GNU_STACK with PF_X)
@@ -285,8 +289,14 @@ pub fn parse(file: &[u8], area: Range<u64>) -> Result<Image, Error> {
                 }
                 let end = p_vaddr.checked_add(p_memsz).ok_or(Error::Overflow)?;
                 let end_page = end.checked_add(PAGE - 1).ok_or(Error::Overflow)? & !(PAGE - 1);
-                if p_vaddr < area.start || end_page > area.end || p_memsz == 0 {
+                if p_memsz == 0 {
+                    return Err(Error::EmptySegment);
+                }
+                if p_vaddr < area.start {
                     return Err(Error::OutsideArea);
+                }
+                if end_page > area.end {
+                    return Err(Error::AboveArea);
                 }
                 let seg = Segment { vaddr: p_vaddr, memsz: p_memsz, offset: p_offset, filesz: p_filesz, flags: p_flags };
                 if let Some(prev) = img.segments[..img.count].last() {
@@ -452,8 +462,11 @@ mod tests {
         assert_eq!(with(|p| p[2].align = 0x800), Err(Error::BadAlignment));
         assert_eq!(with(|p| p[2].align = 0x3000), Err(Error::BadAlignment));
         assert_eq!(with(|p| { p[3].vaddr = u64::MAX - 0xFFF; p[3].offset = 0x3000 }), Err(Error::Overflow));
-        assert_eq!(with(|p| p[3].vaddr = 0x200_0000_0000), Err(Error::OutsideArea));
-        assert_eq!(with(|p| p[0].vaddr = 0x40_0000), Err(Error::OutsideArea)); // the usual Linux address: not ours
+        // below and above the area are told apart, so the bridge names the right cause (the architect, 21 Nov)
+        assert_eq!(with(|p| p[3].vaddr = 0x200_0000_0000), Err(Error::AboveArea)); // past the area's end
+        assert_eq!(with(|p| { p[3].vaddr = 0x1FF_FFFF_F000; p[3].offset = 0x3000 }), Err(Error::AboveArea)); // ends past it
+        assert_eq!(with(|p| p[0].vaddr = 0x40_0000), Err(Error::OutsideArea)); // the usual Linux address: below ours
+        assert_eq!(with(|p| { p[2].filesz = 0; p[2].memsz = 0 }), Err(Error::EmptySegment));
         assert_eq!(with(|p| p[2].vaddr = BASE + 0x1000), Err(Error::SharedPage));
         assert_eq!(with(|p| p[2].vaddr = BASE), Err(Error::Unordered));
         assert_eq!(with(|p| p[0].ty = PT_INTERP), Err(Error::NeedsInterpreter));

@@ -17,6 +17,8 @@
 # sample values (speech, not a copy of the tone or silence).
 # Since 12 Nov 2026 also `lshda late`: a codec answer left unread in the RIRB (as after a command that timed
 # out) must be dropped, not taken as the next command's answer; graded on the line it prints.
+# Since 13 Nov 2026 also the jacks line: lshda asks each jack that can sense a plug (pin caps presence detect)
+# whether something is plugged in. QEMU's codec pins have no presence detect, so here it must say none can.
 #   scripts/pc-hda-test.sh              # grader selftest, then the QEMU boot
 #   scripts/pc-hda-test.sh --selftest   # grader selftest only
 set -uo pipefail
@@ -97,6 +99,8 @@ grade() { # grade <serial log>
     has 'lshda: codec 0: QEMU 1af4:[0-9a-f]{4}, audio function group at node [0-9]+, [1-9][0-9]* widgets' || _f "lshda did not describe the codec"
     has '  node [0-9]+ pin: line out \(config 0x[0-9a-f]{8}\)' || _f "lshda did not list the line-out pin as used"
     has '  node [0-9]+ audio output \(DAC\)' || _f "lshda did not list the DAC"
+    has 'lshda: jacks: none on this codec can tell whether something is plugged in' ||
+        _f "lshda did not give the jacks line (QEMU's pins have no presence detect)"
     has "lshda: sound goes out through $P, stream 1, 44\.1 kHz 16-bit stereo" || _f "lshda did not give the output path at 44.1 kHz"
     has "\[audio\] HD Audio online: QEMU codec 1af4:[0-9a-f]{4}, out through $P; 'audio tone' to play" || _f "audio did not report HD Audio"
     has '\[audio\] streaming a test tone through Intel HD Audio\.\.\.' || _f "audio tone did not go to HD Audio"
@@ -122,6 +126,7 @@ lshda: 1 codec(s) answered (mask 0x0001)
 lshda: codec 0: QEMU 1af4:0012, audio function group at node 1, 2 widgets
   node 2 audio output (DAC)
   node 3 pin: line out (config 0x01014010)
+lshda: jacks: none on this codec can tell whether something is plugged in
 lshda: sound goes out through pin 3 (line out) <- DAC 2, stream 1, 44.1 kHz 16-bit stereo
 afrisovera> audio
 [audio] HD Audio online: QEMU codec 1af4:0012, out through pin 3 (line out) <- DAC 2; 'audio tone' to play
@@ -170,6 +175,9 @@ selftest() {
     arm late-shifted-ok red "$(printf '%s\n' "$GREEN" | sed 's/got 0x1af40012, then 0x1af40012/got 0x00010001, then 0x1af40012/')"
     arm late-none-dropped red "$(printf '%s\n' "$GREEN" | sed 's/, 1 dropped: OK/, 0 dropped: OK/')"
     arm late-in-use red "$(printf '%s\n' "$GREEN" | sed 's/^lshda: sound goes out.*/&\nlshda: late codec answers dropped before a command: 3/')"
+    arm no-jacks-line red "$(printf '%s\n' "$GREEN" | grep -v '^lshda: jacks:')"
+    arm jack-sensed red "$(printf '%s\n' "$GREEN" | sed 's/^lshda: jacks: .*/lshda: jacks: line out (node 3) empty/')"
+    arm jack-no-answer red "$(printf '%s\n' "$GREEN" | sed 's/^lshda: jacks: .*/lshda: jacks: line out (node 3) did not answer/')"
     arm panic red "$(printf '%s\nKERNEL PANIC\n' "$GREEN")"
     arm empty red ""
     arm wav-missing red "$GREEN" "wav: missing"
@@ -196,7 +204,7 @@ EOF
     arm measured-600hz red "$GREEN" "$(wav "$D/high.wav")"
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 30 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 33 ]
 }
 
 echo "== PC sound: Intel HD Audio (hda.rs) =="

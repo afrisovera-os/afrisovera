@@ -69,6 +69,14 @@ else:
             fail.append("plain help has only %d lines (the shared list is over 600)" % N)
         if P != (N + 35) // 36:
             fail.append("%d lines should be %d pages of 36, the summary says %d" % (N, (N + 35) // 36, P))
+        # the owner's HP (14 Nov 2026): no line of the PC's list names ARM's firmware call (PSCI); helpview.rs
+        # rewords the two power lines (pc-power), and this keeps them that way
+        if any("PSCI" in l for l in lst):
+            fail.append("plain help still names PSCI (ARM's firmware call) on the PC")
+        for want_line in ('  reboot, restart  save the files, then restart the PC (the firmware, then ACPI, then the chipset)',
+                          '  poweroff, shutdown  save the files, then switch the PC off (the firmware, then ACPI S5)'):
+            if want_line not in lst:
+                fail.append("plain help is missing %r" % want_line.strip())
 if lst:
     w = blocks.get("help sha")
     want = [l for l in lst if "sha" in l.lower()]
@@ -113,7 +121,7 @@ EOF
 grade() { [ -r "$1" ] || { echo "  FAIL: missing serial capture"; return 1; }; "$PY" -c "$GRADER" "$1"; }
 
 # a synthetic boot: an 80-line list (3 pages), 2 lines with "sha"
-mklist() { echo "  help            this list"; echo "  sha256 <text>   hash it"; for i in $(seq 3 79); do echo "  cmd$i           thing $i"; done; echo "  SHAsum          upper case"; }
+mklist() { echo "  help            this list"; echo "  sha256 <text>   hash it"; for i in $(seq 3 77); do echo "  cmd$i           thing $i"; done; echo "  reboot, restart  save the files, then restart the PC (the firmware, then ACPI, then the chipset)"; echo "  poweroff, shutdown  save the files, then switch the PC off (the firmware, then ACPI S5)"; echo "  SHAsum          upper case"; }
 L="$(mklist)"
 G="[pc] MANSA-PC BOOT OK
 afrisovera> help
@@ -162,12 +170,14 @@ selftest() {
     arm page-no-next red "$(printf '%s\n' "$G" | sed 's/; help 3 for the next$//')"
     arm miss-shows-lines red "$(printf '%s\n' "$G" | sed '/^afrisovera> help zzqq$/{n;s/^commands:$/commands:\n  cmd3           thing 3/}')"
     arm nopage-unsaid red "$(printf '%s\n' "$G" | grep -v '^help: there is no page')"
+    arm psci-wording red "$(printf '%s\n' "$G" | sed 's/^  reboot, restart  save the files.*/  reboot          reset the machine (PSCI SYSTEM_RESET)/')"
+    arm poweroff-missing red "$(printf '%s\n' "$G" | sed '0,/^  poweroff, shutdown /{/^  poweroff, shutdown /d}')"
     arm panic red "$(printf '%s\nKERNEL PANIC\n' "$G")"
     arm empty red ""
     GRADER="$GR"
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 14 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 16 ]
 }
 
 echo "== PC help split by word and by page (HP ENVY field item F7) =="

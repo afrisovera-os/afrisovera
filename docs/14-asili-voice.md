@@ -63,7 +63,7 @@
   (`virtio.rs:649-703`), which carries a partial period across writes so the caller
   never sees `PERIOD_BYTES`. The ceiling is gone BY CONSTRUCTION — there is no
   `n >= MAXLEN` break — and static `.bss` drops by **79616 B**. MEASURED: the same
-  unedited `scripts/longspeak-probe-3369.sh` flipped exit 10
+  unedited `(a private engineering record)` flipped exit 10
   `UTTERANCE-CEILING-HELD` → exit 0 `UTTERANCE-COMPLETE`, `pcm=2347052` for a
   124-char sentence (12.2× the old ceiling) with no `TRUNCATED` line.
   `sound_play_pcm` is now that same streaming API called once — ONE submit path.
@@ -113,7 +113,7 @@ it's on-device, it works **offline** and privately — vital for the target mark
   `3ecd00c`): `HOST_SPEAK` now calls `crate::voice::say(&tb[..tn])` — the exact call
   `process.rs:897` already makes — instead of the argument-less `sound_play_tone()`
   that made finding 3.260's text-independence true by construction. MEASURED, not
-  inferred: `scripts/speaktext-probe-3263.sh`, unedited across the patch, flipped
+  inferred: `(a private engineering record)`, unedited across the patch, flipped
   exit 10 `SPEAK-TEXT-INDEPENDENT` → exit 0 `SPEAK-TEXT-DEPENDENT`, grading the PCM
   PAYLOADS of two boots whose texts are the only difference. **NOT claimed: the
   `[asili voice]` serial line says nothing about the audio (it is the line that
@@ -123,7 +123,7 @@ it's on-device, it works **offline** and privately — vital for the target mark
   `say()` streams period-by-period instead of filling a fixed 48000-sample buffer, so
   both `speak()` (WASM) and the `say` shell command speak the WHOLE text at any
   length; static `.bss` fell by 79616 B in the same change. MEASURED by the unedited
-  `scripts/longspeak-probe-3369.sh` flipping 10 → 0 (`pcm=2347052`, 12.2× the old
+  `(a private engineering record)` flipping 10 → 0 (`pcm=2347052`, 12.2× the old
   192000-byte ceiling, no `TRUNCATED` line). Before it, a 44-char notification was
   audibly its first 10 characters (finding 3.365) and said so only since 3.366.
 - ⬜ On-device TTS **model** (Piper) producing natural words over the same path.

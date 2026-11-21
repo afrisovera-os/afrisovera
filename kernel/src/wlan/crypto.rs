@@ -66,6 +66,37 @@ pub fn pmk_from_passphrase(passphrase: &[u8], ssid: &[u8]) -> Result<Secret<PMK_
     Ok(s)
 }
 
+/// What the owner typed for a WPA2-Personal network, into its PMK (the architect's rule, 14 Nov 2026): 8 to 63
+/// printable ASCII characters are the passphrase (through PBKDF2, a few seconds), exactly 64 hex digits are the PSK
+/// itself (IEEE 802.11-2020 Annex J.4.1). `typed` is wiped in every case, kept or refused.
+pub fn pmk_from_typed(typed: &mut [u8], ssid: &[u8]) -> Result<Secret<PMK_LEN>, Bad> {
+    let r = if typed.len() == 64 {
+        let mut k = Secret::<PMK_LEN>::zero();
+        let mut ok = ssid.len() <= 32;
+        for (i, pair) in typed.chunks(2).enumerate() {
+            let hex = |c: u8| match c {
+                b'0'..=b'9' => Some(c - b'0'),
+                b'a'..=b'f' => Some(c - b'a' + 10),
+                b'A'..=b'F' => Some(c - b'A' + 10),
+                _ => None,
+            };
+            match (hex(pair[0]), hex(pair[1])) {
+                (Some(h), Some(l)) => k.0[i] = h << 4 | l,
+                _ => ok = false,
+            }
+        }
+        if ok {
+            Ok(k)
+        } else {
+            Err(Bad) // k wipes itself when dropped
+        }
+    } else {
+        pmk_from_passphrase(typed, ssid)
+    };
+    wipe(typed);
+    r
+}
+
 pub fn prf_sha1(key: &[u8], label: &[u8], data: &[u8], out: &mut [u8]) -> Result<(), Bad> {
     wlan_crypto::prf_sha1(key, label, data, out)
 }
@@ -113,6 +144,7 @@ pub enum Kind {
     AesKw,
     Cmac,
     Ccm8,
+    CcmpMpdu,
 }
 
 impl Kind {
@@ -125,11 +157,12 @@ impl Kind {
             Kind::AesKw => "AES key wrap (RFC 3394)",
             Kind::Cmac => "AES-CMAC (RFC 4493)",
             Kind::Ccm8 => "AES-CCM, 8-byte tag (RFC 3610)",
+            Kind::CcmpMpdu => "CCMP frames (802.11i Annex I.7.4)",
         }
     }
 }
 
-pub const KINDS: [Kind; 7] = [Kind::HmacSha1, Kind::Pbkdf2Sha1, Kind::Psk, Kind::PrfSha1, Kind::AesKw, Kind::Cmac, Kind::Ccm8];
+pub const KINDS: [Kind; 8] = [Kind::HmacSha1, Kind::Pbkdf2Sha1, Kind::Psk, Kind::PrfSha1, Kind::AesKw, Kind::Cmac, Kind::Ccm8, Kind::CcmpMpdu];
 
 /// Run every vector of one family. Ok(count) or Err(index of the first vector that failed).
 pub fn run_kind(k: Kind) -> Result<usize, usize> {
@@ -222,6 +255,29 @@ pub fn run_kind(k: Kind) -> Result<usize, usize> {
                 }
             }
             Ok(v::CCM8.len())
+        }
+        Kind::CcmpMpdu => {
+            // the whole frame: AAD and nonce from the 802.11 header (ccmp.rs), then AES-CCM, both ways
+            for (i, &(tk, keyid, pn, plain, enc)) in v::CCMP_MPDU.iter().enumerate() {
+                let tk: &[u8; 16] = tk.try_into().map_err(|_| i)?;
+                let mut out = [0u8; 128];
+                let n = super::ccmp::encrypt(tk, keyid, pn, plain, &mut out).map_err(|_| i)?;
+                if out.get(..n) != Some(enc) {
+                    return Err(i);
+                }
+                let r = super::ccmp::decrypt(tk, enc, &mut out).map_err(|_| i)?;
+                if r.pn != pn || r.keyid != keyid || r.len != plain.len() || out[2..r.len] != plain[2..] || out[0] != plain[0] {
+                    return Err(i);
+                }
+                // one changed ciphertext bit: refused
+                let mut bad = [0u8; 128];
+                bad[..enc.len()].copy_from_slice(enc);
+                bad[enc.len() - 12] ^= 1;
+                if super::ccmp::decrypt(tk, &bad[..enc.len()], &mut out).is_ok() {
+                    return Err(i);
+                }
+            }
+            Ok(v::CCMP_MPDU.len())
         }
     }
 }

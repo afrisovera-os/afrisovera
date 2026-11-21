@@ -123,7 +123,7 @@ number. Step 3 is the TPM driver, reviewed separately.
 ## Follow-up, step 3 (13 Nov 2026): the TPM driver
 
 Built as `kernel/src/pc/tpm.rs` (TIS FIFO, TPM 1.2 and 2.0) with `kernel/src/pc/tpm_wire.rs`; design note
-`docs/design-f3-step3-tpm.md`. Three points recorded here, as the architect asked:
+the F3 step 3 TPM design note (a private engineering record). Three points recorded here, as the architect asked:
 
 - **The bus is trusted.** A discrete TPM 1.2 or 2.0 on LPC or SPI answers GetRandom without authentication or
   encryption. Someone with the machine open and an interposer on the bus can feed chosen bytes, and the kernel counts

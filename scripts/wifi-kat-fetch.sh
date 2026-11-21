@@ -6,7 +6,7 @@
 #   kernel/src/wlan/crypto_kat.rs     the same vectors as Rust constants, for `wifi selftest`
 # The parser reads the bytes straight from the downloaded files; nothing is typed by hand (architect, 14 Nov 2026).
 # A moved or changed file fails here on its pinned hash, instead of quietly giving other vectors.
-# hostapd's file is BSD-licensed; only the IEEE 802.11 test-vector data in it is used (no code).
+# hostapd's and FreeBSD's files are BSD-licensed; only the IEEE 802.11 test-vector data in them is used (no code).
 #
 #   scripts/wifi-kat-fetch.sh            write the three files
 #   scripts/wifi-kat-fetch.sh --check    download and parse again into a temporary folder, and fail unless the
@@ -23,6 +23,7 @@ else
 fi
 mkdir -p "$DEST/wlan-crypto/fixtures" "$DEST/kernel/src/wlan"
 HOSTAP=6d3d778451a9329085eab5777386db0b78d56987   # hostap.git HEAD on 14 Nov 2026
+FREEBSD=70046933082e2e22646fb270320f070b59957b72   # freebsd-src main on 14 Nov 2026
 # name  url  bytes  sha256
 FILES="
 rfc2202.txt https://www.rfc-editor.org/rfc/rfc2202.txt 11942 c19effeca47e801be304460da3b2fb05f595e2309abceb050e40e024868fe483
@@ -31,6 +32,7 @@ rfc3394.txt https://www.rfc-editor.org/rfc/rfc3394.txt 73072 faa400c69c22e5f4a91
 rfc4493.txt https://www.rfc-editor.org/rfc/rfc4493.txt 38751 252850ac038a44e931fdce6cb02b444a18ed1da0c9e212bfdd1da0ed3366fc1c
 rfc3610.txt https://www.rfc-editor.org/rfc/rfc3610.txt 64509 d6c857b1dea18d8259ee0ccc5468859990200e8580d0ad55dc75963d0c46588d
 crypto_module_tests.c https://w1.fi/cgit/hostap/plain/src/crypto/crypto_module_tests.c?id=HOSTAP 82924 40b0183c8812863fcb89a50e013a4b3ece7fd84608bd68bd18dca8335747d2d4
+test_ccmp.c https://raw.githubusercontent.com/freebsd/freebsd-src/FREEBSD/tools/regression/net80211/ccmp/test_ccmp.c 25859 456594b083bc8227aebcaf2f26a4b29e0a67efcc82bd963fc3eb0a79e0991c1d
 "
 SRC="$DEST/wlan-crypto/fixtures/SOURCE.txt"
 {
@@ -40,6 +42,7 @@ SRC="$DEST/wlan-crypto/fixtures/SOURCE.txt"
 while read -r name url size sha; do
   [ -n "$name" ] || continue
   url="${url/HOSTAP/$HOSTAP}"
+  url="${url/FREEBSD/$FREEBSD}"
   curl -fsSL --retry 3 --max-time 120 "$url" -o "$DL/$name"
   got_size=$(wc -c < "$DL/$name" | tr -d ' ')
   got_sha=$(sha256sum "$DL/$name" | cut -d' ' -f1)

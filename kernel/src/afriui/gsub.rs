@@ -9,6 +9,74 @@
 #![allow(dead_code)]
 
 use super::shape_data as sd;
+use super::shape_data_deva as dv;
+
+/// One face's compiled layout tables (shape_data.rs for face 1, shape_data_deva.rs for face 2), all from
+/// tools/face/shape_src.py. `zero_marks`: mark glyphs lose their advance (HarfBuzz does so for Arabic, not for Indic).
+pub struct Tables {
+    pub gclass: &'static [u8],
+    pub sets: &'static [(u32, u16)],
+    pub setg: &'static [(u16, u16)],
+    pub lookups: &'static [(u8, u16, u16, u16, u16)],
+    pub subs: &'static [(u8, u32, u32, u32)],
+    pub single: &'static [(u16, u16)],
+    pub mult: &'static [(u16, u16, u8)],
+    pub multg: &'static [u16],
+    pub ligs: &'static [(u16, u16, u8, u16)],
+    pub ligg: &'static [u16],
+    pub rules: &'static [(u16, u16, u8, u8, u8, u8, u16)],
+    /// each lookup's coverage set (C3b)
+    pub lookup_cov: &'static [u16],
+    pub matchs: &'static [u16],
+    /// packed: the sequence index in the top 4 bits, the lookup in the low 12
+    pub recs: &'static [u16],
+    pub stages: &'static [(u16, u16)],
+    pub stagel: &'static [(u16, u16)],
+    pub plk: &'static [(u8, u16, u16, u32, u32, u32, u32)],
+    pub pmark: &'static [(u16, u16, i16, i16)],
+    pub pbase: &'static [(u16, u16, i16, i16)],
+    pub ksub: &'static [(u16, u8, u16, u16, u16, u32, u32, u32, u32, u32, u32)],
+    pub kpair: &'static [(u16, u16, i16, i16)],
+    pub kcd: &'static [(u16, u16)],
+    pub kcell: &'static [(u16, u16, i16, i16)],
+    pub zero_marks: bool,
+}
+
+macro_rules! tables {
+    ($m:ident, $zero:expr) => {
+        Tables {
+            gclass: &$m::GCLASS,
+            sets: &$m::SETS,
+            setg: &$m::SETG,
+            lookups: &$m::LOOKUPS,
+            subs: &$m::SUBS,
+            single: &$m::SINGLE,
+            mult: &$m::MULT,
+            multg: &$m::MULTG,
+            ligs: &$m::LIGS,
+            ligg: &$m::LIGG,
+            rules: &$m::RULES,
+            lookup_cov: &$m::LOOKUP_COV,
+            matchs: &$m::MATCH,
+            recs: &$m::RECS,
+            stages: &$m::STAGES,
+            stagel: &$m::STAGEL,
+            plk: &$m::PLK,
+            pmark: &$m::PMARK,
+            pbase: &$m::PBASE,
+            ksub: &$m::KSUB,
+            kpair: &$m::KPAIR,
+            kcd: &$m::KCD,
+            kcell: &$m::KCELL,
+            zero_marks: $zero,
+        }
+    };
+}
+
+/// Face 1, Arabic (and Persian, Urdu).
+pub static ARABIC: Tables = tables!(sd, true);
+/// Face 2, Devanagari (SHAPING_C3_PLAN.md).
+pub static DEVA: Tables = tables!(dv, false);
 
 /// The most glyphs a run may hold (a multiple substitution can grow it; the shaper's line is at most 256 characters).
 pub const MAXG: usize = 512;
@@ -22,59 +90,88 @@ pub struct Gi {
     pub g: u16,
     /// the character (index in the line) the glyph came from
     pub cl: u16,
-    /// the feature mask bits (shape_data::M_*)
+    /// the feature mask bits (shape_data::M_*, shape_data_deva::M_*)
     pub mask: u16,
+    /// the script shaper's own word (indic.rs: category and position), carried through every substitution;
+    /// LIGATED and MULTIPLIED are set here
+    pub aux: u16,
+    /// the syllable (indic.rs), carried through every substitution
+    pub syl: u16,
 }
 
-pub const EMPTY: Gi = Gi { g: 0, cl: 0, mask: 0 };
+pub const EMPTY: Gi = Gi { g: 0, cl: 0, mask: 0, aux: 0, syl: 0 };
+/// `aux` bits: the glyph came from a ligature substitution; it came from a multiple substitution.
+pub const LIGATED: u16 = 1 << 15;
+pub const MULTIPLIED: u16 = 1 << 14;
 
 /// (buffer full, budget spent, too deep) since boot.
 pub static mut STATS: (u64, u64, u64) = (0, 0, 0);
 
 pub struct Run<'a> {
-    pub b: &'a mut [Gi; MAXG],
+    pub t: &'static Tables,
+    pub b: &'a mut [Gi],
     pub n: usize,
     ops: u32,
+    /// the end of the range a stage is being applied to (it moves with substitutions that grow or shrink the run)
+    end: usize,
 }
 
 impl<'a> Run<'a> {
-    pub fn new(b: &'a mut [Gi; MAXG], n: usize) -> Run<'a> {
-        Run { b, n: n.min(MAXG), ops: 0 }
+    pub fn new(t: &'static Tables, b: &'a mut [Gi], n: usize) -> Run<'a> {
+        let n = n.min(b.len()).min(MAXG);
+        Run { t, b, n, ops: 0, end: n }
     }
 }
 
-pub fn class(g: u16) -> u8 {
-    sd::GCLASS.get(g as usize).copied().unwrap_or(0)
+pub fn class(t: &Tables, g: u16) -> u8 {
+    t.gclass.get(g as usize).copied().unwrap_or(0)
 }
 
-/// Glyph set `s` holds `g` (a bounded binary search; a set index past the table holds nothing).
-pub fn in_set(s: u16, g: u16) -> bool {
-    match sd::SETS.get(s as usize) {
-        Some(&(a, n)) => sd::SETG.get(a as usize..a as usize + n as usize).map_or(false, |v| v.binary_search(&g).is_ok()),
+/// Glyph set `s` holds `g`. A set is sorted ranges of glyph ids, so a class of hundreds of glyphs costs a few
+/// entries (the architect's C3 note); a bounded binary search, and a set index past the table holds nothing.
+pub fn in_set(t: &Tables, s: u16, g: u16) -> bool {
+    match t.sets.get(s as usize) {
+        Some(&(a, n)) => t.setg.get(a as usize..a as usize + n as usize).map_or(false, |v| {
+            let i = v.partition_point(|r| r.1 < g);
+            v.get(i).map_or(false, |r| r.0 <= g)
+        }),
         None => false,
     }
 }
 
 /// The lookup flag tells this glyph to be skipped.
-fn ignored(g: u16, flag: u16, mfs: u16) -> bool {
-    let c = class(g);
+fn ignored(t: &Tables, g: u16, flag: u16, mfs: u16) -> bool {
+    let c = class(t, g);
     (flag & 2 != 0 && c == 1)
         || (flag & 4 != 0 && c == 2)
         || (flag & 8 != 0 && c == 3)
-        || (c == 3 && flag & 0x10 != 0 && !in_set(mfs, g))
+        || (c == 3 && flag & 0x10 != 0 && !in_set(t, mfs, g))
+}
+
+/// Would the features of stage `si` substitute anything in `glyphs` alone (no context around them)? HarfBuzz's
+/// would_substitute, used by indic.rs to place consonants. At most 4 glyphs.
+pub fn would_substitute(t: &'static Tables, si: usize, glyphs: &[u16]) -> bool {
+    let mut b = [EMPTY; 8];
+    let n = glyphs.len().min(4);
+    for (k, &g) in glyphs.iter().take(n).enumerate() {
+        b[k] = Gi { g, cl: k as u16, mask: u16::MAX, aux: 0, syl: 0 };
+    }
+    let mut r = Run::new(t, &mut b, n);
+    r.stage(si, 0, n);
+    r.n != n || (0..n).any(|k| r.b[k].g != glyphs[k])
 }
 
 impl Run<'_> {
     fn next(&self, from: usize, flag: u16, mfs: u16) -> Option<usize> {
-        (from + 1..self.n).find(|&j| !ignored(self.b[j].g, flag, mfs))
+        (from + 1..self.end.min(self.n)).find(|&j| !ignored(self.t, self.b[j].g, flag, mfs))
     }
     fn prev(&self, from: usize, flag: u16, mfs: u16) -> Option<usize> {
-        (0..from).rev().find(|&j| !ignored(self.b[j].g, flag, mfs))
+        (0..from).rev().find(|&j| !ignored(self.t, self.b[j].g, flag, mfs))
     }
     /// Put `seq` in place of the glyph at `i` (each a copy of it with a new glyph). False if it would not fit.
     fn replace_seq(&mut self, i: usize, seq: &[u16]) -> bool {
         let k = seq.len();
-        if self.n - 1 + k > MAXG {
+        if self.n - 1 + k > self.b.len().min(MAXG) {
             // SAFETY: a scalar counter, mainline only.
             unsafe { STATS.0 += 1 };
             return false;
@@ -90,8 +187,12 @@ impl Run<'_> {
             }
             self.n = self.n + k - 1;
         }
+        let flag = if k > 1 { MULTIPLIED } else { 0 };
         for (j, &g) in seq.iter().enumerate() {
-            self.b[i + j] = Gi { g, ..tmpl };
+            self.b[i + j] = Gi { g, aux: tmpl.aux | flag, ..tmpl };
+        }
+        if self.end > i {
+            self.end = (self.end + k).saturating_sub(1);
         }
         true
     }
@@ -99,6 +200,9 @@ impl Run<'_> {
         if i < self.n {
             self.b.copy_within(i + 1..self.n, i);
             self.n -= 1;
+            if self.end > i {
+                self.end -= 1;
+            }
         }
     }
 
@@ -114,27 +218,33 @@ impl Run<'_> {
             return None;
         }
         self.ops += 1;
-        let &(_, flag, mfs, s0, ns) = sd::LOOKUPS.get(li as usize)?;
+        let &(_, flag, mfs, s0, ns) = self.t.lookups.get(li as usize)?;
         let g = self.b[i].g;
-        if check && ignored(g, flag, mfs) {
+        // C3b: a glyph none of the lookup's subtables can start on is passed at once
+        if let Some(&cov) = self.t.lookup_cov.get(li as usize) {
+            if !in_set(self.t, cov, g) {
+                return None;
+            }
+        }
+        if check && ignored(self.t, g, flag, mfs) {
             return None;
         }
         for si in s0 as usize..s0 as usize + ns as usize {
-            let &(kind, a, b, c) = sd::SUBS.get(si)?;
+            let &(kind, a, b, c) = self.t.subs.get(si)?;
             let (a, b, c) = (a as usize, b as usize, c as usize);
             match kind {
                 1 => {
-                    let rows = sd::SINGLE.get(a..a + b)?;
+                    let rows = self.t.single.get(a..a + b)?;
                     if let Ok(k) = rows.binary_search_by_key(&g, |r| r.0) {
                         self.b[i].g = rows[k].1;
                         return Some(i + 1);
                     }
                 }
                 2 => {
-                    let rows = sd::MULT.get(a..a + b)?;
+                    let rows = self.t.mult.get(a..a + b)?;
                     if let Ok(k) = rows.binary_search_by_key(&g, |r| r.0) {
                         let (_, s, l) = rows[k];
-                        let seq = sd::MULTG.get(s as usize..s as usize + l as usize)?;
+                        let seq = self.t.multg.get(s as usize..s as usize + l as usize)?;
                         if self.replace_seq(i, seq) {
                             return Some(i + seq.len());
                         }
@@ -142,10 +252,10 @@ impl Run<'_> {
                     }
                 }
                 4 => {
-                    let rows = sd::LIGS.get(a..a + b)?;
+                    let rows = self.t.ligs.get(a..a + b)?;
                     let lo = rows.partition_point(|r| r.0 < g);
                     for &(_, cs, cn, lig) in rows[lo..].iter().take_while(|r| r.0 == g) {
-                        let comps = sd::LIGG.get(cs as usize..cs as usize + cn as usize)?;
+                        let comps = self.t.ligg.get(cs as usize..cs as usize + cn as usize)?;
                         let mut at = [0usize; 16];
                         if comps.len() > at.len() {
                             continue;
@@ -166,6 +276,7 @@ impl Run<'_> {
                         }
                         if ok {
                             self.b[i].g = lig;
+                            self.b[i].aux |= LIGATED;
                             for k in (0..comps.len()).rev() {
                                 self.delete(at[k]);
                             }
@@ -174,13 +285,18 @@ impl Run<'_> {
                     }
                 }
                 5 => {
-                    if !in_set(a as u16, g) {
+                    if !in_set(self.t, a as u16, g) {
                         continue;
                     }
-                    let rules = sd::RULES.get(b..b + c)?;
-                    for &(m0, nb, ni, na, r0, nr) in rules {
+                    let rules = self.t.rules.get(b..b + c)?;
+                    let mut ri = 0;
+                    while ri < rules.len() {
+                        let (m0, r0, nb, ni, na, nr, skip) = rules[ri];
+                        // C3b: the first glyph is checked first; a miss jumps past every rule of the same first set
+                        let next = (skip as usize).saturating_sub(b).max(ri + 1);
+                        ri += 1;
                         let (m0, nb, ni, na) = (m0 as usize, nb as usize, ni as usize, na as usize);
-                        let sets = match sd::MATCH.get(m0..m0 + nb + ni + na) {
+                        let sets = match self.t.matchs.get(m0..m0 + nb + ni + na) {
                             Some(s) => s,
                             None => continue,
                         };
@@ -190,14 +306,18 @@ impl Run<'_> {
                         }
                         // the input: the first glyph is at i, the rest found by skipping what the flag skips
                         pos[0] = i;
-                        let mut ok = in_set(sets[nb], g);
+                        let mut ok = in_set(self.t, sets[nb], g);
+                        if !ok {
+                            ri = next;
+                            continue;
+                        }
                         let mut j = i;
                         for k in 1..ni {
                             if !ok {
                                 break;
                             }
                             match self.next(j, flag, mfs) {
-                                Some(nj) if in_set(sets[nb + k], self.b[nj].g) => {
+                                Some(nj) if in_set(self.t, sets[nb + k], self.b[nj].g) => {
                                     pos[k] = nj;
                                     j = nj;
                                 }
@@ -211,7 +331,7 @@ impl Run<'_> {
                                 break;
                             }
                             match self.prev(j, flag, mfs) {
-                                Some(pj) if in_set(sets[k], self.b[pj].g) => j = pj,
+                                Some(pj) if in_set(self.t, sets[k], self.b[pj].g) => j = pj,
                                 _ => ok = false,
                             }
                         }
@@ -222,7 +342,7 @@ impl Run<'_> {
                                 break;
                             }
                             match self.next(j, flag, mfs) {
-                                Some(nj) if in_set(sets[nb + ni + k], self.b[nj].g) => j = nj,
+                                Some(nj) if in_set(self.t, sets[nb + ni + k], self.b[nj].g) => j = nj,
                                 _ => ok = false,
                             }
                         }
@@ -230,8 +350,9 @@ impl Run<'_> {
                             continue;
                         }
                         // matched: the nested lookups, in order; a length change moves the later positions
-                        let recs = sd::RECS.get(r0 as usize..r0 as usize + nr as usize).unwrap_or(&[]);
-                        for &(seq, nl) in recs {
+                        let recs = self.t.recs.get(r0 as usize..r0 as usize + nr as usize).unwrap_or(&[]);
+                        for &rec in recs {
+                            let (seq, nl) = ((rec >> 12) as u8, rec & 0x0FFF);
                             let s = seq as usize;
                             if s >= ni {
                                 continue;
@@ -256,22 +377,36 @@ impl Run<'_> {
 
     /// Every GSUB stage, in order: each lookup of a stage over the whole run, at the glyphs whose mask it has.
     pub fn substitute(&mut self) {
-        for &(f, c) in sd::STAGES.iter() {
-            let ls = match sd::STAGEL.get(f as usize..f as usize + c as usize) {
-                Some(v) => v,
-                None => continue,
-            };
-            for &(li, mask) in ls {
-                let mut i = 0;
-                while i < self.n {
+        for si in 0..self.t.stages.len() {
+            let n = self.n;
+            self.stage(si, 0, n);
+        }
+    }
+
+    /// One stage over glyphs `from..to` of the run (contexts do not reach outside it). Returns the range's new end.
+    pub fn stage(&mut self, si: usize, from: usize, to: usize) -> usize {
+        let t = self.t;
+        let (f, c) = match t.stages.get(si) {
+            Some(&r) => r,
+            None => return to,
+        };
+        let ls = match t.stagel.get(f as usize..f as usize + c as usize) {
+            Some(v) => v,
+            None => return to,
+        };
+        self.end = to.min(self.n);
+        for &(li, mask) in ls {
+            {
+                let mut i = from;
+                while i < self.end {
                     if self.ops >= BUDGET {
                         // SAFETY: a scalar counter, mainline only.
                         unsafe { STATS.1 += 1 };
-                        return;
+                        return self.end;
                     }
                     if self.b[i].mask & mask != 0 {
                         if let Some(nx) = self.apply_at(li, i, 0, true) {
-                            i = nx.max(i + 1).min(self.n.max(i + 1));
+                            i = nx.max(i + 1).min(self.end.max(i + 1));
                             continue;
                         }
                     }
@@ -279,6 +414,9 @@ impl Run<'_> {
                 }
             }
         }
+        let e = self.end;
+        self.end = self.n;
+        e
     }
 
     /// Kerning (GPOS pair positioning, SHAPING_C2_PLAN C2a): for each glyph, (the change to where it is drawn, the
@@ -290,7 +428,7 @@ impl Run<'_> {
         for o in out.iter_mut().take(self.n) {
             *o = (0, 0);
         }
-        let ks = &sd::KSUB;
+        let ks = self.t.ksub;
         let mut s0 = 0;
         while s0 < ks.len() {
             let lk = ks[s0].0;
@@ -303,7 +441,7 @@ impl Run<'_> {
             let mut i = 0;
             while i < self.n {
                 let g = self.b[i].g;
-                if ignored(g, flag, mfs) {
+                if ignored(self.t, g, flag, mfs) {
                     i += 1;
                     continue;
                 }
@@ -314,12 +452,12 @@ impl Run<'_> {
                 let g2 = self.b[j].g;
                 let mut applied = false;
                 for &(_, fmt, _, _, cov, a, b, c, d, e, f) in subs {
-                    if !in_set(cov, g) {
+                    if !in_set(self.t, cov, g) {
                         continue;
                     }
                     let (a, b, c, d, e, f) = (a as usize, b as usize, c as usize, d as usize, e as usize, f as usize);
                     if fmt == 1 {
-                        if let Some(rows) = sd::KPAIR.get(a..a + b) {
+                        if let Some(rows) = self.t.kpair.get(a..a + b) {
                             if let Ok(k) = rows.binary_search_by(|r| (r.0, r.1).cmp(&(g, g2))) {
                                 out[i].0 = out[i].0.saturating_add(rows[k].2 as i32);
                                 out[i].1 = out[i].1.saturating_add(rows[k].3 as i32);
@@ -330,9 +468,9 @@ impl Run<'_> {
                         let class = |rows: Option<&[(u16, u16)]>, x: u16| {
                             rows.and_then(|r| r.binary_search_by_key(&x, |q| q.0).ok().map(|k| r[k].1)).unwrap_or(0)
                         };
-                        let c1 = class(sd::KCD.get(a..a + b), g);
-                        let c2 = class(sd::KCD.get(c..c + d), g2);
-                        let (xp, xa) = sd::KCELL
+                        let c1 = class(self.t.kcd.get(a..a + b), g);
+                        let c2 = class(self.t.kcd.get(c..c + d), g2);
+                        let (xp, xa) = self.t.kcell
                             .get(e..e + f)
                             .and_then(|r| r.binary_search_by(|q| (q.0, q.1).cmp(&(c1, c2))).ok().map(|k| (r[k].2, r[k].3)))
                             .unwrap_or((0, 0));
@@ -356,18 +494,18 @@ impl Run<'_> {
         for o in out.iter_mut().take(self.n) {
             *o = None;
         }
-        for &(typ, flag, mfs, ma, mn, ba, bn) in sd::PLK.iter() {
-            let marks = match sd::PMARK.get(ma as usize..ma as usize + mn as usize) {
+        for &(typ, flag, mfs, ma, mn, ba, bn) in self.t.plk.iter() {
+            let marks = match self.t.pmark.get(ma as usize..ma as usize + mn as usize) {
                 Some(v) => v,
                 None => continue,
             };
-            let bases = match sd::PBASE.get(ba as usize..ba as usize + bn as usize) {
+            let bases = match self.t.pbase.get(ba as usize..ba as usize + bn as usize) {
                 Some(v) => v,
                 None => continue,
             };
             for j in 0..self.n {
                 let g = self.b[j].g;
-                if class(g) != 3 || ignored(g, flag, mfs) {
+                if class(self.t, g) != 3 || ignored(self.t, g, flag, mfs) {
                     continue;
                 }
                 let m = match marks.binary_search_by_key(&g, |r| r.0) {
@@ -376,10 +514,10 @@ impl Run<'_> {
                 };
                 let target = if typ == 6 {
                     // mark to mark: the glyph before, skipping what the flag skips, must be a mark
-                    self.prev(j, flag, mfs).filter(|&k| class(self.b[k].g) == 3)
+                    self.prev(j, flag, mfs).filter(|&k| class(self.t, self.b[k].g) == 3)
                 } else {
                     // mark to base or ligature: the nearest glyph before that is not a mark
-                    (0..j).rev().find(|&k| class(self.b[k].g) != 3)
+                    (0..j).rev().find(|&k| class(self.t, self.b[k].g) != 3)
                 };
                 let k = match target {
                     Some(k) => k,

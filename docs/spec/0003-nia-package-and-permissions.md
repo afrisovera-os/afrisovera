@@ -87,7 +87,7 @@ forwards them to syscalls without a permission check (AFR-0001 §8.2).
 ### 4.4 Storage
 
 Apps are files in the AfriSovera VFS (`AFRIVFS1`): at most 24 files, 24-byte names, **512 bytes of data
-per file** (longer writes are truncated silently — see docs/review). The store screen lists files ending
+per file** (longer writes are truncated silently — see (a private engineering record)). The store screen lists files ending
 `.wasm` (up to 12).
 
 ### 4.5 Integrity and authorship (v0)
@@ -226,7 +226,7 @@ Rules:
 - **Key compromise** is handled by the store revocation list (AFR-0005 §6.4).
 - **The interpreter is part of the TCB** while it runs in the kernel; malformed modules MUST be rejected
   by the validator before execution. The `wasm-fuzz` suite exercises this.
-- **v0 issues** carried to docs/review: all-permission grant from `run_file`; boot-time reference hashes;
+- **v0 issues** carried to (a private engineering record): all-permission grant from `run_file`; boot-time reference hashes;
   silent truncation of files over 512 bytes; non-strict Ed25519; module name not checked.
 
 ## 9. Test vectors

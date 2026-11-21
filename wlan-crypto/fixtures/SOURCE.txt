@@ -6,3 +6,4 @@ rfc3394.txt https://www.rfc-editor.org/rfc/rfc3394.txt 73072 faa400c69c22e5f4a91
 rfc4493.txt https://www.rfc-editor.org/rfc/rfc4493.txt 38751 252850ac038a44e931fdce6cb02b444a18ed1da0c9e212bfdd1da0ed3366fc1c
 rfc3610.txt https://www.rfc-editor.org/rfc/rfc3610.txt 64509 d6c857b1dea18d8259ee0ccc5468859990200e8580d0ad55dc75963d0c46588d
 crypto_module_tests.c https://w1.fi/cgit/hostap/plain/src/crypto/crypto_module_tests.c?id=6d3d778451a9329085eab5777386db0b78d56987 82924 40b0183c8812863fcb89a50e013a4b3ece7fd84608bd68bd18dca8335747d2d4
+test_ccmp.c https://raw.githubusercontent.com/freebsd/freebsd-src/70046933082e2e22646fb270320f070b59957b72/tools/regression/net80211/ccmp/test_ccmp.c 25859 456594b083bc8227aebcaf2f26a4b29e0a67efcc82bd963fc3eb0a79e0991c1d

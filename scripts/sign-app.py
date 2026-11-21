@@ -25,7 +25,8 @@ def extract_bytes(src: str, name: str) -> bytes:
     if not m:
         raise SystemExit(f"array {name} not found in nia.rs")
     out = bytearray()
-    for tok in re.split(r"[,\s]+", m.group(1)):
+    body = "\n".join(line.split("//")[0] for line in m.group(1).split("\n"))  # a line may end in a comment (C1)
+    for tok in re.split(r"[,\s]+", body):
         tok = tok.strip()
         if not tok:
             continue

@@ -9,7 +9,29 @@
 
 pub use crate::virtio_core::*;
 
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Safe updates U4: on a TRIAL boot the data partition is read only (pc/trial.rs). The shared VFS asks
+/// `blk_present` before every save, so a save says there is nothing to write to; `write_sector` refuses too, as a
+/// backstop for any other writer, and counts what it refused.
+static READ_ONLY: AtomicBool = AtomicBool::new(false);
+static REFUSED: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_read_only(on: bool) {
+    READ_ONLY.store(on, Ordering::Relaxed);
+}
+
+/// Sector writes refused while on trial.
+#[allow(dead_code)]
+pub fn refused_writes() -> u64 {
+    REFUSED.load(Ordering::Relaxed)
+}
+
 pub fn blk_present() -> bool {
+    if READ_ONLY.load(Ordering::Relaxed) {
+        crate::kprintln!("[pc] trial: the data partition is read only until this version is kept; nothing is saved");
+        return false;
+    }
     crate::virtio_core::blk_present() || crate::nvme::present() || crate::ahci::present() || crate::ide::present() || crate::xhci::msc_present() || crate::sdhci::present()
 }
 
@@ -50,6 +72,10 @@ pub fn read_sector(n: u64, out: &mut [u8; 512]) -> bool {
 }
 
 pub fn write_sector(n: u64, data: &[u8; 512]) -> bool {
+    if READ_ONLY.load(Ordering::Relaxed) {
+        REFUSED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
     if crate::virtio_core::blk_present() {
         crate::virtio_core::write_sector(n, data)
     } else if crate::nvme::present() {
@@ -71,6 +97,11 @@ pub fn write_sector(n: u64, data: &[u8; 512]) -> bool {
 /// 9). Same order as the calls above. A disk whose driver has no flush yet answers false ("cannot confirm"), never
 /// true; each driver's own blk_flush replaces its false in V2.
 pub fn blk_flush() -> bool {
+    // safe updates U4 (the architect's rule for U4 merging after V2): on a trial boot nothing reached the disk,
+    // so nothing can be confirmed on it
+    if READ_ONLY.load(Ordering::Relaxed) {
+        return false;
+    }
     if crate::virtio_core::blk_present() {
         crate::virtio_core::blk_flush()
     } else if crate::nvme::present() {

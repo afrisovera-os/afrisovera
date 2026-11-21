@@ -166,7 +166,7 @@ Files tile. Screenshots for review come from `scripts/desk-shots.sh` run on GitH
 
 ## 12. Review S1 (Gemini Pro, 10 Nov 2026), what changed
 
-Full table in `docs/DESIGN_LOG.md` (Sovereign S1). Taken: a thicker cloth (6 px) and a gold-deep focus border, lighter
+Full table in `(a private engineering record)` (Sovereign S1). Taken: a thicker cloth (6 px) and a gold-deep focus border, lighter
 lines, a flat grid for apps past eight, the corner rule in section 3. Not taken, with reasons: cutting all four window
 corners (the lopsided cut is the identity; the rule makes it consistent), and moving the clock and bell to the top of
 the Spine (the bottom is where people coming from Windows already look for them, and the top of the Spine is where the

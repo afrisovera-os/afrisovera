@@ -441,6 +441,9 @@ struct State {
     power: u8,
     notes: [[u8; NOTE_LEN]; NNOTE],
     note_len: [usize; NNOTE],
+    /// The catalogue id a notice came from (stage 6): drawn as t(id) at paint time, so it follows a language switch.
+    /// None for text from outside the catalogue (`desk notify`, an app), which stays as posted.
+    note_msg: [Option<lang::Msg>; NNOTE],
     nnotes: usize,
     unread: usize,
     toast_until: u64,
@@ -489,6 +492,7 @@ static mut S: State = State {
     power: 0,
     notes: [[0; NOTE_LEN]; NNOTE],
     note_len: [0; NNOTE],
+    note_msg: [None; NNOTE],
     nnotes: 0,
     unread: 0,
     toast_until: 0,
@@ -2348,9 +2352,20 @@ pub fn notify(msg: &str) {
     notify_bytes(msg.as_bytes());
 }
 
-/// Post one of the desk's own notices, in the desk's language at the moment it is posted.
+/// Post one of the desk's own notices. It is drawn from its id, so it reads in whatever language the desk is in.
 fn notify_msg(m: lang::Msg) {
     notify_bytes(lang::t(m));
+    let s = st();
+    s.note_msg[(s.nnotes - 1) % NNOTE] = Some(m);
+}
+
+/// The text of notice `i`: its catalogue id in the desk's language now, or the bytes it was posted with.
+fn note_text(i: usize) -> &'static [u8] {
+    let s = st();
+    match s.note_msg[i] {
+        Some(m) => lang::t(m),
+        None => &s.notes[i][..s.note_len[i]],
+    }
 }
 
 fn notify_bytes(b: &[u8]) {
@@ -2363,6 +2378,7 @@ fn notify_bytes(b: &[u8]) {
     }
     s.notes[i][..n].copy_from_slice(&b[..n]);
     s.note_len[i] = n;
+    s.note_msg[i] = None;
     s.nnotes += 1;
     s.unread = (s.unread + 1).min(NNOTE);
     s.toast_until = crate::sched::ticks() + 400;
@@ -2897,6 +2913,11 @@ fn set_lang(l: lang::Lang) {
     DIRTY.store(true, Ordering::Relaxed);
     let (_, draft, _, english) = lang::counts(l);
     crate::kprintln!("[desk] lang: {} ({}), {} drafts, {} in English", l.code(), l.own_name(), draft, english);
+    if l.is_test() {
+        // the test language is never kept (the architect's rule 1, 15 Nov)
+        crate::kprintln!("[desk] lang: qps is a test language, for this session only; not saved");
+        return;
+    }
     if let Err(why) = crate::config::set_lang(l.code()) {
         crate::kprintln!("[desk] lang: not saved: {}", why);
     }
@@ -2905,6 +2926,9 @@ fn set_lang(l: lang::Lang) {
 /// At the first `gui`: the language saved in afrisovera.conf. English (the default) prints nothing, so a desk with
 /// no saved language prints what it always did.
 fn apply_saved_lang() {
+    if let Some(v) = crate::config::lang_refused() {
+        crate::kprintln!("[desk] lang: {} in afrisovera.conf refused: a test language is never kept; English", v);
+    }
     let code = crate::config::lang();
     match lang::Lang::from_code(code) {
         Some(lang::Lang::En) => {}
@@ -3384,6 +3408,10 @@ pub fn command(rest: &str) {
                 let msg = "\u{627}\u{644}\u{633}\u{644}\u{627}\u{645} \u{639}\u{644}\u{64A}\u{643}\u{645} AfriSovera \u{662}\u{660}\u{662}\u{666}";
                 notify(msg);
                 crate::kprintln!("[desk] shape sample: a notice with {} characters in {} bytes", msg.chars().count(), msg.len());
+                // and Hindi (C3): "namaste" with a conjunct, a reph and a pre-base matra (38 of 44 bytes)
+                let hi = "\u{0928}\u{092E}\u{0938}\u{094D}\u{0924}\u{0947} \u{0915}\u{093F} \u{0930}\u{094D}\u{0915} OS";
+                notify(hi);
+                crate::kprintln!("[desk] shape sample hindi: a notice with {} characters in {} bytes", hi.chars().count(), hi.len());
             }
             "probe" => {
                 if !s.shown {
@@ -3758,6 +3786,16 @@ pub fn command(rest: &str) {
                         }
                     }
                 }
+                // stage 6: the drop-down's rows and a pick by code come only from LANGS, which never holds the test
+                // language (the architect's rule 2); `desk lang qps` is its only way in
+                all += 1;
+                if !lang::LANGS.contains(&lang::Lang::Qps) && lang::Lang::from_code("qps").is_none()
+                    && lang::Lang::Qps.next() == lang::Lang::En
+                {
+                    ok += 1;
+                } else {
+                    crate::kprintln!("[desk] lang selftest: FAIL the language list could offer the test language qps");
+                }
                 crate::kprintln!("[desk] lang selftest: {}/{} checks held", ok, all);
             }
             "check" => {
@@ -3779,6 +3817,16 @@ pub fn command(rest: &str) {
                 }
                 None => crate::kprintln!("desk: lang pick <code>; codes: {}", lang::codes()),
             },
+            "fit" if it.clone().next() == Some("qps") => {
+                // the test language, a third longer than English: where the desk is tight (not a failure)
+                let mut tight = 0usize;
+                paint::fit_report(lang::Lang::Qps, &mut |id, w, room| {
+                    tight += 1;
+                    crate::kprintln!("[desk] lang fit qps: {}: {} px in {} px", id, w, room);
+                });
+                crate::kprintln!("[desk] lang fit qps: {} place(s) too tight for a third more text (a note, not a failure)", tight);
+            }
+            "qps" => set_lang(lang::Lang::Qps),
             "fit" => {
                 let mut bad = 0usize;
                 for &l in lang::LANGS.iter() {

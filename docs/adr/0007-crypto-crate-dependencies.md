@@ -4,7 +4,7 @@
 - **Date:** 2026-11-13 (written down after the fact: THIRD_PARTY.md has cited it since 10 Nov 2026)
 - **Deciders:** chief architect, with the OS lead (mesh window, review follow-up F2)
 - **Related:** `docs/policy/THIRD_PARTY.md` (the crate list and licences), ADR 0002 (Rust), ADR 0005 (Apache-2.0),
-  AFR-0009 (mesh wire format), `docs/design-f2-vendor-audit.md`, ADR 0008 (the kernel's own DRBG)
+  AFR-0009 (mesh wire format), the F2 vendor audit (a private engineering record), ADR 0008 (the kernel's own DRBG)
 
 ## Context
 

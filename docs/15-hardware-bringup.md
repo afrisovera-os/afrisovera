@@ -176,7 +176,7 @@ Changing an address is the easy 20%. The honest hard parts:
      subsequent EL1-scoped register write this run made was actually
      happening at EL3. It did not fault (EL3 can touch lower-EL registers)
      but this is NOT a verified EL1 boot. Full trace, controls, and the EL3
-     bug detail: `docs/finding-3.712-qemu-raspi4b-device-loader-load-address-override.md`.
+     bug detail: `(a private engineering record)`.
      **Update (3.737): the EL-check bug is fixed.** `_start`
      (`kernel/src/main.rs:97-111`) now branches explicitly — `CurrentEL==2`
      drops to EL1h as before, `CurrentEL==1` continues directly, and anything
@@ -204,7 +204,7 @@ Changing an address is the easy 20%. The honest hard parts:
      console init ever runs — no boot, no UART output, but a real, measured,
      arithmetically-confirmed failure mode instead of an untried one. Full
      trace and arithmetic in
-     `docs/finding-3.704-qemu-raspi4b-loads-kernel-at-0x200000.md`. GIC-400
+     `(a private engineering record)`. GIC-400
      init and the mailbox framebuffer (items 3-4 below) remain entirely
      unexercised via THIS `-kernel` path — the crash happens before either
      could run. (3.712, above: both DO run, but only via the firmware-bypass
@@ -611,7 +611,7 @@ to an EL0 *user-space* process: `crate::c1_on_sgi(intid)` (declared in
 `main.rs`) is called from two IRQ entry points — the EL1 path
 (`exceptions.rs`'s `rust_irq_handler`) and the new EL0 path
 (`process.rs`'s `rust_irq_from_el0`) — so a process running at EL0 now sees
-the same inter-core signal a kernel thread does. `scripts/sgi-el0-probe-2991.sh`
+the same inter-core signal a kernel thread does. `(a private engineering record)`
 falsified first (exit 10, EL1 delivered / EL0 not) then flipped green (exit 0)
 once the EL0 call site landed, and suite 685 `sgi-el0` registered it.
 
@@ -630,7 +630,7 @@ function the same build had compiled out: `error[E0425]: cannot find function
 the break. It first showed up as `pi FAIL` inside walk 2995 (108 s: a failed
 `cargo build` plus the suite's 60 s marker-wait timing out against a guest
 that never booted, not a load-sensitivity ceiling as first misdiagnosed at
-finding-3.120 and corrected at `docs/finding-3.121-sgi-arm-breaks-raspi-build.md`).
+finding-3.120 and corrected at `(a private engineering record)`).
 
 **The fix (landed, commit `6ab91a8`, milestone 3.181).** One statement-position
 `#[cfg(not(feature = "board-raspi"))]` on the `process.rs` call site — not
@@ -651,12 +651,12 @@ happened to already sit in `target/` — a hazard measured live during walk
 reported under the kernel's name rather than the build's).
 
 **Current status: GREEN, no open gap in this chain.** Both patches
-(`docs/repair-3124-c1-on-sgi.patch`, `docs/repair-3125-pi-buildguard.patch`)
+(`(a private engineering record)`, `(a private engineering record)`)
 are landed, not merely proposed. Full derivation, falsification evidence, and
 the sequencing discipline used to land a kernel fix safely *behind* a live
-685-suite regression walk are in `docs/finding-2.997-pi-board-raspi-cfg.md`,
-`docs/design-2.998-raspi-sgi-cfg-fix.md`, and
-`docs/finding-3.121-sgi-arm-breaks-raspi-build.md`.
+685-suite regression walk are in `(a private engineering record)`,
+`(a private engineering record)`, and
+`(a private engineering record)`.
 
 **The standing lesson this episode adds to the "what the base-address
 abstraction does not solve" list above:** exactly one registered suite

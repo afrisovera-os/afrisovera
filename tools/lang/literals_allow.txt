@@ -1,0 +1,16 @@
+# file	literal (or *)	reason. Every drawn string literal outside lang.rs needs a line here.
+kernel/src/dira	*	Dira's page notes: Dira gets its own message table after S5d, the language in its start block (the architect, 15 Nov)
+kernel/src/afriui/paint.rs	wasm 	a command word typed in the Terminal, shown before a file name (Files' preview)
+kernel/src/afriui/paint.rs	Clipped text	a test specimen of desk vector (the drawing self-check), never on a normal desk
+kernel/src/afriui/paint.rs	Wg	a test specimen of desk vector (the drawing self-check), never on a normal desk
+kernel/src/afriui/desk.rs	unfold 	a [desk] serial line that tests read (desk motion), never drawn
+kernel/src/afriui/desk.rs	grow circle	a [desk] serial line that tests read (desk motion), never drawn
+kernel/src/afriui/desk.rs	 ticks	a [desk] serial line that tests read (desk motion), never drawn
+kernel/src/afriui/desk.rs	 early	a [desk] serial line that tests read (desk motion), never drawn
+kernel/src/afriui/desk.rs	plural	a [desk] serial line that desk-locale grades (desk locale probe), never drawn
+kernel/src/afriui/desk.rs	; group	a [desk] serial line that desk-locale grades (desk locale probe), never drawn
+kernel/src/afriui/desk.rs	; memory	a [desk] serial line that desk-locale grades (desk locale probe), never drawn
+kernel/src/afriui/desk.rs	; am=	a [desk] serial line that desk-locale grades (desk locale probe), never drawn
+kernel/src/afriui/desk.rs	 pm=	a [desk] serial line that desk-locale grades (desk locale probe), never drawn
+kernel/src/afriui/desk.rs	; clock 24	a [desk] serial line that desk-locale grades (desk locale probe), never drawn
+kernel/src/afriui/desk.rs	; clock 12	a [desk] serial line that desk-locale grades (desk locale probe), never drawn

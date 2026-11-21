@@ -820,6 +820,9 @@ pub fn check() {
 
 impl Disk {
     pub(crate) fn write(self, n: u64, buf: &[u8; 512]) -> bool {
+        if crate::trial::on_trial() {
+            return false; // safe updates U4: a trial boot writes no disk (the keep writes firmware variables only)
+        }
         match self {
             Disk::Nvme => crate::nvme::table_write(n, buf),
             Disk::Sata(p) => crate::ahci::table_write(p, n, buf),
@@ -845,6 +848,9 @@ impl Disk {
     /// a SATA disk (AHCI or IDE mode, the IDE one also one cache flush) or an NVMe disk (installdisk,
     /// bootcopy); other disks one sector at a time as `write`.
     pub(crate) fn write_run(self, n: u64, data: &[u8]) -> bool {
+        if crate::trial::on_trial() {
+            return false; // safe updates U4: as `write`
+        }
         match self {
             Disk::Nvme => crate::nvme::table_write_run(n, data),
             Disk::Ide(k) => crate::ide::table_write_run(k, n, data),
@@ -1239,6 +1245,12 @@ fn ours(dk: Disk, cap512: u64, bs: u64) -> Option<(u64, u64)> {
         return None;
     }
     Some((a * per, (z - a + 1) * per))
+}
+
+/// For safe updates (pc/trial.rs, the data-format guard): the first 512-byte sector of AfriSovera's partition on
+/// `dk`, if it has a healthy one. Reads only.
+pub(crate) fn ours_first(dk: Disk, cap512: u64, bs: u64) -> Option<u64> {
+    ours(dk, cap512, bs).map(|(a, _)| a)
 }
 
 /// For nvme.rs at boot: AfriSovera's partition on namespace 1, if there is a healthy one.

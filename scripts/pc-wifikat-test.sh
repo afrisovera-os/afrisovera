@@ -5,8 +5,8 @@
 #   2. One QEMU boot (no Wi-Fi hardware is needed or used): `wifi selftest` runs every published vector in
 #      kernel/src/wlan/crypto_kat.rs on the kernel's own build, and says how long one passphrase takes to become a
 #      key (the architect asked for that number: a slow step must never look like a hang).
-# Graded: the seven family lines with their exact counts (HMAC-SHA1 7, PBKDF2 5, passphrase 3, PRF 3, key wrap 1,
-# CMAC 4, CCM 12), the "making keys" line before the two slow families, the summary "35 of 35 vectors PASS", no
+# Graded: the eight family lines with their exact counts (HMAC-SHA1 7, PBKDF2 5, passphrase 3, PRF 3, key wrap 1,
+# CMAC 4, CCM 12, CCMP frames 4), the "making keys" line before the two slow families, the summary "39 of 39 vectors PASS", no
 # FAILED line, and the time for one passphrase. The grader's selftest feeds it a good log and five bad ones.
 #   scripts/pc-wifikat-test.sh              # grader selftest, then the build, the disassembly and the QEMU boot
 #   scripts/pc-wifikat-test.sh --selftest   # grader selftest only
@@ -14,7 +14,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 T="${TMPDIR:-/tmp}"
 
-COUNTS='HMAC-SHA1 \(RFC 2202\): 7 of 7|PBKDF2-HMAC-SHA1 \(RFC 6070\): 5 of 5|passphrase to PMK \(802\.11 Annex J\.4\): 3 of 3|802\.11 PRF-SHA1 \(Annex J\.3\): 3 of 3|AES key wrap \(RFC 3394\): 1 of 1|AES-CMAC \(RFC 4493\): 4 of 4|AES-CCM, 8-byte tag \(RFC 3610\): 12 of 12'
+COUNTS='HMAC-SHA1 \(RFC 2202\): 7 of 7|PBKDF2-HMAC-SHA1 \(RFC 6070\): 5 of 5|passphrase to PMK \(802\.11 Annex J\.4\): 3 of 3|802\.11 PRF-SHA1 \(Annex J\.3\): 3 of 3|AES key wrap \(RFC 3394\): 1 of 1|AES-CMAC \(RFC 4493\): 4 of 4|AES-CCM, 8-byte tag \(RFC 3610\): 12 of 12|CCMP frames \(802\.11i Annex I\.7\.4\): 4 of 4'
 
 grade() { # grade <serial log>
     local fail=0 S c
@@ -30,11 +30,11 @@ grade() { # grade <serial log>
     has '^  PBKDF2-HMAC-SHA1 \(RFC 6070\): making keys \(a few seconds\)' || _f "no 'making keys' line before PBKDF2"
     has '^  passphrase to PMK \(802\.11 Annex J\.4\): making keys \(a few seconds\)' || _f "no 'making keys' line before the passphrases"
     has '^  passphrase to PMK \(802\.11 Annex J\.4\): 3 of 3 PASS in [0-9]+ ms \([0-9]+ ms for one passphrase\)' || _f "no time for one passphrase"
-    has '^wifi selftest: 35 of 35 vectors PASS; Wi-Fi may make keys$' || _f "no '35 of 35 vectors PASS' summary"
+    has '^wifi selftest: 39 of 39 vectors PASS; Wi-Fi may make keys$' || _f "no '39 of 39 vectors PASS' summary"
     has 'FAILED' && _f "a FAILED line was printed"
     has 'PANIC|panicked' && _f "the kernel panicked"
     if [ $fail -eq 0 ]; then
-        echo "  graded: 7 families, 35 vectors PASS; one passphrase took $(printf '%s\n' "$S" | sed -n 's/.*(\([0-9]*\) ms for one passphrase).*/\1/p' | head -1) ms"
+        echo "  graded: 8 families, 39 vectors PASS; one passphrase took $(printf '%s\n' "$S" | sed -n 's/.*(\([0-9]*\) ms for one passphrase).*/\1/p' | head -1) ms"
     fi
     return $fail
 }
@@ -50,7 +50,8 @@ wifi selftest: the Wi-Fi crypto against its published test vectors (nothing is s
   AES key wrap (RFC 3394): 1 of 1 PASS in 0 ms
   AES-CMAC (RFC 4493): 4 of 4 PASS in 1 ms
   AES-CCM, 8-byte tag (RFC 3610): 12 of 12 PASS in 4 ms
-wifi selftest: 35 of 35 vectors PASS; Wi-Fi may make keys
+  CCMP frames (802.11i Annex I.7.4): 4 of 4 PASS in 2 ms
+wifi selftest: 39 of 39 vectors PASS; Wi-Fi may make keys
 afrisovera> '
 
 selftest() {
@@ -60,7 +61,7 @@ selftest() {
     printf '%s' "$GOOD" | sed 's/12 of 12 PASS/11 of 12 PASS/' > "$D/count"
     printf '%s' "$GOOD" | sed 's/  AES-CMAC (RFC 4493): 4 of 4 PASS in 1 ms/  AES-CMAC (RFC 4493): vector 2 FAILED/' > "$D/failed"
     printf '%s' "$GOOD" | grep -v 'making keys' > "$D/nowarn"
-    printf '%s' "$GOOD" | sed 's/35 of 35 vectors PASS; Wi-Fi may make keys/FAILED in 1 family; Wi-Fi will not make keys this boot/' > "$D/summary"
+    printf '%s' "$GOOD" | sed 's/39 of 39 vectors PASS; Wi-Fi may make keys/FAILED in 1 family; Wi-Fi will not make keys this boot/' > "$D/summary"
     printf '%s' "$GOOD" | sed 's/ (600 ms for one passphrase)//' > "$D/notime"
     echo "  --- grader selftest (no QEMU) ---"
     if grade "$D/good" > /dev/null; then pass=$((pass + 1)); else echo "  FAIL selftest: the good log was refused"; grade "$D/good"; bad=$((bad + 1)); fi

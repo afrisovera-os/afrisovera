@@ -4377,6 +4377,9 @@ pub fn msc_settle() -> bool {
 /// - gpt.rs, the partition-table backup, after `msc_present`;
 /// - esp.rs, `BootStick`, made only in `report_save` after the boot-medium and boot-file checks.
 pub fn msc_write(n: u64, data: &[u8; 512]) -> bool {
+    if crate::trial::on_trial() {
+        return false; // safe updates U4: a trial boot writes no stick
+    }
     if !msc_attached() || n >= msc_capacity() {
         return false;
     }
@@ -5667,6 +5670,7 @@ pub fn accel_line() {
 
 /// One pointer report: buttons (bit 0 left, 1 right, 2 middle), then signed x and y moves.
 unsafe fn mouse_report(buttons: u8, dx: i32, dy: i32) {
+    crate::trial::input(); // the person used the PC (safe updates U4)
     MCLICKS += (buttons & !MBUTTONS & 7).count_ones() as u64;
     let left_down = buttons & 1 != 0 && MBUTTONS & 1 == 0;
     let released_left = buttons & 1 == 0 && MBUTTONS & 1 != 0;

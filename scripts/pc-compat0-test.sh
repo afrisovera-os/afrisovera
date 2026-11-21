@@ -113,6 +113,20 @@ tr -d '\r' < "$W/boot.log" | grep -aE '^\[daraja\] (linux|exit|unknown|bridge st
 
 echo "  --- 6. AfriSovera against Linux ---"
 grep -aE '^\[daraja\] out1 ' "$W/boot.log" > /dev/null || echo "  (no stdout lines at all)"
+# the unknown-call limit on the fault path (the architect, 21 Nov): fault0 makes getpriority (140) 5 times, which the
+# bridge does not answer; its section shows 3 lines, then the summary for the other 2 before the fault's exit line.
+# A here-string, not a pipe, for the greps (the pipefail SIGPIPE trap).
+F0="$(tr -d '\r' < "$W/boot.log" | sed -n '/linux fault0: begin/,/linux fault0: end/p')"
+f0_lines="$(grep -cE '^\[daraja\] unknown call 140$' <<< "$F0")"
+f0_sum="$(grep -nE '^\[daraja\] unknown call 140: 2 more not shown$' <<< "$F0" | cut -d: -f1 | head -1)"
+f0_exit="$(grep -nE '^\[daraja\] exit 139 ' <<< "$F0" | cut -d: -f1 | head -1)"
+echo "  fault0: $f0_lines unknown-call lines, summary at line ${f0_sum:-none}, exit at line ${f0_exit:-none}"
+if [ "$f0_lines" != 3 ] || [ -z "$f0_sum" ] || [ -z "$f0_exit" ] || [ "$f0_sum" -gt "$f0_exit" ]; then
+    echo "  FAIL: fault0's unknown-call summary is missing, or not before its exit line"
+    echo "  logs kept in $W"
+    echo "PC COMPAT0 TEST FAILED"
+    exit 1
+fi
 if "$PY" scripts/lib/compat0-compare.py "$W/boot.log" "$REF" hello0 fault0 bench0; then
     # the serial log's lines end in CR: strip it first, or the end-of-line match below finds nothing (first runs)
     cyc="$(tr -d '\r' < "$W/boot.log" | sed -n '/linux bench0: begin/,/linux bench0: end/p' | sed -nE 's/^\[daraja\] out1 ([0-9a-f]+)$/\1/p' | head -1)"

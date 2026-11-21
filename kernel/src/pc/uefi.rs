@@ -704,7 +704,8 @@ unsafe fn read_boot_vars(rt: *const RuntimeServices) {
 //
 // The ONLY firmware variables this kernel ever writes: one Boot#### (AfriSovera's),
 // BootOrder (that number added at its END, or taken out again) and BootNext (`bootnext`:
-// AfriSovera's number, started once at the next power-on; the firmware deletes it then). Called after
+// AfriSovera's number, started once at the next power-on; the firmware deletes it then); since safe updates (AFR-0010)
+// also the "AfriSovera trial" Boot#### (updatestage) and AfriSovera's own record AfriUpdate under its own GUID. Called after
 // exit_boot_services through the runtime services at their physical addresses, which the
 // kernel's 1:1 map keeps valid (RuntimeServicesCode/Data are never handed out as frames:
 // `usable_after_exit` leaves types 5 and 6 out), with interrupts masked for the call.
@@ -763,6 +764,43 @@ pub fn set_global(name: &[u8], data: &[u8]) -> Status {
     masked(|| unsafe {
         let sv: SetVariableFn = core::mem::transmute((*rt).f[SET_VARIABLE]);
         sv(w.as_ptr(), &GLOBAL_VARIABLE_GUID, attr, data.len(), data.as_ptr())
+    })
+}
+
+/// AfriSovera's own vendor GUID (safe updates U4, 14 Nov 2026): the update record `AfriUpdate` lives under it,
+/// never under the firmware's global GUID.
+const AFRISOVERA_GUID: Guid = Guid(0xaf150a7e, 0x0004, 0x4a10, [0x9b, 0x2c, 0x5a, 0xfe, 0x0d, 0x00, 0xa7, 0xe5]);
+
+/// One of AfriSovera's own variables: Ok(bytes) / Err(status) (NOT_FOUND: none).
+pub fn get_ours(name: &[u8], buf: &mut [u8]) -> Result<usize, Status> {
+    let rt = crate::runtime_services();
+    if rt.is_null() {
+        return Err(NOT_FOUND);
+    }
+    let w = wide(name);
+    let mut size = buf.len();
+    let mut attr = 0u32;
+    // SAFETY: as get_global, under AfriSovera's own GUID.
+    let st = masked(|| unsafe {
+        let gv: GetVariableFn = core::mem::transmute((*rt).f[GET_VARIABLE]);
+        gv(w.as_ptr(), &AFRISOVERA_GUID, &mut attr, &mut size, buf.as_mut_ptr())
+    });
+    if st == SUCCESS { Ok(size.min(buf.len())) } else { Err(st) }
+}
+
+/// Write one of AfriSovera's own variables, non-volatile (a handful of times per update, never in a loop: NV writes
+/// wear the firmware's flash). The status.
+pub fn set_ours(name: &[u8], data: &[u8]) -> Status {
+    let rt = crate::runtime_services();
+    if rt.is_null() {
+        return NOT_FOUND;
+    }
+    let w = wide(name);
+    let attr = if data.is_empty() { 0 } else { VAR_NV_BS_RT };
+    // SAFETY: as set_global, under AfriSovera's own GUID.
+    masked(|| unsafe {
+        let sv: SetVariableFn = core::mem::transmute((*rt).f[SET_VARIABLE]);
+        sv(w.as_ptr(), &AFRISOVERA_GUID, attr, data.len(), data.as_ptr())
     })
 }
 

@@ -51,7 +51,7 @@ Bad / accepted costs:
 
 - `kernel/Cargo.toml` line 6: `license = "Apache-2.0"`.
 - Drivers cite Linux behaviour in comments (e.g. "as Linux does") but contain no copied Linux code; reviewers
-  should keep it that way (see docs/review/).
+  should keep it that way (see (a private engineering record)).
 
 ## Revisit if
 

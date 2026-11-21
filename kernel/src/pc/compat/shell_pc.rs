@@ -211,6 +211,16 @@ pub fn intercept(line: &str) -> bool {
             } else if _rest == "selftest" {
                 // the Wi-Fi crypto known-answer tests (W1): published vectors only, nothing sent or changed
                 crate::wifi::selftest()
+            } else if _rest == "scan" {
+                // W4b: the networks in range, strongest first
+                crate::wifinet::scan()
+            } else if let Some(name) = _rest.strip_prefix("connect") {
+                // W4b: join; a passphrase is asked for at the local keyboard or serial line only, never shown
+                crate::wifinet::connect(name.trim())
+            } else if _rest == "status" {
+                crate::wifinet::status()
+            } else if _rest == "disconnect" {
+                crate::wifinet::disconnect()
             } else {
                 crate::wifi::lookup(_rest)
             }
@@ -279,6 +289,21 @@ pub fn intercept(line: &str) -> bool {
         }
         // the update file update.afu on a USB stick, checked whole: signature, machine, version, boot file (reads only)
         "updatecheck" => crate::update::command(),
+        "updatetry" | "updatekeep" | "updateback" => {
+            let mut w = _rest.split_whitespace();
+            let given = match (w.next(), w.next(), w.next()) {
+                (None, _, _) => Some(None),
+                (Some("yes"), Some(c), None) => Some(Some(c)),
+                _ => None,
+            };
+            match (cmd, given) {
+                ("updatetry", Some(g)) => crate::trial::try_(g),
+                ("updatekeep", Some(g)) => crate::trial::keep_cmd(g),
+                ("updateback", Some(g)) => crate::trial::back(g),
+                _ => crate::kprintln!("{}: use  {}  (it asks for the owner's code)", cmd, cmd),
+            }
+        }
+        "updatesetting" => crate::trial::setting(_rest.trim()),
         "updatestage" => {
             let mut w = _rest.split_whitespace();
             match (w.next(), w.next(), w.next(), w.next()) {

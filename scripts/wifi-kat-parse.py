@@ -13,6 +13,12 @@ Sources and what is kept:
   rfc3610.txt   AES-CCM packet vectors with an 8-octet tag and a 13-octet nonce (CCMP's parameters: M=8, L=2)
   crypto_module_tests.c (hostapd, BSD licence): the IEEE 802.11 PRF-SHA1 cases (802.11 Annex J.3, label
                 "prefix") and the passphrase-to-PSK cases (802.11 Annex J.4). Data only; no code is taken.
+  test_ccmp.c   (FreeBSD tools/regression/net80211, BSD licence): the 8 CCMP MPDU vectors of P802.11i/D7.0
+                section I.7.4: TK, key id, PN, the plaintext MPDU and the encrypted MPDU with its MIC (no FCS).
+                Data only; no code is taken. That draft predates 802.11n: in a QoS data frame with the Order bit
+                set it has no HT Control field and keeps Order in the AAD, where 802.11-2020 (which the kernel
+                follows) has an HT Control field and masks Order. Those vectors (3, 4, 5 and 8) mean something
+                else today and are left out; the 4 kept (1, 2, 6, 7) read the same under both.
 
 Modes:
   SRC_DIR --fixture OUT.txt --rust OUT.rs --sources SOURCE.txt   parse everything; write the outputs
@@ -25,7 +31,7 @@ import os
 import re
 import sys
 
-SOURCES = ["rfc2202.txt", "rfc6070.txt", "rfc3394.txt", "rfc4493.txt", "rfc3610.txt", "crypto_module_tests.c"]
+SOURCES = ["rfc2202.txt", "rfc6070.txt", "rfc3394.txt", "rfc4493.txt", "rfc3610.txt", "crypto_module_tests.c", "test_ccmp.c"]
 SLOW_ROUNDS = 100000  # PBKDF2 cases above this are skipped (RFC 6070 has one with 16,777,216 rounds)
 
 
@@ -309,6 +315,34 @@ def parse_hostapd(text):
     return prf, psk
 
 
+# ---- FreeBSD test_ccmp.c: CCMP MPDU vectors (P802.11i/D7.0 I.7.4) --------------------------------------------
+
+def parse_freebsd_ccmp(text):
+    arr = {}
+    for m in re.finditer(r"static const u_int8_t (test\d+_(?:key|plaintext|encrypted))\[\]\s*=\s*\{([^}]*)\};", text):
+        arr[m.group(1)] = bytes(int(x, 16) for x in re.findall(r"0x([0-9a-fA-F]{2})", m.group(2)))
+    out, seen = [], 0
+    for m in re.finditer(r'TEST\((\d+), "CCMP test mpdu \d+", AES_CCM, (\d+), (\d+)\)', text):
+        n, keyid, pn = m.group(1), int(m.group(2)), int(m.group(3))
+        try:
+            key, plain, enc = arr["test%s_key" % n], arr["test%s_plaintext" % n], arr["test%s_encrypted" % n]
+        except KeyError:
+            raise ParseError("test_ccmp.c: arrays of test %s missing" % n)
+        if len(key) != 16 or keyid > 3 or pn >= 1 << 48:
+            raise ParseError("test_ccmp.c: test %s key, key id or PN out of range" % n)
+        # encrypted = the same header, 8 bytes of CCMP header, the encrypted body, 8 bytes of MIC
+        if len(enc) != len(plain) + 16:
+            raise ParseError("test_ccmp.c: test %s lengths do not fit CCMP" % n)
+        fc = plain[0] | (plain[1] << 8)
+        qos_order = (fc >> 2) & 3 == 2 and (fc >> 4) & 8 and fc & 0x8000
+        seen += 1
+        if not qos_order:
+            out.append((key, keyid, pn, plain, enc))
+    if seen != 8 or len(out) != 4:
+        raise ParseError("test_ccmp.c: expected 8 CCMP tests and 4 kept, found %d and %d" % (seen, len(out)))
+    return out
+
+
 # ---- outputs --------------------------------------------------------------------------------------------------
 
 def h(b):
@@ -331,6 +365,8 @@ def fixture_lines(v):
         out.append("cmac %s %s %s" % (h(k), h(m), h(t)))
     for k, n, a, p, c in v["ccm"]:
         out.append("ccm8 %s %s %s %s %s" % (h(k), h(n), h(a), h(p), h(c)))
+    for k, kid, pn, p, e in v["ccmp"]:
+        out.append("ccmp_mpdu %s %d %d %s %s" % (h(k), kid, pn, h(p), h(e)))
     return out
 
 
@@ -367,6 +403,9 @@ def rust_const(v, srcs):
     L += ["];", "", "/// AES-CCM, 8-octet tag, 13-octet nonce (RFC 3610): key, nonce, AAD, plaintext, ciphertext||tag.",
           "pub const CCM8: &[(&[u8], &[u8], &[u8], &[u8], &[u8])] = &["]
     L += ["    (%s, %s, %s, %s, %s)," % tuple(rs_bytes(x) for x in t) for t in v["ccm"]]
+    L += ["];", "", "/// CCMP MPDUs (P802.11i/D7.0 I.7.4, via FreeBSD's tests): TK, key id, PN, plaintext MPDU, encrypted MPDU.",
+          "pub const CCMP_MPDU: &[(&[u8], u8, u64, &[u8], &[u8])] = &["]
+    L += ["    (%s, %d, %d, %s, %s)," % (rs_bytes(k), kid, pn, rs_bytes(p), rs_bytes(e)) for k, kid, pn, p, e in v["ccmp"]]
     L += ["];", ""]
     return "\n".join(L)
 
@@ -381,6 +420,7 @@ def parse_all(texts):
         "ccm": parse_rfc3610(texts["rfc3610.txt"]),
         "prf": prf,
         "psk": psk,
+        "ccmp": parse_freebsd_ccmp(texts["test_ccmp.c"]),
     }
 
 
@@ -504,6 +544,21 @@ static const struct passphrase_test passphrase_tests[] =
 """ % tuple(", ".join(["0x%02x" % n] * 32) for n in (1, 2, 3))
 
 
+SAMPLE_FREEBSD = "".join("""
+static const u_int8_t test%d_key[] = {		/* TK */
+	%s
+};
+static const u_int8_t test%d_plaintext[] = {	/* Plaintext MPDU w/o MIC */
+	%s, 0x01,
+};
+static const u_int8_t test%d_encrypted[] = {	/* Encrypted MPDU with MIC */
+	%s
+};
+""" % (n, ", ".join(["0x%02x" % n] * 16), n, "0xb8, 0xc8" if n in (3, 4, 5, 8) else "0x08, 0x48", n,
+       ", ".join(["0xee"] * 19)) for n in range(1, 9)) + "".join(
+    '\tTEST(%d, "CCMP test mpdu %d", AES_CCM, %d, %d),\n' % (n, n, n % 4, 1000 + n) for n in range(1, 9))
+
+
 def selftest():
     bad = 0
 
@@ -514,7 +569,8 @@ def selftest():
             bad += 1
 
     v = parse_all({"rfc2202.txt": SAMPLE_2202, "rfc6070.txt": SAMPLE_6070, "rfc3394.txt": SAMPLE_3394,
-                   "rfc4493.txt": SAMPLE_4493, "rfc3610.txt": _sample_3610(), "crypto_module_tests.c": SAMPLE_HOSTAPD})
+                   "rfc4493.txt": SAMPLE_4493, "rfc3610.txt": _sample_3610(), "crypto_module_tests.c": SAMPLE_HOSTAPD,
+                 "test_ccmp.c": SAMPLE_FREEBSD})
     ok(v["hmac"][0] == (b"\x01\x02", b"\xdd\xdd\xdd", bytes.fromhex("00112233445566778899aabbccddeeff00112233")),
        "rfc2202: hex key, 'repeated N times' data, digest")
     ok(v["hmac"][1][0] == b"k" and v["hmac"][1][1] == b"d e" and len(v["hmac"]) == 7,
@@ -531,6 +587,9 @@ def selftest():
     ok(v["prf"][0] == (b"\x0b\x0b", b"prefix", b"Hi", b"\x01\x02"), "hostapd: sizeof(string) - 1 drops the NUL")
     ok(v["prf"][1][0] == b"Jefe" and v["prf"][2][2] == b"\xdd\xdd", "hostapd: string key, whole array data")
     ok(v["psk"][0] == (b"password", b"IEEE", b"\x01" * 32) and len(v["psk"]) == 3, "hostapd: passphrase table")
+    ok(len(v["ccmp"]) == 4 and v["ccmp"][1][:3] == (b"\x02" * 16, 2, 1002) and len(v["ccmp"][0][4]) == 19
+       and [x[2] for x in v["ccmp"]] == [1001, 1002, 1006, 1007],
+       "freebsd: CCMP MPDUs with key id and PN; the 4 pre-802.11n QoS+Order ones left out")
     # damaged inputs must be refused, not half-parsed
     for name, text, mod in (("rfc2202 length lie", SAMPLE_2202, lambda t: t.replace("key_len =       2", "key_len =       3")),
                             ("rfc2202 repeat differs", SAMPLE_2202,
@@ -538,7 +597,8 @@ def selftest():
                             ("rfc6070 length lie", SAMPLE_6070, lambda t: t.replace("(4 octets)\n", "(5 octets)\n", 1)),
                             ("rfc3610 vector lost", _sample_3610(), lambda t: t.replace("Packet Vector #24", "Packet Vektor #24"))):
         texts = {"rfc2202.txt": SAMPLE_2202, "rfc6070.txt": SAMPLE_6070, "rfc3394.txt": SAMPLE_3394,
-                 "rfc4493.txt": SAMPLE_4493, "rfc3610.txt": _sample_3610(), "crypto_module_tests.c": SAMPLE_HOSTAPD}
+                 "rfc4493.txt": SAMPLE_4493, "rfc3610.txt": _sample_3610(), "crypto_module_tests.c": SAMPLE_HOSTAPD,
+                 "test_ccmp.c": SAMPLE_FREEBSD}
         key = {"rfc2202 length lie": "rfc2202.txt", "rfc2202 repeat differs": "rfc2202.txt", "rfc6070 length lie": "rfc6070.txt",
                "rfc3610 vector lost": "rfc3610.txt"}[name]
         texts[key] = mod(text)
@@ -584,8 +644,9 @@ def main():
     with open(a.rust, "w", encoding="ascii", newline="\n") as f:
         f.write(rust_const(v, srcs))
     n = sum(len(x) for x in v.values())
-    print("wifi-kat-parse: %d vectors (hmac %d, pbkdf2 %d, psk %d, prf %d, aes-kw %d, cmac %d, ccm8 %d)" % (
-        n, len(v["hmac"]), len(v["pbkdf2"]), len(v["psk"]), len(v["prf"]), len(v["kw"]), len(v["cmac"]), len(v["ccm"])))
+    print("wifi-kat-parse: %d vectors (hmac %d, pbkdf2 %d, psk %d, prf %d, aes-kw %d, cmac %d, ccm8 %d, ccmp %d)" % (
+        n, len(v["hmac"]), len(v["pbkdf2"]), len(v["psk"]), len(v["prf"]), len(v["kw"]), len(v["cmac"]), len(v["ccm"]),
+        len(v["ccmp"])))
 
 
 if __name__ == "__main__":

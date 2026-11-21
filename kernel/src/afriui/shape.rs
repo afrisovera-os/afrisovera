@@ -19,6 +19,8 @@
 use super::bidi;
 use super::gsub::{self, Gi, MAXG};
 use super::shape_data as sd;
+use super::indic;
+use super::shape_data_deva as dv;
 use super::vector;
 
 pub const MAX: usize = bidi::MAX;
@@ -103,7 +105,8 @@ pub fn needed(s: &[u8]) -> bool {
         if cp >= 0x0590
             && (bidi::is_explicit(cp)
                 || matches!(bidi::class(cp), bidi::R | bidi::AL | bidi::AN)
-                || vector::lookup_arabic(cp).is_some())
+                || vector::lookup_arabic(cp).is_some()
+                || (deva_script(cp) && vector::lookup_deva(cp).is_some()))
         {
             return true;
         }
@@ -186,6 +189,10 @@ fn reorder_harakat(cps: &mut [u32]) {
 fn decompose(cp: u32) -> Option<(u32, u32)> {
     let i = sd::DECOMP.binary_search_by_key(&cp, |r| r.0).ok()?;
     sd::DECOMP.get(i).map(|r| (r.1, r.2))
+}
+
+fn deva_script(cp: u32) -> bool {
+    (0x0900..=0x097F).contains(&cp)
 }
 
 fn arabic_script(cp: u32) -> bool {
@@ -422,7 +429,29 @@ fn layout_inner(s: &[u8], cap: i32, rtl: Option<bool>, kind: Text, f: &mut dyn F
     // would hold it); everything else face 0
     for k in 0..n {
         let cp = cps[k];
-        face[k] = (arabic_script(cp) && vector::lookup_arabic(cp).is_some()) as u8;
+        face[k] = if arabic_script(cp) && vector::lookup_arabic(cp).is_some() {
+            1
+        } else if deva_script(cp) && vector::lookup_deva(cp).is_some() {
+            2
+        } else {
+            0
+        };
+    }
+    // Devanagari: the joiners (which matter in Indic shaping), the dotted circle and the space between two
+    // Devanagari characters are face 2's, as HarfBuzz's run would hold them
+    for k in 0..n {
+        if face[k] == 0 && matches!(cps[k], 0x200C | 0x200D | 0x25CC | 0x20) && vector::lookup_deva(cps[k]).is_some() {
+            let before = (0..k).rev().find(|&j| face[j] != 9 && !matches!(cps[j], 0x200C | 0x200D | 0x20)).map_or(false, |j| face[j] == 2);
+            let after = (k + 1..n).find(|&j| !matches!(cps[j], 0x200C | 0x200D | 0x20)).map_or(false, |j| face[j] == 2);
+            if before && (after || cps[k] != 0x20) {
+                face[k] = 9;
+            }
+        }
+    }
+    for v in face[..n].iter_mut() {
+        if *v == 9 {
+            *v = 2;
+        }
     }
     if vector::lookup_arabic(0x20).is_some() {
         for k in 0..n {
@@ -430,12 +459,12 @@ fn layout_inner(s: &[u8], cap: i32, rtl: Option<bool>, kind: Text, f: &mut dyn F
                 let before = (0..k).rev().find(|&j| cps[j] != 0x20).map_or(false, |j| face[j] == 1);
                 let after = (k + 1..n).find(|&j| cps[j] != 0x20).map_or(false, |j| face[j] == 1);
                 if before && after {
-                    face[k] = 2;
+                    face[k] = 8; // a marker while deciding (2 is Devanagari's face)
                 }
             }
         }
         for v in face[..n].iter_mut() {
-            if *v == 2 {
+            if *v == 8 {
                 *v = 1;
             }
         }
@@ -478,8 +507,53 @@ fn layout_inner(s: &[u8], cap: i32, rtl: Option<bool>, kind: Text, f: &mut dyn F
     let mut m = 0usize;
     let mut k = 0usize;
     while k < n {
-        if levels[k] == bidi::REMOVED || hidden(cps[k]) {
+        if levels[k] == bidi::REMOVED || (hidden(cps[k]) && face[k] != 2) {
             k += 1;
+            continue;
+        }
+        if face[k] == 2 {
+            let lv = levels[k];
+            let mut rn = 0;
+            let mut rcp = [0u32; MAXG];
+            while k < n && face[k] == 2 && (levels[k] == lv || levels[k] == bidi::REMOVED) {
+                // the joiners are boundary-neutral to bidi (removed), but they shape: ZWJ asks for a half form and
+                // ZWNJ stops a conjunct, so they stay in the run and are only left undrawn
+                let joiner = matches!(cps[k], 0x200C | 0x200D);
+                if (levels[k] != bidi::REMOVED || joiner) && rn < MAXG {
+                    let g = vector::lookup_deva(cps[k]).unwrap_or(0);
+                    run[rn] = Gi { g, cl: k as u16, mask: dv::M_ALL | dv::M_CJCT, aux: 0, syl: 0 };
+                    rcp[rn] = cps[k];
+                    rn += 1;
+                }
+                k += 1;
+            }
+            let mut r = gsub::Run::new(&gsub::DEVA, &mut run[..], rn);
+            indic::shape(&mut r, &rcp[..rn]);
+            r.attach(att);
+            // SAFETY: mainline only (BUSY), touched only here.
+            let kadj = unsafe { &mut *core::ptr::addr_of_mut!(KADJ) };
+            r.kern(kadj);
+            let rn = r.n;
+            let base = m;
+            for j in 0..rn {
+                if m >= MAXG {
+                    break;
+                }
+                let gi = run[j];
+                let ch = (gi.cl as usize).min(n.saturating_sub(1));
+                let cp = cps[ch];
+                // a joiner left as its own glyph is not drawn (HarfBuzz hides it)
+                let hide = matches!(cp, 0x200C | 0x200D) && vector::lookup_deva(cp) == Some(gi.g);
+                let adv = if hide { 0 } else { vector::units(vector::DEVA, gi.g).saturating_add(kadj[j].1) };
+                gl[m] = Glyph { face: vector::DEVA, g: gi.g, boxed: hide, adv, cp, ch: gi.cl };
+                gxo[m] = kadj[j].0;
+                glv[m] = levels[ch];
+                gatt[m] = att[j].and_then(|(t, dx, dy)| {
+                    let t = base + t as usize;
+                    (t < m).then_some((t as u16, dx, dy))
+                });
+                m += 1;
+            }
             continue;
         }
         if face[k] == 1 {
@@ -489,12 +563,12 @@ fn layout_inner(s: &[u8], cap: i32, rtl: Option<bool>, kind: Text, f: &mut dyn F
                 if levels[k] != bidi::REMOVED && rn < MAXG {
                     let g = vector::lookup_arabic(cps[k]).unwrap_or(0);
                     let mask = sd::M_ALL | if lv & 1 == 1 { sd::M_RTL } else { 0 } | form[k];
-                    run[rn] = Gi { g, cl: k as u16, mask };
+                    run[rn] = Gi { g, cl: k as u16, mask, aux: 0, syl: 0 };
                     rn += 1;
                 }
                 k += 1;
             }
-            let mut r = gsub::Run::new(run, rn);
+            let mut r = gsub::Run::new(&gsub::ARABIC, &mut run[..], rn);
             r.substitute();
             r.attach(att);
             // SAFETY: mainline only (BUSY), touched only here.
@@ -507,10 +581,10 @@ fn layout_inner(s: &[u8], cap: i32, rtl: Option<bool>, kind: Text, f: &mut dyn F
                     break;
                 }
                 let gi = run[j];
-                let adv = if gsub::class(gi.g) == 3 { 0 } else { vector::units(vector::ARABIC, gi.g).saturating_add(kadj[j].1) };
+                let adv = if gsub::class(&gsub::ARABIC, gi.g) == 3 { 0 } else { vector::units(vector::ARABIC, gi.g).saturating_add(kadj[j].1) };
                 let ch = (gi.cl as usize).min(n.saturating_sub(1));
                 gl[m] = Glyph { face: vector::ARABIC, g: gi.g, boxed: false, adv, cp: cps[ch], ch: gi.cl };
-                gxo[m] = if gsub::class(gi.g) == 3 { 0 } else { kadj[j].0 };
+                gxo[m] = if gsub::class(&gsub::ARABIC, gi.g) == 3 { 0 } else { kadj[j].0 };
                 glv[m] = levels[ch];
                 gatt[m] = att[j].and_then(|(t, dx, dy)| {
                     let t = base + t as usize;
@@ -555,6 +629,9 @@ fn layout_inner(s: &[u8], cap: i32, rtl: Option<bool>, kind: Text, f: &mut dyn F
     }
     for &j in &order[..cnt] {
         let j = j as usize;
+        if gl[j].face == vector::DEVA && gl[j].boxed {
+            continue; // a joiner left as its own glyph: never drawn
+        }
         f(&gl[j], xs[j], ys[j]);
     }
     pen
@@ -564,12 +641,20 @@ fn layout_inner(s: &[u8], cap: i32, rtl: Option<bool>, kind: Text, f: &mut dyn F
 /// units of every glyph in visual order, x where it is drawn. A face 0 glyph or a box counts as glyph 0xFFFF, so a
 /// line that should have been all Arabic cannot match by accident.
 pub fn oracle_hash(s: &[u8]) -> u64 {
+    oracle_hash_face(s, vector::ARABIC)
+}
+
+/// The oracle hash of a line drawn in `face` (Devanagari: tools/face/shape_expected_deva.txt).
+pub fn oracle_hash_face(s: &[u8], face: u8) -> u64 {
     if BUSY.swap(true, core::sync::atomic::Ordering::Acquire) {
         panic!("shape::layout entered twice");
     }
     let mut h: u64 = 0xCBF29CE484222325;
     layout_inner(s, 9, None, Text::Identity, &mut |g, x, y| {
-        let gid = if g.face == vector::ARABIC && !g.boxed { g.g } else { 0xFFFF };
+        if g.face == vector::DEVA && g.boxed && g.adv == 0 {
+            return; // a hidden joiner: the oracle leaves it out too
+        }
+        let gid = if g.face == face && !g.boxed { g.g } else { 0xFFFF };
         for b in gid.to_le_bytes().iter().chain(x.to_le_bytes().iter()).chain(y.to_le_bytes().iter()) {
             h ^= *b as u64;
             h = h.wrapping_mul(0x100000001B3);
