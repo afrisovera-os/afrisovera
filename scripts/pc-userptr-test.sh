@@ -10,7 +10,8 @@
 #   text (each EPERM), SYS_VMO_UNMAP of it (E_INVAL), SYS_CELL_PUT of 16 bytes from it (E_FAULT), SYS_DNS_A with it
 #   as the name (E_FAULT; uptr holds a NET handle, 1, so the call reaches its pointer);
 #   SYS_AI with its own read-only code page as the reply buffer (EPERM: inside its range but not writable; a
-#   kernel write there would fault in ring 0); the object's own unmap (0), then 0x5afe.
+#   kernel write there would fault in ring 0); with RFLAGS.DF set by the program (std), SPEAK of its own text
+#   "DF-LOCK-16-BYTES" (0, spoken exactly: the kernel clears DF at entry); the object's own unmap (0), then 0x5afe.
 # Then: the canary is intact and was never spoken, the program ended without a fault, every frame came back, and
 # the shell still answers. The other calls take no user address (SEND, RECV, the WIN calls, VMO_CREATE, CELL_OPEN,
 # CELL_CURSOR, CELL_SIZE, CELL_EVENT, TCP_DIAL, TCP_CLOSE; VMO_MAP's offset must be 0). TCP_SEND and TCP_RECV take a
@@ -79,8 +80,8 @@ for r in "the kernel canary" "a non-canonical address" "a range past the top of 
     NAMES+=("AI prompt at $r" "AI reply buffer at $r" "SPEAK text at $r" "VMO_UNMAP of $r" "CELL_PUT from $r" "DNS_A name at $r")
     WANT+=($EP $EP $EP $INVAL $FAULT $FAULT)
 done
-NAMES+=("AI reply buffer at its own read-only code page" "the object's own unmap" "the end mark")
-WANT+=($EP 0x0 0x5afe)
+NAMES+=("AI reply buffer at its own read-only code page" "SPEAK with DF set by the program" "the object's own unmap" "the end mark")
+WANT+=($EP 0x0 0x0 0x5afe)
 mapfile -t GOT < <(grep -aoE '^\[P[0-9]\] 0x[0-9a-f]+$' <<< "$V" | cut -d' ' -f2)
 [ "${#GOT[@]}" -eq "${#WANT[@]}" ] || _f "the program printed ${#GOT[@]} results, wanted ${#WANT[@]}"
 for i in "${!WANT[@]}"; do
@@ -90,10 +91,16 @@ grep -aqE '^\[uptr\] P[0-9] aims at the kernel canary at 0x[0-9a-f]+$' <<< "$V" 
 grep -aqx '\[uptr\] G2-CANARY intact' <<< "$V" || _f "the kernel canary was not reported intact"
 grep -aq 'G2-CANARY OVERWRITTEN' <<< "$V" && _f "kernel memory was written through a ring-3 pointer"
 grep -aq 'speaking: "G2-CANARY' <<< "$V" && _f "kernel memory was spoken through a ring-3 pointer"
+# the DF lock: the program set RFLAGS.DF (std) before SPEAK; the kernel clears it at entry (isr_common's cld), so its
+# copy runs forwards and the text comes out exactly (a backwards rep movs would garble it or corrupt the kernel)
+grep -aqF 'speaking: "DF-LOCK-16-BYTES"' <<< "$V" || _f "SPEAK with the program's DF set did not copy its text exactly (DF not cleared at kernel entry)"
 grep -aqE '^\[uptr\] test: 1 ended, 0 fault\(s\), frames in use ([0-9]+) before and \1 after \(ok\)$' <<< "$V" \
     || _f "the program faulted, did not end, or frames did not all come back"
 grep -aq "heap:" <<< "$S" || _f "the shell stopped answering"
 grep -aq '^\[pc\] SMAP: on (CR4.SMAP)' <<< "$S" || _f "boot 1: SMAP was not on (-cpu max)"
+# G13: the boot names this CPU's side-channel state (which state QEMU's -cpu max reports does not matter here)
+grep -aqE '^\[pc\] cpu side channels: Meltdown (no|OPEN|not ruled out) \(RDCL_NO [01?]\), MDS ' <<< "$S" \
+    || _f "boot 1: no 'cpu side channels' line"
 grep -aq 'SMAP stopped a kernel access' <<< "$S" && _f "boot 1: SMAP stopped a kernel access (a copy outside pc/uaccess.rs)"
 grep -aqE "^\[smap\] probe: a plain kernel read of P[0-9]'s code page at 0x10000000000, SMAP on$" <<< "$P" \
     || _f "boot 2: no probe line with SMAP on"

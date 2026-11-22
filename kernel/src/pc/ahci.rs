@@ -313,7 +313,7 @@ pub fn at() -> Option<(u8, u8, u8)> {
 pub fn init() {
     let Some((b, d, f)) = pci::find_by(8, |b, d, f, id| crate::hwdb::pci_part(BINDS, b, d, f, id).is_some()) else { return };
     let abar = (pci::cfg_read32(b, d, f, 0x24) & !0xF) as u64; // BAR5 (always 32-bit in AHCI)
-    if abar == 0 || !mmu::map_mmio(abar, 0x1100) {
+    if abar == 0 || !mmu::map_mmio(abar, 0x1100, "ahci-sata") {
         crate::kprintln!("[ahci] controller at {:02x}:{:02x}.{} has no usable ABAR", b, d, f);
         return;
     }

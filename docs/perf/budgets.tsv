@@ -17,6 +17,7 @@ pc	mem.apps_rerun_growth_kib	0	-	no	the same 3 apps again leave nothing more (PC
 pc	mem.vmo_left_kib	0	-	yes	frames a finished ring-3 program keeps after its memory objects (vmotest, AFR-0001 7.6): none
 pc	vmo.map1m_us	-	15	no	map a 1 MiB memory object (frames taken, zeroed, not executable); compared once a baseline is kept
 pc	vmo.map16m_us	-	15	no	the same for 16 MiB (a Dira tab)
+*	compat.*	-	10	no	Daraja per-call ns (daraja bench): refused native call, native IPC, forwarded foreign call, forwarding's own share; C2's per-step A/B judges null and IPC at 2%
 *	mem.apps_rerun_growth_kib	-	0	no	ARM: 72 KiB per 3-app run today (kernel stacks, process.rs, shared ARM file); target 0, never more
 *	image.total	-	5	yes	kernel RAM: code + data + zeroed data
 *	image.text	-	5	no

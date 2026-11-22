@@ -11,7 +11,7 @@ cd "$(dirname "$0")/../userland/daraja-linux"
 HOST="$(rustc -vV | sed -n 's/^host: //p')"
 out="$(cargo test --offline --target "$HOST" 2>&1)"; rc=$?
 printf '%s\n' "$out" | grep -E '^test |test result:' | sed 's/^/  | /'
-if [ $rc -eq 0 ] && grep -qE '^test result: ok\. 16 passed; 0 failed' <<< "$out"; then
+if [ $rc -eq 0 ] && grep -qE '^test result: ok\. 24 passed; 0 failed' <<< "$out"; then
     echo "DARAJA-LINUX TEST PASSED"; exit 0
 fi
 printf '%s\n' "$out" | tail -30

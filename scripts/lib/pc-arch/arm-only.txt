@@ -65,3 +65,14 @@ perf-release   -- the ARM benchmark rig, release build; pc-perf-release is its P
 # The PC checks every user pointer in kernel/src/pc/proc.rs user_range; pc-vmo step 4 proves a refusal
 # at a guard page. A PC twin that hands SYS_AI and SYS_SPEAK a kernel address is planned (pc-userptr).
 el0-ptr        -- an AArch64 EL0 program and the ARM SYS_AI / SYS_SPEAK refusal lines
+#
+# Dira M3 S5 on ARM (added 21 Nov 2026, browser engineer): the test programs are AArch64 machine code in
+# kernel/src/process.rs (user_vmo, user_vmox, user_cell, user_nocell, user_busy, user_net3, user_net3b) and the graded
+# lines are the ARM EL0 layer's own (the map area in L1 slot 256, the idle-served cell and network calls). Their PC
+# twins are pc-vmo, pc-cell3 and pc-net3. The public walk 43715832443 ran the first two on the PC and failed them.
+arm-vmo        -- AArch64 EL0 programs for calls 32 to 34 (process memory); pc-vmo is its PC twin
+arm-cell3      -- AArch64 EL0 programs for calls 64 to 68 (the cell window, served by idle); pc-cell3 is its PC twin
+arm-net3       -- AArch64 EL0 programs for calls 72 to 76 (the network, served by idle); pc-net3 is its PC twin
+pan            -- ARM PAN (ID_AA64MMFR1) and the LDTR/STTR door; the PC's twin is SMAP in pc-userptr
+el0-ptr-max   -- el0-ptr on QEMU -cpu max (ARM PAN); the PC's twin is pc-userptr on -cpu max
+arm-rt79       -- AArch64 EL0 programs for call 79 (clock_monotonic); pc-rt79 is its PC twin

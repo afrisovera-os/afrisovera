@@ -5,6 +5,11 @@ edition = "2021"
 description = "A Nia mini WASM interpreter, compiled as an EL0 userland app (the interpreter runs at EL0; host calls are syscalls)."
 license = "Apache-2.0"
 
+[features]
+# The test build (test images only; release-guard refuses it): runs the two sandbox-finding modules of OS_REQUESTS
+# item 9 instead of the demo module. scripts/build-userapp.sh builds it into niavm-sandbox.bin.
+sandbox-test = []
+
 [[bin]]
 name = "niavm"
 path = "src/main.rs"

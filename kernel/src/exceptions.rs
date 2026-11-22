@@ -110,6 +110,19 @@ extern "C" fn rust_sync_handler() -> ! {
             crate::cpu::wfi();
         }
     }
+    // G2 part 2 step 2: PAN stopped a plain kernel access to EL0 memory (a data abort at EL1, permission fault, on an
+    // address in a process's user blocks or map area). Named: the code that did it skipped kernel/src/uaccess.rs.
+    if crate::uaccess::pan_on()
+        && (esr >> 26) & 0x3F == 0x25
+        && (esr & 0x3C) == 0x0C
+        && ((0x8000_0000..0x8040_0000).contains(&far) || (crate::process::MAP_LO..crate::process::MAP_HI).contains(&far))
+    {
+        crate::kprintln!(
+            "[mansa] PAN stopped a kernel access to EL0 memory at {:#x} (ELR {:#x}): only kernel/src/uaccess.rs may touch it",
+            far,
+            elr
+        );
+    }
     crate::kprintln!(
         "[mansa] SYNC EXCEPTION  ESR={:#018x}  ELR={:#018x}  FAR={:#018x}",
         esr,

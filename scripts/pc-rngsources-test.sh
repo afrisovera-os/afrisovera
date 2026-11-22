@@ -89,8 +89,8 @@ grade2() { # grade2 <serial log of boot 2>
         _f "the synthetic TCPA table (50 B, rev 2) is not reported present with those values"
     has '^rng sources: acpi TPM2 \(TPM 2\.0\) present, length 52 rev 4, start method 7 \(CRB\)$' ||
         _f "the synthetic TPM2 table (52 B, rev 4, start method 7) is not reported present with those values"
-    has '^rng sources: tpm: off \(CRB, not supported yet: only the TIS interface is driven\)$' ||
-        _f "the TPM2 table says CRB, but the TPM is not reported off for that reason"
+    has "^rng sources: tpm: off \\(CRB control area 0x0 is not inside the TPM's page\\)\$" ||
+        _f "the TPM2 table says CRB with control area 0, but the TPM is not reported off for that reason"
     has '^rng sources: counted now: none, so fill_secret refuses on this PC; jitter is not counted yet \(ADR 0008 step 2b\)$' ||
         _f "no rdrand/rdseed and the TPM is off, but 'counted now' does not say fill_secret refuses"
     return "$fail"
@@ -134,7 +134,7 @@ rng sources: cpu GenuineIntel family 0x6 model 0x6 stepping 3
 rng sources: rdrand no  rdseed no  invariant-tsc no  hypervisor no
 rng sources: acpi TCPA (TPM 1.2) present, length 50 rev 2
 rng sources: acpi TPM2 (TPM 2.0) present, length 52 rev 4, start method 7 (CRB)
-rng sources: tpm: off (CRB, not supported yet: only the TIS interface is driven)
+rng sources: tpm: off (CRB control area 0x0 is not inside the TPM's page)
 rng sources: counted now: none, so fill_secret refuses on this PC; jitter is not counted yet (ADR 0008 step 2b)"
 
 selftest() {

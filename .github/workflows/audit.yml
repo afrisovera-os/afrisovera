@@ -1,0 +1,85 @@
+# Public Audit (R6 item 3): cargo audit and a vendor check of this public tree, nightly.
+# Same tools and versions as the private Audit; it reads only this checkout, crates.io and the public RustSec advisory
+# database. Rules (a) to (d) as in compat-ref.yml: overlay only, contents: read, no secrets, pinned actions, artifacts.
+#   - every Cargo.lock in this tree (outside vendor/) is audited against today's advisories, so a new advisory on a
+#     crate we ship turns this red the night it is published, without waiting for a sync;
+#   - every crate a public lockfile needs is in vendor/ exactly as crates.io serves it (a fresh `cargo vendor` of the
+#     public locks, compared crate by crate). A crate in vendor/ that no public lock needs is listed, not failed:
+#     it belongs to a lockfile that stays private.
+name: Audit
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  push:
+    branches: [main]
+    paths: ['**/Cargo.lock', '**/Cargo.toml', 'vendor/**', '.cargo/config.toml', '.github/workflows/audit.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_VER: 1.97.1
+  AUDIT_VER: 0.23.0   # pinned, as the private Audit; the run prints "cargo audit --version"
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
+
+      - name: Rust
+        run: |
+          rustup toolchain install "$RUST_VER" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$RUST_VER" >> "$GITHUB_ENV"
+
+      - name: cargo-audit from cache
+        id: ca
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ env.AUDIT_VER }}-${{ runner.os }}
+
+      - name: Build cargo-audit (first run only)
+        if: steps.ca.outputs.cache-hit != 'true'
+        # outside the repo: the source replacement in .cargo/config.toml would send it to vendor/
+        run: cd /tmp && cargo install cargo-audit --version "$AUDIT_VER" --locked
+
+      - name: The public lockfiles
+        run: |
+          git ls-files '*Cargo.lock' | grep -v '^vendor/' > locks.txt
+          cat locks.txt
+          test -s locks.txt
+
+      - name: vendor/ holds what crates.io serves for every public lock
+        run: |
+          # cargo vendor ignores the [source] replacement, so this fetches from crates.io
+          extra_manifests=()
+          while read -r lock; do
+            d=$(dirname "$lock")
+            [ "$d" = . ] || extra_manifests+=(-s "$d/Cargo.toml")
+          done < locks.txt
+          cargo vendor --locked "${extra_manifests[@]}" /tmp/vendor-fresh > /dev/null
+          bad=0
+          for c in /tmp/vendor-fresh/*/; do
+            n=$(basename "$c")
+            if [ ! -d "vendor/$n" ]; then echo "MISSING from vendor/: $n"; bad=1
+            elif ! diff -r -q "vendor/$n" "$c" > /dev/null; then echo "DIFFERS from crates.io: $n"; bad=1; fi
+          done
+          extra=0
+          for c in vendor/*/; do
+            n=$(basename "$c")
+            [ -d "/tmp/vendor-fresh/$n" ] || { echo "not needed by a public lock: $n"; extra=$((extra + 1)); }
+          done
+          echo "fresh crates: $(ls /tmp/vendor-fresh | wc -l), in vendor/ but needed only by private locks: $extra"
+          exit $bad
+
+      - name: cargo audit
+        run: |
+          cargo audit --version
+          rc=0
+          while read -r f; do echo "== $f"; cargo audit --file "$f" || rc=1; done < locks.txt
+          exit $rc

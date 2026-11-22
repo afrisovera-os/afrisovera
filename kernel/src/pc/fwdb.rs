@@ -86,13 +86,26 @@ const FWTEST_SHA: [u8; 32] = hex("738d796683b53552914356087ff339feb1be5d8b796cff
 /// The AfriSovera test Bluetooth controller (pc-bt); no real device has this id.
 const BT_TEST: Dev = Dev::UsbId { vendor: 0x46F4, product: 0xAF02 };
 
+/// The Intel Wireless 7265 (8086:095a, 095b) and 3165 (8086:3165, 3166) Wi-Fi chips (Wi-Fi W5). The driver picks the
+/// file by the chip's hardware revision: 7265D silicon (and every 3165) takes 7265D-29, an early 7265 takes 7265-17.
+const INTEL_7265: [Dev; 2] = [Dev::PciId { vendor: 0x8086, device: 0x095A }, Dev::PciId { vendor: 0x8086, device: 0x095B }];
+const INTEL_7265D: [Dev; 4] = [
+    Dev::PciId { vendor: 0x8086, device: 0x095A },
+    Dev::PciId { vendor: 0x8086, device: 0x095B },
+    Dev::PciId { vendor: 0x8086, device: 0x3165 },
+    Dev::PciId { vendor: 0x8086, device: 0x3166 },
+];
+
 /// Every firmware file AfriSovera may send, one row per firmware/MANIFEST row (fwtool.py check compares them).
-const ROWS: [Fw; 4] = [
+const ROWS: [Fw; 6] = [
     Fw { name: "fwtest.bin", size: 70000, sha256: hex("738d796683b53552914356087ff339feb1be5d8b796cff59925bbaf9e7320fa8"), devs: &[Dev::SelfTest] },
     // pc-bt's test patches, for the test Bluetooth controller only (scripts/ci/qemu-hci-test.patch, 46f4:af02)
     Fw { name: "ibt-hw-37.8.10-fw-1.1.1.2c.13.bseq", size: 120, sha256: hex("3e0d0db38c76db7491137442176a40d53e66184bdf4a73430a6f025fa0a3bc3d"), devs: &[BT_TEST] },
     Fw { name: "ibt-hw-37.8.10-fw-1.1.2.2c.13.bseq", size: 120, sha256: hex("14f39d19030c5be4630030e300997db261a6ddd56dfc0a73f39e2f9ef1929fab"), devs: &[BT_TEST] },
     Fw { name: "ibt-hw-37.8.10-fw-1.1.4.2c.13.bseq", size: 120, sha256: hex("d6b5018633ca5a188f5db1e54d13db103900c2a4bd870632dc53cb024d22f143"), devs: &[BT_TEST] },
+    // Intel Wi-Fi (W5): linux-firmware f8817f93, licence LICENCE.iwlwifi_firmware (binary redistribution, unchanged)
+    Fw { name: "iwlwifi-7265D-29.ucode", size: 1036312, sha256: hex("c52bcaa0595f64d5fb32b7db3dd4b832ea7bf78f1037bcafc19d9c0f5c5c617e"), devs: &INTEL_7265D },
+    Fw { name: "iwlwifi-7265-17.ucode", size: 1180412, sha256: hex("91f699308f102a9ed90217d813bfdb355464ece958a4f8ac96bba5e9d77fe870"), devs: &INTEL_7265 },
 ];
 pub static FIRMWARE: [Fw; ROWS.len()] = ROWS;
 

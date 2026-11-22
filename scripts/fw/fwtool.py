@@ -9,6 +9,7 @@ AfriSovera's own test file) and stopping on any wrong size or hash.
     fwtool.py check              # every row has its licence text; fwdb.rs matches the MANIFEST; generated files hash right
     fwtool.py gen fwtest OUT     # write AfriSovera's own test file
     fwtool.py fetch DIR [CACHE]  # every MANIFEST file into DIR, its licence beside it, checked by hash; downloads kept in CACHE
+    fwtool.py fetch DIR [CACHE] --real  # the same for real devices' files only (no generated test files): the stick
 """
 import hashlib
 import os
@@ -125,9 +126,11 @@ def check():
     return bad == 0
 
 
-def fetch(dest, cache=None):
+def fetch(dest, cache=None, real=False):
     os.makedirs(dest, exist_ok=True)
     for r in rows():
+        if real and r["source"] in GENERATED:
+            continue  # AfriSovera's own test files stay off a real stick
         if r["source"] in GENERATED:
             b = GENERATED[r["source"]]()
         else:
@@ -154,9 +157,12 @@ def main(a):
     if len(a) == 3 and a[0] == "gen" and "gen:" + a[1] in GENERATED:
         open(a[2], "wb").write(GENERATED["gen:" + a[1]]())
         return 0
-    if a[:1] == ["fetch"] and len(a) in (2, 3):
-        fetch(a[1], a[2] if len(a) == 3 else None)
-        return 0
+    if a[:1] == ["fetch"]:
+        real = "--real" in a
+        rest = [x for x in a[1:] if x != "--real"]
+        if len(rest) in (1, 2):
+            fetch(rest[0], rest[1] if len(rest) == 2 else None, real)
+            return 0
     print(__doc__)
     return 2
 

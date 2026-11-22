@@ -5,6 +5,7 @@
 //! - [`calls`]: the Linux calls of stage 0 over a `Host` (the kernel, or a fake one in the tests);
 //! - [`cpio`]: the bundle (the program and its files, read-only), a cpio "newc" archive;
 //! - [`limit`]: a per-number limit on a repeated console line (`[daraja] unknown call`);
+//! - [`mem`]: the program's memory calls (brk, mmap, munmap, mprotect) over the kernel's fproc calls (L1.1);
 //! - [`stack`]: the stack a Linux program finds at its entry point (argc, argv, envp, the auxiliary vector).
 
 #![no_std]
@@ -14,6 +15,7 @@ pub mod bundle;
 pub mod calls;
 pub mod cpio;
 pub mod limit;
+pub mod mem;
 pub mod stack;
 
 /// The ELF reader the bridge loads programs with, re-exported so fuzz-host's `afri_elf` target reaches it through

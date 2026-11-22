@@ -12,6 +12,7 @@ its number first, and prints 99 at the end. Each case is what a standard WebAsse
 """
 import os
 import sys
+from permlist import permlist  # C2: a list for the apps that call more than print and putc
 
 
 def uleb(n):
@@ -126,5 +127,6 @@ if __name__ == '__main__':
     os.makedirs(d, exist_ok=True)
     for i, (n, kind, expect, body, data) in enumerate(CASES, 1):
         kw = data if isinstance(data, dict) else {'data': data}
-        open(os.path.join(d, n + '.wasm'), 'wb').write(module(i, body, **kw))
+        perms = ['print', 'draw'] if n == 'oob13' else []
+        open(os.path.join(d, n + '.wasm'), 'wb').write(module(i, body, **kw) + permlist(perms))
         print(n, kind, expect)

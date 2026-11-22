@@ -1038,6 +1038,14 @@ fn spine() {
         l.u(h12).s(b":").two(mm);
         under.s(if hh < 12 { locale::am(lang::current()) } else { locale::pm(lang::current()) });
     }
+    // the time in the language's own digits (stage 7: Marathi, Nepali), drawn for people, never parsed
+    let l = {
+        let mut n = Line::new();
+        locale::native(lang::current(), l.get(), &mut |b: &[u8]| {
+            n.s(b);
+        });
+        n
+    };
     rect(8, H() - 30, body - 16, 1, LINE);
     text(mid - text_w(l.get(), 1) / 2, H() - 23, l.get(), GOLD, 1);
     text(mid - text_w(under.get(), 1) / 2, H() - 12, under.get(), DIM, 1);
@@ -1135,6 +1143,14 @@ fn bar() {
         l.u(h12).s(b":").two(mm);
         under.s(if hh < 12 { locale::am(lang::current()) } else { locale::pm(lang::current()) });
     }
+    // the time in the language's own digits (stage 7: Marathi, Nepali), drawn for people, never parsed
+    let l = {
+        let mut n = Line::new();
+        locale::native(lang::current(), l.get(), &mut |b: &[u8]| {
+            n.s(b);
+        });
+        n
+    };
     let (cx, cy, cw, _) = clock_box();
     let mid = cx + cw / 2;
     rect(cx, cy + WEAVE + 8, 1, 36, LINE);

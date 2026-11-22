@@ -3380,6 +3380,21 @@ pub fn command(rest: &str) {
             );
             DIRTY.store(true, Ordering::Relaxed);
         }
+        "sysinfo" => {
+            // what About and Settings say about this machine, as they draw it, with the numbers behind it
+            let arch = lang::t(if cfg!(target_arch = "aarch64") { lang::Msg::AboutArm } else { lang::Msg::AboutPc });
+            let mut set = Line::new();
+            set.f(lang::Msg::SetCores, &[lang::Arg::G(crate::cores_found() as u64), lang::Arg::Mem(crate::ram_mib())]);
+            let mut dev = Line::new();
+            dev.f(lang::Msg::AboutDeviceIs, &[lang::Arg::S(arch), lang::Arg::G(crate::cores_found() as u64)]);
+            let mut mem = Line::new();
+            mem.f(lang::Msg::AboutMemoryIs, &[lang::Arg::Mem(crate::ram_mib()), lang::Arg::G(0)]);
+            crate::kprintln!("[desk] sysinfo: {} core(s), {} MiB", crate::cores_found(), crate::ram_mib());
+            crate::kprintln!("[desk] sysinfo: Settings: {}", core::str::from_utf8(set.get()).unwrap_or("?"));
+            crate::kprintln!("[desk] sysinfo: About: {}", core::str::from_utf8(dev.get()).unwrap_or("?"));
+            crate::kprintln!("[desk] sysinfo: About: {}", core::str::from_utf8(mem.get()).unwrap_or("?"));
+            return;
+        }
         "power" => {
             // the power panel from the shell (serial, the suite): open, off or restart (the confirm), cancel, yes
             match arg {
@@ -3784,6 +3799,23 @@ pub fn command(rest: &str) {
                         } else {
                             crate::kprintln!("[desk] lang selftest: FAIL a safety word in {} is drawn from a draft", l.code());
                         }
+                    }
+                }
+                // stage 7: the coverage rule `desk lang check` applies, on planted strings (the architect: a planted
+                // broken cluster must fail it): a lone vowel sign is a broken cluster, a private-use character has no
+                // glyph, and plain words are whole
+                for (what, text, want) in [
+                    ("a lone Devanagari vowel sign is a broken cluster", "\u{093F}", (0usize, 1usize)),
+                    ("a private-use character has no glyph", "\u{E000}", (1, 0)),
+                    ("a desk word draws whole", "Settings", (0, 0)),
+                    ("a Hindi word draws whole", "\u{0939}\u{093F}\u{0928}\u{094D}\u{0926}\u{0940}", (0, 0)),
+                ] {
+                    all += 1;
+                    let got = paint::shape::coverage(text.as_bytes());
+                    if got == want {
+                        ok += 1;
+                    } else {
+                        crate::kprintln!("[desk] lang selftest: FAIL {}: coverage {:?}", what, got);
                     }
                 }
                 // stage 6: the drop-down's rows and a pick by code come only from LANGS, which never holds the test

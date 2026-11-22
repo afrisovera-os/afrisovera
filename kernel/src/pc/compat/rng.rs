@@ -263,7 +263,7 @@ pub fn cmd_sources() {
 pub fn cmd_secret(n: usize) {
     let mut b = [0u8; 64];
     let r = fill_secret(&mut b[..n]);
-    b.fill(0);
+    crate::drbg::wipe(&mut b);
     let s = status();
     match r {
         Ok(()) => crate::kprintln!(

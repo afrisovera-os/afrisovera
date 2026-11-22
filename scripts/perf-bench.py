@@ -196,6 +196,21 @@ def parse(text):
     m = re.search(r"\[vmo\] test: \d+ ended, \d+ fault\(s\), frames in use (\d+) before and (\d+) after", t)
     if m:
         r["mem.vmo_left_kib"] = max(0, int(m.group(2)) - int(m.group(1))) * 4
+    # Daraja's per-call costs (`daraja bench`, PC, foreign.rs): N calls each of a refused native call, a native IPC
+    # round trip and a forwarded foreign call, timed in us of the kernel clock (1 ns per instruction under -icount).
+    # Per call in ns; bridge_ns is forwarding's own work (forwarded minus native IPC). C2's syscall and IPC proof.
+    # On the rig's default CPU (no RDRAND) the bridge cannot spawn: "forwarded refused", so null and IPC rows only.
+    m = re.search(r"\[daraja\] bench: (\d+) calls: native-null (\d+) us, native-ipc (\d+) us, "
+                  r"forwarded (?:(\d+) us|refused)", t)
+    if m and int(m.group(1)) > 0:
+        n = int(m.group(1))
+        null, ipc = (int(m.group(i)) * 1000 // n for i in (2, 3))
+        r["compat.null_call_ns"] = null
+        r["compat.ipc_call_ns"] = ipc
+        if m.group(4) is not None:
+            fwd = int(m.group(4)) * 1000 // n
+            r["compat.fwd_call_ns"] = fwd
+            r["compat.bridge_ns"] = max(0, fwd - ipc)
     m = re.search(r"bench: sha256 .*? in (\d+) us \((\d+) MiB/s\)", t)
     if m:
         r["cpu.sha256_us"] = int(m.group(1))
@@ -329,7 +344,7 @@ def run(arch, kernel, out_dir, ovmf=None, label=None):
         # objects, AFR-0001 7.6): their map times, and a leak as a number (architect, stick gate verdict 14 Nov)
         own = os.environ.get("PERF_CMDS")
         for c in ([x.strip() for x in own.split(";") if x.strip()] if own is not None
-                  else CMDS + (["vmotest"] if arch == "pc" else [])):
+                  else CMDS + (["vmotest", "daraja bench"] if arch == "pc" else [])):
             start = len(log)
             ser.sendall((c + "\r").encode())
             ceiling = SINK_SECS + 60 if c.startswith("net tcp sink") else 120
@@ -504,6 +519,15 @@ def selftest():
     check(r.get("draw.fbwm.create_us") == 120 and r.get("draw.fbwm.present_us") == 3400, "fbwm pairs")
     check(r.get("timer.sleep50_over_ms") == 10, "sleep overshoot 10 ms")
     check(r.get("net.sink_kibs_host") == 170, "sink 1 MiB in 6 s = 170 KiB/s")
+    rd = parse("[daraja] bench: 10000 calls: native-null 1200 us, native-ipc 9000 us, forwarded 15500 us\n")
+    check(rd.get("compat.null_call_ns") == 120 and rd.get("compat.ipc_call_ns") == 900
+          and rd.get("compat.fwd_call_ns") == 1550 and rd.get("compat.bridge_ns") == 650, "daraja bench per call")
+    check(not any(k.startswith("compat.") for k in parse(
+        "[daraja] bench: a program could not be spawned (null None, ipc Some(9), forwarded None)\n")),
+        "daraja bench refused: no compat rows")
+    rr = parse("[daraja] bench: 10000 calls: native-null 1200 us, native-ipc 9000 us, forwarded refused\n")
+    check(rr.get("compat.null_call_ns") == 120 and rr.get("compat.ipc_call_ns") == 900
+          and "compat.fwd_call_ns" not in rr and "compat.bridge_ns" not in rr, "daraja bench, bridge refused: null and IPC")
     check(parse("no prompt at all") == {}, "nothing printed, nothing invented")
     d = tempfile.mkdtemp()
     w = lambda n, s: open(os.path.join(d, n), "w").write(s) and os.path.join(d, n)

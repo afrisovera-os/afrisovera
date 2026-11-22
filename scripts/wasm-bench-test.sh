@@ -36,9 +36,17 @@ Q=$(grep -ac "print(-1598551745)" "$OUT")
 D=$(grep -ac "print(1189282394)" "$OUT")
 [ "$Q" -eq 1 ] || fail "ngoma qoa printed -1598551745 $Q times, wanted 1"
 [ "$D" -eq 1 ] || fail "ngoma drums printed 1189282394 $D times, wanted 1"
+# Hesabu (the spreadsheet's split bench): eight apps, one run each. part1 and part2 of a sheet print the same value,
+# so those values come twice, the rest once. The bars are evidence, not a pass mark.
+for want in "-1947082752 1 chain-loadonly" "-1947071729 2 chain-part1-and-part2" "-1947072752 1 chain" \
+            "-1826739384 1 fanout-loadonly" "1567011484 2 fanout-part1-and-part2" "-710521864 1 fanout"; do
+    set -- $want
+    n=$(grep -ac "print($1)" "$OUT")
+    [ "$n" -eq "$2" ] || fail "hesabu $3 printed $1 $n times, wanted $2"
+done
 grep -aq "heap:" "$OUT" || fail "shell unresponsive after wasmbench"
 # The new way must not be slower than the old way (each app's best of three).
 while read -r old new; do
     [ "$new" -le "$old" ] || fail "new way slower: old $old us, new $new us"
 done < <(grep -a "\[bench\] b" "$OUT" | sed -E 's/.*old ([0-9]+) us, new ([0-9]+) us.*/\1 \2/')
-echo "WASM-BENCH TEST PASSED (both bench apps right both ways; block-end memo not slower; both Ngoma apps right)"
+echo "WASM-BENCH TEST PASSED (both bench apps right both ways; block-end memo not slower; both Ngoma apps right; all eight Hesabu apps right)"

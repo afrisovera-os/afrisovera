@@ -465,8 +465,33 @@ they become services over channels like 64 to 76; the numbers are retired then, 
   own per-request cap, so one call is one DRBG request.
 - `time_now` reads the real-time clock (the PC's CMOS clock; ARM's PL031), UTC, no time zone. Flags bit 0: the clock
   was never set or reads before 2026-01-01, so it is not to be trusted for dates such as a certificate's. The
-  monotonic clock stays the cycle counter a process already reads.
+  monotonic clock is call 79, below.
 - Both copy through the uaccess door, whole or not at all.
+
+**The monotonic clock (v0.5, added 22 Nov 2026; the architect's verdict on CLOCK_PLAN, 21 Nov 2026).** No handle and
+no right: elapsed time since boot tells a process nothing it could not measure by counting its own work. In v1 it
+becomes the clock service's `monotonic`, and 79 is retired then, never reused (§9).
+
+| # | Name | Arguments | Result | Errors |
+|---|---|---|---|---|
+| 79 | `clock_monotonic` | none | nanoseconds since the kernel's timer was set up at boot (u64, as a non-negative value) | none |
+
+- One rule for every process: the value is rounded down to a whole **microsecond** (the coarse-timer rule).
+- **Never backwards:** the kernel keeps the largest value it has given out and returns at least that (`fetch_max`),
+  across cores and across the rounding. A value can repeat.
+- The counter: the PC's TSC at the rate measured once at boot (`timer::hz`); ARM's CNTPCT_EL0 at CNTFRQ_EL0, read by
+  the kernel (what EL0 may read itself, through CNTKCTL_EL1, is unchanged). ns = (counter - t0) * 10^9 / hz, in 128
+  bits. The PC's boot prints a `[timer]` line naming the rate's source and whether the TSC is invariant (CPUID
+  0x80000007 EDX bit 8); where it is not, 79 still never goes backwards, but its rate may drift with power states.
+  When no source answers and the rate is the assumed 1 GHz, the boot (and so the field report) prints "time source
+  rate assumed, not measured".
+
+**Test vectors for 79** (a ring-3 program `rt79`, suites `pc-rt79` and `arm-rt79`, no test-rig flag needed): 10,000
+calls in a row, each at least the one before and each a whole number of microseconds; four more after 50 ms sleeps,
+none backwards; two calls around a 100 ms sleep differ by 90 ms to 2 s; the frames all back. A failing control (a
+job-only build that drops `fetch_max` and the rounding and takes 1 us off every second value) must fail the
+backwards and the whole-microsecond checks. The Linux bridge's `clock1` program (pc-compat0) checks the same clocks
+through `clock_gettime` against Linux.
 
 **The stop rule (the kernel's job now that Dira is a process).** A close request on the process's window (the close
 box, Alt+F4, Ctrl+\\ on the serial line), or the window closing, ends a blocked `tcp_dial`, `tcp_recv` or `dns_a`
@@ -504,7 +529,7 @@ reset on exit, the `[net]` line; a close request while `tcp_recv` waits on a ser
 within 100 ms and the connection reset (in the capture); the same for `tcp_dial` and `dns_a`; pc-dira-net and dira
 against the process.
 
-### 7.7 v0.5: the Daraja subset (Designed, 14 Nov 2026)
+### 7.7 v0.5: the Daraja subset (Designed, 14 Nov 2026; amended for stage L1.1, 21 Nov 2026)
 
 The calls and rules a compatibility bridge (Daraja, docs/06) needs to run one foreign program, taken from v1 or added
 beside it, so that a bridge built on them does not change when v1 lands. The plan is COMPAT_STAGE0_PLAN.md; the
@@ -553,6 +578,11 @@ preemptible) and its bridge, a native program, with exactly these handles:
 | 1 | `CHANNEL` (kernel-peered) | READ, WRITE, WAIT | the foreign process's call channel; the kernel is the other end |
 | 2 | `VMO` | READ, MAP | the bundle: a header (below), then a cpio "newc" archive of the program and its files |
 
+The clock (the architect's verdict on CLOCK_PLAN, 21 Nov 2026): the bridge reads call 79 with no handle. Its
+realtime is a base read once at its start plus the monotonic time since, so it never steps back within a run. Once
+`time_now` (78) is in the kernel, the bridge also gets handle 3, `TIME` with READ, for that base; until then the base
+is v0's `SYS_TIME` (seconds). The foreign process holds no handles either way.
+
 The bundle header is per spawn, 48 bytes (the architect's layout, 15 Nov 2026): bytes 0..8 magic `DARAJA02`; 8..16
 the archive's length in bytes, little-endian, written by the kernel from the bytes it copied, never from the archive;
 16..32 `AT_RANDOM`, filled from `drbg::fill_secret` for that spawn and never reused (fail closed: no secret bytes, no
@@ -568,14 +598,14 @@ read, and fuzz-host's `daraja_bundle` target checks it on any bytes. No `NET` or
 | 17 | `channel_write` | ch h, bytes_ptr, bytes_len, 0, 0 | 0 | `E_PERM` no WRITE; `E_FAULT`; `E_INVAL` not a valid reply (below), or handles given; `E_PEERCLOSED` |
 | 18 | `channel_read` | ch h, bytes_ptr, bytes_cap, 0, 0 | 0 | `E_PERM` no READ; `E_FAULT`; `E_TOOBIG` as §7.5; `E_WOULDBLOCK` empty; `E_PEERCLOSED` empty and the foreign process gone |
 | 24 | `wait_one` | h, signals (bit 0 READABLE, bit 2 PEER_CLOSED), timeout_ns (negative: no limit) | observed signals; 0 when the time ran out | `E_BADHANDLE`; `E_PERM` no WAIT |
-| 49 | `fproc_map` | fproc h, foreign addr, len, prot (bit 0 READ, 1 WRITE; READ or READ\|WRITE) | 0 | `E_PERM` no MAP right, or this CPU has no NX; `E_INVAL` EXECUTE asked, prot not R or RW, not page-aligned, outside the foreign area, or overlapping a mapping; `E_NOMEM` past the caps or no frames (nothing half made) |
-| 50 | `fproc_unmap` | fproc h, foreign addr, len | 0 | `E_INVAL` not a whole mapping |
+| 49 | `fproc_map` | fproc h, foreign addr, len, prot (bit 0 READ, 1 WRITE; READ or READ\|WRITE) | 0 | `E_PERM` no MAP right, or this CPU has no NX; `E_INVAL` EXECUTE asked, prot not R or RW, not page-aligned, outside the foreign area, or overlapping a mapping; `E_NOMEM` past the caps, no frames, or no free range entry (nothing half made) |
+| 50 | `fproc_unmap` | fproc h, foreign addr, len | 0 | `E_INVAL` not page-aligned, or a page in the run not mapped; `E_NOMEM` no free range entry for the split (nothing changed) |
 | 51 | `fproc_read` | fproc h, foreign addr, my ptr, len | bytes copied | `E_FAULT` any page on either side not mapped (all checked before the first byte moves) |
 | 52 | `fproc_write` | fproc h, foreign addr, my ptr, len | bytes copied | `E_FAULT` as 51, or any foreign page in the range not WRITE (so never one that is EXECUTE, or sealed) |
 | 53 | `fproc_start` | fproc h, rip, rsp | 0 | `E_INVAL` already started, rip not in an EXECUTE mapping, or rsp not in a WRITE mapping |
 | 54 | `fproc_set_tls` | fproc h, which (0 FS, 1 GS), value | 0 | `E_INVAL` which, or value not canonical or not in the foreign area |
 | 55 | `fproc_kill` | fproc h, exit code | 0 | `E_BADHANDLE` |
-| 56 | `fproc_protect` | fproc h, foreign addr, len, prot (READ, or READ\|EXECUTE) | 0 | `E_PERM` EXECUTE without the right, or EXECUTE after `fproc_start`; `E_INVAL` WRITE asked, not a whole mapping, or EXECUTE on a page that is not currently WRITE (it must come straight from RW) |
+| 56 | `fproc_protect` | fproc h, foreign addr, len, prot (0 none, READ, or READ\|EXECUTE) | 0 | `E_PERM` EXECUTE without the right; after `fproc_start`, any right a page in the run does not have now (RW to RX included, and anything from none); `E_INVAL` WRITE asked, not page-aligned, a page in the run not mapped, or before the start EXECUTE on a page that is not currently RW; `E_NOMEM` no free range entry for the split (nothing changed) |
 
 Channel numbers and their semantics are v1's (§7.3, §7.5). In v0.5 they act only on the kernel-peered call channel,
 and any other handle kind is `E_BADHANDLE`. When v1 channels land, nothing a bridge calls changes.
@@ -600,17 +630,32 @@ Test vectors: a bridge's 24 after its foreign process has ended gives PEER_CLOSE
   foreign process ends, and pc-daraja checks that the frame pool's used count and the total reservation are back at
   their starting values with the foreign process dead and the bridge still alive.
 - **No NX, no foreign memory:** on a CPU without NX, `fproc_map` is `E_PERM`, as `vmo_map` is (§7.6).
-- **Write or execute, never both, and the seal is one way, per page.** A page is RW (no-execute), R (no-execute) or
-  RX. `fproc_protect` may turn RW into R or RX. Nothing ever turns R or RX back into WRITE: `fproc_map` never maps over
-  an existing page, and no call adds WRITE. `fproc_write` refuses any page that is not WRITE.
+- **Write or execute, never both, and the seal is one way, per page.** A page is RW (no-execute), R (no-execute), RX,
+  or none. Before the start, `fproc_protect` may turn RW into R or RX. Nothing ever turns R or RX back into WRITE:
+  `fproc_map` never maps over an existing page, and no call adds WRITE. `fproc_write` refuses any page that is not WRITE.
 - **EXECUTE only before the start.** `fproc_protect` may add EXECUTE only before `fproc_start`. Stage 0 and L1 need no
   code generated at run time; a program that needs a JIT is its own plan, because "write, then execute" is what W^X
-  exists to stop. After the start, `fproc_protect` may still drop WRITE (to R), never add EXECUTE.
-- **Stale TLB entries.** When `fproc_protect` (or `fproc_unmap`) changes a page of a foreign address space, no TLB
-  entry may keep the old permission. On one core the bridge is running during its call, so the foreign space is not
-  the loaded one, and the next CR3 load into it drops its non-global entries (user pages are never global). The kernel
-  still runs `invlpg` on each changed page when the foreign root is the loaded one, so this stays true if that ever
-  changes (another core, or a call made with the foreign space loaded).
+  exists to stop.
+- **After the start, rights are only removed** (amended 21 Nov 2026 for L1.1, the architect's verdict on
+  COMPAT_L1_PLAN section 9). The new rights must be a subset of every covered page's rights now: RW to R, RW or R or RX
+  to none, RX to R. Adding any right is `E_PERM`, RW to RX included (it adds EXECUTE). A bridge answers a program's
+  `mprotect` with these rules, and its own refusal (EACCES) for anything they forbid.
+- **None frees the frames.** Rights 0 gives the pages' frames back at once (they leave the process's count), and the
+  pages keep rights 0 in their range, so a later unmap or protect of them still answers as for mapped pages. A page
+  with rights 0 never gains a right again (`E_PERM`); the way back is unmap, then a fresh `fproc_map` (zeroed frames).
+  This differs from Linux, which keeps the contents under PROT_NONE; a bridge says so by name rather than give zeroed
+  pages where a program expects its old data. Keeping frames under rights 0 is its own plan if a program that matters
+  needs it.
+- **Ranges.** The kernel keeps up to 128 ranges per foreign process (a range: a run of pages with one set of rights).
+  `fproc_map` that starts exactly where a range with the same rights ends grows that range instead of taking a new
+  entry. `fproc_unmap` and `fproc_protect` act on any page-aligned run inside mapped pages: the kernel splits ranges at
+  the run's two ends, checking for room first, so a full table is `E_NOMEM` with nothing changed. A bridge's
+  `MAP_FIXED` is `fproc_unmap` then a fresh `fproc_map`, never a map over pages.
+- **Stale TLB entries.** When `fproc_protect` or `fproc_unmap` changes a page of a foreign address space, including
+  every split, no TLB entry may keep the old permission. On one core the bridge is running during its call, so the
+  foreign space is not the loaded one, and the next CR3 load into it drops its non-global entries (user pages are never
+  global). The kernel still runs `invlpg` on each changed page when the foreign root is the loaded one, so this stays
+  true if that ever changes (another core, or a call made with the foreign space loaded).
 - **The limit:** the low 1 TiB (slot 0, the kernel's 1:1 map) cannot hold foreign pages. Programs linked at fixed low
   addresses (non-PIE, for example at `0x400000`) cannot run under v0.5. Position-independent programs, and ours
   linked high, can. Lifting this is its own plan to the architect before stage L1 claims "programs as downloaded".
@@ -644,6 +689,11 @@ queue. FAULT and EXITED messages take no reply.
   address space, VMOs), and the frame pool's free count returns to its starting value.
 - Each foreign process's start and end is one `[daraja]` console line: the process, its bridge, the personality, the
   exit code or the fault.
+- **Per-call lines only when asked** (amended 21 Nov 2026 for L1.1). The kernel's per-call `[daraja]` line, and the
+  bridge's, appear only for a pair spawned with the trace flag. In the test build the shell's `linux <name>` sets it
+  when the bundle holds the file `daraja/trace` (the shell reads the archive's names; the kernel never reads a
+  foreign program's file). It is off by default, because per-call lines at 115200 baud dominate a real program's run
+  time. pc-daraja and pc-compat0 keep one traced run, where the call order is compared.
 
 **Test vectors (suite `pc-daraja`, with each step).** A foreign process that runs `int 0x80` ends, with the refusal
 line and a FAULT to its bridge. `fproc_map` with EXECUTE is `E_INVAL`; `fproc_protect` adding EXECUTE to a page that is
@@ -657,6 +707,19 @@ opcode (`pc-ring3` unchanged). A foreign `syscall` with TF set does not single-s
 NMI, #DB and #MC are set at boot. The end-to-end proof: `hello0` and `fault0`, built from source with musl 1.2.5, give
 the same stdout, stderr and exit code on Linux and through the bridge, and the forwarded call numbers equal `strace`'s
 list.
+
+**Test vectors for the L1.1 amendment (pc-daraja, one case per point).**
+- A second `fproc_map` that starts where an RW range ends grows it: the range count stays the same.
+- Unmapping the middle page of a three-page range leaves two ranges, and both still read through `fproc_read`.
+- Protecting part of a range to R, then the whole range to R, works; a write to the R page by the started program
+  faults (a FAULT message, vector 14), which shows no stale TLB entry kept WRITE.
+- After the start: R to RW, and RW to RX, are both `E_PERM`, and nothing changes.
+- Protecting a run to none gives its frames back: the pair's page count drops by the run's pages; protecting it back
+  to R is `E_PERM`; unmapping it works.
+- With the range table full, a split by `fproc_unmap` or `fproc_protect` is `E_NOMEM`, and the ranges and pages are
+  exactly as before.
+- End to end: `mprot0` (rights only removed) gives the same output as Linux; `mprot1` (rights added after the start)
+  is refused with EACCES on all three tries through the bridge, and allowed on Linux, each side graded on its own.
 
 ## 8. Security considerations
 

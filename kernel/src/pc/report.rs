@@ -131,7 +131,7 @@ const PROBES: &[&str] = &[
 /// Lines of the console log that look like trouble.
 const TROUBLE: &[&str] = &[
     "PANIC", "EXCEPTION", "panicked", "FAIL", "WRONG", "NOT STOPPED", "stuck", "timed out",
-    "did not", "could not", "no reply",
+    "did not", "could not", "no reply", "not measured",
 ];
 
 /// Copy the log (`HEAD` then the `TAIL` ring in order) through `f`, a line at a time.

@@ -8770,7 +8770,7 @@ fn cmd_rng(line: &str, cmd: &str, rest: &str) {
     if rest.trim() == "secret" {
         let mut b = [0u8; 16];
         let r = crate::rng::fill_secret(&mut b);
-        b.fill(0);
+        crate::drbg::wipe(&mut b); // volatile writes and a fence: a plain fill of a dead buffer may be dropped
         match r {
             Ok(()) => crate::kprintln!("[rng] secret OK, 16 bytes, not shown"),
             Err(e) => crate::kprintln!("[rng] secret REFUSED: {:?}", e),

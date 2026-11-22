@@ -1,0 +1,61 @@
+# Reproducible build (R6 item 4): the same commit, built on two different runner images, must give the same kernels.
+# Both images check out to the same path (/home/runner/work/...), so the debug ARM image, which embeds its build
+# path, is comparable here too. Builds only: no QEMU, no tests.
+# Rules (a) to (d) as in compat-ref.yml: overlay only, contents: read, no secrets, pinned actions, artifacts.
+name: Reproducible build
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 5 * * 3'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_VER: 1.97.1          # as rust-toolchain.toml and the setup action
+  CARGO_NET_OFFLINE: "true" # vendor/ only, as every other build here
+
+jobs:
+  build:
+    name: build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
+      - name: Rust
+        run: |
+          rustup toolchain install "$RUST_VER" --profile minimal --target aarch64-unknown-none \
+            --target x86_64-unknown-uefi --target x86_64-unknown-none --component rust-src,llvm-tools
+          echo "RUSTUP_TOOLCHAIN=$RUST_VER" >> "$GITHUB_ENV"
+      - name: Build the ARM and PC kernels, debug and release
+        run: |
+          cargo build -p mansa-kernel
+          cargo build -p mansa-kernel --release
+          cargo build -p mansa-kernel --bin mansa-pc --features pc --target x86_64-unknown-uefi
+          cargo build -p mansa-kernel --bin mansa-pc --features pc --target x86_64-unknown-uefi --release
+          md5sum target/aarch64-unknown-none/debug/mansa-kernel target/aarch64-unknown-none/release/mansa-kernel \
+            target/x86_64-unknown-uefi/debug/mansa-pc.efi target/x86_64-unknown-uefi/release/mansa-pc.efi > md5.txt
+          cat md5.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: "md5-${{ matrix.os }}", path: md5.txt }
+
+  compare:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { pattern: md5-*, path: md5 }
+      - name: Same kernels on both images
+        run: |
+          a=md5/md5-ubuntu-24.04/md5.txt; b=md5/md5-ubuntu-22.04/md5.txt
+          { echo "## Reproducible build"; echo; echo '```'; paste -d' ' <(cut -d' ' -f1 "$a") <(cut -d' ' -f1 "$b") <(awk '{print $2}' "$a"); echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if diff "$a" "$b"; then echo "all four kernels are the same on ubuntu-24.04 and ubuntu-22.04"
+          else echo "the kernels differ between the two images (above)"; exit 1; fi

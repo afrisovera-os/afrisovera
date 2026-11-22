@@ -408,7 +408,7 @@ unsafe fn bring_up(b: u8, d: u8, f: u8, ven: u16, dev: u16) -> bool {
     if lo & 0x6 == 0x4 {
         bar |= (pci::cfg_read32(b, d, f, 0x14) as u64) << 32;
     }
-    if bar == 0 || !mmu::map_mmio(bar, 0x4000) {
+    if bar == 0 || !mmu::map_mmio(bar, 0x4000, "intel-hda") {
         WHY = "no usable BAR0";
         return false;
     }

@@ -5,6 +5,13 @@ inputs:
   qemu-version:
     description: QEMU version to build
     default: '11.0.0'
+  # The hash is checked by hand once per version, not just taken from the download (architect, 22 Nov 2026):
+  # 11.0.0 on 22 Nov 2026: two downloads gave this sha256, and qemu-11.0.0.tar.xz.sig is a good signature by the
+  # QEMU release key CEACC9E15534EBABB82D3FA03353C9CEF108B584 (Michael Roth), the fingerprint qemu.org/download lists.
+  # At a version change: hash the new tarball, verify its .sig the same way, then change both values together.
+  qemu-sha256:
+    description: sha256 of qemu-<version>.tar.xz, checked against QEMU's signed release (see the comment above)
+    default: 'c04ca36012653f32d11c674d370cf52a710e7d3f18c2d8b63e4932052a4854d6'
   rust-version:
     description: Rust toolchain (must match rust-toolchain.toml)
     default: '1.97.1'
@@ -26,12 +33,13 @@ runs:
 
     - name: QEMU from cache
       id: qemu-cache
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ~/tools/qemu
         # v3: built with the test patches in scripts/ci/qemu-*.patch (usb-net's NCM mode for pc-usbncm); the key
-        # hashes them, so a changed patch builds QEMU again (same key as the private ci.yml)
-        key: qemu-${{ inputs.qemu-version }}-aarch64-x86_64-${{ runner.os }}-v3-${{ hashFiles('scripts/ci/qemu-*.patch') }}
+        # hashes them, so a changed patch builds QEMU again. v4 (public only, architect 22 Nov 2026): built from the
+        # sha256-checked tarball, so no QEMU from before the check is used
+        key: qemu-${{ inputs.qemu-version }}-aarch64-x86_64-${{ runner.os }}-v4-${{ hashFiles('scripts/ci/qemu-*.patch') }}
 
     # QEMU 11 is required: older distribution builds fail some suites (heap). The first run builds it
     # (about 20 minutes); every later run restores it from the cache.
@@ -40,8 +48,11 @@ runs:
       shell: bash
       env:
         V: ${{ inputs.qemu-version }}
+        SUM: ${{ inputs.qemu-sha256 }}
       run: |
         curl -fsSL --retry 3 -o /tmp/qemu.txz "https://download.qemu.org/qemu-$V.tar.xz"
+        # the tarball must be the one hashed in this file (architect, 22 Nov 2026): a mismatch stops the build
+        sha256sum -c <<< "$SUM  /tmp/qemu.txz" || { echo "qemu-$V.tar.xz does not match its pinned sha256"; exit 3; }
         tar -xJf /tmp/qemu.txz -C /tmp
         cd "/tmp/qemu-$V"
         # test equipment only, never part of AfriSovera: e.g. usb-net's NCM mode, which pc-usbncm needs

@@ -70,15 +70,16 @@ _start:
         );
     }
 }
-#[cfg(target_arch = "aarch64")] fn sys_exit() -> ! {
+#[cfg(target_arch = "aarch64")] fn sys_exit(code: u64) -> ! {
     unsafe {
-        asm!("svc #0", in("x8") SYS_EXIT, options(noreturn, nostack));
+        asm!("svc #0", in("x8") SYS_EXIT, in("x0") code, options(noreturn, nostack));
     }
 }
 
 // Embedded WASM module chaining POINTER-ARG host calls at EL0:
 //   run() { let n = ai(&"WHO ARE YOU",11,&mem[64],192); speak(&mem[64],n); print(n); }
 // The EL0 app asks the on-device AI and SPEAKS the answer — all via syscalls.
+#[cfg(not(feature = "sandbox-test"))]
 #[rustfmt::skip]
 static WASM: &[u8] = &[
     0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x15, 0x04, 0x60,
@@ -94,6 +95,63 @@ static WASM: &[u8] = &[
     0x01, 0x00, 0x41, 0x00, 0x0B, 0x0B, 0x57, 0x48, 0x4F, 0x20, 0x41, 0x52,
     0x45, 0x20, 0x59, 0x4F, 0x55,
 ];
+
+// The test build (feature `sandbox-test`, built into the test images only; release-guard refuses it) runs these two
+// modules, one after the other: the two sandbox findings of OS_REQUESTS item 9 (scripts/niavm-sandbox-test.sh).
+#[cfg(feature = "sandbox-test")]
+#[rustfmt::skip]
+static TEST_UNKNOWN: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0B, 0x03, 0x60,
+    0x00, 0x00, 0x60, 0x01, 0x7F, 0x00, 0x60, 0x00, 0x00, 0x02, 0x18, 0x02,
+    0x03, 0x65, 0x6E, 0x76, 0x04, 0x6E, 0x6F, 0x70, 0x65, 0x00, 0x00, 0x03,
+    0x65, 0x6E, 0x76, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x00, 0x01, 0x03,
+    0x02, 0x01, 0x02, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x02,
+    0x0A, 0x0A, 0x01, 0x08, 0x00, 0x10, 0x00, 0x41, 0x01, 0x10, 0x01, 0x0B,
+];
+#[cfg(feature = "sandbox-test")]
+#[rustfmt::skip]
+static TEST_OOB: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0D, 0x03, 0x60,
+    0x02, 0x7F, 0x7F, 0x00, 0x60, 0x01, 0x7F, 0x00, 0x60, 0x00, 0x00, 0x02,
+    0x19, 0x02, 0x03, 0x65, 0x6E, 0x76, 0x05, 0x73, 0x70, 0x65, 0x61, 0x6B,
+    0x00, 0x00, 0x03, 0x65, 0x6E, 0x76, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74,
+    0x00, 0x01, 0x03, 0x02, 0x01, 0x02, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75,
+    0x6E, 0x00, 0x02, 0x0A, 0x10, 0x01, 0x0E, 0x00, 0x41, 0xE8, 0x07, 0x41,
+    0xE4, 0x00, 0x10, 0x00, 0x41, 0x02, 0x10, 0x01, 0x0B,
+];
+
+/// Text to the console through putc (the kernel prints it as the process's output).
+fn say(t: &[u8]) {
+    for &b in t {
+        sys_putc(b as u64);
+    }
+}
+
+/// How a run ended: 0 the module returned; anything else stopped it (the line was printed first).
+const STOPPED: u64 = 1;
+
+/// The DENIED line nia.rs prints for a host call the app may not make, then the TRAP line.
+fn denied(name: &[u8]) -> u64 {
+    say(b"    [nia] DENIED: app called host '");
+    say(name);
+    say(b"' without the capability\n    [nia] TRAP: capability denied\n");
+    STOPPED
+}
+
+/// The bytes [off, off + len) of the module's memory, as WebAssembly says: both unsigned, no wrap, inside `mem`.
+/// None is a TRAP (nia.rs's mem_range).
+fn mem_range(mem: &[u8], off: i32, len: i32) -> Option<(u64, u64)> {
+    let (o, l) = (off as u32 as u64, len as u32 as u64);
+    if o + l > mem.len() as u64 {
+        return None;
+    }
+    Some((mem.as_ptr() as u64 + o, l))
+}
+
+fn oob() -> u64 {
+    say(b"    [nia] TRAP: out of bounds memory access\n");
+    STOPPED
+}
 
 fn uleb(b: &[u8], start: usize) -> (usize, usize) {
     let mut c = start;
@@ -130,14 +188,15 @@ fn sleb(b: &[u8], start: usize) -> (i32, usize) {
     (r as i32, c - start)
 }
 
-fn run_module(m: &[u8], mem: &mut [u8]) {
+fn run_module(m: &[u8], mem: &mut [u8]) -> u64 {
     if m.len() < 8 || &m[0..4] != b"\0asm" {
         sys_debug(0xBAD0);
-        return;
+        return STOPPED;
     }
     let mut c = 8;
     let mut imports = 0usize;
     let mut import_host = [255u8; 8]; // host id per import (0=print,1=putc,2=time,3=ai,4=speak)
+    let mut import_name: [&[u8]; 8] = [b""; 8]; // for the DENIED line
     let mut run_idx = usize::MAX;
     let mut code_off = [0usize; 8];
     let mut code_len = [0usize; 8];
@@ -176,9 +235,13 @@ fn run_module(m: &[u8], mem: &mut [u8]) {
                     } else {
                         255
                     };
-                    if imports < 8 {
-                        import_host[imports] = hid;
+                    if imports >= 8 {
+                        // more imports than this interpreter keeps: refused, never a call into the wrong one
+                        say(b"    [nia] parse error: more than 8 imports\n");
+                        return STOPPED;
                     }
+                    import_host[imports] = hid;
+                    import_name[imports] = name;
                     imports += 1;
                 }
             }
@@ -241,17 +304,17 @@ fn run_module(m: &[u8], mem: &mut [u8]) {
     }
     if run_idx == usize::MAX || run_idx < imports {
         sys_debug(0xBAD1);
-        return;
+        return STOPPED;
     }
     let li = run_idx - imports;
     if li >= ncode {
         sys_debug(0xBAD2);
-        return;
+        return STOPPED;
     }
-    exec(&m[code_off[li]..code_off[li] + code_len[li]], imports, &import_host, mem);
+    exec(&m[code_off[li]..code_off[li] + code_len[li]], imports, &import_host, &import_name, mem)
 }
 
-fn exec(code: &[u8], imports: usize, import_host: &[u8; 8], mem: &mut [u8]) {
+fn exec(code: &[u8], imports: usize, import_host: &[u8; 8], import_name: &[&[u8]; 8], mem: &mut [u8]) -> u64 {
     let mut c = 0;
     let (ngroups, a) = uleb(code, c);
     c += a;
@@ -299,7 +362,13 @@ fn exec(code: &[u8], imports: usize, import_host: &[u8; 8], mem: &mut [u8]) {
             0x10 => {
                 let (f, a) = uleb(code, c);
                 c += a;
-                if f < imports {
+                if f >= imports {
+                    // a call to one of the module's own functions: this interpreter cannot make it, so it stops
+                    // rather than skip it
+                    say(b"    [nia] TRAP: calls between functions are not supported here\n");
+                    return STOPPED;
+                }
+                {
                     // dispatch the host import to the matching OS syscall
                     match import_host[f] {
                         0 => {
@@ -318,48 +387,62 @@ fn exec(code: &[u8], imports: usize, import_host: &[u8; 8], mem: &mut [u8]) {
                             // ai(prompt_off, len, out_off, cap) -> reply_len.
                             // Translate WASM offsets to real addresses in this
                             // app's memory and hand them to the kernel syscall.
-                            let cap = st[sp - 1] as u64;
-                            let out_off = st[sp - 2] as u64;
-                            let len = st[sp - 3] as u64;
-                            let prompt_off = st[sp - 4] as u64;
+                            let (cap, out_off, len, prompt_off) = (st[sp - 1], st[sp - 2], st[sp - 3], st[sp - 4]);
                             sp -= 4;
-                            let base = mem.as_ptr() as u64;
-                            let r = sys_ai(base + prompt_off, len, base + out_off, cap);
+                            let (Some((prompt, len)), Some((out, cap))) =
+                                (mem_range(mem, prompt_off, len), mem_range(mem, out_off, cap))
+                            else {
+                                return oob();
+                            };
+                            let r = sys_ai(prompt, len, out, cap);
                             st[sp] = r as i32;
                             sp += 1;
                         }
                         4 => {
                             // speak(text_off, len) -> () : Asili Voice at EL0.
-                            let len = st[sp - 1] as u64;
-                            let text_off = st[sp - 2] as u64;
+                            let (len, text_off) = (st[sp - 1], st[sp - 2]);
                             sp -= 2;
-                            let base = mem.as_ptr() as u64;
-                            sys_speak(base + text_off, len);
+                            let Some((text, len)) = mem_range(mem, text_off, len) else {
+                                return oob();
+                            };
+                            sys_speak(text, len);
                         }
-                        _ => {}
+                        _ => return denied(import_name[f]),
                     }
                 }
             }
-            0x0B => return,
+            0x0B => return 0,
             _ => {
                 sys_debug(0xBADC0DE);
-                return;
+                return STOPPED;
             }
         }
     }
+    0
 }
 
 #[no_mangle]
 pub extern "C" fn rust_main() -> ! {
     sys_debug(0xE10); // marker: Nia mini-interpreter starting at EL0
     let mut mem = [0u8; 1024]; // the module's linear memory (on the EL0 stack)
-    run_module(WASM, &mut mem);
-    sys_exit();
+    #[cfg(not(feature = "sandbox-test"))]
+    let code = run_module(WASM, &mut mem);
+    #[cfg(feature = "sandbox-test")]
+    let code = {
+        // each module on fresh memory; the exit code has bit 0 for the first stopped, bit 1 for the second
+        let a = run_module(TEST_UNKNOWN, &mut mem);
+        say(if a == 0 { b"[niavm] test 1 (unknown import): ran to the end\n" } else { b"[niavm] test 1 (unknown import): stopped\n" });
+        mem = [0u8; 1024];
+        let b = run_module(TEST_OOB, &mut mem);
+        say(if b == 0 { b"[niavm] test 2 (offset past memory): ran to the end\n" } else { b"[niavm] test 2 (offset past memory): stopped\n" });
+        (a & 1) | ((b & 1) << 1)
+    };
+    sys_exit(code);
 }
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    sys_exit();
+    sys_exit(4);
 }
 
 // The PC (x86-64 ring 3, 5 Nov 2026): the same interpreter through the PC kernel's int 0x80
@@ -406,9 +489,9 @@ fn sys_speak(text: u64, tlen: u64) {
     sys(14, text, tlen, 0, 0);
 }
 #[cfg(target_arch = "x86_64")]
-fn sys_exit() -> ! {
+fn sys_exit(code: u64) -> ! {
     // SAFETY: SYS_EXIT never returns to the program.
     unsafe {
-        asm!("int 0x80", in("rax") 0u64, in("rdi") 0u64, options(noreturn, nostack));
+        asm!("int 0x80", in("rax") 0u64, in("rdi") code, options(noreturn, nostack));
     }
 }

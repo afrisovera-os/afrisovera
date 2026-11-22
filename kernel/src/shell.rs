@@ -551,14 +551,31 @@ pub(crate) fn exec(line: &str) { if paged(line) { return; } pc_intercept!(line);
             crate::process::run_fault_demo();
             crate::kprintln!("[faultdemo] the offending process was killed; the OS is still running.");
         }
+        "rt79test" => {
+            // call 79 clock_monotonic for EL0 (CLOCK_PLAN; suite arm-rt79). The PC's is shell_pc's.
+            crate::process::run_rt79_test();
+        }
         "celltest3" => {
             // the cell window for EL0 (AFR-0001 7.6, Dira M3 S5b; suite arm-cell3); the test rig only. The PC's is shell_pc's.
             crate::process::run_cell_test();
+        }
+        "nettest3" => {
+            // the network for EL0 (AFR-0001 7.6, calls 72 to 76, Dira M3 S5c; suite arm-net3); the test rig only. The
+            // PC's is shell_pc's.
+            crate::process::run_net_test();
+        }
+        "dnsa" => {
+            // ARM's checked DNS (S5c): a random id and port from the entropy source, or a named refusal without one
+            crate::process::dns_a_shell(rest.trim());
         }
         "vmotest" => {
             // process memory for EL0 (AFR-0001 7.6, Dira M3 S5a; suite arm-vmo). The PC's `vmotest` is shell_pc's.
             crate::process::run_vmo_test();
         }
+        // G2 part 2 step 2: PAN's and UAO's state; `panprobe` (test rig only): a plain kernel read of EL0 memory,
+        // which PAN must stop (suite pan; it halts the machine when PAN works)
+        "pan" => crate::uaccess::status(),
+        "panprobe" => crate::process::run_pan_probe(),
         "el0-ptr" => {
             // Gap G2 probe: an EL0 program passes kernel addresses to SYS_AI and SYS_SPEAK (scripts/el0-ptr-test.sh).
             crate::kprintln!("[el0-ptr] an EL0 program hands the kernel its own addresses...");
@@ -7278,6 +7295,12 @@ pub(crate) fn exec(line: &str) { if paged(line) { return; } pc_intercept!(line);
             crate::kprintln!("[niavm] Nia interpreter at EL0 runs WASM using print+putc+time via syscalls (see [P3])...");
             crate::process::run_niavm();
             crate::kprintln!("[niavm] done: the WASM runtime ran as a userspace process, host calls = syscalls");
+        }
+        #[cfg(feature = "test-apps")]
+        "niavm-sandbox" => {
+            // niavm's test build: an unknown import and an offset past the memory must each stop the app
+            crate::process::run_niavm_sandbox();
+            crate::kprintln!("[niavm] sandbox test done");
         }
         "appget" => {
             // Install a Nia app from the network: appget <ip> <port> <name> <sha256> (appget.rs).

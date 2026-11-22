@@ -10,6 +10,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 static HZ: AtomicU64 = AtomicU64::new(0);
 static T0: AtomicU64 = AtomicU64::new(0);
+/// Where `hz()` came from: 1 the PIT, 2 CPUID 0x15 or 0x16, 3 the ACPI PM timer, 4 assumed (0: not set up yet).
+static SOURCE: AtomicU64 = AtomicU64::new(0);
+/// Call 79's floor: the largest value any process has been given, so the clock never goes backwards (CLOCK_PLAN 1).
+static LAST_NS: AtomicU64 = AtomicU64::new(0);
 
 /// The calibration loops run before the TSC rate is known, so their bound is raw TSC ticks: 1,000,000,000 is at
 /// least 100 ms on any TSC up to 10 GHz (each window wants 10 ms). Their spin counts stay as the last fallback.
@@ -108,17 +112,58 @@ pub fn init() -> u64 {
             best = best.min(t);
         }
     }
-    let hz = if best != u64::MAX && best >= 10_000 {
-        best * 100
+    let (hz, src) = if best != u64::MAX && best >= 10_000 {
+        (best * 100, 1)
     } else if let Some(h) = cpuid_tsc_hz() {
-        h // no PIT (some recent PCs gate it off): the CPU's own statement of its TSC rate
+        (h, 2) // no PIT (some recent PCs gate it off): the CPU's own statement of its TSC rate
     } else if let Some(h) = pm_timer_hz() {
-        h // nor CPUID: measure against the ACPI power-management timer
+        (h, 3) // nor CPUID: measure against the ACPI power-management timer
     } else {
-        1_000_000_000 // nothing answered: assume 1 GHz rather than divide by zero
+        (1_000_000_000, 4) // nothing answered: assume 1 GHz rather than divide by zero
     };
     HZ.store(hz, Ordering::Relaxed);
+    SOURCE.store(src, Ordering::Relaxed);
     hz
+}
+
+/// The name of the source `hz()` was measured against, for the boot's `[timer]` line.
+pub fn source_name() -> &'static str {
+    match SOURCE.load(Ordering::Relaxed) {
+        1 => "the 8254 PIT",
+        2 => "CPUID (the TSC rate the CPU states)",
+        3 => "the ACPI PM timer",
+        4 => "nothing (assumed 1 GHz)",
+        _ => "not set up",
+    }
+}
+
+/// True when no source answered and `hz()` is the assumed 1 GHz.
+pub fn rate_assumed() -> bool {
+    SOURCE.load(Ordering::Relaxed) == 4
+}
+
+/// The boot's `[timer]` lines (CLOCK_PLAN 2 and the architect's verdict, point 4): the rate and its source, whether
+/// the TSC is invariant, and a named line when the rate was assumed. The field report carries them (the boot log).
+pub fn report() {
+    crate::kprintln!(
+        "[timer] TSC {} MHz, measured against {}; invariant TSC: {}",
+        hz() / 1_000_000,
+        source_name(),
+        if crate::rng::has_invariant_tsc() { "yes" } else { "no (the clock never goes backwards, but its rate may drift with CPU power states)" }
+    );
+    if rate_assumed() {
+        crate::kprintln!("[timer] time source rate assumed, not measured");
+    }
+}
+
+/// Call 79 `clock_monotonic` (AFR-0001 7.6; CLOCK_PLAN): nanoseconds since the timer was set up at boot, rounded
+/// down to a whole microsecond for every process (the coarse-timer rule), never below a value already given out.
+pub fn monotonic_ns() -> u64 {
+    let ticks = rdtsc().saturating_sub(t0()); // a core whose TSC reads behind T0 counts as 0, not as 2^64
+    let ns = (ticks as u128 * 1_000_000_000 / hz().max(1) as u128).min(u64::MAX as u128) as u64;
+    let us_ns = ns - ns % 1_000;
+    let last = LAST_NS.fetch_max(us_ns, Ordering::Relaxed);
+    last.max(us_ns)
 }
 
 /// TSC value when the timer was set up (the PC's "boot" for tick counting).

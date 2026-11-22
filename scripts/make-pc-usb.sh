@@ -23,6 +23,14 @@ OUT=build/pc-usb
 rm -rf "$OUT"
 mkdir -p "$OUT/EFI/BOOT"
 cp "$EFI" "$OUT/EFI/BOOT/BOOTX64.EFI"
+# Device firmware (the Intel Wi-Fi files, W5): only in the cloud stick build. The architect, 21 Nov 2026: the firmware
+# is fetched and checked there and one finished image goes to the owner; nothing is fetched on his PC.
+# STICK_FIRMWARE=1 fetches every real device's MANIFEST row from its pinned source, stops on any wrong size or sha256,
+# and lays each file with its licence in \EFI\afrisovera\firmware\ (the kernel checks the same hashes again).
+if [ "${STICK_FIRMWARE:-0}" = 1 ]; then
+  python3 scripts/fw/fwtool.py fetch "$OUT/EFI/afrisovera/firmware" "${FW_CACHE:-/tmp/fw-cache}" --real ||
+    { echo "make-pc-usb: the firmware fetch failed; no stick"; exit 1; }
+fi
 REV="$(git rev-parse --short HEAD 2> /dev/null || echo unknown)"
 cat > "$OUT/README-USB.txt" << EOF
 AfriSovera OS -- PC test stick (commit $REV, $PROF build, built $(date +%Y-%m-%d))
@@ -54,6 +62,8 @@ built-in keyboard or a USB keyboard. Try, one at a time:
   lssd          the SD card slot and the card in it (left alone unless blank)
   acpiinfo      how many processor cores it found
   ifconfig      the network address it got (plug in a network cable first)
+  wifi up       an Intel 7265 / 3165 Wi-Fi chip powered up with its firmware (no network yet)
+  wifi diag     each step of wifi up again; then  report save  brings it home
   ping          talk to the router
   gui           the desktop screen -- with a USB mouse, click FILES, STORE, ASILI-AI or
                 DEVICES at the bottom;   clear   back to text

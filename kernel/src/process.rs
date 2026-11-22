@@ -51,6 +51,9 @@ const SYS_WIN_CREATE: u64 = 5; // (w, h) -> window id
 const SYS_WIN_FILL: u64 = 6; // (wid, rx, ry, rw, rh, color)
 const SYS_WIN_PRESENT: u64 = 7; // composite all app surfaces
 const SYS_GETPID: u64 = 8; // -> current process id
+/// Call 79 `clock_monotonic` (AFR-0001 7.6): nanoseconds since boot, whole microseconds, never backwards; no handle
+/// (CLOCK_PLAN; numbered after 77 and 78, which the Dira runtime branch adds)
+const SYS_CLOCK_MONOTONIC: u64 = 79;
 const SYS_WIN_TEXT: u64 = 9; // (wid, x, y, char, color) -> draw a glyph
 const SYS_WIN_GETKEY: u64 = 10; // block for the next input key -> key code
 const SYS_PUTC: u64 = 11; // (char) -> print one character to the console
@@ -89,6 +92,17 @@ const SYS_CELL_PUT: u64 = 65; // (h, col, row, ptr, len) -> cells written
 const SYS_CELL_CURSOR: u64 = 66; // (h, col, row, shape) -> 0
 const SYS_CELL_SIZE: u64 = 67; // (h) -> cols << 14 | rows
 const SYS_CELL_EVENT: u64 = 68; // (h, timeout_ms; negative = no limit) -> an event, or 0
+// The network (AFR-0001 7.6; Dira M3 S5c: ARM gets S3's calls). As the cell calls: the call is checked and its bytes
+// copied here, the process blocks, and idle runs the connection in mainline (interrupts on) under the same stop rule
+// as the PC (the caller's deadline, a close request on its window, Ctrl+C on the console when it has none).
+const SYS_TCP_DIAL: u64 = 72; // (net h, IPv4 big-endian, port, timeout_ms) -> a CONN handle
+const SYS_TCP_SEND: u64 = 73; // (conn h, ptr, len <= 512) -> bytes sent
+const SYS_TCP_RECV: u64 = 74; // (conn h, ptr, cap, timeout_ms) -> bytes received; 0 = the peer closed
+const SYS_TCP_CLOSE: u64 = 75; // (conn h, how: bit 0 = reset at once) -> 0
+const SYS_DNS_A: u64 = 76; // (net h, name ptr, name len, timeout_ms) -> the IPv4 address, big-endian
+const E_TOOBIG: i64 = -9;
+const E_CANCELED: i64 = -10;
+const E_NOROUTE: i64 = -11;
 fn err(e: i64) -> u64 {
     e as u64
 }
@@ -166,16 +180,30 @@ fn user_stack_block(pa: u64) -> u64 {
 /// hardware capability a userspace driver holds for its MMIO region. Granting
 /// this maps exactly one device window into the driver's address space and
 /// nothing else, so a driver can touch only its own hardware.
+#[allow(dead_code)] // the old 2 MiB grant; kept only to name what changed (G2, 16 Nov 2026)
 fn user_device_block(pa: u64) -> u64 {
     pa | paging::AF | AP_EL0_RW | PXN | UXN | paging::BLOCK_DESC
 }
 
-/// User VA where a driver's device-MMIO window is mapped (2 MiB, → PA 0x0900_0000,
-/// the QEMU virt device region containing the PL031 RTC at PA 0x0901_0000).
-/// The RTC driver reads the clock at VA 0x8061_0000 (this base + 0x10000).
-#[allow(dead_code)] // documents the VA the driver asm hardcodes
+/// User VA of a driver's device window: VA 0x8060_0000 + (PA - 0x0900_0000), for a device page in the QEMU virt
+/// device region at PA 0x0900_0000. The RTC driver reads the clock at VA 0x8061_0000 (the PL031 at PA 0x0901_0000).
 const USER_MMIO_VA: u64 = 0x8060_0000;
 const MMIO_PHYS_BASE: u64 = 0x0900_0000;
+/// The PL031 RTC's page: the one device page the RTC demo driver is granted.
+const RTC_PAGE: u64 = 0x0901_0000;
+
+/// G2 (architect, 16 Nov 2026): a driver gets exactly ONE 4 KiB device page, its own, through an L3 table. The whole
+/// 2 MiB region it used to get also holds the UART and fw_cfg (PA 0x0902_0000), whose DMA interface lets the caller
+/// make QEMU write anywhere in guest memory, kernel included. One L3 table per process slot, in .bss.
+#[repr(C, align(4096))]
+struct L3Table([u64; 512]);
+const NO_L3: L3Table = L3Table([0; 512]);
+static mut DEVICE_L3: [L3Table; N_PROC] = [NO_L3; N_PROC];
+
+/// The EL0 page descriptor for one device page: Device memory (MAIR index 0), EL0 read/write, never executable.
+fn user_device_page(pa: u64) -> u64 {
+    (pa & !0xFFF) | paging::AF | AP_EL0_RW | PXN | UXN | 0b11
+}
 
 // --- Physical backing for user code/stack (2 MiB-aligned, in .bss) -----------
 // One slot per process index (slot 0 = idle, unused). Indexing by process id
@@ -185,8 +213,16 @@ const MMIO_PHYS_BASE: u64 = 0x0900_0000;
 #[repr(C, align(0x200000))]
 struct Region2M([u8; TWO_MIB]);
 const ZERO_REGION: Region2M = Region2M([0; TWO_MIB]);
-static mut USER_CODE_MEM: [Region2M; N_PROC] = [ZERO_REGION; N_PROC];
-static mut USER_STACK_MEM: [Region2M; N_PROC] = [ZERO_REGION; N_PROC];
+/// Both arrays in ONE 2 MiB-aligned static, code then stack, back to back (each is a whole number of 2 MiB
+/// regions, so `repr(C)` puts no padding between them). As two statics, the linker could place a small static
+/// between them, and the second array then moved up to the next 2 MiB: +2 MiB of .bss and of RAM for padding
+/// (S5c's WAIT_CANCELED did that, 22 Nov 2026; architect's ARM .bss verdict).
+#[repr(C)]
+struct UserMem {
+    code: [Region2M; N_PROC],
+    stack: [Region2M; N_PROC],
+}
+static mut USER_MEM: UserMem = UserMem { code: [ZERO_REGION; N_PROC], stack: [ZERO_REGION; N_PROC] };
 
 // --- Editor persistence (2.86) ----------------------------------------------
 // The `edit` EL0 app draws typed keys into its window; during an edit session
@@ -214,6 +250,10 @@ enum CapKind {
     Vmo { pages: u32, va: u64 },
     /// the desk's cell window, with the title the kernel gave it at spawn (never the process's own words)
     Cell { title: &'static [u8] },
+    /// the network (S5c): the address classes it may dial (bit 0 public, 1 private, 2 link-local, 3 this machine)
+    Net { classes: u8 },
+    /// one TCP connection (S5c); a reset leaves the handle, dead
+    Conn { id: u32 },
 }
 
 /// A cell call waiting for idle to serve it (S5b).
@@ -229,6 +269,23 @@ struct CellOp {
 }
 const NO_OP: CellOp = CellOp { call: 0, a: 0, b: 0, c: 0, len: 0, buf: [0; 240], deadline: 0 };
 
+/// A network call waiting for idle to serve it (S5c). `buf` holds the bytes to send, the name to ask, or what recv
+/// read (copied out in the caller's own call once it resumes).
+#[derive(Clone, Copy)]
+struct NetOp {
+    call: u64, // SYS_TCP_* or SYS_DNS_A; 0 = none
+    h: usize,
+    ip: [u8; 4],
+    port: u16,
+    timeout_ms: i64,
+    how: u64,
+    ptr: u64,
+    len: usize,
+    buf: [u8; crate::virtio::CONN_SEG],
+}
+const NO_NET: NetOp =
+    NetOp { call: 0, h: 0, ip: [0; 4], port: 0, timeout_ms: 0, how: 0, ptr: 0, len: 0, buf: [0; crate::virtio::CONN_SEG] };
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
     Runnable,
@@ -236,6 +293,8 @@ enum State {
     BlockedRecv,
     /// waiting for idle to serve its cell call (S5b)
     BlockedCell,
+    /// waiting for idle to serve its network call (S5c)
+    BlockedNet,
     Dead,
 }
 
@@ -251,6 +310,8 @@ struct Process {
     map_l2: u64,      // the L2 table of this process's map area (0: none yet)
     vmo_pages: u32,   // pages reserved by this process's memory objects (the 32 MiB cap)
     cell_op: CellOp,  // the cell call idle serves while the process is BlockedCell (S5b)
+    kstack: usize,    // the kernel stack heap::alloc_stack gave it (0: none), given back once it has ended
+    net_op: NetOp,    // the network call idle serves while the process is BlockedNet (S5c)
 }
 
 #[derive(Clone, Copy)]
@@ -269,6 +330,8 @@ const IDLE: Process = Process {
     map_l2: 0,
     vmo_pages: 0,
     cell_op: NO_OP,
+    kstack: 0,
+    net_op: NO_NET,
     syscall_ret: 0,
     preempt: false,
 };
@@ -308,6 +371,10 @@ extern "C" {
     static user_nocell_end: u8;
     static user_busy_start: u8;
     static user_busy_end: u8;
+    static user_net3_start: u8;
+    static user_net3_end: u8;
+    static user_net3b_start: u8;
+    static user_net3b_end: u8;
     static user_gui_start: u8;
     static user_gui_end: u8;
     static user_edit_start: u8;
@@ -316,6 +383,8 @@ extern "C" {
     static user_rtc_end: u8;
     static user_rtc_client_start: u8;
     static user_rtc_client_end: u8;
+    static user_rt79_start: u8;
+    static user_rt79_end: u8;
 }
 
 // --- Raw accessors (single-core, IRQ-masked while at EL1 → no aliasing) -------
@@ -330,6 +399,7 @@ fn state_name(s: State) -> &'static str {
         State::BlockedSend => "blk-send",
         State::BlockedRecv => "blk-recv",
         State::BlockedCell => "cell",
+        State::BlockedNet => "net",
         State::Dead => "dead",
     }
 }
@@ -348,7 +418,7 @@ pub fn dump_table() {
             let st = (*p).state;
             match st {
                 State::Runnable => runnable += 1,
-                State::BlockedSend | State::BlockedRecv | State::BlockedCell => blocked += 1,
+                State::BlockedSend | State::BlockedRecv | State::BlockedCell | State::BlockedNet => blocked += 1,
                 State::Dead => dead += 1,
             }
             let kind = if i == 0 {
@@ -402,13 +472,13 @@ pub fn init() {
 
 /// Build the private page tables for user process `idx` and return its TTBR0, or `None`
 /// if the frame allocator has nothing left to build them from.
-/// `mmio` grants the device-MMIO window (a hardware capability for a driver).
+/// `mmio` grants one device page (its physical address; a hardware capability for a driver), mapped alone.
 ///
 /// 2.735: the two `frame::alloc().expect(...)` calls that used to be here were the same
 /// mistake as the heap `assert!` below — a bound that takes the machine down instead of
 /// failing the spawn. Both frames are taken up front so a half-built address space is
 /// never left behind: if the second one is not there, the first is released.
-unsafe fn build_address_space(idx: usize, mmio: bool) -> Option<u64> {
+unsafe fn build_address_space(idx: usize, mmio: Option<u64>) -> Option<u64> {
     let l1 = frame::alloc()? as *mut u64;
     let l2 = match frame::alloc() {
         Some(f) => f as *mut u64,
@@ -423,8 +493,8 @@ unsafe fn build_address_space(idx: usize, mmio: bool) -> Option<u64> {
         l2.add(i).write(0); // uaccess: a page-table entry
     }
 
-    let code_pa = addr_of_mut!(USER_CODE_MEM) as usize + idx * core::mem::size_of::<Region2M>();
-    let stack_pa = addr_of_mut!(USER_STACK_MEM) as usize + idx * core::mem::size_of::<Region2M>();
+    let code_pa = addr_of_mut!(USER_MEM.code) as usize + idx * core::mem::size_of::<Region2M>();
+    let stack_pa = addr_of_mut!(USER_MEM.stack) as usize + idx * core::mem::size_of::<Region2M>();
 
     // L1: [0] devices (EL1), [1] DRAM (EL1) — so the kernel stays mapped; [2] → L2.
     l1.add(0).write(paging::device_block(0x0000_0000)); // uaccess: a page-table entry
@@ -438,8 +508,19 @@ unsafe fn build_address_space(idx: usize, mmio: bool) -> Option<u64> {
     l2.add(1).write(user_stack_block(stack_pa as u64)); // uaccess: a page-table entry; VA 0x8020_0000
 
     // L2[3] (VA 0x8060_0000): optional device-MMIO window for a driver process.
-    if mmio {
-        l2.add(3).write(user_device_block(MMIO_PHYS_BASE)); // uaccess: a page-table entry; VA 0x8060_0000
+    if let Some(pa) = mmio {
+        // exactly the granted 4 KiB page, at its place in the window, through this slot's own L3 table
+        if !(MMIO_PHYS_BASE..MMIO_PHYS_BASE + TWO_MIB as u64).contains(&pa) || pa & 0xFFF != 0 {
+            frame::free(l2 as usize);
+            frame::free(l1 as usize);
+            return None;
+        }
+        let l3 = addr_of_mut!(DEVICE_L3[idx].0) as *mut u64;
+        for i in 0..512 {
+            l3.add(i).write(0); // uaccess: a page-table entry
+        }
+        l3.add(((pa - MMIO_PHYS_BASE) >> 12) as usize).write(user_device_page(pa)); // uaccess: a page-table entry
+        l2.add(3).write(l3 as u64 | paging::TABLE_DESC); // uaccess: a page-table entry; VA 0x8060_0000
     }
 
     Some(l1 as u64)
@@ -447,7 +528,7 @@ unsafe fn build_address_space(idx: usize, mmio: bool) -> Option<u64> {
 
 /// Spawn user process `idx` running the image `[src_start, src_end)`, or refuse **by
 /// name** without starting it.
-/// `preemptible` = timer-preemptible EL0; `mmio` = grant the device-MMIO window
+/// `preemptible` = timer-preemptible EL0; `mmio` = grant one device page (its physical address)
 /// (a hardware capability), turning this process into a userspace driver.
 ///
 /// 2.735: the kernel stack is taken FIRST, before the program is copied and before any
@@ -459,22 +540,26 @@ unsafe fn spawn(
     src_start: *const u8,
     src_end: *const u8,
     preemptible: bool,
-    mmio: bool,
+    mmio: Option<u64>,
 ) -> Result<(), &'static str> {
     // Kernel stack + forged initial frame so the first cpu_switch lands in
     // user_entry_trampoline with x19 = idx (see sched.rs for the slot layout).
+    reap(idx); // a slot whose last process ended: its tables and stack go back first
     let kstack = heap::alloc_stack()?;
 
     // Copy the (position-independent) program into its physical code region.
     let len = src_end as usize - src_start as usize;
-    let code_dst = addr_of_mut!(USER_CODE_MEM) as *mut u8;
+    let code_dst = addr_of_mut!(USER_MEM.code) as *mut u8;
     let dst = code_dst.add(idx * core::mem::size_of::<Region2M>());
     core::ptr::copy_nonoverlapping(src_start, dst, len); // uaccess: the program image into its code region by physical address, before it runs
     cpu::sync_icache_range(dst as usize, len);
 
     let ttbr0 = match build_address_space(idx, mmio) {
         Some(t) => t,
-        None => return Err(BOUND_FRAMES),
+        None => {
+            free_kstack(kstack as usize);
+            return Err(BOUND_FRAMES);
+        }
     };
 
     let frame_base = ((kstack as usize) + KSTACK_SIZE - FRAME_SLOTS * 8) as *mut u64;
@@ -487,11 +572,52 @@ unsafe fn spawn(
     let p = proc_ptr(idx);
     (*p).sp = frame_base as u64;
     (*p).ttbr0 = ttbr0;
+    (*p).kstack = kstack as usize;
     (*p).is_user = true;
     (*p).state = State::Runnable;
     (*p).syscall_ret = 0;
     (*p).preempt = preemptible;
     Ok(())
+}
+
+/// Give a 16 KiB kernel stack from heap::alloc_stack back to the heap (as the PC does since 59c6a9ab).
+fn free_kstack(base: usize) {
+    if base == 0 {
+        return;
+    }
+    if let Ok(layout) = core::alloc::Layout::from_size_align(heap::STACK_SIZE, heap::STACK_ALIGN) {
+        // SAFETY: `base` came from heap::alloc_stack, which allocates exactly this layout from the global allocator.
+        unsafe { alloc::alloc::dealloc(base as *mut u8, layout) };
+    }
+}
+
+/// An ended process's own L1 and L2 tables and its kernel stack go back (architect, S5 merge review: each spawn kept
+/// two table frames and 16 KiB after exit, 8 KiB of frames a Dira page). Only for a Dead process that is not the one
+/// running: its context is never resumed. The TLB is dropped first (no ASIDs: walks cached from those tables must not
+/// outlive them). Its map area was already given back at exit (vmo_release).
+unsafe fn reap(pid: usize) {
+    let p = proc_ptr(pid);
+    if pid == 0 || pid == CURRENT || (*p).state != State::Dead {
+        return;
+    }
+    if (*p).ttbr0 != 0 {
+        let l1 = (*p).ttbr0 as *mut u64;
+        let l2 = l1.add(2).read_volatile() & DESC_ADDR; // uaccess: the ended process's own L1 table (a frame)
+        asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack));
+        if l2 != 0 {
+            frame::free(l2 as usize);
+        }
+        frame::free(l1 as usize);
+        (*p).ttbr0 = 0;
+    }
+    free_kstack(core::mem::replace(&mut (*p).kstack, 0));
+}
+
+/// Every ended process's tables and stack back (the tests call it before and after their run).
+unsafe fn reap_all() {
+    for i in 1..N_PROC {
+        reap(i);
+    }
 }
 
 /// [`spawn`], with the refusal reported on the console and folded into a bool the demo
@@ -507,7 +633,7 @@ unsafe fn spawn_or_refuse(
     src_start: *const u8,
     src_end: *const u8,
     preemptible: bool,
-    mmio: bool,
+    mmio: Option<u64>,
 ) -> bool {
     match spawn(idx, src_start, src_end, preemptible, mmio) {
         Ok(()) => true,
@@ -537,12 +663,12 @@ pub fn run_demo() {
         // --- Cooperative capability-secured IPC demo (deterministic) ---
         // A refusal ends the demo, not the kernel (2.735). The pair is all-or-nothing:
         // a sender with no receiver would block forever on an endpoint nobody reads.
-        if !spawn_or_refuse(1, &user_a_start as *const u8, &user_a_end as *const u8, false, false) {
+        if !spawn_or_refuse(1, &user_a_start as *const u8, &user_a_end as *const u8, false, None) {
             return;
         }
         grant(1, 0, 0, RIGHT_SEND); // P1: SEND cap to endpoint 0
 
-        if !spawn_or_refuse(2, &user_b_start as *const u8, &user_b_end as *const u8, false, false) {
+        if !spawn_or_refuse(2, &user_b_start as *const u8, &user_b_end as *const u8, false, None) {
             crate::kprintln!("[proc] IPC demo abandoned — P1 spawned but has no peer to send to");
             (*proc_ptr(1)).state = State::Dead; // never scheduled; do not leave it Runnable
             return;
@@ -559,10 +685,10 @@ pub fn run_demo() {
         crate::kprintln!("[mansa] preemption demo: 2 CPU-bound EL0 workers, timer time-slices them");
         // One worker still proves preemption (it time-slices against idle), so a refusal
         // of the second is survivable; a refusal of the first leaves nothing to run.
-        if !spawn_or_refuse(3, &user_worker_start as *const u8, &user_worker_end as *const u8, true, false) {
+        if !spawn_or_refuse(3, &user_worker_start as *const u8, &user_worker_end as *const u8, true, None) {
             return;
         }
-        let _ = spawn_or_refuse(4, &user_worker_start as *const u8, &user_worker_end as *const u8, true, false);
+        let _ = spawn_or_refuse(4, &user_worker_start as *const u8, &user_worker_end as *const u8, true, None);
         schedule_switch(); // interleaves P3/P4 via timer preemption until both exit
         crate::kprintln!("[mansa] workers exited — preemptive EL0 multitasking proven");
     }
@@ -574,7 +700,7 @@ pub fn run_demo() {
 pub fn run_sleep_demo() {
     // SAFETY: single-core, shell (idle) context; the sole driver here.
     unsafe {
-        if spawn_or_refuse(3, &user_sleep_start as *const u8, &user_sleep_end as *const u8, false, false) {
+        if spawn_or_refuse(3, &user_sleep_start as *const u8, &user_sleep_end as *const u8, false, None) {
             schedule_switch();
         }
     }
@@ -598,7 +724,7 @@ pub fn run_sgi_el0_probe() {
             core::hint::spin_loop();
         }
         crate::kprintln!("SGI-EL1-SEEN {}", crate::SGI_PROBE_SEEN.load(Ordering::Acquire));
-        if spawn_or_refuse(3, &user_sgi_start as *const u8, &user_sgi_end as *const u8, true, false) {
+        if spawn_or_refuse(3, &user_sgi_start as *const u8, &user_sgi_end as *const u8, true, None) {
             schedule_switch();
         } else {
             crate::kprintln!("SGI-EL0-SEEN spawn-refused");
@@ -614,9 +740,35 @@ pub fn run_sgi_el0_probe() {
 pub fn run_fault_demo() {
     // SAFETY: single-core, shell (idle) context; the sole driver here.
     unsafe {
-        if spawn_or_refuse(3, &user_fault_start as *const u8, &user_fault_end as *const u8, false, false) {
+        if spawn_or_refuse(3, &user_fault_start as *const u8, &user_fault_end as *const u8, false, None) {
             schedule_switch();
         }
+    }
+}
+
+/// `panprobe` (suite pan, the test rig only): the kernel reads a just-spawned process's code page plainly, outside
+/// kernel/src/uaccess.rs. With PAN on, the CPU must stop it (rust_sync_handler names it, then halts); without PAN
+/// the read goes through and is reported, and the `fault` program then runs and is stopped by its own fault.
+pub fn run_pan_probe() {
+    if crate::fwcfg::find_file("opt/afrisovera/test-grants").is_none() {
+        crate::kprintln!("[pan] refused: only the test rig (fw_cfg opt/afrisovera/test-grants) may run the probe");
+        return;
+    }
+    // SAFETY: single-core, shell (idle) context; the sole driver here.
+    unsafe {
+        if !spawn_or_refuse(3, &user_fault_start as *const u8, &user_fault_end as *const u8, false, None) {
+            return;
+        }
+        crate::kprintln!(
+            "[pan] probe: a plain kernel read of P3's code page at {:#x}, PAN {}",
+            USER_ENTRY,
+            if crate::uaccess::pan_on() { "on" } else { "not in this CPU" }
+        );
+        cpu::set_ttbr0((*proc_ptr(3)).ttbr0);
+        let v = core::ptr::read_volatile(USER_ENTRY as *const u8); // uaccess: the PAN probe itself
+        cpu::set_ttbr0(paging::kernel_ttbr0());
+        crate::kprintln!("[pan] probe read {:#x} from EL0 memory: nothing stopped it", v);
+        schedule_switch();
     }
 }
 
@@ -633,10 +785,10 @@ pub fn run_el0_ptr_probe() {
     unsafe {
         *addr_of_mut!(G2_CANARY) = *b"G2-CANARY-INTACT";
         crate::tonga::wm_reset(); // a free window for the u64::MAX WIN_FILL / WIN_TEXT case
-        if spawn_or_refuse(3, &user_ptr_start as *const u8, &user_ptr_end as *const u8, false, false) {
+        if spawn_or_refuse(3, &user_ptr_start as *const u8, &user_ptr_end as *const u8, false, None) {
             // G2 part 2, condition 1: LDTR/STTR protect only pages that deny EL0, so no kernel page may be reachable
             // from EL0 at all. Walk this process's own tables before it runs.
-            let (leaves, outside) = el0_reach_audit((*proc_ptr(3)).ttbr0, false);
+            let (leaves, outside, _) = el0_reach_audit((*proc_ptr(3)).ttbr0, None);
             crate::kprintln!(
                 "[g2] P3 tables: {} EL0-reachable leaf entr{}, {} outside its user blocks {:#x}..{:#x}{}",
                 leaves,
@@ -659,11 +811,11 @@ pub fn run_el0_ptr_probe() {
 
 /// G2 part 2, condition 1: walk the stage-1 tables at `ttbr0` (39-bit VA, 4 KiB granule, the walk starts at level 1)
 /// and count the leaf entries (blocks and pages) EL0 may access (AP[1], bit 6), and how many of them lie outside the
-/// process's user blocks [USER_ENTRY, USER_STACK_TOP), its map area [MAP_LO, MAP_HI) (S5a) and, for a driver granted
-/// one, the device window.
-unsafe fn el0_reach_audit(ttbr0: u64, mmio: bool) -> (usize, usize) {
+/// process's user blocks [USER_ENTRY, USER_STACK_TOP), its map area [MAP_LO, MAP_HI) (S5a) and, for a driver, its one
+/// granted 4 KiB device page (any wider device mapping counts as outside). Returns (leaves, outside, device pages).
+unsafe fn el0_reach_audit(ttbr0: u64, mmio: Option<u64>) -> (usize, usize, usize) {
     const ADDR: u64 = 0x0000_FFFF_FFFF_F000;
-    unsafe fn walk(table: u64, level: u32, va_base: u64, mmio: bool, leaves: &mut usize, outside: &mut usize) {
+    unsafe fn walk(table: u64, level: u32, va_base: u64, mmio: Option<u64>, leaves: &mut usize, outside: &mut usize, dev: &mut usize) {
         let shift = 39 - 9 * level; // level 1: 30, level 2: 21, level 3: 12
         for i in 0..512u64 {
             // SAFETY: page tables are 1:1 mapped frames the kernel built (or its own static tables).
@@ -673,7 +825,7 @@ unsafe fn el0_reach_audit(ttbr0: u64, mmio: bool) -> (usize, usize) {
             }
             let va = va_base + (i << shift);
             if level < 3 && e & 0b10 != 0 {
-                unsafe { walk(e & ADDR, level + 1, va, mmio, leaves, outside) };
+                unsafe { walk(e & ADDR, level + 1, va, mmio, leaves, outside, dev) };
                 continue;
             }
             if e & (1 << 6) == 0 {
@@ -682,7 +834,11 @@ unsafe fn el0_reach_audit(ttbr0: u64, mmio: bool) -> (usize, usize) {
             *leaves += 1;
             let end = va + (1u64 << shift);
             let in_user = va >= USER_ENTRY && end <= USER_STACK_TOP;
-            let in_mmio = mmio && va >= USER_MMIO_VA && end <= USER_MMIO_VA + TWO_MIB as u64;
+            // a driver's device: exactly its granted 4 KiB page (level 3), at its place in the window, nothing wider
+            let in_mmio = mmio.is_some_and(|pa| level == 3 && va == USER_MMIO_VA + (pa - MMIO_PHYS_BASE) && e & ADDR == pa);
+            if in_mmio {
+                *dev += 1;
+            }
             // the map area (S5a, L1 slot 256): the process's own memory objects
             let in_map = va >= MAP_LO && end <= MAP_HI;
             if !in_user && !in_mmio && !in_map {
@@ -691,10 +847,10 @@ unsafe fn el0_reach_audit(ttbr0: u64, mmio: bool) -> (usize, usize) {
             }
         }
     }
-    let (mut leaves, mut outside) = (0usize, 0usize);
+    let (mut leaves, mut outside, mut dev) = (0usize, 0usize, 0usize);
     // SAFETY: as above.
-    unsafe { walk(ttbr0 & ADDR, 1, 0, mmio, &mut leaves, &mut outside) };
-    (leaves, outside)
+    unsafe { walk(ttbr0 & ADDR, 1, 0, mmio, &mut leaves, &mut outside, &mut dev) };
+    (leaves, outside, dev)
 }
 
 /// Spawn three EL0 "GUI apps"; each creates a window via the compositor and
@@ -708,7 +864,7 @@ pub fn run_gui_demo() {
         // refusal costs one window rather than the compositor (2.735).
         let mut windows = 0;
         for idx in 3..=5 {
-            if spawn_or_refuse(idx, &user_gui_start as *const u8, &user_gui_end as *const u8, false, false) {
+            if spawn_or_refuse(idx, &user_gui_start as *const u8, &user_gui_end as *const u8, false, None) {
                 windows += 1;
             }
         }
@@ -731,7 +887,7 @@ pub fn run_rustapp() {
     unsafe {
         let s = RUSTAPP.as_ptr();
         let e = s.add(RUSTAPP.len());
-        if spawn_or_refuse(3, s, e, false, false) {
+        if spawn_or_refuse(3, s, e, false, None) {
             schedule_switch();
         }
     }
@@ -740,6 +896,22 @@ pub fn run_rustapp() {
 /// The Nia mini WASM interpreter, compiled as an EL0 app (`userland/niavm`). It
 /// runs a WASM module **at EL0**; the module's host `print` becomes a syscall.
 static NIAVM: &[u8] = include_bytes!("niavm.bin");
+/// niavm's test build (feature sandbox-test, OS_REQUESTS item 9): the two sandbox-finding modules. Test images only.
+#[cfg(feature = "test-apps")]
+static NIAVM_SANDBOX: &[u8] = include_bytes!("niavm-sandbox.bin");
+
+/// `niavm-sandbox` (test images only): niavm's test build as an EL0 process (scripts/niavm-sandbox-test.sh).
+#[cfg(feature = "test-apps")]
+pub fn run_niavm_sandbox() {
+    // SAFETY: single-core, shell (idle) context, as run_niavm.
+    unsafe {
+        let s = NIAVM_SANDBOX.as_ptr();
+        let e = s.add(NIAVM_SANDBOX.len());
+        if spawn_or_refuse(3, s, e, false, None) {
+            schedule_switch();
+        }
+    }
+}
 
 /// Spawn and run the Nia mini-interpreter as an EL0 process.
 pub fn run_niavm() {
@@ -747,7 +919,7 @@ pub fn run_niavm() {
     unsafe {
         let s = NIAVM.as_ptr();
         let e = s.add(NIAVM.len());
-        if spawn_or_refuse(3, s, e, false, false) {
+        if spawn_or_refuse(3, s, e, false, None) {
             schedule_switch();
         }
     }
@@ -765,7 +937,7 @@ pub fn run_edit_app() {
         EDITING = true;
         // A refused spawn must disarm the edit session it armed, or the next key the
         // shell reads would still be buffered into a document nobody is editing (2.735).
-        if !spawn_or_refuse(3, &user_edit_start as *const u8, &user_edit_end as *const u8, false, false) {
+        if !spawn_or_refuse(3, &user_edit_start as *const u8, &user_edit_end as *const u8, false, None) {
             EDITING = false;
             return;
         }
@@ -799,11 +971,21 @@ pub fn run_rtc_demo() {
         (*ep_ptr(0)).receiver = None;
         // Driver and client are a pair, like the IPC demo: one without the other blocks
         // forever on an endpoint with no counterpart, so a refusal ends the demo (2.735).
-        if !spawn_or_refuse(3, &user_rtc_start as *const u8, &user_rtc_end as *const u8, false, true) {
+        if !spawn_or_refuse(3, &user_rtc_start as *const u8, &user_rtc_end as *const u8, false, Some(RTC_PAGE)) {
             return;
         }
+        // G2: the driver's tables give EL0 its code, its stack and exactly one 4 KiB device page (the PL031's)
+        let (leaves, outside, dev) = el0_reach_audit((*proc_ptr(3)).ttbr0, Some(RTC_PAGE));
+        crate::kprintln!(
+            "[g2] P3 (driver) tables: {} EL0-reachable leaf entries, {} device page(s) of 4 KiB (PA {:#x}), {} outside{}",
+            leaves,
+            dev,
+            RTC_PAGE,
+            outside,
+            if dev == 1 && outside == 0 { " (ok)" } else { " (WRONG)" }
+        );
         grant(3, 0, 0, RIGHT_SEND); // driver: SEND the time
-        if !spawn_or_refuse(4, &user_rtc_client_start as *const u8, &user_rtc_client_end as *const u8, false, false) {
+        if !spawn_or_refuse(4, &user_rtc_client_start as *const u8, &user_rtc_client_end as *const u8, false, None) {
             crate::kprintln!("[proc] RTC demo abandoned — the driver has no client to serve");
             (*proc_ptr(3)).state = State::Dead; // never scheduled; do not leave it Runnable
             return;
@@ -851,7 +1033,9 @@ unsafe fn preempt() {
     let t0 = crate::timer::cycles();
     // due after half a tick: a pass just after one tick is due again at the next (a full 10 ms test would skip a tick
     // and leave a key waiting about 20 ms plus the busy slice: the 57 ms gap of the first S5b run)
-    if cell_pid().is_some() && t0.wrapping_sub(CELL_PASS_AT) >= crate::timer::hz() / 200 {
+    // a network call waits for idle too (S5c): a busy process must not hold it off
+    let net_due = (1..N_PROC).any(|i| (*proc_ptr(i)).state == State::BlockedNet);
+    if net_due || (cell_pid().is_some() && t0.wrapping_sub(CELL_PASS_AT) >= crate::timer::hz() / 200) {
         let next = 0;
         let us = crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / crate::timer::hz().max(1);
         if us > TICK_MASKED_MAX_US {
@@ -1036,12 +1220,14 @@ extern "C" fn rust_svc_dispatch(frame: *mut u64) {
                 0
             }
             SYS_GETPID => pid as u64,
+            SYS_CLOCK_MONOTONIC => crate::timer::monotonic_ns(),
             SYS_VMO_CREATE => vmo_create(pid, a0),
             SYS_VMO_MAP => vmo_map(pid, a0, a1, a2, a3),
             SYS_VMO_UNMAP => vmo_unmap(pid, a0, a1),
             SYS_CELL_OPEN | SYS_CELL_PUT | SYS_CELL_CURSOR | SYS_CELL_SIZE | SYS_CELL_EVENT => {
                 cell_call(pid, num, a0, a1, a2, a3, a4)
             }
+            SYS_TCP_DIAL | SYS_TCP_SEND | SYS_TCP_RECV | SYS_TCP_CLOSE | SYS_DNS_A => net_call(pid, num, a0, a1, a2, a3),
             SYS_WIN_TEXT => {
                 crate::tonga::win_text(a0 as usize, a1 as usize, a2 as usize, a3 as u8, a4 as u32);
                 0
@@ -1374,11 +1560,12 @@ unsafe fn run_with_cell() {
                     live = true;
                     runnable = true;
                 }
-                State::BlockedCell => live = true,
+                State::BlockedCell | State::BlockedNet => live = true,
                 _ => {}
             }
         }
         cell_pump();
+        net_pump();
         if cell_pid().is_some() {
             let len = crate::timer::cycles().wrapping_sub(t_idle) * 1_000_000 / crate::timer::hz().max(1);
             if len > PASS_LEN_MAX_US {
@@ -1422,30 +1609,460 @@ pub fn run_cell_test() {
         crate::kprintln!("[cell3] the desk is not showing (open it with: desk)");
         return;
     }
+    // SAFETY: single-core, shell (idle) context.
+    unsafe { reap_all() };
     let f0 = frame::used_frames();
     // SAFETY: single-core, shell (idle) context; the sole driver here.
     unsafe {
-        let a = spawn_or_refuse(3, &user_cell_start as *const u8, &user_cell_end as *const u8, true, false);
+        let a = spawn_or_refuse(3, &user_cell_start as *const u8, &user_cell_end as *const u8, true, None);
         if a {
             if let Some(h) = (*proc_ptr(3)).caps.iter().position(|c| !c.valid) {
                 (*proc_ptr(3)).caps[h] = Cap { valid: true, obj: 0, rights: 0, kind: CapKind::Cell { title: b"celltest3 (test)" } };
             }
         }
-        let b = spawn_or_refuse(4, &user_nocell_start as *const u8, &user_nocell_end as *const u8, false, false);
+        let b = spawn_or_refuse(4, &user_nocell_start as *const u8, &user_nocell_end as *const u8, false, None);
         if b {
             (*proc_ptr(4)).caps[0] = Cap { valid: true, obj: 0, rights: RIGHT_SEND, kind: CapKind::Endpoint };
         }
         // a CPU-bound second process while the owner waits: the window must still answer keys (point 1)
-        spawn_or_refuse(5, &user_busy_start as *const u8, &user_busy_end as *const u8, true, false);
+        spawn_or_refuse(5, &user_busy_start as *const u8, &user_busy_end as *const u8, true, None);
         run_with_cell();
+        reap_all();
     }
     let f1 = frame::used_frames();
     crate::kprintln!(
-        "[cell3] ended; frames in use {} before and {} after (ARM's spawn keeps two table frames a process; map area {})",
+        "[cell3] ended; frames in use {} before and {} after ({}; map area {})",
         f0,
         f1,
+        if f0 == f1 { "ok" } else { "WRONG" },
         VMO_FRAMES.load(core::sync::atomic::Ordering::Relaxed)
     );
+}
+
+// --------------------------------------------------------------------- the network (AFR-0001 7.6, Dira M3 S5c) --
+
+/// The connection's owner and id (one connection in all, as on the PC): a reset elsewhere leaves the handle, dead.
+static mut CONN_LIVE: Option<(usize, u32)> = None;
+static mut CONN_NEXT: u32 = 1;
+/// The wait idle runs now (one at a time): its caller, its deadline, and how it was stopped.
+static mut WAIT_PID: usize = 0;
+static mut WAIT_UNTIL: u64 = 0;
+static mut WAIT_LOOK: u64 = 0;
+static mut WAIT_CANCELED: bool = false;
+static mut WAIT_KIND: u32 = 0;
+static mut WAIT_SEEN_AT: u64 = 0;
+const STOP_CLOSE: u32 = 1;
+const STOP_CTRLC: u32 = 2;
+
+/// The NET handle `h` of process `pid`: its classes.
+unsafe fn net_handle(pid: usize, h: u64) -> Result<u8, i64> {
+    let c = (*proc_ptr(pid)).caps.get(h as usize).copied().filter(|c| c.valid).ok_or(E_BADHANDLE)?;
+    let CapKind::Net { classes } = c.kind else { return Err(E_PERM) };
+    Ok(classes)
+}
+
+/// The CONN handle `h` of process `pid`: whether its connection is still open.
+unsafe fn conn_handle(pid: usize, h: u64) -> Result<bool, i64> {
+    let c = (*proc_ptr(pid)).caps.get(h as usize).copied().filter(|c| c.valid).ok_or(E_BADHANDLE)?;
+    let CapKind::Conn { id } = c.kind else { return Err(E_BADHANDLE) };
+    Ok(CONN_LIVE == Some((pid, id)))
+}
+
+/// virtio.rs dropped the connection (a reset either way): the handle goes dead.
+unsafe fn conn_sync() {
+    if !crate::virtio::conn_open() {
+        CONN_LIVE = None;
+    }
+}
+
+/// `pid` holds the window and a close request waits: a network call returns E_CANCELED.
+unsafe fn close_pending(pid: usize) -> bool {
+    cell_pid() == Some(pid) && crate::desk::cell_close_pending()
+}
+
+/// A network call from pid: checked here (the handle, the class, the lengths, the pointer; the bytes copied into the
+/// kernel), then served by idle. The process blocks until idle has an answer; recv's bytes are copied out here, in
+/// the caller's own space, once it resumes.
+unsafe fn net_call(pid: usize, n: u64, h: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let p = proc_ptr(pid);
+    let mut op = NO_NET;
+    op.call = n;
+    op.h = h as usize;
+    match n {
+        SYS_TCP_DIAL => {
+            let classes = match net_handle(pid, h) {
+                Ok(c) => c,
+                Err(e) => return err(e),
+            };
+            if a1 > u32::MAX as u64 || a2 == 0 || a2 > 0xFFFF {
+                return err(E_INVAL);
+            }
+            let a = (a1 as u32).to_be_bytes();
+            let class = crate::virtio::ip_class(a);
+            let allowed = class.is_some_and(|b| classes & (1 << b) != 0);
+            crate::kprintln!(
+                "[net] P{} dial {}.{}.{}.{}:{} ({}){}",
+                pid, a[0], a[1], a[2], a[3], a2,
+                class.map_or("never allowed", |b| crate::virtio::CLASS_NAMES[b as usize]),
+                if allowed { "" } else { ": refused" }
+            );
+            if !allowed {
+                return err(E_PERM);
+            }
+            if CONN_LIVE.is_some() || crate::virtio::conn_open() {
+                return err(E_WOULDBLOCK);
+            }
+            if !(*p).caps.iter().any(|c| !c.valid) {
+                return err(E_NOMEM);
+            }
+            op.ip = a;
+            op.port = a2 as u16;
+            op.timeout_ms = a3 as i64;
+        }
+        SYS_TCP_SEND => {
+            let live = match conn_handle(pid, h) {
+                Ok(l) => l,
+                Err(e) => return err(e),
+            };
+            if a2 == 0 || a2 > crate::virtio::TCP_MAX_PAYLOAD as u64 {
+                return err(E_INVAL);
+            }
+            if !user_range(a1, a2, false) {
+                return err(E_FAULT);
+            }
+            if !live {
+                return err(E_PEERCLOSED);
+            }
+            if crate::uaccess::from_user(a1, &mut op.buf[..a2 as usize]).is_err() {
+                return err(E_FAULT);
+            }
+            op.len = a2 as usize;
+        }
+        SYS_TCP_RECV => {
+            let live = match conn_handle(pid, h) {
+                Ok(l) => l,
+                Err(e) => return err(e),
+            };
+            if a2 == 0 {
+                return err(E_INVAL);
+            }
+            let k = a2.min(crate::virtio::CONN_SEG as u64);
+            if !user_range(a1, k, true) {
+                return err(E_FAULT);
+            }
+            if !live {
+                return err(E_PEERCLOSED);
+            }
+            op.ptr = a1;
+            op.len = k as usize;
+            op.timeout_ms = a3 as i64;
+        }
+        SYS_TCP_CLOSE => {
+            if let Err(e) = conn_handle(pid, h) {
+                return err(e);
+            }
+            op.how = a1;
+        }
+        SYS_DNS_A => {
+            if let Err(e) = net_handle(pid, h) {
+                return err(e);
+            }
+            if a2 == 0 || a2 > 253 {
+                return err(E_INVAL);
+            }
+            if !user_range(a1, a2, false) {
+                return err(E_FAULT);
+            }
+            if crate::uaccess::from_user(a1, &mut op.buf[..a2 as usize]).is_err() {
+                return err(E_FAULT);
+            }
+            op.len = a2 as usize;
+            let Ok(name) = core::str::from_utf8(&op.buf[..op.len]) else { return err(E_INVAL) };
+            let mut q = [0u8; 260];
+            if crate::dnscheck::question(name, &mut q).is_none() {
+                return err(E_INVAL);
+            }
+            // one exchange at a time on the card, as the PC's one route at a time
+            if CONN_LIVE.is_some() || crate::virtio::conn_open() {
+                return err(E_WOULDBLOCK);
+            }
+            op.timeout_ms = a3 as i64;
+        }
+        _ => return err(E_INVAL),
+    }
+    (*p).net_op = op;
+    (*p).state = State::BlockedNet;
+    schedule_switch();
+    let r = (*p).syscall_ret;
+    if n == SYS_TCP_RECV && (r as i64) > 0 {
+        // back in the caller's own call, its own TTBR0 live (to_user's STTRB goes through the current tables:
+        // security engineer's rule); [ptr, ptr+len) was checked writable before the wait and only this process
+        // changes its own mappings (it was blocked). A refusal now loses the bytes read, and the call says E_FAULT.
+        assert_eq!(pid, CURRENT, "net_call: a recv copied out from another process's context");
+        let k = (r as usize).min((*p).net_op.len);
+        let (out, ptr) = ((*p).net_op.buf, (*p).net_op.ptr);
+        if crate::uaccess::to_user(ptr, &out[..k]).is_err() {
+            return err(E_FAULT);
+        }
+    }
+    r
+}
+
+/// The stop hook while idle runs a network wait (virtio.rs asks it every 256 spins): the call's deadline, or, looked
+/// at every 10 ms, the window. While a window is owned its desk pass runs here (the serial line's bytes to the desk,
+/// keys kept queued for cell_event), and a close request on the caller's own window stops the wait; with no window,
+/// Ctrl+C on the console does (as on the PC).
+fn net_stop() -> bool {
+    // SAFETY: single core, idle's mainline; the statics are set by `net_wait` around this wait only.
+    unsafe {
+        if WAIT_CANCELED {
+            return true;
+        }
+        let now = crate::timer::cycles();
+        if WAIT_UNTIL != 0 && now >= WAIT_UNTIL {
+            return true;
+        }
+        if now.wrapping_sub(WAIT_LOOK) < crate::timer::hz().max(1) / 100 {
+            return false;
+        }
+        WAIT_LOOK = now;
+        match cell_pid() {
+            None => {
+                while let Some(c) = crate::uart::getc() {
+                    if c == 3 {
+                        WAIT_CANCELED = true;
+                        WAIT_KIND = STOP_CTRLC;
+                        WAIT_SEEN_AT = crate::timer::cycles();
+                    }
+                }
+            }
+            Some(owner) => {
+                while let Some(b) = crate::uart::getc() {
+                    crate::desk::cell_serial_byte(b);
+                }
+                crate::desk::app_tick();
+                CELL_PASS_AT = crate::timer::cycles();
+                if owner == WAIT_PID && crate::desk::cell_close_pending() {
+                    WAIT_CANCELED = true;
+                    WAIT_KIND = STOP_CLOSE;
+                    WAIT_SEEN_AT = crate::timer::cycles();
+                }
+            }
+        }
+        WAIT_CANCELED
+    }
+}
+
+/// Run `f` (a network wait) for process `pid` under the stop hook; `timeout_ms` negative = no limit. Returns its result
+/// and whether a stop request ended it. Idle's mainline: interrupts are already on.
+unsafe fn net_wait<T>(pid: usize, timeout_ms: i64, f: impl FnOnce() -> T) -> (T, bool) {
+    let hz = crate::timer::hz().max(1);
+    WAIT_PID = pid;
+    WAIT_CANCELED = false;
+    WAIT_KIND = 0;
+    WAIT_LOOK = 0;
+    WAIT_UNTIL = if timeout_ms < 0 {
+        0
+    } else {
+        crate::timer::cycles().saturating_add((timeout_ms.min(3_600_000) as u64 * hz / 1000).max(1))
+    };
+    crate::virtio::set_net_abort(Some(net_stop));
+    let r = f();
+    crate::virtio::set_net_abort(None);
+    (r, WAIT_CANCELED)
+}
+
+/// A wait stopped by a stop request: the connection is reset at once (7.6), with the line arm-net3 grades.
+unsafe fn net_canceled(pid: usize, call: &str) -> u64 {
+    if WAIT_KIND == 0 {
+        // a stop found before the wait began (close_pending) is seen now
+        WAIT_KIND = STOP_CLOSE;
+        WAIT_SEEN_AT = crate::timer::cycles();
+    }
+    let ms = crate::timer::cycles().saturating_sub(WAIT_SEEN_AT) * 1000 / crate::timer::hz().max(1);
+    let what = if WAIT_KIND == STOP_CTRLC { "Ctrl+C on the console" } else { "the close request" };
+    crate::kprintln!("[net] P{} {}: E_CANCELED {} ms after {} was seen", pid, call, ms, what);
+    crate::virtio::conn_reset("a close request");
+    conn_sync();
+    err(E_CANCELED)
+}
+
+/// Serve the network call of a BlockedNet process (idle, mainline, interrupts on).
+unsafe fn net_serve(pid: usize) {
+    use crate::virtio::{ConnErr, DnsErr};
+    let p = proc_ptr(pid);
+    let op = (*p).net_op;
+    WAIT_KIND = 0;
+    let ret = match op.call {
+        SYS_TCP_DIAL => {
+            if close_pending(pid) {
+                err(E_CANCELED)
+            } else {
+                let (r, canceled) = net_wait(pid, op.timeout_ms, || crate::virtio::conn_dial(op.ip, op.port));
+                match r {
+                    Ok(()) => {
+                        let id = CONN_NEXT;
+                        CONN_NEXT = CONN_NEXT.wrapping_add(1);
+                        CONN_LIVE = Some((pid, id));
+                        // a free slot was there at the call, and only this (blocked) process changes its handles
+                        match (*p).caps.iter().position(|c| !c.valid) {
+                            Some(slot) => {
+                                (*p).caps[slot] = Cap { valid: true, obj: 0, rights: 0, kind: CapKind::Conn { id } };
+                                slot as u64
+                            }
+                            None => {
+                                crate::virtio::conn_reset("no handle slot");
+                                conn_sync();
+                                err(E_NOMEM)
+                            }
+                        }
+                    }
+                    Err(_) if canceled => net_canceled(pid, "dial"),
+                    Err(ConnErr::Busy) => err(E_WOULDBLOCK),
+                    Err(ConnErr::NoRoute) => err(E_NOROUTE),
+                    Err(_) => err(E_PEERCLOSED),
+                }
+            }
+        }
+        SYS_TCP_SEND => {
+            if close_pending(pid) {
+                net_canceled(pid, "send")
+            } else {
+                let (r, canceled) = net_wait(pid, -1, || crate::virtio::conn_send(&op.buf[..op.len]));
+                conn_sync();
+                match r {
+                    Ok(k) => k as u64,
+                    Err(_) if canceled => net_canceled(pid, "send"),
+                    Err(ConnErr::TooBig) => err(E_TOOBIG),
+                    Err(_) => err(E_PEERCLOSED),
+                }
+            }
+        }
+        SYS_TCP_RECV => {
+            if close_pending(pid) {
+                net_canceled(pid, "recv")
+            } else {
+                let out = core::slice::from_raw_parts_mut(addr_of_mut!((*p).net_op.buf) as *mut u8, op.len); // uaccess: the kernel's own net_op buffer
+                let (r, canceled) = net_wait(pid, op.timeout_ms, || crate::virtio::conn_recv(out));
+                conn_sync();
+                match r {
+                    Ok(k) => k as u64,
+                    Err(ConnErr::Stopped) if canceled => net_canceled(pid, "recv"),
+                    Err(ConnErr::Stopped) => err(E_WOULDBLOCK),
+                    Err(ConnErr::TooBig) => {
+                        crate::kprintln!("[net] P{} recv: past 4 MiB on this connection (E_TOOBIG, reset)", pid);
+                        err(E_TOOBIG)
+                    }
+                    Err(_) => err(E_PEERCLOSED),
+                }
+            }
+        }
+        SYS_TCP_CLOSE => {
+            if conn_handle(pid, op.h as u64) == Ok(true) {
+                if op.how & 1 != 0 {
+                    crate::virtio::conn_reset("closed at once by its process");
+                } else {
+                    crate::virtio::conn_close();
+                }
+                conn_sync();
+            }
+            (*p).caps[op.h] = Cap { valid: false, obj: 0, rights: 0, kind: CapKind::Endpoint };
+            0
+        }
+        SYS_DNS_A => {
+            if close_pending(pid) {
+                err(E_CANCELED)
+            } else {
+                let name = core::str::from_utf8(&op.buf[..op.len]).unwrap_or("");
+                let (r, canceled) = net_wait(pid, op.timeout_ms, || crate::virtio::dns_a_checked(name));
+                match r {
+                    Ok(a) => u32::from_be_bytes(a) as u64,
+                    Err(_) if canceled => net_canceled(pid, "dns_a"),
+                    Err(DnsErr::BadName) => err(E_INVAL),
+                    // no entropy source is refused as no route: nothing is asked with a guessable id
+                    Err(DnsErr::NoRoute) | Err(DnsErr::NoEntropy) => err(E_NOROUTE),
+                    Err(DnsErr::NoAnswer) => err(E_PEERCLOSED),
+                }
+            }
+        }
+        _ => err(E_INVAL),
+    };
+    (*p).syscall_ret = ret;
+    (*p).net_op.call = 0;
+    (*p).state = State::Runnable;
+}
+
+/// Process `pid` ended (exit, fault, Close anyway): its connection is reset at once (7.6).
+unsafe fn conn_ended(pid: usize) {
+    if let Some((owner, _)) = CONN_LIVE {
+        if owner == pid {
+            crate::virtio::conn_reset("its process ended");
+            CONN_LIVE = None;
+        }
+    }
+}
+
+/// Idle's network work between process slices (S5c): the calls that wait, then the connection of a process that ended.
+unsafe fn net_pump() {
+    for i in 1..N_PROC {
+        if (*proc_ptr(i)).state == State::BlockedNet {
+            net_serve(i);
+        }
+    }
+    for i in 1..N_PROC {
+        if (*proc_ptr(i)).state == State::Dead {
+            conn_ended(i);
+        }
+    }
+}
+
+/// `nettest3` (suite arm-net3, the test rig only): the EL0 programs `net3b` (a NET handle; the 4 MiB cap, an exit with
+/// the connection open) and then `net3` (a CELL handle titled "nettest3 (test)" and a NET handle), against
+/// scripts/lib/dira-server.py on the host, reached at QEMU's gateway 10.0.2.2:18087. Prints the check after.
+pub fn run_net_test() {
+    if crate::fwcfg::find_file("opt/afrisovera/test-grants").is_none() {
+        crate::kprintln!("[net3] refused: only the test rig (fw_cfg opt/afrisovera/test-grants) may grant the network");
+        return;
+    }
+    if !crate::desk::shown() {
+        crate::kprintln!("[net3] the desk is not showing (open it with: desk)");
+        return;
+    }
+    // SAFETY: single-core, shell (idle) context.
+    unsafe { reap_all() };
+    let f0 = frame::used_frames();
+    // SAFETY: single-core, shell (idle) context; the sole driver here.
+    unsafe {
+        let net = Cap { valid: true, obj: 0, rights: 0, kind: CapKind::Net { classes: 0b0111 } };
+        // one connection in all: net3b first, then net3 (the PC runs them side by side and the slot decides)
+        if spawn_or_refuse(4, &user_net3b_start as *const u8, &user_net3b_end as *const u8, true, None) {
+            (*proc_ptr(4)).caps[0] = net;
+            run_with_cell();
+        }
+        if spawn_or_refuse(3, &user_net3_start as *const u8, &user_net3_end as *const u8, true, None) {
+            (*proc_ptr(3)).caps[0] =
+                Cap { valid: true, obj: 0, rights: 0, kind: CapKind::Cell { title: b"nettest3 (test)" } };
+            (*proc_ptr(3)).caps[1] = net;
+            run_with_cell();
+        }
+        reap_all();
+    }
+    let f1 = frame::used_frames();
+    crate::kprintln!(
+        "[net3] 2 ended; frames in use {} before and {} after ({}); a connection open: {}",
+        f0,
+        f1,
+        if f0 == f1 { "ok" } else { "WRONG" },
+        crate::virtio::conn_open()
+    );
+}
+
+/// `dnsa NAME`: ARM's checked DNS from the shell (S5c point 3): the answer, or the named refusal.
+pub fn dns_a_shell(name: &str) {
+    match crate::virtio::dns_a_checked(name) {
+        Ok(a) => crate::kprintln!("[dnsa] {} is {}.{}.{}.{}", name, a[0], a[1], a[2], a[3]),
+        Err(e) => crate::kprintln!("[dnsa] {}: refused ({:?})", name, e),
+    }
 }
 
 // ------------------------------------------------------------- process memory (AFR-0001 7.6, Dira M3 S5a) --
@@ -1727,29 +2344,54 @@ pub fn map_area_check() {
     }
 }
 
+/// `rt79test` (suite arm-rt79): the EL0 program `rt79` (no handles; call 79 needs none) and the frames check.
+pub fn run_rt79_test() {
+    // SAFETY: single-core, shell (idle) context.
+    unsafe { reap_all() };
+    let f0 = frame::used_frames();
+    // SAFETY: single-core, shell (idle) context; the sole driver here.
+    unsafe {
+        if spawn_or_refuse(3, &user_rt79_start as *const u8, &user_rt79_end as *const u8, false, None) {
+            schedule_switch();
+        }
+        reap_all();
+    }
+    let f1 = frame::used_frames();
+    crate::kprintln!(
+        "[rt79] 1 ended; frames in use {} before and {} after ({})",
+        f0,
+        f1,
+        if f0 == f1 { "ok" } else { "WRONG" }
+    );
+}
+
 /// `vmotest` (suite arm-vmo): the EL0 `vmo` program, then the one that jumps into its object; then the frames
 /// check (every frame the map area held is back) and the reservation.
 pub fn run_vmo_test() {
     use core::sync::atomic::Ordering;
+    // SAFETY: single-core, shell (idle) context.
+    unsafe { reap_all() };
     let (f0, r0) = (frame::used_frames(), VMO_RESERVED.load(Ordering::Relaxed));
     VMO_WALK.store(true, Ordering::Relaxed);
     // SAFETY: single-core, shell (idle) context; the sole driver here.
     unsafe {
-        if spawn_or_refuse(3, &user_vmo_start as *const u8, &user_vmo_end as *const u8, false, false) {
+        if spawn_or_refuse(3, &user_vmo_start as *const u8, &user_vmo_end as *const u8, false, None) {
             schedule_switch();
         }
-        if spawn_or_refuse(4, &user_vmox_start as *const u8, &user_vmox_end as *const u8, false, false) {
+        if spawn_or_refuse(4, &user_vmox_start as *const u8, &user_vmox_end as *const u8, false, None) {
             schedule_switch();
         }
     }
     VMO_WALK.store(false, Ordering::Relaxed);
+    // SAFETY: as above; both programs have ended.
+    unsafe { reap_all() };
     let (f1, held, r1) = (frame::used_frames(), VMO_FRAMES.load(Ordering::Relaxed), VMO_RESERVED.load(Ordering::Relaxed));
     crate::kprintln!(
         "[vmo] test: map area frames held {}, reserved pages {} before and {} after ({}); frames in use {} before, {} after",
         held,
         r0,
         r1,
-        if held == 0 && r0 == r1 { "ok" } else { "WRONG" },
+        if held == 0 && r0 == r1 && f0 == f1 { "ok" } else { "WRONG" },
         f0,
         f1
     );
@@ -2161,6 +2803,386 @@ user_busy_start:
     mov  x8, #3
     svc  #0
 user_busy_end:
+
+// ---- the network for EL0 (AFR-0001 7.6, calls 72 to 76; Dira M3 S5c; `nettest3`, suite arm-net3, the ARM side of
+// pc-net3; the page server on the host at 18087, pc-net3 keeps 18086). net3: handle 0 a CELL, handle 1 a NET (classes 0, 1, 2). Prints, in order: cell_open (0); dials to
+// 224.0.0.1, 0.0.0.1 and 127.0.0.1 (E_PERM each); dns_a of "a..b" (E_INVAL); dns_a of "net3.invalid" (E_PEERCLOSED:
+// no checked answer); a dial to 10.0.2.2:18087 (a CONN handle); a second dial (E_WOULDBLOCK); the send of
+// GET /index.html (28); the bad pointers (send from, then recv into, the kernel image, a non-canonical address, the
+// stack's top running past the user blocks and a wrap, then recv into its code block: E_FAULT each); recv until it
+// returns 0 (0, then the byte total); tcp_close (0); a send on the closed handle
+// (E_BADHANDLE); a dial (a handle) and the send of GET /slow (22); recv with no limit, ended by the close request
+// (E_CANCELED); cell_event (the close request, 0x30000000); recv again (E_PEERCLOSED: the connection was reset).
+// Exits 7. The receive buffer is on its stack.
+.global user_net3_start
+.global user_net3_end
+user_net3_start:
+    sub  sp, sp, #4096
+    mov  x0, #0
+    mov  x1, #40
+    mov  x2, #10
+    mov  x8, #64
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, #1
+    movz x1, #0x1
+    movk x1, #0xe000, lsl #16
+    mov  x2, #80
+    mov  x3, #1000
+    mov  x8, #72
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, #1
+    movz x1, #0x1
+    mov  x2, #80
+    mov  x3, #1000
+    mov  x8, #72
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, #1
+    movz x1, #0x1
+    movk x1, #0x7f00, lsl #16
+    mov  x2, #80
+    mov  x3, #1000
+    mov  x8, #72
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, #1
+    adr  x1, 91f
+    mov  x2, #4
+    mov  x3, #3000
+    mov  x8, #76
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, #1
+    adr  x1, 92f
+    mov  x2, #12
+    mov  x3, #6000
+    mov  x8, #76
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, #1
+    movz x1, #0x202
+    movk x1, #0xa00, lsl #16
+    movz x2, #0x46a7
+    mov  x3, #5000
+    mov  x8, #72
+    svc  #0
+    mov  x19, x0
+    mov  x8, #0
+    svc  #0
+    mov  x0, #1
+    movz x1, #0x202
+    movk x1, #0xa00, lsl #16
+    movz x2, #0x46a7
+    mov  x3, #5000
+    mov  x8, #72
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, x19
+    adr  x1, 93f
+    mov  x2, #28
+    mov  x8, #73
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    // bad pointers on the live connection, before the page is read: the kernel image (identity-mapped DRAM),
+    // non-canonical, the stack's top running past the user blocks, a wrap; send 16 bytes from each, recv up to 32
+    // into each, then recv into its own code block (not writable): E_FAULT every time, and nothing is consumed
+    mov  x0, x19
+    movz x1, #0x4008, lsl #16
+    mov  x2, #16
+    mov  x8, #73
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, x19
+    movz x1, #0x1, lsl #48
+    mov  x2, #16
+    mov  x8, #73
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, x19
+    movz x1, #0xfff8
+    movk x1, #0x803f, lsl #16
+    mov  x2, #16
+    mov  x8, #73
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, x19
+    movn x1, #0xf
+    mov  x2, #16
+    mov  x8, #73
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, x19
+    movz x1, #0x4008, lsl #16
+    mov  x2, #32
+    mov  x3, #1000
+    mov  x8, #74
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, x19
+    movz x1, #0x1, lsl #48
+    mov  x2, #32
+    mov  x3, #1000
+    mov  x8, #74
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, x19
+    movz x1, #0xfff8
+    movk x1, #0x803f, lsl #16
+    mov  x2, #32
+    mov  x3, #1000
+    mov  x8, #74
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, x19
+    movn x1, #0xf
+    mov  x2, #32
+    mov  x3, #1000
+    mov  x8, #74
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, x19
+    movz x1, #0x8000, lsl #16
+    mov  x2, #32
+    mov  x3, #1000
+    mov  x8, #74
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x20, #0
+2:
+    mov  x0, x19
+    mov  x1, sp
+    mov  x2, #4096
+    mov  x3, #5000
+    mov  x8, #74
+    svc  #0
+    cmp  x0, #0
+    b.le 3f
+    add  x20, x20, x0
+    b    2b
+3:
+    mov  x8, #0
+    svc  #0
+    mov  x0, x20
+    mov  x8, #0
+    svc  #0
+    mov  x0, x19
+    mov  x1, #0
+    mov  x8, #75
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, x19
+    adr  x1, 93f
+    mov  x2, #28
+    mov  x8, #73
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, #1
+    movz x1, #0x202
+    movk x1, #0xa00, lsl #16
+    movz x2, #0x46a7
+    mov  x3, #5000
+    mov  x8, #72
+    svc  #0
+    mov  x19, x0
+    mov  x8, #0
+    svc  #0
+    mov  x0, x19
+    adr  x1, 94f
+    mov  x2, #22
+    mov  x8, #73
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, x19
+    mov  x1, sp
+    mov  x2, #4096
+    mvn  x3, xzr
+    mov  x8, #74
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, #0
+    mvn  x1, xzr
+    mov  x8, #68
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, x19
+    mov  x1, sp
+    mov  x2, #4096
+    mov  x3, #0
+    mov  x8, #74
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, #7
+    mov  x8, #3
+    svc  #0
+91:
+    .ascii "a..b"
+92:
+    .ascii "net3.invalid"
+93:
+    .ascii "GET /index.html HTTP/1.0\r\n\r\n"
+94:
+    .ascii "GET /slow HTTP/1.0\r\n\r\n"
+    .balign 4
+user_net3_end:
+
+// ---- net3b: handle 0 a NET (classes 0, 1, 2), no window. Dials 10.0.2.2:18087 (a handle), sends GET /huge (22),
+// reads until a call returns 0 or less: E_TOOBIG past 4 MiB (printed), then the byte total; dials again (a handle: the
+// reset freed it) and sends GET /slow (22); exits 5 with that connection open (the kernel resets it).
+.global user_net3b_start
+.global user_net3b_end
+user_net3b_start:
+    sub  sp, sp, #4096
+    bl   6f
+    mov  x0, x19
+    adr  x1, 95f
+    mov  x2, #22
+    mov  x8, #73
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x20, #0
+2:
+    mov  x0, x19
+    mov  x1, sp
+    mov  x2, #4096
+    mov  x3, #5000
+    mov  x8, #74
+    svc  #0
+    cmp  x0, #0
+    b.le 3f
+    add  x20, x20, x0
+    b    2b
+3:
+    mov  x8, #0
+    svc  #0
+    mov  x0, x20
+    mov  x8, #0
+    svc  #0
+    bl   6f
+    mov  x0, x19
+    adr  x1, 94f
+    mov  x2, #22
+    mov  x8, #73
+    svc  #0
+    mov  x8, #0
+    svc  #0
+    mov  x0, #5
+    mov  x8, #3
+    svc  #0
+6:
+    mov  x0, #0
+    movz x1, #0x202
+    movk x1, #0xa00, lsl #16
+    movz x2, #0x46a7
+    mov  x3, #5000
+    mov  x8, #72
+    svc  #0
+    mov  x19, x0
+    mov  x8, #0
+    svc  #0
+    ret
+94:
+    .ascii "GET /slow HTTP/1.0\r\n\r\n"
+95:
+    .ascii "GET /huge HTTP/1.0\r\n\r\n"
+    .balign 4
+user_net3b_end:
+
+// ---- call 79 clock_monotonic for EL0 (CLOCK_PLAN 4; `rt79test`, suite arm-rt79, the ARM side of pc-rt79).
+// rt79: no handles. Prints, in order: how many of 10,000 back-to-back calls returned less than the call before (0);
+// how many were not a whole number of microseconds (0); the backwards count again after four more calls, each after
+// a 50 ms SYS_SLEEP (0); the difference in ns of two calls around a 100 ms SYS_SLEEP; the last value. Exits 0.
+.global user_rt79_start
+.global user_rt79_end
+user_rt79_start:
+    mov  x19, #0
+    mov  x20, #0
+    mov  x21, #0
+    mov  x22, #10000
+    mov  x23, #1000
+user_rt79_loop:
+    mov  x8, #79
+    svc  #0
+    cmp  x0, x19
+    b.hs user_rt79_fwd1
+    add  x20, x20, #1
+user_rt79_fwd1:
+    mov  x19, x0
+    udiv x9, x0, x23
+    msub x9, x9, x23, x0
+    cbz  x9, user_rt79_us1
+    add  x21, x21, #1
+user_rt79_us1:
+    subs x22, x22, #1
+    b.ne user_rt79_loop
+    mov  x0, x20
+    mov  x8, #0
+    svc  #0
+    mov  x0, x21
+    mov  x8, #0
+    svc  #0
+    mov  x22, #4
+user_rt79_tick:
+    mov  x0, #50
+    mov  x8, #15
+    svc  #0
+    mov  x8, #79
+    svc  #0
+    cmp  x0, x19
+    b.hs user_rt79_fwd2
+    add  x20, x20, #1
+user_rt79_fwd2:
+    mov  x19, x0
+    subs x22, x22, #1
+    b.ne user_rt79_tick
+    mov  x0, x20
+    mov  x8, #0
+    svc  #0
+    mov  x8, #79
+    svc  #0
+    mov  x21, x0
+    mov  x0, #100
+    mov  x8, #15
+    svc  #0
+    mov  x8, #79
+    svc  #0
+    mov  x19, x0
+    sub  x0, x0, x21
+    mov  x8, #0
+    svc  #0
+    mov  x0, x19
+    mov  x8, #0
+    svc  #0
+    mov  x0, #0
+    mov  x8, #3
+    svc  #0
+    .balign 4
+user_rt79_end:
 
 // ---- process memory (AFR-0001 7.6, Dira M3 S5a; `vmotest`, suite arm-vmo). Prints, in order: vmo_create(1 MiB)
 // (a handle); vmo_map (the address, in the map area); the words read back from its first and last 8 bytes after

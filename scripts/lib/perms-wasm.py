@@ -12,7 +12,7 @@ print, putc, draw, time, input and random; never file, net, AI or voice.
   p4   asks print and 'teleport'                                          refused at load: unknown permission
   p5   two afri.permissions sections                                      refused at load
   p6   a section whose count says 2 but holds one name                    refused at load
-  p7   no section; prints 7, calls time                                   runs on the v0 grant, with its line
+  p7   no section; prints 7, calls time                                   the v0 grant is print and putc only (C2): DENIED time
   p8   asks print, imports nothing it calls but print; prints 8           runs (asking is not using)
   p9   a `name` section, then the code, then afri.permissions [print] LAST; prints 9, calls time
                                                                           DENIED time (the grant is made after

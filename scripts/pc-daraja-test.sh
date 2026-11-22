@@ -14,16 +14,18 @@
 #   9. `wrfsbase` in a foreign process is an invalid opcode (ring 3 cannot set its own bases);
 #  10. refused at spawn: a foreign process with a handle or with a grant (S2's cell window), personalities 2 and 3;
 #  11. the frame pool's count is the same before and after.
-# Graded: the fourteen PASS lines, "14 of 14 PASS", the call line with the six values, the int 0x80 refusal line, no
+#  12. L1.1 (7.7 as amended): ranges grow in place and split, rights are only removed after the start, none frees
+#      the frames, a full table refuses splits, and a write to a page sealed R faults.
+# Graded: the twenty-three PASS lines, "23 of 23 PASS", the call line with the six values, the int 0x80 refusal line, no
 # 0x5a5a line, the native fault line (vector 6 at USER_BASE), no FAIL, EXCEPTION, PANIC or STACK OVERFLOW line, and
-# MANSA-PC BOOT OK. The grader's selftest feeds it a good log and seven bad ones.
+# MANSA-PC BOOT OK. The grader's selftest feeds it a good log and eleven bad ones.
 #   scripts/pc-daraja-test.sh              # grader selftest, then the build and the QEMU boot
 #   scripts/pc-daraja-test.sh --selftest   # grader selftest only
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T="${TMPDIR:-/tmp}"
 
-CHECKS='entry: EFER\.SCE true, CR4\.FSGSBASE off true, LSTAR at syscall_entry true, SFMASK clears IF TF DF AC true|IST: stacks set for NMI, #DB, #MC true, boot core.s gates on IST 2, 3, 4 true, core 1.s gates on none true|call: nr 0x1234 with arguments 0x11 to 0x66 from rdi rsi rdx r10 r8 r9 reached the hook|int 0x80 from a foreign process refused|syscall with TF set: call 0 arrived, the kernel was not stepped|FS/GS per process: A read 0xa1/0xb2, B read 0xb2/0xa1 \(want 0xa1/0xb2 and 0xb2/0xa1\), the native one faulted on fs:\[0\]|back in the kernel: FS base 0x0, GS base 0x0|a native program.s syscall ended it as an invalid opcode|wrfsbase in a foreign process: an invalid opcode|refused: a foreign process with a handle true, with a grant true, personality 2 true, personality 3 true|step 2: the pair spawned \(a foreign process and its bridge with FPROC, CHAN, the bundle\)|step 2: fp0.s three calls went through its bridge \(3 calls, the last 0x30 with 0x21; want 3, 0x30, 0x21\)|step 2: frames in use [0-9]+ before and [0-9]+ after, reserved pages [0-9]+ before and [0-9]+ after|frames in use before [0-9]+ and after [0-9]+'
+CHECKS='entry: EFER\.SCE true, CR4\.FSGSBASE off true, LSTAR at syscall_entry true, SFMASK clears IF TF DF AC true|IST: stacks set for NMI, #DB, #MC true, boot core.s gates on IST 2, 3, 4 true, core 1.s gates on none true|bundle names: an entry named daraja/trace found true, the same bytes as a file.s data found false, a cut archive found false|call: nr 0x1234 with arguments 0x11 to 0x66 from rdi rsi rdx r10 r8 r9 reached the hook|int 0x80 from a foreign process refused|syscall with TF set: call 0 arrived, the kernel was not stepped|FS/GS per process: A read 0xa1/0xb2, B read 0xb2/0xa1 \(want 0xa1/0xb2 and 0xb2/0xa1\), the native one faulted on fs:\[0\]|back in the kernel: FS base 0x0, GS base 0x0|a native program.s syscall ended it as an invalid opcode|wrfsbase in a foreign process: an invalid opcode|refused: a foreign process with a handle true, with a grant true, personality 2 true, personality 3 true|step 2: the pair spawned \(a foreign process and its bridge with FPROC, CHAN, the bundle\)|step 2: fp0.s three calls went through its bridge \(3 calls, the last 0x30 with 0x21; want 3, 0x30, 0x21\)|step 2: frames in use [0-9]+ before and [0-9]+ after, reserved pages [0-9]+ before and [0-9]+ after|L1\.1: a map where a range with the same rights ends grew it|L1\.1: unmapping the middle page split the range in two \(Ok\(0\), ranges 2, both halves mapped true|L1\.1: P protected to R on its first page \(a split true\), then whole \(Ok\(0\) Ok\(0\)\)|L1\.1: after the start RW to RX Err\(-1\), R to RX Err\(-1\), WRITE asked Err\(-5\)|L1\.1: none gave the frame back \(frames [0-9]+ then [0-9]+\), R after none Err\(-1\), unmap Ok\(0\)|L1\.1: a full table \(128 ranges\) refused both splits \(Err\(-6\) Err\(-6\)\), nothing changed|L1\.1: the program.s write to the page sealed R faulted \(vector 14 at 0x[0-9a-f]+; want 14 at 0x[0-9a-f]+\)|L1\.1: frames in use [0-9]+ before and [0-9]+ after, reserved pages [0-9]+ before and [0-9]+ after|frames in use before [0-9]+ and after [0-9]+'
 
 grade() { # grade <serial log>
     local fail=0 S c
@@ -42,7 +44,9 @@ grade() { # grade <serial log>
     local fr
     fr="$(printf '%s\n' "$S" | sed -nE 's/^  PASS frames in use before ([0-9]+) and after ([0-9]+)$/\1 \2/p' | tail -1)"
     if [ -n "$fr" ]; then set -- $fr; [ "$1" = "$2" ] || _f "frames before $1, after $2"; fi
-    has '^daraja selftest: 14 of 14 PASS$' || _f "no '14 of 14 PASS' summary"
+    fr="$(printf '%s\n' "$S" | sed -nE 's/^  PASS L1\.1: frames in use ([0-9]+) before and ([0-9]+) after.*$/\1 \2/p' | tail -1)"
+    if [ -n "$fr" ]; then set -- $fr; [ "$1" = "$2" ] || _f "L1.1: frames before $1, after $2"; fi
+    has '^daraja selftest: 23 of 23 PASS$' || _f "no '23 of 23 PASS' summary"
     has '^\[daraja\] P[0-9] personality 1 call 0x1234 \(0x11, 0x22, 0x33, 0x44, 0x55, 0x66\); no bridge yet' ||
         _f "no hook line for call 0x1234 with the six arguments in order"
     has '^\[daraja\] P[0-9] int 0x80 refused \(rax 0x1\)' || _f "no refusal line for the foreign int 0x80"
@@ -71,7 +75,7 @@ grade() { # grade <serial log>
     has '^\[daraja\] bench: 10000 calls: native-null [0-9]+ us, native-ipc [0-9]+ us, forwarded [0-9]+ us$' || _f "no well-formed '[daraja] bench: 10000 calls: ...' line"
     has '^\[pc\] MANSA-PC BOOT OK$' || _f "no 'MANSA-PC BOOT OK' line"
     if [ $fail -eq 0 ]; then
-        echo "  graded: 14 of 14; $(grep -m1 -aoE 'syscall with TF set: .*$' <<< "$S")"
+        echo "  graded: 23 of 23; $(grep -m1 -aoE 'syscall with TF set: .*$' <<< "$S")"
         echo "  graded: $(grep -m1 -aoE 'FS/GS per process: .*$' <<< "$S")"
     fi
     return $fail
@@ -92,7 +96,11 @@ grade_norand() { # grade_norand <serial log>
         _f "the bridge's spawn did not refuse as a whole"
     has '^  FAIL step 2: the pair spawned' || _f "the pair was not reported as refused"
     has '^  PASS frames in use before [0-9]+ and after [0-9]+$' || _f "frames were left behind by the refused spawn"
-    has '^daraja selftest: 11 of 12 PASS$' || _f "not 11 of 12 (step 1's eleven, the frame check among them, plus the refused pair): only the refused pair may fail"
+    has '^daraja selftest: 12 of 13 PASS$' || _f "not 12 of 13 (step 1's twelve, the frame check among them, plus the refused pair): only the refused pair may fail"
+    # the bench on a CPU without secret random bytes: the native floors still print, the forwarded row says refused
+    # (the perf rig boots this CPU; the performance engineer's parser reads this form)
+    has '^\[daraja\] bench: 10000 calls: native-null [0-9]+ us, native-ipc [0-9]+ us, forwarded refused$' ||
+        _f "no '[daraja] bench: ... forwarded refused' line on the default CPU"
     has '^\[pc\] (EXCEPTION|PANIC)|panicked' && _f "the kernel stopped"
     [ $fail -eq 0 ] && echo "  graded (default CPU): the bridge refused, fail closed, nothing kept"
     return $fail
@@ -104,6 +112,7 @@ afrisovera> daraja selftest
 daraja selftest: the foreign-process hook (AFR-0001 7.7, stage 0 step 1; nothing is changed)
   PASS entry: EFER.SCE true, CR4.FSGSBASE off true, LSTAR at syscall_entry true, SFMASK clears IF TF DF AC true
   PASS IST: stacks set for NMI, #DB, #MC true, boot core'"'"'s gates on IST 2, 3, 4 true, core 1'"'"'s gates on none true
+  PASS bundle names: an entry named daraja/trace found true, the same bytes as a file'"'"'s data found false, a cut archive found false
 [daraja] P0 personality 1 call 0x1234 (0x11, 0x22, 0x33, 0x44, 0x55, 0x66); no bridge yet (stage 0 step 1), process ended
   PASS call: nr 0x1234 with arguments 0x11 to 0x66 from rdi rsi rdx r10 r8 r9 reached the hook
 [daraja] P0 int 0x80 refused (rax 0x1): a foreign process never reaches the Mansa calls; process ended
@@ -155,8 +164,16 @@ daraja selftest: the foreign-process hook (AFR-0001 7.7, stage 0 step 1; nothing
   PASS step 2: the pair spawned (a foreign process and its bridge with FPROC, CHAN, the bundle)
   PASS step 2: fp0'"'"'s three calls went through its bridge (3 calls, the last 0x30 with 0x21; want 3, 0x30, 0x21)
   PASS step 2: frames in use 812 before and 812 after, reserved pages 0 before and 0 after
+  PASS L1.1: a map where a range with the same rights ends grew it (Ok(0) Ok(0), ranges 1 then 1)
+  PASS L1.1: unmapping the middle page split the range in two (Ok(0), ranges 2, both halves mapped true, frames 900 then 899)
+  PASS L1.1: P protected to R on its first page (a split true), then whole (Ok(0) Ok(0))
+  PASS L1.1: after the start RW to RX Err(-1), R to RX Err(-1), WRITE asked Err(-5)
+  PASS L1.1: none gave the frame back (frames 903 then 902), R after none Err(-1), unmap Ok(0)
+  PASS L1.1: a full table (128 ranges) refused both splits (Err(-6) Err(-6)), nothing changed
+  PASS L1.1: the program'"'"'s write to the page sealed R faulted (vector 14 at 0x10000430000; want 14 at 0x10000430000)
+  PASS L1.1: frames in use 812 before and 812 after, reserved pages 0 before and 0 after
   PASS frames in use before 812 and after 812
-daraja selftest: 14 of 14 PASS
+daraja selftest: 23 of 23 PASS
 afrisovera> daraja bench
 [daraja] bench: 10000 calls: native-null 9000 us, native-ipc 41000 us, forwarded 88000 us
 afrisovera> '
@@ -165,7 +182,7 @@ selftest() {
     local D pass=0 bad=0
     D="$(mktemp -d "$T/pc-daraja-selftest.XXXXXX")" || return 1
     printf '%s' "$GOOD" > "$D/good"
-    printf '%s' "$GOOD" | sed 's/14 of 14 PASS/13 of 14 PASS/' > "$D/count"
+    printf '%s' "$GOOD" | sed 's/23 of 23 PASS/22 of 23 PASS/' > "$D/count"
     printf '%s' "$GOOD" | sed 's/(0x11, 0x22, 0x33, 0x44, 0x55, 0x66)/(0x11, 0x22, 0x33, 0xbad, 0x55, 0x66)/' > "$D/rcx"
     printf '%s' "$GOOD" | sed 's/^\[daraja\] P0 int 0x80 refused.*$/[P0] 0x5a5a/' > "$D/int80"
     printf '%s' "$GOOD" | sed 's/  PASS FS\/GS per process: A read 0xa1\/0xb2/  FAIL FS\/GS per process: A read 0xb2\/0xb2/' > "$D/tls"
@@ -175,9 +192,11 @@ selftest() {
     printf '%s' "$GOOD" | sed '0,/^\[P0\] 0xfffffffffffffffc$/s//[P0] 0x8/' > "$D/sealwrite"
     printf '%s' "$GOOD" | sed 's/^\[P0\] 0xfffffffffffffffd$/[P0] 0x0/' > "$D/winmap"
     printf '%s' "$GOOD" | grep -v 'memory given back' > "$D/noreap"
+    printf '%s' "$GOOD" | sed 's/^  PASS L1.1: the program.s write to the page sealed R faulted (vector 14/  FAIL L1.1: the program'"'"'s write to the page sealed R faulted (vector 0/' > "$D/staletlb"
+    printf '%s' "$GOOD" | sed 's/the same bytes as a file.s data found false/the same bytes as a file'"'"'s data found true/' > "$D/bundlename"
     echo "  --- grader selftest (no QEMU) ---"
     if grade "$D/good" > /dev/null; then pass=$((pass + 1)); else echo "  FAIL selftest: the good log was refused"; grade "$D/good"; bad=$((bad + 1)); fi
-    for f in count rcx int80 tls frames native stepped sealwrite winmap noreap; do
+    for f in count rcx int80 tls frames native stepped sealwrite winmap noreap staletlb bundlename; do
         if grade "$D/$f" > /dev/null; then echo "  FAIL selftest: the '$f' log was accepted"; bad=$((bad + 1)); else pass=$((pass + 1)); fi
     done
     rm -rf "$D"
@@ -247,10 +266,10 @@ cp "$VARS" "$W/vars2.fd"
     -serial "tcp:127.0.0.1:5476,server,nowait" -qmp "tcp:127.0.0.1:5477,server,nowait" &
 Q=$!
 AFRISH_BOOT_GRACE="${AFRISH_BOOT_GRACE:-10}" "$PY" scripts/shell-demo.py 5476 5477 "$W/shot2.png" \
-    "daraja selftest" > "$W/boot2.log" 2>&1
+    "daraja selftest" "daraja bench" > "$W/boot2.log" 2>&1
 kill "$Q" 2> /dev/null
 wait "$Q" 2> /dev/null
-tr -d '\r' < "$W/boot2.log" | grep -aE '^daraja selftest|^  (PASS|FAIL) step 2|NOT given|NOT spawned: a grant' | sed 's/^/  | /'
+tr -d '\r' < "$W/boot2.log" | grep -aE '^daraja selftest|^  (PASS|FAIL) step 2|NOT given|NOT spawned: a grant|^\[daraja\] bench' | sed 's/^/  | /'
 ok2=0; grade_norand "$W/boot2.log" && ok2=1
 
 if [ $ok1 -eq 1 ] && [ $ok2 -eq 1 ]; then

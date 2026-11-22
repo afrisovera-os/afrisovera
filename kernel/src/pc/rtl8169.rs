@@ -202,7 +202,7 @@ pub fn init() -> bool {
     };
     let Some((b, d, f)) = pci::find_by(8, hit) else { return false };
     let bar = mem_bar(b, d, f);
-    if bar == 0 || !mmu::map_mmio(bar, 0x1000) {
+    if bar == 0 || !mmu::map_mmio(bar, 0x1000, "realtek-nic") {
         crate::kprintln!("[rtl] {} at {:02x}:{:02x}.{} has no usable register BAR", name, b, d, f);
         return false;
     }

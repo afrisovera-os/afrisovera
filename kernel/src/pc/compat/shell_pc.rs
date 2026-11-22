@@ -87,6 +87,7 @@ fn cpuinfo() {
     }
     crate::kprintln!("cpuinfo: family 0x{:x} model 0x{:x} stepping 0x{:x}", family, model, stepping);
     crate::kprintln!("cpuinfo: core (APIC id) {}  ring 0", ebx >> 24);
+    crate::cpu::side_channel_line("cpuinfo: ");
     crate::kprint!("cpuinfo: features");
     for (on, name) in [
         (edx & (1 << 4) != 0, "tsc"),
@@ -221,16 +222,35 @@ pub fn intercept(line: &str) -> bool {
                 crate::wifinet::status()
             } else if _rest == "disconnect" {
                 crate::wifinet::disconnect()
+            } else if _rest == "up" {
+                // W5: the Intel 7265 / 3165 powered up, its firmware loaded to ALIVE, its NVM read (polled)
+                crate::iwm::up()
+            } else if _rest == "down" {
+                crate::iwm::down()
+            } else if _rest == "diag" {
+                crate::iwm::diag()
             } else {
                 crate::wifi::lookup(_rest)
             }
         }
+        // the laptop screen's backlight as the Intel graphics chip's PWM has it; `backlight selftest`: the decoding (reads only)
+        "backlight" => {
+            if _rest == "selftest" {
+                crate::backlight::selftest()
+            } else {
+                crate::backlight::show()
+            }
+        }
+        // sensors S1: the GPS on a USB serial cable, if one has spoken (reads only; the position on the screen only)
+        "sensors" => crate::gps::command(_rest),
         // every PCI, USB and ACPI device, each marked driven, class, missing or none needed; or one by its id (reads only)
         "hwscan" => crate::hwscan::command(_rest),
         // process memory for ring 3 (AFR-0001 7.6, Dira M3 S1): the vmo program's checks, frames back, pc-perf's times
         "vmotest" => crate::proc::vmo_test(),
         // gap G2 on the PC: a ring-3 program hands every pointer-taking call kernel and bad addresses (suite pc-userptr)
         "uptrtest" => crate::proc::uptr_test(),
+        // call 79 clock_monotonic for ring 3 (CLOCK_PLAN; suite pc-rt79): never backwards, whole microseconds
+        "rt79test" => crate::proc::rt79_test(),
         // G2 part 3: the kernel reads a ring-3 page outside the door; SMAP must stop it (test rig only, halts)
         "smapprobe" => crate::proc::smap_probe(),
         // G2 part 3: a program sets RFLAGS.AC, then asks for a raw read; SMAP must still stop it (test rig only, halts)

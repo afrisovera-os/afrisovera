@@ -51,6 +51,11 @@ pub fn smap_on() -> bool {
     SMAP_ON.load(Ordering::Relaxed)
 }
 
+/// The shared `pan` command on the PC: SMAP is the PC's PAN.
+pub fn status() {
+    crate::kprintln!("pan: the PC's equivalent is SMAP: {}", if smap_on() { "on" } else { "not in this CPU" });
+}
+
 /// Guard 1: may the kernel move `len` bytes at `ptr` for the program whose space is current? A write also needs
 /// every page writable for ring 3 (the code pages are read-only: a kernel write there would fault and halt).
 pub fn user_pages_ok(ptr: u64, len: u64, write: bool) -> bool {

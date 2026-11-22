@@ -20,14 +20,16 @@ static mut PM_TMR: u16 = 0;
 
 /// The TPM tables the XSDT lists (ADR 0008 step 1, read-only: nothing talks to a TPM). TCPA describes a TPM 1.2,
 /// TPM2 a TPM 2.0; each is (length, revision) of a table whose checksum is good, length 0 = not listed. For TPM2
-/// also its Start Method (offset 48: 2 ACPI start, 6 memory-mapped FIFO/TIS, 7 CRB, 8 CRB with ACPI start ...).
+/// also its Start Method (offset 48: 2 ACPI start, 6 memory-mapped FIFO/TIS, 7 CRB, 8 CRB with ACPI start ...) and
+/// the address of its CRB control area (offset 40; 0 when the table is shorter than 52 bytes).
 #[derive(Clone, Copy)]
 pub struct TpmTables {
     pub tcpa: (u32, u8),
     pub tpm2: (u32, u8),
     pub tpm2_start: u32,
+    pub tpm2_ctrl: u64,
 }
-static mut TPM: TpmTables = TpmTables { tcpa: (0, 0), tpm2: (0, 0), tpm2_start: 0 };
+static mut TPM: TpmTables = TpmTables { tcpa: (0, 0), tpm2: (0, 0), tpm2_start: 0, tpm2_ctrl: 0 };
 
 /// What the XSDT said about a TPM, for `rng sources`.
 pub fn tpm_tables() -> TpmTables {
@@ -247,6 +249,7 @@ pub fn init(n_config: usize, config_table: u64) {
                     } else {
                         TPM.tpm2 = (tl, rd(t + 8));
                         TPM.tpm2_start = if tl >= 52 { rd(t + 48) } else { 0 };
+                        TPM.tpm2_ctrl = if tl >= 52 { rd(t + 40) } else { 0 };
                     }
                 }
             }

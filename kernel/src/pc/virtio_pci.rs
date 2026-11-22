@@ -138,9 +138,9 @@ fn probe(b: u8, d: u8, f: u8) {
     // memory decoding + bus mastering (the device reads and writes our rings)
     let cmd = cfg32(b, d, f, 0x04);
     cfg_write32(b, d, f, 0x04, (cmd & 0xFFFF) | 0x406); // ... and INTx off: these devices are polled
-    let ok = crate::mmu::map_mmio(common, lens[0].max(0x38))
-        && crate::mmu::map_mmio(notify, lens[1].max(2))
-        && (devcfg == 0 || crate::mmu::map_mmio(devcfg, lens[3].max(1)));
+    let ok = crate::mmu::map_mmio(common, lens[0].max(0x38), "virtio")
+        && crate::mmu::map_mmio(notify, lens[1].max(2), "virtio")
+        && (devcfg == 0 || crate::mmu::map_mmio(devcfg, lens[3].max(1), "virtio"));
     if !ok {
         crate::kprintln!("[virtio] pci {:02x}:{:02x}.{}: could not map its registers", b, d, f);
         return;

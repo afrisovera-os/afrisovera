@@ -132,7 +132,8 @@ def thinwasm(out, width=1):
             + b"\x10\x01"                                                            # win_present()
             + b"\x41" + sleb(7777) + b"\x10\x02" + b"\x0b")                           # print(7777)
     code = sec(10, b"\x01" + bytes([len(body)]) + body)
-    open(out, "wb").write(b"\x00asm\x01\x00\x00\x00" + types + imp + funcs + exp + code)
+    from permlist import permlist  # C2: it draws, so it lists draw (an unlisted app gets print and putc only)
+    open(out, "wb").write(b"\x00asm\x01\x00\x00\x00" + types + imp + funcs + exp + code + permlist(["draw", "print"]))
 
 
 def bigwasm(out):

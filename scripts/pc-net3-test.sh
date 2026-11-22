@@ -99,9 +99,14 @@ echo "  net3b printed: $SB"
 E_PERM=0xffffffffffffffff; E_BADHANDLE=0xfffffffffffffffe; E_INVAL=0xfffffffffffffffb
 E_WOULDBLOCK=0xfffffffffffffff9; E_PEERCLOSED=0xfffffffffffffff8; E_TOOBIG=0xfffffffffffffff7; E_CANCELED=0xfffffffffffffff6
 WANT_HEX="$(printf '0x%x' "${WANT:-0}")"
-RE_A="^0x0 $E_PERM $E_PERM $E_PERM $E_INVAL $E_PEERCLOSED (0x[2-7]) $E_WOULDBLOCK 0x1c 0x0 $WANT_HEX 0x0 $E_BADHANDLE \\1 0x16 $E_CANCELED 0x30000000 $E_PEERCLOSED\$"
-grep -qE "$RE_A" <<< "$SA" || _f "net3 printed [$SA], not the 17 results expected (the page is $WANT bytes, $WANT_HEX)"
+E_FAULT=0xfffffffffffffffc
+F9="$E_FAULT $E_FAULT $E_FAULT $E_FAULT $E_FAULT $E_FAULT $E_FAULT $E_FAULT $E_FAULT"
+# after the GET: send from, then recv into, the kernel's canary, a non-canonical address, the stack's top running
+# past the ring-3 range and a wrap, then recv into its own code page (E_FAULT each), then the whole page is still read (nothing was consumed)
+RE_A="^0x0 $E_PERM $E_PERM $E_PERM $E_INVAL $E_PEERCLOSED (0x[2-7]) $E_WOULDBLOCK 0x1c $F9 0x0 $WANT_HEX 0x0 $E_BADHANDLE \\1 0x16 $E_CANCELED 0x30000000 $E_PEERCLOSED\$"
+grep -qE "$RE_A" <<< "$SA" || _f "net3 printed [$SA], not the 26 results expected (the page is $WANT bytes, $WANT_HEX)"
 grep -aqE '^\[P0\] exit 7$' <<< "$R" || _f "net3 did not exit 7"
+grep -aqF "[net3] G2-CANARY intact" <<< "$R" || _f "the kernel canary was written by a ring-3 pointer (or not checked)"
 grep -aqF "[desk] cell: opened by nettest3 (test) (signed)" <<< "$R" || _f "the window was not opened with the kernel's title"
 for d in "224.0.0.1:80 (never allowed): refused" "0.0.0.1:80 (never allowed): refused" "127.0.0.1:80 (this machine): refused" "192.168.50.1:$PORT (private network)"; do
     grep -aqF "[net] P0 dial $d" <<< "$R" || _f "no line [net] P0 dial $d"

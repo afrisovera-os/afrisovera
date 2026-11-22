@@ -35,13 +35,19 @@ BASE = "https://raw.githubusercontent.com/unicode-org/cldr-json/%s/cldr-json/" %
 # international English (the architect, 15 Nov), not the US English that plain "en" stands for. A locale with a
 # region takes its hour cycle from that region; one without takes it from its likely region (likelySubtags).
 LANGS = [("en", "en-001"), ("tw", "ak"), ("es", "es"), ("fr", "fr"), ("pt", "pt"), ("id", "id"), ("de", "de"),
-         ("tr", "tr")]
+         ("tr", "tr"), ("hi", "hi"), ("mr", "mr"), ("ne", "ne")]
 
-# file -> sha256, filled in from the first cloud run (--pin, the cloud runner, 14 Nov 2026)
+# Digits other than Latin the desk may draw (stage 7, the architect's Q1): a language whose CLDR default numbering
+# system is one of these gets its digits in text the desk formats for people (counts, sizes, the clock), never in
+# anything parsed or copied. Devanagari's digits are in the desk's Devanagari face (SHAPING_C3_PLAN.md).
+NATIVE = ("deva",)
+
+# file -> sha256, filled in from cloud runs (--pin, the cloud runner: 14 Nov 2026; hi, mr, ne and numberingSystems 22 Nov)
 SHAS = {
     "cldr-core/supplemental/plurals.json": "83f10932abb4ce2c4681725c6d11e4c01097a758830677127142c80c79bd6322",
     "cldr-core/supplemental/timeData.json": "6dc8a7c33bf6bf5ebf895dfabdfe290def6c6a4ecfd55a2afbe8fe74d3a219e3",
     "cldr-core/supplemental/likelySubtags.json": "b0f791c37b7f1dedb57f6d0542b904ab0ceee7a476f5194c797f53e87511b9db",
+    "cldr-core/supplemental/numberingSystems.json": "7fbe7f10209e9770538cef70dfe97e295d06edebe4161908332eea02418f2642",
     "cldr-numbers-full/main/en-001/numbers.json": "cb070ae274b6f1010744419f7efb61ef30e58be419ece7c490b1e951a927a4c7",
     "cldr-dates-full/main/en-001/ca-gregorian.json": "adade05b0d391156d23f179b8cf6d81d9606870e8eb9ca907ab4f037763cbfde",
     "cldr-numbers-full/main/ak/numbers.json": "cb7e5e4334841551ce87779e8e53c26f5c41df164a66facd443827a7f8780c6e",
@@ -58,6 +64,12 @@ SHAS = {
     "cldr-dates-full/main/de/ca-gregorian.json": "bad700a4ba2886856c89a2354c8a8845e43e0a0c9bb6537cb77986d6921d17c8",
     "cldr-numbers-full/main/tr/numbers.json": "02d9c0797bdd22f565c10f291e27df16d73cd9e24b32aa494c31574bffc84c33",
     "cldr-dates-full/main/tr/ca-gregorian.json": "087c32392cef8e75bc931c2bc8b2fb688295a5b3f8c1a5d6781c741a547998a8",
+    "cldr-numbers-full/main/hi/numbers.json": "c5a3596b758a7ab87e9ff2bb261144b8c7040920c603376d003664b6f75dd437",
+    "cldr-dates-full/main/hi/ca-gregorian.json": "f1c4d7f36643a89a5f848b929bb27341db279b0aa67227ac135d46a44a6fcbe5",
+    "cldr-numbers-full/main/mr/numbers.json": "491e8fdfb6b26630cc675fbb42a7d1965af10d80183aabfb35e011bce7e978a9",
+    "cldr-dates-full/main/mr/ca-gregorian.json": "6a86e049a172677ecd462428502e718defaf3fd5b16279f7570cffdbff954b85",
+    "cldr-numbers-full/main/ne/numbers.json": "53cad5139231231e6608f7c8ed3ccd9ffefe98838fbe618c34a9b24694e1f543",
+    "cldr-dates-full/main/ne/ca-gregorian.json": "4a79071fcf6316c017014986f4ae637caff356a7cb3bb600064f21fd7501117b",
 }
 
 # Characters the desk's font cannot draw yet, and what the table writes instead (afriui.md section 26's CHARS).
@@ -70,7 +82,7 @@ SAMPLE_CAP = 40  # values kept per category: enough to test every branch, small 
 
 def files():
     out = ["cldr-core/supplemental/plurals.json", "cldr-core/supplemental/timeData.json",
-           "cldr-core/supplemental/likelySubtags.json"]
+           "cldr-core/supplemental/likelySubtags.json", "cldr-core/supplemental/numberingSystems.json"]
     for _, c in LANGS:
         out.append("cldr-numbers-full/main/%s/numbers.json" % c)
         out.append("cldr-dates-full/main/%s/ca-gregorian.json" % c)
@@ -174,29 +186,37 @@ def samples(text):
 PROBE_PLURAL = [0, 1, 2, 3, 5, 11, 21, 101, 1000000]
 
 
-def py_group(n, group, min_group):
+def native(text, digits):
+    return "".join(digits[int(c)] if digits and c.isdigit() else c for c in text)
+
+
+def py_group(n, group, min_group, group2=3, digits=""):
+    """The primary group is 3 digits; the ones before it are `group2` (2 in Indian grouping: 12,34,567)."""
     d = str(n)
     if len(d) < 3 + min_group:
-        return d
-    first = len(d) % 3 or 3
-    parts = [d[:first]] + [d[i:i + 3] for i in range(first, len(d), 3)]
-    return group.join(parts)
+        return native(d, digits)
+    head, tail = d[:-3], d[-3:]
+    first = len(head) % group2 or group2
+    parts = [head[:first]] + [head[i:i + group2] for i in range(first, len(head), group2)] + [tail]
+    return native(group.join(parts), digits)
 
 
-def py_memory(mib, group, decimal, min_group):
+def py_memory(mib, group, decimal, min_group, group2=3, digits=""):
     if mib < 1024:
-        return py_group(mib, group, min_group) + " MiB"
+        return py_group(mib, group, min_group, group2, digits) + " MiB"
     tenths = (mib * 10 + 512) // 1024
-    out = py_group(tenths // 10, group, min_group)
+    out = py_group(tenths // 10, group, min_group, group2, digits)
     if tenths % 10:
-        out += decimal + str(tenths % 10)
+        out += decimal + native(str(tenths % 10), digits)
     return out + " GiB"
 
 
-def probe_line(code, rules, group, decimal, min_group, h24, am, pm):
+def probe_line(code, rules, group, decimal, min_group, h24, am, pm, group2=3, digits=""):
     out = "plural " + " ".join("%d=%s" % (n, form_of(rules, n)) for n in PROBE_PLURAL)
-    out += "; group " + " ".join("%d=%s" % (n, py_group(n, group, min_group)) for n in (1000, 1234567))
-    out += "; memory " + " ".join("%d=%s" % (m, py_memory(m, group, decimal, min_group)) for m in (512, 3891, 16384))
+    out += "; group " + " ".join("%d=%s" % (n, py_group(n, group, min_group, group2, digits))
+                                  for n in (1000, 1234567))
+    out += "; memory " + " ".join("%d=%s" % (m, py_memory(m, group, decimal, min_group, group2, digits))
+                                   for m in (512, 3891, 16384))
     out += "; am=%s pm=%s; clock %s" % (am, pm, "24" if h24 else "12")
     return "[desk] locale %s: %s" % (code, out)
 
@@ -217,6 +237,7 @@ def main():
     plurals = got["cldr-core/supplemental/plurals.json"]["supplemental"]["plurals-type-cardinal"]
     time = got["cldr-core/supplemental/timeData.json"]["supplemental"]["timeData"]
     likely = got["cldr-core/supplemental/likelySubtags.json"]["supplemental"]["likelySubtags"]
+    systems = got["cldr-core/supplemental/numberingSystems.json"]["supplemental"]["numberingSystems"]
 
     lines = []
     w = lines.append
@@ -244,12 +265,20 @@ def main():
                 samp.append((code, n, f))
                 total += 1
         nums = got["cldr-numbers-full/main/%s/numbers.json" % cl]["main"][cl]["numbers"]
-        if nums.get("defaultNumberingSystem", "latn") != "latn":
-            sys.exit("refused: %s: digits other than latn (the scripts engineer's phase)" % cl)
-        sym = nums["symbols-numberSystem-latn"]
-        pat = nums["decimalFormats-numberSystem-latn"]["standard"]
-        if not re.fullmatch(r"#,##0(\.#+)?", pat):
-            sys.exit("refused: %s: number pattern %r does not group by 3" % (cl, pat))
+        ns = nums.get("defaultNumberingSystem", "latn")
+        if ns != "latn" and ns not in NATIVE:
+            sys.exit("refused: %s: digits %s, which the desk cannot draw yet" % (cl, ns))
+        digits = "" if ns == "latn" else systems[ns]["_digits"]
+        if digits and len(digits) != 10:
+            sys.exit("refused: %s: %s has %d digits" % (cl, ns, len(digits)))
+        sym = nums.get("symbols-numberSystem-" + ns) or nums["symbols-numberSystem-latn"]
+        pat = (nums.get("decimalFormats-numberSystem-" + ns) or nums["decimalFormats-numberSystem-latn"])["standard"]
+        if re.fullmatch(r"#,##0(\.#+)?", pat):
+            group2 = 3
+        elif re.fullmatch(r"#,##,##0(\.#+)?", pat):
+            group2 = 2  # Indian grouping: 12,34,567
+        else:
+            sys.exit("refused: %s: number pattern %r is not one the desk groups" % (cl, pat))
         group = "".join(SUBSTITUTE.get(c, c) for c in sym["group"])
         decimal = "".join(SUBSTITUTE.get(c, c) for c in sym["decimal"])
         min_group = int(nums.get("minimumGroupingDigits", "1"))
@@ -264,9 +293,9 @@ def main():
             "dayPeriods"]["format"]["abbreviated"]
         am = "".join(SUBSTITUTE.get(c, c) for c in dp["am"])
         pm = "".join(SUBSTITUTE.get(c, c) for c in dp["pm"])
-        locs.append((code, cl, rules, group, decimal, min_group, h24, region, pref, am, pm))
+        locs.append((code, cl, rules, group, decimal, min_group, h24, region, pref, am, pm, group2, digits))
 
-    for code, cl, rules, group, decimal, min_group, h24, region, pref, am, pm in locs:
+    for code, cl, rules, group, decimal, min_group, h24, region, pref, am, pm, group2, digits in locs:
         name = code.upper()
         for f in FORMS:
             if f == "other" or rules.get(f) is None:
@@ -279,19 +308,20 @@ def main():
                     "Cond { m: %d, ne: %s, r: &R_%s_%s_%d_%d }" % (m, "true" if ne else "false", name, f.upper(), gi,
                                                                    ci) for ci, (m, ne, r) in enumerate(g))))
         forms = [f for f in FORMS if f != "other" and rules.get(f) is not None]
-        w("// %s (CLDR %s): %s; numbers group %r decimal %r min %d; region %s prefers %s; am %r pm %r" % (
-            code, cl, ", ".join(f for f in FORMS if f in rules) or "other", group, decimal, min_group, region, pref,
-            am, pm))
+        w("// %s (CLDR %s): %s; numbers group %r decimal %r min %d then %d; digits %s; region %s prefers %s; am %r "
+          "pm %r" % (code, cl, ", ".join(f for f in FORMS if f in rules) or "other", group, decimal, min_group, group2,
+                     "latn" if not digits else "native", region, pref, am, pm))
         w("static P_%s: [Rule; %d] = [%s];" % (name, len(forms), ", ".join(
             "Rule { form: Form::%s, any: &[%s] }" % (f.capitalize(), ", ".join(
                 "&G_%s_%s_%d" % (name, f.upper(), gi) for gi in range(len(rules[f])))) for f in forms)))
         w("")
     w("/// The locale data of each language, in the order of lang::LANGS.")
     w("pub static LOCS: [Loc; %d] = [" % len(locs))
-    for code, cl, rules, group, decimal, min_group, h24, region, pref, am, pm in locs:
-        w('    Loc { code: "%s", group: "%s", decimal: "%s", min_group: %d, h24: %s, am: "%s", pm: "%s", plural: '
-          '&P_%s },' % (code, rust_str(group), rust_str(decimal), min_group, "true" if h24 else "false",
-                        rust_str(am), rust_str(pm), code.upper()))
+    for code, cl, rules, group, decimal, min_group, h24, region, pref, am, pm, group2, digits in locs:
+        dl = "&[]" if not digits else "&[%s]" % ", ".join('"%s"' % rust_str(c) for c in digits)
+        w('    Loc { code: "%s", group: "%s", decimal: "%s", min_group: %d, group2: %d, digits: %s, h24: %s, am: "%s", '
+          'pm: "%s", plural: &P_%s },' % (code, rust_str(group), rust_str(decimal), min_group, group2, dl,
+                                          "true" if h24 else "false", rust_str(am), rust_str(pm), code.upper()))
     w("];")
     w("")
     w("/// CLDR's own @integer samples: (language index, n, the form CLDR gives it). The kernel's evaluator must agree")
@@ -309,8 +339,8 @@ def main():
     w("];")
     with open(out, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("\n".join(lines) + "\n")
-    probe = [probe_line(code, rules, group, decimal, min_group, h24, am, pm)
-             for code, cl, rules, group, decimal, min_group, h24, region, pref, am, pm in locs]
+    probe = [probe_line(code, rules, group, decimal, min_group, h24, am, pm, group2, digits)
+             for code, cl, rules, group, decimal, min_group, h24, region, pref, am, pm, group2, digits in locs]
     for line in probe:
         print("expected: " + line)
     if expected:

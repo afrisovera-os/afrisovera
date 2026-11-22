@@ -60,6 +60,12 @@ grade() { # grade <serial log>
         _f "the USB Device Manager id was not named AR9271 (ath9k_htc, open firmware)"
     has 'wifi: usb 148f:7601 is MediaTek MT7601U \(USB Wi-Fi stick\); Linux driver mt7601u; .*' || _f "148f:7601 was not named the MT7601U stick"
     has 'wifi: usb 1234:5678 is not in AfriSovera.s list of USB Wi-Fi sticks; tell us this id' || _f "an unknown USB id was not called unknown"
+    # W5: QEMU has no Intel Wi-Fi device; wifi up says so and holds nothing, diag and down agree
+    has 'wifi up: no Intel Wi-Fi chip AfriSovera drives on this PC \(Wireless 7265 or 3165; `wifi` lists the chips\)' ||
+        _f "wifi up did not say there is no Intel Wi-Fi chip"
+    has 'wifi diag: the last wifi up, step by step:' || _f "wifi diag did not repeat the last wifi up"
+    has 'wifi diag: the chip is not up; frames used now [0-9]+' || _f "wifi diag did not say the chip is not up"
+    has 'wifi down: the chip was not up' || _f "wifi down did not say the chip was not up"
     if grep -aqE 'KERNEL PANIC|^\[pc\] (EXCEPTION|PANIC)' <<< "$S"; then _f "the kernel panicked"; fi
     return "$fail"
 }
@@ -89,7 +95,15 @@ wifi: usb 0cf3:9271 is Qualcomm Atheros AR9271 (e.g. TP-Link TL-WN722N v1, Alfa 
 afrisovera> wifi 148f:7601
 wifi: usb 148f:7601 is MediaTek MT7601U (USB Wi-Fi stick); Linux driver mt7601u; needs MediaTek's firmware file loaded first
 afrisovera> wifi $UBAD
-wifi: usb 1234:5678 is not in AfriSovera's list of USB Wi-Fi sticks; tell us this id"
+wifi: usb 1234:5678 is not in AfriSovera's list of USB Wi-Fi sticks; tell us this id
+afrisovera> wifi up
+wifi up: no Intel Wi-Fi chip AfriSovera drives on this PC (Wireless 7265 or 3165; \`wifi\` lists the chips)
+afrisovera> wifi diag
+wifi diag: the last wifi up, step by step:
+  no Intel Wi-Fi chip AfriSovera drives on this PC (Wireless 7265 or 3165; \`wifi\` lists the chips)
+wifi diag: the chip is not up; frames used now 1234
+afrisovera> wifi down
+wifi down: the chip was not up"
 
 selftest() {
     local D pass=0 bad=0
@@ -125,11 +139,14 @@ selftest() {
     arm usb-devmgr-not-parsed red "$(printf '%s\n' "$GREEN" | grep -v '^wifi: usb 0cf3:9271')"
     arm mt7601-unknown red "$(printf '%s\n' "$GREEN" | sed 's/^wifi: usb 148f:7601 is .*/wifi: 148f:7601 is not in AfriSovera'"'"'s list of network chips; tell us this id/')"
     arm usb-unknown-named red "$(printf '%s\n' "$GREEN" | sed 's/^wifi: usb 1234:5678 is .*/wifi: usb 1234:5678 is Ralink RT5370 (USB Wi-Fi stick); x/')"
+    arm up-not-said red "$(printf '%s\n' "$GREEN" | grep -v '^wifi up: no Intel')"
+    arm diag-missing red "$(printf '%s\n' "$GREEN" | grep -v '^wifi diag: the chip is not up')"
+    arm down-missing red "$(printf '%s\n' "$GREEN" | grep -v '^wifi down:')"
     arm panic red "$(printf '%s\nKERNEL PANIC\n' "$GREEN")"
     arm empty red ""
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 25 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 28 ]
 }
 
 echo "== PC network chips and Wi-Fi (wifi, read only) =="
@@ -177,7 +194,7 @@ echo "  --- boot: Intel 82574L (e1000e) + Realtek RTL8029 (ne2k_pci) on PCI, an 
 Q=$!
 AFRISH_BOOT_GRACE="${AFRISH_BOOT_GRACE:-10}" "$PY" scripts/shell-demo.py 5470 5471 "$W/shot.png" \
     wifi "wifi 8086:2723" "wifi $DMID" "wifi 8086:15b8" "wifi 1234:5678" "wifi 86:2723" \
-    "wifi $UMID" "wifi 148f:7601" "wifi $UBAD" > "$W/boot.log" 2>&1
+    "wifi $UMID" "wifi 148f:7601" "wifi $UBAD" "wifi up" "wifi diag" "wifi down" > "$W/boot.log" 2>&1
 kill "$Q" 2> /dev/null
 wait "$Q" 2> /dev/null
 tr -d '\r' < "$W/boot.log" | grep -aE '^wifi|^  [0-9a-f]{2}:|^  for the owner|^afrisovera> wifi' | sed 's/^/  | /'

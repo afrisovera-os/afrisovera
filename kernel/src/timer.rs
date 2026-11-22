@@ -13,6 +13,11 @@ pub const TIMER_INTID: u32 = 30;
 /// Scheduler tick rate.
 const TICK_HZ: u64 = 100; // 10 ms slices
 
+/// The counter's value when the boot core set up its timer: call 79 counts from here.
+static T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Call 79's floor: the largest value any process has been given, so the clock never goes backwards (CLOCK_PLAN 1).
+static LAST_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 #[inline]
 fn read_cntfrq() -> u64 {
     let f: u64;
@@ -45,6 +50,8 @@ pub fn rearm() {
 /// Configure the GIC to deliver the timer interrupt and arm the first tick.
 pub fn init() {
     gic::enable(TIMER_INTID);
+    // the first core here sets call 79's zero; the others keep it
+    let _ = T0.compare_exchange(0, cycles(), core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed);
     rearm();
 }
 
@@ -57,6 +64,18 @@ pub fn cycles() -> u64 {
 /// Frequency of the physical counter (CNTFRQ_EL0), in Hz.
 pub fn hz() -> u64 {
     read_cntfrq()
+}
+
+/// Call 79 `clock_monotonic` (AFR-0001 7.6; CLOCK_PLAN): nanoseconds since the boot core set up its timer, rounded
+/// down to a whole microsecond for every process (the coarse-timer rule), never below a value already given out. The
+/// kernel reads the counter here; what EL0 may read itself (CNTKCTL_EL1) is unchanged.
+pub fn monotonic_ns() -> u64 {
+    use core::sync::atomic::Ordering;
+    let ticks = cycles().saturating_sub(T0.load(Ordering::Relaxed));
+    let ns = (ticks as u128 * 1_000_000_000 / hz().max(1) as u128).min(u64::MAX as u128) as u64;
+    let us_ns = ns - ns % 1_000;
+    let last = LAST_NS.fetch_max(us_ns, Ordering::Relaxed);
+    last.max(us_ns)
 }
 
 /// A deadline `us` microseconds from now in `cycles()` units, or None while the counter's rate is not known yet

@@ -348,7 +348,7 @@ fn init_ctl(b: u8, d: u8, f: u8, id: u32) -> bool {
     if lo >> 1 & 3 == 2 && off < 0x24 {
         bar |= (cfg32(b, d, f, off + 4) as u64) << 32;
     }
-    if bar == 0 || !mmu::map_mmio(bar, 0x100) {
+    if bar == 0 || !mmu::map_mmio(bar, 0x100, "sd-card") {
         crate::kprintln!("[sdhci] controller at {:02x}:{:02x}.{} has no usable register BAR", b, d, f);
         return false;
     }

@@ -28,7 +28,7 @@ grade() { # grade <boot log>
     in_blk() { grep -aqxF -e "$2" <<< "$1"; }
     local L F
     L="$(blk "$A" 'firmware')"; F="$(blk "$A" 'firmware test')"
-    in_blk "$L" "firmware: 4 file(s) listed; each must match its size and sha256 before it may go to its device" ||
+    in_blk "$L" "firmware: 6 file(s) listed; each must match its size and sha256 before it may go to its device" ||
         _f "firmware did not say how many files are listed"
     in_blk "$L" "firmware: fwtest.bin (70000 bytes): present on sata port 2, sha256 as listed" ||
         _f "firmware did not find fwtest.bin on sata port 2 with its hash right"
@@ -57,7 +57,7 @@ EOF
 }
 
 G="afrisovera> firmware
-firmware: 4 file(s) listed; each must match its size and sha256 before it may go to its device
+firmware: 6 file(s) listed; each must match its size and sha256 before it may go to its device
 firmware: fwtest.bin (70000 bytes): present on sata port 2, sha256 as listed
 afrisovera> firmware test
 firmware test: fwtest.bin (the right file, in a cluster chain with a gap)

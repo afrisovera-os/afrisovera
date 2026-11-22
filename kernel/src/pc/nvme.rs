@@ -189,7 +189,7 @@ fn msix_setup(b: u8, d: u8, f: u8) {
             return Err("its MSI-X table BAR is not usable");
         }
         let tab = tab + (t & !7) as u64;
-        if !mmu::map_mmio(tab, 16 * n as u64) {
+        if !mmu::map_mmio(tab, 16 * n as u64, "nvme (MSI-X table)") {
             return Err("its MSI-X table could not be mapped");
         }
         // enable with the function masked (control bits 15 and 14), program entry 0, unmask it, then the function
@@ -455,7 +455,7 @@ pub fn at() -> Option<(u8, u8, u8)> {
 pub fn init() {
     let Some((b, d, f)) = pci::find_by(8, |b, d, f, id| crate::hwdb::pci_part(BINDS, b, d, f, id).is_some()) else { return };
     let bar = pci::bar_mem(b, d, f, 0);
-    if bar == 0 || !mmu::map_mmio(bar, 0x2000) {
+    if bar == 0 || !mmu::map_mmio(bar, 0x2000, "nvme") {
         crate::kprintln!("[nvme] controller at {:02x}:{:02x}.{} has no usable BAR0", b, d, f);
         return;
     }

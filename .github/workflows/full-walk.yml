@@ -1,13 +1,21 @@
 # The full test walk: every registered suite, split across parallel GitHub runners.
 # Public repositories get standard GitHub-hosted runners free, so the whole registry (hours of QEMU boots on
 # one machine) runs here as N shards side by side, then one job joins the results into a single roll-up.
-#   - weekly (Sunday 02:00 UTC) on the default branch: ARM and PC kernels;
-#   - "Run workflow" on the Actions tab: pick ARM, PC or both, the number of shards, and optionally a subset.
+#   - on every push to main (each public sync) and nightly (02:00 UTC): ARM and PC kernels (R6 item 1);
+#   - weekly flake census (Saturday 04:00 UTC): three walks of the same commit side by side; the roll-up names every
+#     suite that did not give the same result all three times (R6 item 2);
+#   - "Run workflow" on the Actions tab: pick ARM, PC or both, the number of shards, rounds, and optionally a subset.
+# Every walk also keeps the benchmark numbers (build/perf/, the perf suites) as a 90-day artifact (R6 item 5), and
+# the roll-up says whether every shard built the same kernel (md5).
+# Rules (a) to (d) as in compat-ref.yml: overlay only, contents: read, no secrets, pinned actions, artifacts.
 name: Full walk
 
 on:
+  push:
+    branches: [main]
   schedule:
-    - cron: '0 2 * * 0'
+    - cron: '0 2 * * *'   # nightly
+    - cron: '0 4 * * 6'   # the flake census: 3 rounds (the plan job reads this exact string)
   workflow_dispatch:
     inputs:
       arch:
@@ -24,12 +32,16 @@ on:
       timeout:
         description: 'Per-suite timeout, seconds'
         default: '300'
+      rounds:
+        description: 'Walks of this commit side by side (1-3); more than 1 is a flake census'
+        default: '1'
 
 permissions:
   contents: read
 
 concurrency:
-  group: full-walk-${{ github.ref }}
+  # the census has its own queue, so a nightly walk never waits behind it
+  group: full-walk-${{ github.ref }}-${{ github.event.schedule == '0 4 * * 6' && 'census' || 'walk' }}
   cancel-in-progress: false
 
 env:
@@ -42,12 +54,14 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
       - id: plan
         env:
           ARCH: ${{ github.event.inputs.arch || 'both' }}
           SHARDS: ${{ github.event.inputs.shards || '12' }}
           ONLY: ${{ github.event.inputs.only }}
+          ROUNDS: ${{ github.event.schedule == '0 4 * * 6' && '3' || github.event.inputs.rounds || '1' }}
         shell: python
         run: |
           import fnmatch, json, os, re
@@ -69,15 +83,17 @@ jobs:
           n = max(1, min(20, int(os.environ.get("SHARDS") or 12)))
           arch = os.environ["ARCH"]
           arches = ["arm", "pc"] if arch == "both" else [arch]
+          rounds = max(1, min(3, int(os.environ.get("ROUNDS") or 1)))
           include = []
-          for a in arches:
-              lst = [s for s in suites if not (a == "pc" and s in arm_only)]
-              k = min(n, max(1, len(lst)))
-              for i in range(k):
-                  part = lst[i::k]  # round-robin, so the slow suites spread across shards
-                  if part:
-                      include.append({"arch": a, "shard": i + 1, "of": k, "suites": ",".join(part)})
-          print(f"{len(suites)} suites; {len(include)} shard(s)")
+          for r in range(1, rounds + 1):
+              for a in arches:
+                  lst = [s for s in suites if not (a == "pc" and s in arm_only)]
+                  k = min(n, max(1, len(lst)))
+                  for i in range(k):
+                      part = lst[i::k]  # round-robin, so the slow suites spread across shards
+                      if part:
+                          include.append({"arch": a, "shard": i + 1, "of": k, "round": r, "suites": ",".join(part)})
+          print(f"{len(suites)} suites; {len(include)} shard(s); {rounds} round(s)")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("matrix=" + json.dumps({"include": include}) + "\n")
 
@@ -87,11 +103,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
       - uses: ./.github/actions/setup
 
   walk:
-    name: ${{ matrix.arch }} shard ${{ matrix.shard }}/${{ matrix.of }}
+    name: ${{ matrix.arch }} shard ${{ matrix.shard }}/${{ matrix.of }} round ${{ matrix.round }}
     needs: [plan, warm]
     runs-on: ubuntu-24.04
     timeout-minutes: 350
@@ -99,7 +116,8 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
       - uses: ./.github/actions/setup
       - name: Walk
         env:
@@ -118,10 +136,10 @@ jobs:
           tail -25 walk.out
           # The team's ARM baseline: md5 of the ARM image as built here. The debug image embeds the build path,
           # so compare it only with other walks of this public repo (same runner path), never with a PC build.
-          if [ "$ARCH" = arm ]; then md5sum target/mansa-kernel.img target/aarch64-unknown-none/debug/mansa-kernel 2> /dev/null | sed 's/^/ARM md5: /' || true; fi
+          if [ "$ARCH" = arm ]; then md5sum target/mansa-kernel.img target/aarch64-unknown-none/debug/mansa-kernel 2> /dev/null | sed 's/^/ARM md5: /' | tee -a md5.txt || true; fi
           # The PC kernel's md5, next to it: a repeatable link (/Brepro, no PDB; docs/design-pc-repro-link.md), so the
-          # same commit gives the same value in every shard that built it.
-          md5sum target/x86_64-unknown-uefi/debug/mansa-pc.efi 2> /dev/null | sed 's/^/PC md5: /' || true
+          # same commit gives the same value in every shard that built it (the roll-up checks that).
+          md5sum target/x86_64-unknown-uefi/debug/mansa-pc.efi 2> /dev/null | sed 's/^/PC md5: /' | tee -a md5.txt || true
           want=$(tr ',' '\n' <<< "$SUITES" | grep -c .)
           ran=$(wc -l < results.tsv 2>/dev/null || echo 0)
           bad=$(awk -F'\t' '$2 != "PASS"' results.tsv 2>/dev/null | wc -l)
@@ -129,15 +147,24 @@ jobs:
           [ "$ran" -eq "$want" ] && [ "$bad" -eq 0 ]
       - name: Upload the shard's results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: walk-${{ matrix.arch }}-${{ matrix.shard }}
+          name: walk-${{ matrix.arch }}-${{ matrix.shard }}-r${{ matrix.round }}
           path: |
             results.tsv
             walk.out
+            md5.txt
             logs/
             !logs/**/*.img
           retention-days: 14
+      - name: Keep the benchmark numbers (only the shard that ran a perf suite has them)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: perf-${{ matrix.arch }}-${{ matrix.shard }}-r${{ matrix.round }}
+          path: build/perf/
+          if-no-files-found: ignore
+          retention-days: 90
 
   rollup:
     name: Roll-up
@@ -145,7 +172,7 @@ jobs:
     if: always() && needs.plan.result == 'success'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: walk-*
           path: shards
@@ -156,24 +183,57 @@ jobs:
         run: |
           import json, os, pathlib
           matrix = json.loads(os.environ["MATRIX"])["include"]
+          rounds = sorted({m.get("round", 1) for m in matrix})
           out = ["## Full walk", ""]
           red = 0
-          for arch in sorted({m["arch"] for m in matrix}):
-              want = [s for m in matrix if m["arch"] == arch for s in m["suites"].split(",")]
-              got = {}
-              for f in pathlib.Path("shards").glob(f"walk-{arch}-*/results.tsv"):
-                  for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
-                      cols = line.split("\t")
-                      if len(cols) >= 2:
-                          got[cols[0]] = cols[1]
-              passed = [s for s in want if got.get(s) == "PASS"]
-              notpass = [f"{s} {got[s]}" for s in want if s in got and got[s] != "PASS"]
-              missing = [s for s in want if s not in got]
-              red += len(notpass) + len(missing)
-              out.append(f"**{arch}**: {len(passed)}/{len(want)} PASS, {len(notpass)} not PASS, {len(missing)} not run")
-              out += [f"- not PASS: `{x}`" for x in notpass[:100]]
-              out += [f"- not run: `{x}`" for x in missing[:100]]
-              out.append("")
+          census = {}   # (arch, suite) -> results, one per round
+          for r in rounds:
+              if len(rounds) > 1:
+                  out += [f"### Round {r}", ""]
+              for arch in sorted({m["arch"] for m in matrix}):
+                  want = [s for m in matrix if m["arch"] == arch and m.get("round", 1) == r for s in m["suites"].split(",")]
+                  got = {}
+                  for f in pathlib.Path("shards").glob(f"walk-{arch}-*-r{r}/results.tsv"):
+                      for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                          cols = line.split("\t")
+                          if len(cols) >= 2:
+                              got[cols[0]] = cols[1]
+                  passed = [s for s in want if got.get(s) == "PASS"]
+                  notpass = [f"{s} {got[s]}" for s in want if s in got and got[s] != "PASS"]
+                  missing = [s for s in want if s not in got]
+                  red += len(notpass) + len(missing)
+                  for s in want:
+                      census.setdefault((arch, s), []).append(got.get(s, "NOT-RUN"))
+                  out.append(f"**{arch}**: {len(passed)}/{len(want)} PASS, {len(notpass)} not PASS, {len(missing)} not run")
+                  out += [f"- not PASS: `{x}`" for x in notpass[:100]]
+                  out += [f"- not run: `{x}`" for x in missing[:100]]
+                  out.append("")
+          if len(rounds) > 1:
+              # the flake census: a suite is flaky when the same commit gave it different results
+              out += [f"### Flake census: {len(rounds)} walks of {os.environ.get('GITHUB_SHA', '')[:12]}", ""]
+              for arch in sorted({a for a, _ in census}):
+                  rows = {s: v for (a, s), v in census.items() if a == arch}
+                  flaky = {s: v for s, v in rows.items() if len(set(v)) > 1}
+                  steady_red = {s: v for s, v in rows.items() if len(set(v)) == 1 and v[0] != "PASS"}
+                  out.append(f"**{arch} census**: {len(rows) - len(flaky) - len(steady_red)} steady PASS, "
+                             f"{len(flaky)} flaky, {len(steady_red)} red every time")
+                  out += [f"- flaky: `{s}` PASS in {v.count('PASS')} of {len(v)} ({', '.join(v)})" for s, v in sorted(flaky.items())]
+                  out += [f"- red every time: `{s}` {v[0]}" for s, v in sorted(steady_red.items())]
+                  out.append("")
+          # every shard of one commit should have built the same kernels (repeatable builds)
+          md5 = {}
+          for f in pathlib.Path("shards").glob("walk-*/md5.txt"):
+              for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                  parts = line.split()
+                  if len(parts) >= 4:
+                      md5.setdefault(f"{parts[0]} {parts[3]}", {}).setdefault(parts[2], []).append(f.parent.name)
+          for what, sums in sorted(md5.items()):
+              n = sum(len(v) for v in sums.values())
+              if len(sums) == 1:
+                  out.append(f"- md5 {what}: `{next(iter(sums))}`, the same in all {n} shard(s)")
+              else:
+                  red += 1
+                  out.append(f"- md5 {what}: DIFFERS across shards: " + "; ".join(f"`{k}` in {len(v)}" for k, v in sums.items()))
           text = "\n".join(out)
           print(text)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:

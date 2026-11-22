@@ -59,6 +59,8 @@ mod canvas; // the desktop draws straight into the ramfb framebuffer
 mod font_lower;
 mod uart;
 mod uart_ns16550;
+#[path = "pc/dnscheck.rs"] // the checked DNS answer, shared with the PC since Dira S5c (to a shared folder by S5d)
+mod dnscheck;
 mod virtio; mod netparse; // netparse: received-frame readers on slices (gap G1)
 mod voice;
 mod web;

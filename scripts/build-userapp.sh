@@ -11,6 +11,11 @@ for app in rustapp niavm; do
     "$OC" -O binary "target/aarch64-unknown-none/debug/$app" "kernel/src/$app.bin"
     echo "wrote kernel/src/$app.bin ($(wc -c < "kernel/src/$app.bin") bytes)"
 done
+# niavm's test build (OS_REQUESTS item 9's sandbox findings; test images only)
+cargo build -p niavm --features sandbox-test
+"$OC" -O binary target/aarch64-unknown-none/debug/niavm kernel/src/niavm-sandbox.bin
+echo "wrote kernel/src/niavm-sandbox.bin ($(wc -c < kernel/src/niavm-sandbox.bin) bytes)"
+cargo build -p niavm  # leave the normal build in target/, as before
 
 # The PC (x86-64): the same rustapp source for the PC kernel's ring 3, linked at its
 # USER_BASE (userland/rustapp/linker-x86_64.ld). Position-independent code, with the GOT
@@ -21,3 +26,7 @@ for app in rustapp niavm; do
     "$OC" -O binary "target/x86_64-unknown-none/debug/$app" "kernel/src/pc/$app-x86_64.bin"
     echo "wrote kernel/src/pc/$app-x86_64.bin ($(wc -c < "kernel/src/pc/$app-x86_64.bin") bytes)"
 done
+RUSTFLAGS="-C link-arg=--apply-dynamic-relocs" cargo build -p niavm --target x86_64-unknown-none --features sandbox-test
+"$OC" -O binary target/x86_64-unknown-none/debug/niavm kernel/src/pc/niavm-sandbox-x86_64.bin
+echo "wrote kernel/src/pc/niavm-sandbox-x86_64.bin ($(wc -c < kernel/src/pc/niavm-sandbox-x86_64.bin) bytes)"
+RUSTFLAGS="-C link-arg=--apply-dynamic-relocs" cargo build -p niavm --target x86_64-unknown-none

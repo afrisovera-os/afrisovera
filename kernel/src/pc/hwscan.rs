@@ -795,10 +795,18 @@ fn unbound(say: bool) -> (u32, u32) {
 /// `hwscan`: the whole inventory.
 pub fn show() {
     crate::kprintln!("hwscan: this PC's hardware (read only, nothing is changed; ids and classes only)");
+    crate::cpu::side_channel_line("hwscan: ");
     let mut c = Counts::default();
     scan_pci(&mut c);
     scan_usb(&mut c);
     scan_acpi(&mut c);
+    let (high, nh) = crate::mmu::high_mmio();
+    for &(pa, who) in &high[..nh] {
+        crate::kprintln!(
+            "hwscan: {} registers at {:#x}: at or above 1 TiB, in the slots ring-3 programs use (programs cannot start until device mappings move)",
+            who, pa
+        );
+    }
     let (n, bad) = unbound(false);
     crate::kprintln!("hwscan: {} registered driver(s), {} without a match table", n, bad);
     crate::kprintln!(

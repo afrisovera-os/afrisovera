@@ -204,10 +204,48 @@ fn split_2m(e: u64, big: u64) -> Option<u64> {
     Some(pt)
 }
 
+/// Where the slots ring-3 programs use begin (PML4 slot 2, 1 TiB). A device's registers mapped 1:1 at or above it
+/// land in a user slot: `entry_in` refuses to open them to ring 3, so nothing leaks, but no program can start there
+/// (the compatibility engineer's low-TiB review, the architect's note of 15 Nov 2026).
+pub const USER_SLOTS_FROM: u64 = 1 << 40;
+/// Register windows mapped at or above USER_SLOTS_FROM: (physical address, the driver that asked), for hwscan and the
+/// report, so the field reports show whether real machines place BARs that high. Written at boot, read by the shell.
+static HIGH_MMIO: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static mut HIGH_WHO: [&str; 8] = [""; 8];
+static HIGH_N: AtomicU64 = AtomicU64::new(0);
+
+/// The register windows mapped at or above 1 TiB: (address, driver), and how many.
+pub fn high_mmio() -> ([(u64, &'static str); 8], usize) {
+    let n = (HIGH_N.load(Ordering::Relaxed) as usize).min(8);
+    let mut out = [(0u64, ""); 8];
+    for (i, o) in out.iter_mut().enumerate().take(n) {
+        // SAFETY: HIGH_WHO[i] for i < HIGH_N was written before HIGH_N grew past it, at boot, single core.
+        *o = (HIGH_MMIO[i].load(Ordering::Relaxed), unsafe { (*core::ptr::addr_of!(HIGH_WHO))[i] });
+    }
+    (out, n)
+}
+
 /// Map device registers at [pa, pa + len) 1:1, uncached, in 2 MiB pages: for a PCI BAR the
 /// firmware placed above the RAM map (on q35 the 64-bit window starts far above 4 GiB).
-/// Pages already mapped are left as they are. False when out of table frames.
-pub fn map_mmio(pa: u64, len: u64) -> bool {
+/// Pages already mapped are left as they are. False when out of table frames. `who` names the driver, for the
+/// one boot line a window at or above 1 TiB gets (USER_SLOTS_FROM).
+pub fn map_mmio(pa: u64, len: u64, who: &'static str) -> bool {
+    if pa.saturating_add(len) > USER_SLOTS_FROM {
+        let n = HIGH_N.load(Ordering::Relaxed) as usize;
+        let seen = (0..n.min(8)).any(|i| HIGH_MMIO[i].load(Ordering::Relaxed) == pa);
+        if !seen {
+            if n < 8 {
+                // SAFETY: boot or shell context, single core; written before HIGH_N makes it visible.
+                unsafe { (*core::ptr::addr_of_mut!(HIGH_WHO))[n] = who };
+                HIGH_MMIO[n].store(pa, Ordering::Relaxed);
+            }
+            HIGH_N.store(n as u64 + 1, Ordering::Relaxed);
+            crate::kprintln!(
+                "[mmu] {}: registers at {:#x} lie at or above 1 TiB, in the slots ring-3 programs use: programs cannot start on this PC until device mappings move (hwscan names it)",
+                who, pa
+            );
+        }
+    }
     let mut p = pa & !(PAGE_2M - 1);
     while p < pa + len {
         if translate(p).is_none() {
@@ -533,7 +571,7 @@ pub fn wc_fence() {
 ///    and main.rs's boot trail only write it); a read from WC memory is uncached and slow, so
 ///    keep it that way.
 pub fn map_screen(pa: u64, len: u64, wc: bool) -> Option<u64> {
-    if !map_mmio(pa, len) {
+    if !map_mmio(pa, len, "screen") {
         return None; // pages above the 1:1 map get their entries first (uncached)
     }
     let wc = wc && pat_all_cores();

@@ -20,7 +20,8 @@ cd "$(dirname "$0")/.."
 T="${TMPDIR:-/tmp}"
 PY="${PY:-python3}"
 echo "== arm-cell3: the cell window for EL0 processes (calls 64 to 68), ARM kernel =="
-BIN="target/aarch64-unknown-none/debug/mansa-kernel"
+# ARM_BIN: another build of the kernel (the release figure for idle's share, architect's S5b verdict)
+BIN="${ARM_BIN:-target/aarch64-unknown-none/debug/mansa-kernel}"
 BL="$(mktemp)"
 cargo build -p mansa-kernel > "$BL" 2>&1
 tail -2 "$BL"
@@ -88,6 +89,7 @@ MS="$(sed -n 's/^\[desk\] cell: the app stopped \([0-9]*\) ms after Close anyway
 echo "  run B: stopped ${MS:-?} ms after Close anyway"
 [ -n "$MS" ] && [ "$MS" -lt 100 ] || _f "run B: stopped ${MS:-never} ms after Close anyway (the limit is 100 ms)"
 grep -aqE '^\[cell3\] ended; .* map area 0\)$' <<< "$A" || _f "run A: the map area held frames after the run"
+grep -aqE '^\[cell3\] ended; frames in use ([0-9]+) before and \1 after \(ok; map area 0\)$' <<< "$S" || _f "frames not all back after the runs (the ended processes' tables and stacks)"
 grep -aqE '^\[desk\] verify: 0 of [0-9]+ rows differ' <<< "$S" || _f "desk verify found rows that differ"
 grep -aq "heap:" <<< "$S" || _f "the shell stopped answering (boot 1)"
 P="$(clean "$W/plain.log")"

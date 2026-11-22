@@ -28,6 +28,9 @@ pub const SYS_TIME: u64 = 12; // -> seconds since 1970 (CMOS clock)
 pub const SYS_AI: u64 = 13; // (prompt, len, out, cap) -> reply length (the on-device responder)
 pub const SYS_SPEAK: u64 = 14; // (text, len) -> 0 (Asili Voice, text form as on ARM)
 pub const SYS_SLEEP: u64 = 15; // (ms) -> block ~ms on the TSC, returns the ms slept (the ARM number)
+/// Call 79 `clock_monotonic` (AFR-0001 7.6): nanoseconds since boot, whole microseconds, never backwards; no handle
+/// (CLOCK_PLAN; numbered after 77 and 78, which the Dira runtime branch adds)
+pub const SYS_CLOCK_MONOTONIC: u64 = 79;
 // The window calls (the shared tonga window manager, as the ARM kernel's EL0 apps use it);
 // numbered 20.. because this PC ABI already gives 5 to SYS_PREEMPTED.
 pub const SYS_WIN_CREATE: u64 = 20; // (w, h) -> window id
@@ -741,6 +744,20 @@ pub(crate) fn poke_data_u32(slot: usize, v: u32) {
     }
 }
 
+/// fproc_start's second half (AFR-0001 7.7): the foreign process `s` runs from `rip` with `rsp`, interrupts on, in
+/// ring 3. The call's dispatch and daraja's L1.1 selftest both use it, so the test starts a process exactly as a
+/// bridge does.
+pub(crate) fn start_frame(s: usize, rip: u64, rsp: u64) {
+    let p = &mut procs()[s];
+    p.frame = ZERO_FRAME;
+    p.frame.rip = rip;
+    p.frame.rsp = rsp;
+    p.frame.cs = USER_CS;
+    p.frame.ss = USER_DS;
+    p.frame.rflags = 0x202;
+    p.state = State::Runnable;
+}
+
 /// The page-table root of `slot`.
 pub(crate) fn root_of(slot: usize) -> u64 {
     procs()[slot].root
@@ -1068,18 +1085,8 @@ static mut WAIT_KIND: u32 = 0;
 /// `net_stop` also uses; one call at a time, single core).
 static mut NET_BUF: [u8; crate::virtio::CONN_SEG] = [0; crate::virtio::CONN_SEG];
 
-/// An address's class (7.6): bit 0 public, 1 private networks, 2 link-local, 3 this machine (127/8). `None` for 0/8,
-/// 224/3 and 255.255.255.255, which no handle reaches.
-fn ip_class(ip: [u8; 4]) -> Option<u8> {
-    match ip {
-        [0, ..] | [224..=255, ..] => None,
-        [127, ..] => Some(3),
-        [10, ..] | [172, 16..=31, ..] | [192, 168, ..] => Some(1),
-        [169, 254, ..] => Some(2),
-        _ => Some(0),
-    }
-}
-const CLASS_NAMES: [&str; 4] = ["public", "private network", "link-local", "this machine"];
+// An address's class (7.6): shared with ARM since Dira S5c (virtio.rs).
+use crate::virtio::{ip_class, CLASS_NAMES};
 
 /// The NET handle `h` of process `pid`: its classes.
 fn net_handle(pid: usize, h: u64) -> Result<u8, i64> {
@@ -1447,12 +1454,23 @@ pub fn net_test() {
     let net = Grant::Net { classes: 0b0111 };
     let a = spawn_with(code(Prog::Net3), &[], &[Grant::Cell { title: b"nettest3 (test)" }, net], false);
     let b = spawn_with(code(Prog::Net3b), &[], &[net], false);
+    // the bad-pointer cases (security engineer's G2 part 3, 15 Nov): net3 aims send and recv at the kernel's canary
+    let canary = core::ptr::addr_of_mut!(UPTR_CANARY);
+    // SAFETY: single core, shell context; nothing else touches the canary.
+    unsafe { canary.write_volatile(*b"G2-CANARY-INTACT") }; // uaccess: the kernel's own canary
+    if let Some(slot) = a {
+        procs()[slot].frame.rdi = canary as u64;
+        crate::kprintln!("[net3] P{} aims at the kernel canary at {:#x}", slot, canary as u64);
+    }
     if a.is_none() || b.is_none() {
         crate::kprintln!("[net3] could not spawn the programs");
         let _ = run_all();
         return;
     }
     let ended = run_all();
+    // SAFETY: as above; read through the pointer so the check sees memory.
+    let c = unsafe { canary.read_volatile() }; // uaccess: the kernel's own canary
+    crate::kprintln!("[net3] G2-CANARY {}", if &c == b"G2-CANARY-INTACT" { "intact" } else { "OVERWRITTEN" });
     let frames1 = frame::used_frames();
     crate::kprintln!(
         "[net3] {} ended; frames in use {} before and {} after ({}); a connection open: {}",
@@ -1461,6 +1479,25 @@ pub fn net_test() {
         frames1,
         if frames0 == frames1 { "ok" } else { "WRONG" },
         crate::virtio::conn_open()
+    );
+}
+
+/// `rt79test` (suite pc-rt79): the ring-3 program `rt79` (no handles; call 79 needs none) and the frames check.
+pub fn rt79_test() {
+    let frames0 = frame::used_frames();
+    if spawn(code(Prog::Rt79), &[], false).is_none() {
+        crate::kprintln!("[rt79] could not spawn the program");
+        let _ = run_all();
+        return;
+    }
+    let ended = run_all();
+    let frames1 = frame::used_frames();
+    crate::kprintln!(
+        "[rt79] {} ended; frames in use {} before and {} after ({})",
+        ended,
+        frames0,
+        frames1,
+        if frames0 == frames1 { "ok" } else { "WRONG" }
     );
 }
 
@@ -1714,6 +1751,7 @@ pub fn syscall(f: &mut TrapFrame) {
     match f.rax {
         SYS_EXIT => {
             crate::kprintln!("[P{}] exit {}", pid, f.rdi);
+            LAST_EXIT.store(f.rdi, core::sync::atomic::Ordering::Relaxed);
             procs()[pid].state = State::Dead;
             ended(pid);
             switch(f);
@@ -1755,6 +1793,7 @@ pub fn syscall(f: &mut TrapFrame) {
         }
         SYS_PREEMPTED => f.rax = procs()[pid].slices,
         SYS_GETPID => f.rax = pid as u64,
+        SYS_CLOCK_MONOTONIC => f.rax = crate::timer::monotonic_ns(),
         SYS_PUTC => {
             let c = f.rdi as u8;
             if c == b'\n' {
@@ -2017,14 +2056,7 @@ fn bridge_call(pid: usize, f: &mut TrapFrame) -> bool {
         SYS_FPROC_START => {
             f.rax = match d::fproc_start(pid, f.rdi, f.rsi, f.rdx) {
                 Ok((s, rip, rsp)) => {
-                    let p = &mut procs()[s];
-                    p.frame = ZERO_FRAME;
-                    p.frame.rip = rip;
-                    p.frame.rsp = rsp;
-                    p.frame.cs = USER_CS;
-                    p.frame.ss = USER_DS;
-                    p.frame.rflags = 0x202;
-                    p.state = State::Runnable;
+                    start_frame(s, rip, rsp);
                     0
                 }
                 Err(e) => err(e),
@@ -2578,7 +2610,9 @@ proc_prog_vmo_end:
 // match. Prints with SYS_PRINT: the object's address; cell_open (0); then for each range AI with it as the prompt,
 // AI with it as the reply buffer, SPEAK with it as the text (each EPERM), VMO_UNMAP of it (E_INVAL) and CELL_PUT of
 // 16 bytes from it (E_FAULT) and DNS_A with it as the name (handle 1, a NET grant; E_FAULT); then AI with its own read-only code page as the reply buffer (EPERM: inside its range,
-// but not writable), the object's own unmap (0) and 0x5afe. Stack: [rsp] the four ranges, [rsp+32]
+// but not writable); then, with RFLAGS.DF set by `std`, SPEAK of its own 16-byte text "DF-LOCK-16-BYTES" (0, and
+// spoken exactly: the kernel clears DF at entry, isr_common's cld; a regression lock); the object's own unmap (0) and
+// 0x5afe. Stack: [rsp] the four ranges, [rsp+32]
 // the prompt "hi", [rsp+48] a reply buffer.
 // RULE: a new system call that takes a user address adds its line here, and to scripts/pc-userptr-test.sh, in the
 // same commit that adds the call.
@@ -2679,6 +2713,19 @@ proc_prog_uptr_next:
     mov ecx, 16
     mov eax, 13
     int 0x80
+    mov rdi, rax
+    mov eax, 1
+    int 0x80
+    mov rax, 0x2D4B434F4C2D4644
+    mov qword ptr [rsp + 64], rax
+    mov rax, 0x53455459422D3631
+    mov qword ptr [rsp + 72], rax
+    std
+    lea rdi, [rsp + 64]
+    mov esi, 16
+    mov eax, 14
+    int 0x80
+    cld
     mov rdi, rax
     mov eax, 1
     int 0x80
@@ -2855,6 +2902,7 @@ proc_prog_nocell_end:
 .global proc_prog_net3
 .global proc_prog_net3_end
 proc_prog_net3:
+    mov r15, rdi
     mov eax, 64
     xor edi, edi
     mov esi, 40
@@ -2931,6 +2979,86 @@ proc_prog_net3:
     mov rdi, r13
     lea rsi, [rip + net3_get]
     mov edx, 28
+    int 0x80
+    mov rdi, rax
+    mov eax, 1
+    int 0x80
+    // bad pointers on the live connection, before the page is read: the canary, non-canonical, the stack's top
+    // running past the ring-3 range, a wrap; send 16 bytes from each, recv up to 32 into each, then recv into its own
+    // read-only code page: E_FAULT every time
+    mov eax, 73
+    mov rdi, r13
+    mov rsi, r15
+    mov edx, 16
+    int 0x80
+    mov rdi, rax
+    mov eax, 1
+    int 0x80
+    mov eax, 73
+    mov rdi, r13
+    mov rsi, 0x0000800000000000
+    mov edx, 16
+    int 0x80
+    mov rdi, rax
+    mov eax, 1
+    int 0x80
+    mov eax, 73
+    mov rdi, r13
+    mov rsi, 0x000001000003FFF8
+    mov edx, 16
+    int 0x80
+    mov rdi, rax
+    mov eax, 1
+    int 0x80
+    mov eax, 73
+    mov rdi, r13
+    mov rsi, 0xFFFFFFFFFFFFFFF0
+    mov edx, 16
+    int 0x80
+    mov rdi, rax
+    mov eax, 1
+    int 0x80
+    mov eax, 74
+    mov rdi, r13
+    mov rsi, r15
+    mov edx, 32
+    mov ecx, 1000
+    int 0x80
+    mov rdi, rax
+    mov eax, 1
+    int 0x80
+    mov eax, 74
+    mov rdi, r13
+    mov rsi, 0x0000800000000000
+    mov edx, 32
+    mov ecx, 1000
+    int 0x80
+    mov rdi, rax
+    mov eax, 1
+    int 0x80
+    mov eax, 74
+    mov rdi, r13
+    mov rsi, 0x000001000003FFF8
+    mov edx, 32
+    mov ecx, 1000
+    int 0x80
+    mov rdi, rax
+    mov eax, 1
+    int 0x80
+    mov eax, 74
+    mov rdi, r13
+    mov rsi, 0xFFFFFFFFFFFFFFF0
+    mov edx, 32
+    mov ecx, 1000
+    int 0x80
+    mov rdi, rax
+    mov eax, 1
+    int 0x80
+    mov eax, 74
+    mov rdi, r13
+    mov rsi, 0x0000010000000000
+    mov edx, 32
+    mov ecx, 1000
     int 0x80
     mov rdi, rax
     mov eax, 1
@@ -3098,6 +3226,80 @@ proc_prog_fault:
 2:
     jmp 2b
 proc_prog_fault_end:
+
+// rt79 (suite pc-rt79, call 79 clock_monotonic; CLOCK_PLAN 4). No handles. Prints, in order: how many of 10,000
+// back-to-back calls returned less than the call before (0); how many were not a whole number of microseconds (0);
+// the backwards count again after four more calls, each after a 50 ms SYS_SLEEP (0); the difference in ns of two
+// calls around a 100 ms SYS_SLEEP; the last value. Exits 0.
+.global proc_prog_rt79
+.global proc_prog_rt79_end
+proc_prog_rt79:
+    sub rsp, 16
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    mov r15d, 10000
+rt79_loop:
+    mov eax, 79
+    int 0x80
+    cmp rax, r12
+    jae rt79_fwd1
+    inc r13
+rt79_fwd1:
+    mov r12, rax
+    xor edx, edx
+    mov ecx, 1000
+    div rcx
+    test rdx, rdx
+    jz rt79_us1
+    inc r14
+rt79_us1:
+    dec r15
+    jnz rt79_loop
+    mov rdi, r13
+    mov eax, 1
+    int 0x80
+    mov rdi, r14
+    mov eax, 1
+    int 0x80
+    mov r15d, 4
+rt79_tick:
+    mov edi, 50
+    mov eax, 15
+    int 0x80
+    mov eax, 79
+    int 0x80
+    cmp rax, r12
+    jae rt79_fwd2
+    inc r13
+rt79_fwd2:
+    mov r12, rax
+    dec r15
+    jnz rt79_tick
+    mov rdi, r13
+    mov eax, 1
+    int 0x80
+    mov eax, 79
+    int 0x80
+    mov qword ptr [rsp], rax
+    mov edi, 100
+    mov eax, 15
+    int 0x80
+    mov eax, 79
+    int 0x80
+    mov r12, rax
+    sub rax, qword ptr [rsp]
+    mov rdi, rax
+    mov eax, 1
+    int 0x80
+    mov rdi, r12
+    mov eax, 1
+    int 0x80
+    add rsp, 16
+    xor eax, eax
+    xor edi, edi
+    int 0x80
+proc_prog_rt79_end:
 "#,
     data = const DATA_VA,
 );
@@ -3123,6 +3325,8 @@ extern "C" {
     static proc_prog_edit_end: u8;
     static proc_prog_fault: u8;
     static proc_prog_fault_end: u8;
+    static proc_prog_rt79: u8;
+    static proc_prog_rt79_end: u8;
     static proc_prog_vmo: u8;
     static proc_prog_vmo_end: u8;
     static proc_prog_uptr: u8;
@@ -3151,6 +3355,8 @@ pub enum Prog {
     Sleep,
     Edit,
     Fault,
+    /// call 79 clock_monotonic (the `rt79test` command, suite pc-rt79)
+    Rt79,
     /// process memory, AFR-0001 7.6 (the `vmotest` command, suite pc-vmo)
     Vmo,
     /// every pointer-taking call handed kernel and bad addresses (the `uptrtest` command, suite pc-userptr)
@@ -3171,6 +3377,9 @@ pub enum Prog {
     RustApp,
     /// userland/niavm built for x86-64: the Nia WASM interpreter as a ring-3 process
     NiaVm,
+    /// niavm's test build (feature sandbox-test, OS_REQUESTS item 9), test images only
+    #[cfg(feature = "test-apps")]
+    NiaVmSandbox,
 }
 
 /// The compiled-Rust ring-3 app: the ARM kernel's `rustapp` source, built for x86-64 and
@@ -3178,6 +3387,11 @@ pub enum Prog {
 static RUSTAPP: &[u8] = include_bytes!("rustapp-x86_64.bin");
 /// The Nia WASM interpreter (userland/niavm) built for x86-64, same way as RUSTAPP.
 static NIAVM: &[u8] = include_bytes!("niavm-x86_64.bin");
+#[cfg(feature = "test-apps")]
+static NIAVM_SANDBOX: &[u8] = include_bytes!("niavm-sandbox-x86_64.bin");
+
+/// The code the last process passed to SYS_EXIT (so `niavm` reports the real one, not an assumed 0).
+pub static LAST_EXIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn code(p: Prog) -> &'static [u8] {
     if let Prog::RustApp = p {
@@ -3185,6 +3399,10 @@ pub fn code(p: Prog) -> &'static [u8] {
     }
     if let Prog::NiaVm = p {
         return NIAVM;
+    }
+    #[cfg(feature = "test-apps")]
+    if let Prog::NiaVmSandbox = p {
+        return NIAVM_SANDBOX;
     }
     // SAFETY: each pair of labels brackets one program's machine code in .text.
     unsafe {
@@ -3198,6 +3416,7 @@ pub fn code(p: Prog) -> &'static [u8] {
             Prog::Sleep => (&proc_prog_sleep as *const u8, &proc_prog_sleep_end as *const u8),
             Prog::Edit => (&proc_prog_edit as *const u8, &proc_prog_edit_end as *const u8),
             Prog::Fault => (&proc_prog_fault as *const u8, &proc_prog_fault_end as *const u8),
+            Prog::Rt79 => (&proc_prog_rt79 as *const u8, &proc_prog_rt79_end as *const u8),
             Prog::Gui => (&proc_prog_gui as *const u8, &proc_prog_gui_end as *const u8),
             Prog::Vmo => (&proc_prog_vmo as *const u8, &proc_prog_vmo_end as *const u8),
             Prog::Uptr => (&proc_prog_uptr as *const u8, &proc_prog_uptr_end as *const u8),
@@ -3207,6 +3426,8 @@ pub fn code(p: Prog) -> &'static [u8] {
             Prog::Net3 => (&proc_prog_net3 as *const u8, &proc_prog_net3_end as *const u8),
             Prog::Net3b => (&proc_prog_net3b as *const u8, &proc_prog_net3b_end as *const u8),
             Prog::RustApp | Prog::NiaVm => unreachable!(),
+            #[cfg(feature = "test-apps")]
+            Prog::NiaVmSandbox => unreachable!(),
         };
         core::slice::from_raw_parts(a, b as usize - a as usize) // uaccess: the kernel's own program code
     }

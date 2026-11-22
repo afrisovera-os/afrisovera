@@ -106,6 +106,11 @@ const fn holds_demo_update_key(t: &[Key]) -> bool {
     false
 }
 
+// AFR-0010 §7 (OS_REQUESTS item 9): a release build may not be a test image. `test-apps` bundles the test apps and
+// niavm's sandbox-test build, which exist only to be refused or to misbehave on purpose.
+#[cfg(all(feature = "release", feature = "test-apps"))]
+const _: () = panic!("release build refused: the test images' feature test-apps is set (AFR-0010 section 7)");
+
 // AFR-0010 §7: a build marked for release (`--features pc,release`) must trust no demo key, update or app.
 // Checked as the kernel compiles, so such a build cannot be made at all, in CI or anywhere else; the suite
 // pc-releaseguard proves the check is armed. Today it always stops: the owner's keys do not exist yet.

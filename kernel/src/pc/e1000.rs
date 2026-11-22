@@ -265,7 +265,7 @@ pub fn init() -> bool {
     };
     let Some((b, d, f)) = pci::find_by(8, hit) else { return false };
     let bar = pci::bar_mem(b, d, f, 0); // 64-bit on the igb/igc parts
-    if bar == 0 || !mmu::map_mmio(bar, 0x20000) {
+    if bar == 0 || !mmu::map_mmio(bar, 0x20000, "intel-e1000") {
         crate::kprintln!("[e1000] {} at {:02x}:{:02x}.{} has no usable BAR0", name, b, d, f);
         return false;
     }

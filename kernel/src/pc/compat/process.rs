@@ -139,16 +139,36 @@ pub fn run_niavm() {
     let exited = crate::proc::run_all();
     crate::cpu::sti();
     if exited == 1 {
-        crate::kprintln!("    [P{} @EL0] Nia interpreter exited (ring 3, code 0)", pid);
+        let code = crate::proc::LAST_EXIT.load(core::sync::atomic::Ordering::Relaxed);
+        crate::kprintln!("    [P{} @EL0] Nia interpreter exited (ring 3, code {})", pid, code);
     } else {
         crate::kprintln!("[pc] niavm: the process did not exit cleanly");
     }
+}
+
+/// `niavm-sandbox` (test images only): niavm's test build in ring 3 (scripts/niavm-sandbox-test.sh).
+#[cfg(feature = "test-apps")]
+pub fn run_niavm_sandbox() {
+    let Some(pid) = crate::proc::spawn(crate::proc::code(crate::proc::Prog::NiaVmSandbox), &[], false) else {
+        crate::kprintln!("[pc] niavm: could not create the process");
+        return;
+    };
+    crate::cpu::cli();
+    let exited = crate::proc::run_all();
+    crate::cpu::sti();
+    let code = crate::proc::LAST_EXIT.load(core::sync::atomic::Ordering::Relaxed);
+    crate::kprintln!("    [P{} @EL0] niavm sandbox test exited ({} by exit, code {})", pid, exited, code);
 }
 pub fn run_rtc_demo() { absent("userspace RTC driver (EL0)") }
 pub fn run_sgi_el0_probe() { absent("SGI probe from EL0") }
 /// `el0-ptr` (gap G2): the PC checks every user pointer in pc/proc.rs user_range; its probe is `uptrtest`.
 pub fn run_cell_test() { absent("ARM cell window test (the PC's own is `celltest3` in shell_pc, suite pc-cell3)") }
+pub fn run_net_test() { absent("ARM network test (the PC's own is `nettest3` in shell_pc, suite pc-net3)") }
+pub fn run_rt79_test() { absent("ARM clock test (the PC's own is `rt79test` in shell_pc, suite pc-rt79)") }
+pub fn dns_a_shell(_name: &str) { absent("ARM checked DNS (the PC asks through its lease: dira)") }
 pub fn run_vmo_test() { absent("ARM process memory test (the PC's own is `vmotest` in shell_pc, suite pc-vmo)") }
+/// `panprobe` (G2 part 2 step 2, ARM): the PC's probe is `smapprobe` (suite pc-userptr).
+pub fn run_pan_probe() { absent("PAN probe (the PC's is `smapprobe`, suite pc-userptr)") }
 pub fn run_el0_ptr_probe() { absent("EL0 user-pointer probe (the PC's own probe is `uptrtest`, suite pc-userptr)") }
 /// `syssleep`: a ring-3 process asks the kernel, by system call, to block it ~300 ms
 /// (pc/proc.rs SYS_SLEEP), prints the measured time and exits; the shell resumes after.

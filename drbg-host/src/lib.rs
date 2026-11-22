@@ -15,3 +15,8 @@ pub mod tpm_wire;
 // tests/tpm_tis.rs (architect's TPM merge follow-up 2).
 #[path = "../../kernel/src/pc/tpm_tis.rs"]
 pub mod tpm_tis;
+// The rules above the interface (a Link) and the CRB interface (tests/tpm_crb.rs), F3 TPM over CRB.
+#[path = "../../kernel/src/pc/tpm_rules.rs"]
+pub mod tpm_rules;
+#[path = "../../kernel/src/pc/tpm_crb.rs"]
+pub mod tpm_crb;

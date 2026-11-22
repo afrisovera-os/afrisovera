@@ -7,6 +7,7 @@ Imports (module afri): time (0), sleep_ms (1), print (2).
 """
 import os
 import sys
+from permlist import permlist  # C2: a list for the apps that call more than print and putc
 
 
 def uleb(n):
@@ -72,5 +73,5 @@ if __name__ == '__main__':
     d = sys.argv[1]
     os.makedirs(d, exist_ok=True)
     for n, body in APPS.items():
-        open(os.path.join(d, n + '.wasm'), 'wb').write(module(body))
+        open(os.path.join(d, n + '.wasm'), 'wb').write(module(body) + permlist(['print', 'time']))
         print(n)

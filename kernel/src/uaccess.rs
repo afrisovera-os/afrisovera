@@ -15,6 +15,10 @@
 //! the CPU has it, and the `pan` suite (step 2) shows that a helper copy from a kernel address still faults there.
 
 use core::arch::{asm, global_asm};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// G2 part 2 step 2: PAN is on (ARMv8.1+ only; the A72 and the Pi 4 do not have it).
+static PAN_ON: AtomicBool = AtomicBool::new(false);
 
 global_asm!(
     r#"
@@ -109,4 +113,51 @@ pub fn init() {
     } else {
         crate::kprintln!("[cpu] uaccess: EL0 memory only through LDTR/STTR (no UAO in this CPU)");
     }
+    pan_init();
+}
+
+/// G2 part 2 step 2: PAN where ID_AA64MMFR1_EL1.PAN (bits 23:20) says the CPU has it. SCTLR_EL1.SPAN is cleared, so
+/// PAN is set again on every exception taken to EL1, and PSTATE.PAN is set now. With PAN on, any plain EL1 access
+/// to a page EL0 may access faults; the uaccess helpers use LDTRB/STTRB, which PAN allows. On the boot core (the
+/// only core that runs EL0 processes).
+fn pan_init() {
+    let mmfr1: u64;
+    // SAFETY: reading ID_AA64MMFR1_EL1 at EL1 (by encoding).
+    unsafe { asm!("mrs {}, s3_0_c0_c7_1", out(reg) mmfr1, options(nomem, nostack)) };
+    let pan = (mmfr1 >> 20) & 0xF;
+    if pan == 0 {
+        crate::kprintln!("[cpu] PAN: not in this CPU (ARMv8.0); EL0 memory is guarded by LDTR/STTR alone");
+        return;
+    }
+    // SAFETY: SCTLR_EL1 read-modify-write at EL1; SPAN (bit 23) cleared means "set PAN on exception entry". Then
+    // `msr pan, #1` (encoded, so no v8.1 assembler feature is needed) on a CPU that implements PAN (checked).
+    unsafe {
+        let mut sctlr: u64;
+        asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nomem, nostack));
+        sctlr &= !(1 << 23);
+        asm!("msr sctlr_el1, {}", "isb", in(reg) sctlr, options(nomem, nostack));
+        asm!(".inst 0xd500419f", "isb", options(nomem, nostack));
+    }
+    PAN_ON.store(true, Ordering::Relaxed);
+    crate::kprintln!("[cpu] PAN: on (ID_AA64MMFR1 PAN={}): a plain kernel access to EL0 memory faults", pan);
+}
+
+pub fn pan_on() -> bool {
+    PAN_ON.load(Ordering::Relaxed)
+}
+
+/// The `pan` command: PAN's state, and UAO's.
+pub fn status() {
+    let (mmfr1, mmfr2): (u64, u64);
+    // SAFETY: reading two ID registers at EL1.
+    unsafe {
+        asm!("mrs {}, s3_0_c0_c7_1", out(reg) mmfr1, options(nomem, nostack));
+        asm!("mrs {}, s3_0_c0_c7_2", out(reg) mmfr2, options(nomem, nostack));
+    }
+    crate::kprintln!(
+        "pan: {} (ID_AA64MMFR1 PAN={}); UAO {}",
+        if pan_on() { "on" } else { "not in this CPU" },
+        (mmfr1 >> 20) & 0xF,
+        if (mmfr2 >> 4) & 0xF != 0 { "present, kept off" } else { "not in this CPU" }
+    );
 }

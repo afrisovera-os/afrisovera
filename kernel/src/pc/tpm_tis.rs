@@ -1,14 +1,18 @@
-//! The TPM's TIS (FIFO) protocol and its rules, generic over the register bus (architect's TPM merge follow-up 2,
-//! 13 Nov 2026). Pure: no MMIO, no clock and no statics of its own. tpm.rs supplies the real bus (MMIO at 0xFED40000
-//! and the TSC); drbg-host/tests/tpm_tis.rs supplies a scripted TPM, so the rules below are tested on the host:
+//! The TPM's TIS (FIFO) protocol, generic over the register bus (architect's TPM merge follow-up 2, 13 Nov 2026).
+//! Pure: no MMIO, no clock and no statics of its own. tpm.rs supplies the real bus (MMIO at 0xFED40000 and the TSC);
+//! drbg-host/tests/tpm_tis.rs supplies a scripted TPM, so this is tested on the host:
 //! - one command at a time, and every wait has a clock ceiling, never a fixed sleep or an unbounded spin;
-//! - a response is read whole and size-checked (`tpm_wire`), and bytes left over after it are refused;
-//! - Startup only when the TPM answers "not started", once per boot, then the command once more (condition 2);
-//! - TPM 1.2 is counted only when its `disable` and `deactivated` flags both say on;
-//! - the start-up test (the first STARTUP_SAMPLES bytes) has a total ceiling, and a slow TPM says how slow.
+//! - a response is read whole and size-checked (`tpm_wire`), and bytes left over after it are refused.
+//! The rules above the interface (Startup once, the 1.2 flags, the start-up ceiling) are in tpm_rules.rs, over
+//! `TisLink`; the functions at the end of this file call them through it, for tpm.rs and the TIS host tests.
 #![allow(dead_code)]
 
-use crate::tpm_wire::{self as w, Cmd, Flags, Ver, WireErr};
+use crate::tpm_rules::{self as rules, Link};
+pub use crate::tpm_rules::{
+    not_started, Budget, Bus, IoErr, Session, Slow, STARTUP_CEILING_MS,
+};
+pub use crate::tpm_rules::{ticks, wait};
+use crate::tpm_wire::{self as w, Cmd};
 
 pub const ACCESS: u64 = 0x00;
 pub const STS: u64 = 0x18;
@@ -28,57 +32,6 @@ pub const STS_EXPECT: u32 = 1 << 3;
 /// TIS timeout A (locality), and the ceiling for a command to finish (TIS timeout B; GetRandom is a short one).
 pub const TIMEOUT_A_MS: u64 = 750;
 pub const TIMEOUT_CMD_MS: u64 = 2000;
-/// Architect's condition 5: the start-up test's total ceiling.
-pub const STARTUP_CEILING_MS: u64 = 2000;
-
-/// The TIS registers of locality 0 and a clock. The kernel's is MMIO and the TSC; the host test's is a script.
-pub trait Bus {
-    fn r8(&mut self, off: u64) -> u8;
-    fn r32(&mut self, off: u64) -> u32;
-    fn w8(&mut self, off: u64, v: u8);
-    fn w32(&mut self, off: u64, v: u32);
-    /// A clock that only goes forward, in ticks.
-    fn now(&mut self) -> u64;
-    /// Ticks per second.
-    fn hz(&self) -> u64;
-}
-
-/// What one boot remembers between calls.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Session {
-    pub ver: Ver,
-    /// Set once this boot has sent Startup; it is never sent twice.
-    pub started_by_us: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum IoErr {
-    NotReady,
-    NoBurst,
-    Expect,
-    Timeout,
-    Extra,
-    Wire(WireErr),
-}
-
-pub fn ticks<B: Bus>(b: &B, ms: u64) -> u64 {
-    b.hz().saturating_mul(ms) / 1000
-}
-
-/// Wait until `ok` or `ms` milliseconds have passed on the bus's clock; true when it came true.
-pub fn wait<B: Bus>(b: &mut B, ms: u64, mut ok: impl FnMut(&mut B) -> bool) -> bool {
-    let start = b.now();
-    let limit = ticks(b, ms);
-    loop {
-        if ok(b) {
-            return true;
-        }
-        if b.now().wrapping_sub(start) > limit {
-            return ok(b);
-        }
-        core::hint::spin_loop();
-    }
-}
 
 fn burst<B: Bus>(b: &mut B) -> usize {
     ((b.r32(STS) >> 8) & 0xFFFF) as usize
@@ -165,142 +118,41 @@ fn read_rsp<B: Bus>(b: &mut B, rsp: &mut [u8; w::RSP_MAX]) -> Result<usize, IoEr
     Ok(n)
 }
 
-/// Send `c` and parse the answer's header; the body (a copy, bounded) goes to `body`, its length is returned.
+/// The TIS path as a `Link` for the shared rules.
+pub struct TisLink<'a, B: Bus>(pub &'a mut B);
+
+impl<B: Bus> Link for TisLink<'_, B> {
+    fn transact(&mut self, cmd: &[u8], rsp: &mut [u8; w::RSP_MAX]) -> Result<usize, IoErr> {
+        transact(self.0, cmd, rsp)
+    }
+    fn now(&mut self) -> u64 {
+        self.0.now()
+    }
+    fn hz(&self) -> u64 {
+        self.0.hz()
+    }
+}
+
 pub fn call<B: Bus>(b: &mut B, s: &Session, c: Cmd, body: &mut [u8; w::RSP_MAX]) -> Result<usize, IoErr> {
-    let mut cmd = [0u8; w::CMD_MAX];
-    let n = w::build(s.ver, c, &mut cmd).map_err(IoErr::Wire)?;
-    let mut rsp = [0u8; w::RSP_MAX];
-    let len = transact(b, &cmd[..n], &mut rsp)?;
-    let r = match w::parse(s.ver, &rsp[..len]) {
-        Ok(x) => {
-            body[..x.len()].copy_from_slice(x);
-            Ok(x.len())
-        }
-        Err(e) => Err(IoErr::Wire(e)),
-    };
-    rsp.fill(0);
-    r
+    rules::call(&mut TisLink(b), s, c, body)
 }
 
-pub fn not_started(e: IoErr) -> bool {
-    matches!(e, IoErr::Wire(WireErr::Rc(w::RC12_INVALID_POSTINIT)) | IoErr::Wire(WireErr::Rc(w::RC20_INITIALIZE)))
-}
-
-/// `c`, and if the TPM says it was never started: Startup once, then `c` once more (condition 2).
 pub fn call_starting<B: Bus>(b: &mut B, s: &mut Session, c: Cmd, body: &mut [u8; w::RSP_MAX]) -> Result<usize, IoErr> {
-    match call(b, s, c, body) {
-        Err(e) if not_started(e) && !s.started_by_us => {
-            s.started_by_us = true;
-            call(b, s, Cmd::Startup, body)?;
-            call(b, s, c, body)
-        }
-        r => r,
-    }
+    rules::call_starting(&mut TisLink(b), s, c, body)
 }
 
-/// One GetRandom of up to 32 bytes into `dst`; returns the bytes written.
 pub fn get_random_once<B: Bus>(b: &mut B, s: &mut Session, dst: &mut [u8]) -> Result<usize, IoErr> {
-    let ask = dst.len().min(w::RANDOM_MAX);
-    let mut body = [0u8; w::RSP_MAX];
-    let n = call_starting(b, s, Cmd::GetRandom(ask as u16), &mut body)?;
-    let r = match w::random_bytes(s.ver, &body[..n], ask) {
-        Ok(x) => {
-            dst[..x.len()].copy_from_slice(x);
-            Ok(x.len())
-        }
-        Err(e) => Err(IoErr::Wire(e)),
-    };
-    body.fill(0);
-    r
+    rules::get_random_once(&mut TisLink(b), s, dst)
 }
 
-/// TPM 1.2: the permanent `disable` and volatile `deactivated` flags; Ok(true) only when both say on.
 pub fn tpm12_switched_on<B: Bus>(b: &mut B, s: &mut Session) -> Result<bool, IoErr> {
-    let mut body = [0u8; w::RSP_MAX];
-    let n = call_starting(b, s, Cmd::GetCapFlags(Flags::Permanent), &mut body)?;
-    let disabled = w::first_flag(&body[..n], Flags::Permanent).map_err(IoErr::Wire)?;
-    let n = call(b, s, Cmd::GetCapFlags(Flags::Volatile), &mut body)?;
-    let deactivated = w::first_flag(&body[..n], Flags::Volatile).map_err(IoErr::Wire)?;
-    Ok(!disabled && !deactivated)
+    rules::tpm12_switched_on(&mut TisLink(b), s)
 }
 
-/// The boot probe, with locality held by the caller: for 1.2 the flags must say on, then one GetRandom of 32 bytes
-/// must come back whole. Ok carries that call's time in microseconds; Err says why the TPM is not counted.
 pub fn probe<B: Bus>(b: &mut B, s: &mut Session) -> Result<u64, &'static str> {
-    if s.ver == Ver::V12 {
-        match tpm12_switched_on(b, s) {
-            Ok(true) => {}
-            Ok(false) => return Err("switched off in the firmware setup; switch it on there to use it"),
-            Err(_) => return Err("its on/off flags could not be read, so it is not counted"),
-        }
-    }
-    let mut x = [0u8; w::RANDOM_MAX];
-    let t0 = b.now();
-    let r = get_random_once(b, s, &mut x);
-    let dt = b.now().wrapping_sub(t0);
-    x.fill(0);
-    match r {
-        Ok(n) if n == w::RANDOM_MAX => Ok(dt.saturating_mul(1_000_000) / b.hz().max(1)),
-        Ok(_) => Err("GetRandom gave fewer bytes than asked for"),
-        Err(IoErr::Wire(WireErr::Rc(_))) => Err("GetRandom returned an error code"),
-        Err(IoErr::Wire(_)) => Err("GetRandom's answer was malformed"),
-        Err(_) => Err("GetRandom timed out"),
-    }
+    rules::probe(&mut TisLink(b), s)
 }
 
-/// One batch, with locality held by the caller: GetRandom until `buf` is full or the TPM stops answering.
-/// Returns the bytes written, the GetRandom calls made, and whether it stopped answering.
 pub fn fill_batch<B: Bus>(b: &mut B, s: &mut Session, buf: &mut [u8]) -> (usize, u64, bool) {
-    let mut n = 0;
-    let mut calls = 0u64;
-    while n < buf.len() {
-        calls += 1;
-        match get_random_once(b, s, &mut buf[n..]) {
-            Ok(k) => n += k,
-            Err(_) => return (n, calls, true),
-        }
-    }
-    (n, calls, false)
-}
-
-/// The start-up test's clock (condition 5): bytes, ticks and GetRandom calls spent until `samples` bytes have gone.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Budget {
-    pub served: usize,
-    pub spent: u64,
-    pub calls: u64,
-}
-
-/// How slow a TPM that missed the start-up ceiling was (follow-up 4: the "too slow" line prints these).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Slow {
-    pub total_ms: u64,
-    pub calls: u64,
-    pub us_per_call: u64,
-}
-
-impl Budget {
-    /// Charge one batch of `n` bytes that took `dt` ticks over `calls` GetRandom calls. Only batches that start
-    /// before `samples` bytes have been served count. Err when the total has passed `ceiling_ms`.
-    pub fn charge(
-        &mut self,
-        n: usize,
-        dt: u64,
-        calls: u64,
-        hz: u64,
-        samples: usize,
-        ceiling_ms: u64,
-    ) -> Result<(), Slow> {
-        if self.served >= samples {
-            return Ok(());
-        }
-        self.served = self.served.saturating_add(n);
-        self.spent = self.spent.saturating_add(dt);
-        self.calls = self.calls.saturating_add(calls);
-        if self.spent > hz.saturating_mul(ceiling_ms) / 1000 {
-            let us = self.spent.saturating_mul(1_000_000) / hz.max(1);
-            return Err(Slow { total_ms: us / 1000, calls: self.calls, us_per_call: us / self.calls.max(1) });
-        }
-        Ok(())
-    }
+    rules::fill_batch(&mut TisLink(b), s, buf)
 }

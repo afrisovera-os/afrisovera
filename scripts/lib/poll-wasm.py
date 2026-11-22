@@ -15,6 +15,7 @@ memory and exports run. Locals: 0 = k (the last key), 1 = n (a counter).
 """
 import os
 import sys
+from permlist import permlist  # C2: a list for the apps that call more than print and putc
 
 
 def uleb(n):
@@ -98,5 +99,6 @@ if __name__ == '__main__':
     d = sys.argv[1]
     os.makedirs(d, exist_ok=True)
     for n, body in APPS.items():
-        open(os.path.join(d, n + '.wasm'), 'wb').write(module(body))
+        perms = ['print', 'time', 'input']  # every app here imports pollkey and sleep_ms (pk2 sleeps too)
+        open(os.path.join(d, n + '.wasm'), 'wb').write(module(body) + permlist(perms))
         print(n)

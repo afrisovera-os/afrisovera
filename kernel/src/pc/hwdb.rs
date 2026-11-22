@@ -487,7 +487,7 @@ pub const ACPI_IDS: &[(&str, &str, AcpiV)] = &[
     ("ACPI0008", "ambient light sensor", AcpiV::Missing),
     ("PNP0C50", "HID over I2C (touchpad, touchscreen or keyboard)", AcpiV::Missing),
     ("ACPI0C50", "HID over I2C (touchpad, touchscreen or keyboard)", AcpiV::Missing),
-    ("MSFT0101", "TPM 2.0 security chip", AcpiV::Missing),
+    ("MSFT0101", "TPM 2.0 security chip", AcpiV::Asks(crate::tpm::claim)),
     ("MSFT0001", "keyboard (Microsoft id)", AcpiV::Ours("ps2-keyboard")),
     ("PNP0700", "floppy controller", AcpiV::Missing),
     ("PNP0400", "printer port", AcpiV::Missing),

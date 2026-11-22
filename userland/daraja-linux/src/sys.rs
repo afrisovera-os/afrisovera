@@ -56,6 +56,18 @@ pub fn exit(code: u64) -> ! {
 pub fn putc(c: u8) {
     call(11, [c as u64, 0, 0, 0, 0, 0]);
 }
+/// Seconds since 1970 (v0's SYS_TIME, 12, the CMOS clock): L1.1's only clock a native program has on the PC.
+pub fn time() -> u64 {
+    call(12, [0; 6])
+}
+/// Call 79 `clock_monotonic`: nanoseconds since boot, whole microseconds, never backwards (CLOCK_PLAN 1).
+pub fn clock_monotonic() -> u64 {
+    call(79, [0; 6])
+}
+/// Sleep about `ms` milliseconds (v0's SYS_SLEEP, 15).
+pub fn sleep_ms(ms: u64) {
+    call(15, [ms, 0, 0, 0, 0, 0]);
+}
 
 // --- v0.5 memory (7.6) ------------------------------------------------------------------------------------------------
 pub fn vmo_create(size: u64) -> R {

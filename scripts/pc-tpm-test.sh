@@ -2,7 +2,7 @@
 # PC track, mesh F3 step 3 (13 Nov 2026): the TPM's random number generator as a counted strong source (ADR 0008
 # Decision 1a; kernel/src/pc/tpm.rs over the TIS FIFO, command bytes and parsing in kernel/src/pc/tpm_wire.rs).
 # The CPU has no RDRAND or RDSEED (-cpu qemu64,-rdrand,-rdseed), so without a TPM `fill_secret` refuses; with a
-# TPM switched on, it must succeed from the TPM alone. Four power-ons, each with `rng sources`, `rng secret 32`, `rng`:
+# TPM switched on, it must succeed from the TPM alone. Five power-ons, each with `rng sources`, `rng secret 32`, `rng`:
 #   boot 1: swtpm --tpm2 behind -tpmdev emulator -device tpm-tis: the `[tpm] TPM 2.0 over TIS` line, counted now:
 #           tpm, `rng secret: ok` with counted bits=256, source tpm healthy with >= 1024 samples (start-up test).
 #   boot 2: swtpm in TPM 1.2 mode, prepared with swtpm_setup (enabled and activated): the same through TCPA.
@@ -13,15 +13,18 @@
 #           is not an "off" TPM; the first version of this boot assumed it was, and boot 3 went green-for-on.
 #   boot 4: a synthetic TCPA table with NO TPM behind it (the table lies): `[tpm] off (table but no TIS answer)`,
 #           nothing counted, refused.
+#   boot 5 (F3 TPM over CRB, 14 Nov 2026): swtpm --tpm2 behind -device tpm-crb (QEMU's TPM2 table: start method 7,
+#           control area 0xFED40040), plus a synthetic TCPA table, as the owner's HP lists both for one Intel PTT:
+#           `[tpm] TPM 2.0 over CRB` and counted exactly as boot 1. The TCPA table must not pull it to TIS.
 # Architect's condition 7: `rng secret 32` prints exactly one line, which has no room for a byte of the secret.
-#   scripts/pc-tpm-test.sh              # grader selftest, then the four QEMU boots (needs swtpm and swtpm_setup)
+#   scripts/pc-tpm-test.sh              # grader selftest, then the five QEMU boots (needs swtpm and swtpm_setup)
 #   scripts/pc-tpm-test.sh --selftest   # grader selftest only
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T="${TMPDIR:-/tmp}"
 PY=python3; command -v python3 > /dev/null || PY=python
 
-R_ON='^\[tpm\] TPM (1\.2|2\.0) over TIS at 0xfed40000: vendor 0x[0-9a-f]{4} device 0x[0-9a-f]{4}, GetRandom ok \(32 bytes in [0-9]+ us\)(, started by us)?$'
+R_ON='^\[tpm\] TPM (1\.2|2\.0) over (TIS|CRB) at 0xfed40000: vendor 0x[0-9a-f]{4} device 0x[0-9a-f]{4}, GetRandom ok \(32 bytes in [0-9]+ us\)(, started by us)?$'
 R_SECRET_OK='^rng secret: ok, 32 bytes, not shown \(secret_ok=[1-9][0-9]* secret_refused=0 counted bits=256\)$'
 R_SECRET_NO='^rng secret: refused, no counted source \(secret_ok=0 secret_refused=[1-9][0-9]* counted bits=0\)$'
 R_REFUSES='^rng sources: counted now: none, so fill_secret refuses on this PC; jitter is not counted yet \(ADR 0008 step 2b\)$'
@@ -31,15 +34,15 @@ clean() { tr -d '\r' < "$1" 2> /dev/null | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g'; }
 # The lines `rng secret 32` printed: everything after its prompt line up to the next prompt (condition 7).
 secret_out() { awk '/^afrisovera> rng secret 32$/{on=1; next} /^afrisovera>/{on=0} on' <<< "$1"; }
 
-grade_on() { # grade_on <log> <boot name> <1.2|2.0>
-    local S fail=0 v="$3" n
+grade_on() { # grade_on <log> <boot name> <1.2|2.0> [TIS|CRB]
+    local S fail=0 v="$3" i="${4:-TIS}" n
     S="$(clean "$1")"
     has() { grep -aqE "$1" <<< "$S"; }
     _f() { echo "  FAIL: $2: $1"; fail=1; }
     if grep -aqE 'KERNEL PANIC|\[pc\] (fault|exception)' <<< "$S"; then _f "the kernel panicked or faulted" "$2"; fi
     has '^rng sources: rdrand no  rdseed no ' || _f "the CPU must have neither RDRAND nor RDSEED for this suite" "$2"
-    grep -aE "$R_ON" <<< "$S" | grep -aq "TPM $v over TIS" || _f "no '[tpm] TPM $v over TIS ... GetRandom ok' boot line" "$2"
-    has "^rng sources: tpm: TPM ${v//./\\.} over TIS at 0xfed40000: " || _f "'rng sources' has no 'tpm: TPM $v' line" "$2"
+    grep -aE "$R_ON" <<< "$S" | grep -aq "TPM $v over $i" || _f "no '[tpm] TPM $v over $i ... GetRandom ok' boot line" "$2"
+    has "^rng sources: tpm: TPM ${v//./\\.} over $i at 0xfed40000: " || _f "'rng sources' has no 'tpm: TPM $v over $i' line" "$2"
     has '^rng sources: counted now: tpm; jitter is not counted yet \(ADR 0008 step 2b\)$' ||
         _f "the TPM is on, but 'counted now' does not say tpm" "$2"
     n="$(secret_out "$S")"
@@ -52,6 +55,11 @@ grade_on() { # grade_on <log> <boot name> <1.2|2.0>
     has '^\[rng\] source tpm claim: H=256/64 bit per byte, rct_cutoff=6 apt_cutoff=62/512$' ||
         _f "source tpm does not claim H=256/64 with cutoffs 6 and 62" "$2"
     has '^\[rng\] source rdrand: absent samples=0$' || _f "rdrand is not absent, so the TPM was not the only source" "$2"
+    # hwdb asks the TPM driver for MSFT0101 (the architect's Q2 on the CRB plan): QEMU lists a TPM 2.0 as MSFT0101
+    if [ "$v" = 2.0 ]; then
+        has "^  acpi MSFT0101( x[0-9]+)? \\([^)]*\\): TPM 2\\.0 security chip: driven by: tpm, $i " ||
+            _f "hwscan does not show MSFT0101 driven by tpm over $i" "$2"
+    fi
     return "$fail"
 }
 
@@ -75,14 +83,14 @@ grade_off() { # grade_off <log> <boot name> <exact reason>
 OFF12='switched off in the firmware setup; switch it on there to use it'
 OFFLIE='table but no TIS answer'
 
-on_fixture() { # on_fixture <1.2|2.0>
+on_fixture() { # on_fixture <1.2|2.0> [TIS|CRB]
     cat <<EOF
-[tpm] TPM $1 over TIS at 0xfed40000: vendor 0x1014 device 0x0001, GetRandom ok (32 bytes in 412 us)
+[tpm] TPM $1 over ${2:-TIS} at 0xfed40000: vendor 0x1014 device 0x0001, GetRandom ok (32 bytes in 412 us)
 [pc] MANSA-PC BOOT OK
 afrisovera> rng sources
 rng sources: cpu AuthenticAMD family 0x6 model 0x6 stepping 3
 rng sources: rdrand no  rdseed no  invariant-tsc no  hypervisor no
-rng sources: tpm: TPM $1 over TIS at 0xfed40000: vendor 0x1014 device 0x0001, GetRandom ok (32 bytes in 412 us)
+rng sources: tpm: TPM $1 over ${2:-TIS} at 0xfed40000: vendor 0x1014 device 0x0001, GetRandom ok (32 bytes in 412 us)
 rng sources: counted now: tpm; jitter is not counted yet (ADR 0008 step 2b)
 afrisovera> rng secret 32
 rng secret: ok, 32 bytes, not shown (secret_ok=1 secret_refused=0 counted bits=256)
@@ -95,8 +103,10 @@ afrisovera> rng
 [rng] source rdseed claim: H=256/64 bit per byte, rct_cutoff=6 apt_cutoff=62/512
 [rng] source rdrand claim: H=256/64 bit per byte, rct_cutoff=6 apt_cutoff=62/512
 [rng] source tpm claim: H=256/64 bit per byte, rct_cutoff=6 apt_cutoff=62/512
-afrisovera>
+afrisovera> hwscan
 EOF
+    [ "$1" = 2.0 ] && echo "  acpi MSFT0101 (TPM_): TPM 2.0 security chip: driven by: tpm, ${2:-TIS} (its random numbers are a counted source)"
+    echo "afrisovera>"
 }
 
 off_fixture() { # off_fixture <reason>
@@ -118,9 +128,9 @@ EOF
 }
 
 selftest() {
-    local pass=0 bad=0 D G20 G12 GOFF GLIE
+    local pass=0 bad=0 D G20 G12 GOFF GLIE GCRB
     D="$(mktemp -d "$T/pc-tpm-selftest.XXXXXX")" || return 1
-    G20="$(on_fixture 2.0)"; G12="$(on_fixture 1.2)"; GOFF="$(off_fixture "$OFF12")"; GLIE="$(off_fixture "$OFFLIE")"
+    G20="$(on_fixture 2.0)"; G12="$(on_fixture 1.2)"; GOFF="$(off_fixture "$OFF12")"; GLIE="$(off_fixture "$OFFLIE")"; GCRB="$(on_fixture 2.0 CRB)"
     arm() { # arm <name> <expected> <text> <grader> <args...>
         local name="$1" want="$2" text="$3" got; shift 3
         printf '%s\n' "$text" > "$D/in"
@@ -158,9 +168,15 @@ selftest() {
     arm lie-green green "$GLIE" grade_off boot4 "$OFFLIE"
     arm lie-none red "$(off_fixture 'no TCPA or TPM2 table' | sed 's/^\[tpm\] off (no TCPA or TPM2 table)/[tpm] none (no TCPA or TPM2 table)/')" grade_off boot4 "$OFFLIE"
     arm lie-empty red "" grade_off boot4 "$OFFLIE"
+    arm crb-green green "$GCRB" grade_on boot5 2.0 CRB
+    arm crb-is-tis red "$G20" grade_on boot5 2.0 CRB
+    arm crb-not-in-hwscan red "$(printf '%s
+' "$GCRB" | grep -v MSFT0101)" grade_on boot5 2.0 CRB
+    arm tis-is-crb red "$GCRB" grade_on boot1 2.0
+    arm crb-off red "$(off_fixture 'CRB control area 0x0 is not inside the TPM'"'"'s page')" grade_on boot5 2.0 CRB
     rm -rf "$D"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 29 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 34 ]
 }
 
 echo "== PC TPM: the TPM's RNG as a counted source (mesh F3 step 3) =="
@@ -220,7 +236,7 @@ boot() { # boot <log> [extra qemu args...]
         -serial "tcp:127.0.0.1:5770,server,nowait" -qmp "tcp:127.0.0.1:5771,server,nowait" &
     local q=$!
     AFRISH_BOOT_GRACE="${AFRISH_BOOT_GRACE:-10}" "$PY" scripts/shell-demo.py 5770 5771 "$W/shot.png" \
-        "rng sources" "rng secret 32" "rng" > "$log" 2>&1
+        "rng sources" "rng secret 32" "rng" "hwscan" > "$log" 2>&1
     kill "$q" 2> /dev/null
     wait "$q" 2> /dev/null
 }
@@ -264,7 +280,9 @@ EOP
     kill "$p" 2> /dev/null; wait "$p" 2> /dev/null
     return "$r"
 }
-tpmargs() { echo "-chardev socket,id=chrtpm,path=$1/sock -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis,tpmdev=tpm0"; }
+tpmargs() { # tpmargs <state dir> [tpm-tis|tpm-crb]
+    echo "-chardev socket,id=chrtpm,path=$1/sock -tpmdev emulator,id=tpm0,chardev=chrtpm -device ${2:-tpm-tis},tpmdev=tpm0"
+}
 show() { clean "$1" | grep -aE '^\[tpm\]|^rng (sources: (tpm|counted)|secret)|^\[rng\] (source tpm|counted)' | sed 's/^/  | /'; }
 
 echo "  --- boot 1: TPM 2.0 (swtpm --tpm2) ---"
@@ -283,6 +301,9 @@ fi
 show "$W/boot3.log"
 echo "  --- boot 4: a TCPA table with no TPM behind it ---"
 boot "$W/boot4.log" -acpitable "sig=TCPA,rev=2,oem_id=AFRI,oem_table_id=AFRITEST,data=$W/tcpa.bin"; show "$W/boot4.log"
+echo "  --- boot 5: TPM 2.0 over CRB (swtpm --tpm2, -device tpm-crb), plus a TCPA table as on the owner's HP ---"
+swtpm_start "$W/t20crb" --tpm2 && boot "$W/boot5.log" $(tpmargs "$W/t20crb" tpm-crb) \
+    -acpitable "sig=TCPA,rev=2,oem_id=AFRI,oem_table_id=AFRITEST,data=$W/tcpa.bin"; swtpm_stop; show "$W/boot5.log"
 
 echo "  --- grading ---"
 ok=0
@@ -290,6 +311,7 @@ grade_on "$W/boot1.log" boot1 2.0 || ok=1
 grade_on "$W/boot2.log" boot2 1.2 || ok=1
 grade_off "$W/boot3.log" boot3 "$OFF12" || ok=1
 grade_off "$W/boot4.log" boot4 "$OFFLIE" || ok=1
+grade_on "$W/boot5.log" boot5 2.0 CRB || ok=1
 if [ "$ok" -eq 0 ]; then
     rm -rf "$W"
     echo "PC TPM TEST PASSED"

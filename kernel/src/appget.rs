@@ -291,7 +291,8 @@ pub fn run(args: &str, getkey: fn() -> u8) {
         }
         None => {
             crate::nia::print_caps("  it uses: ", needs, "  (none)");
-            crate::nia::print_caps("  it will NOT get: ", needs & !crate::nia::CAP_SIDELOAD, "  (nothing withheld)");
+            crate::kprintln!("  it has no permission list, so it gets print and putc only");
+            crate::nia::print_caps("  it will NOT get: ", needs & !crate::nia::CAP_V0, "  (nothing withheld)");
         }
     }
     match crate::vfs::read_full(name) {

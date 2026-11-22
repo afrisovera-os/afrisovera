@@ -9,7 +9,7 @@
 #   vmox: a 4 KiB object with a `ret` written in it; branching there faults (an instruction abort: UXN).
 # Every successful map prints the G2 walk of the process's tables (architect's S5 verdict, G2 part 2 condition 1):
 # every EL0-accessible entry inside its code, stack or map area. Then the frames check: the map area holds no frame
-# after both programs, and the reservation is back where it was. `echo alive`: the shell answers.
+# after both programs, the reservation is back where it was, and every frame is back (the ended processes' tables too). `echo alive`: the shell answers.
 set -uo pipefail
 
 BIN="target/aarch64-unknown-none/debug/mansa-kernel"
@@ -56,8 +56,8 @@ if faults.get(4, 0) >> 26 != 0x20:
 walks = re.findall(r"\[vmo\] walk P\d: (\d+) EL0 entries, (\d+) outside .* \((ok|WRONG)\)", s)
 if len(walks) != 3 or any(w[2] != "ok" for w in walks):
     fail.append("the G2 walks were %s, not three ok" % walks)
-m = re.search(r"\[vmo\] test: map area frames held (\d+), reserved pages (\d+) before and (\d+) after \((ok|WRONG)\)", s)
-if not m or m.group(4) != "ok":
+m = re.search(r"\[vmo\] test: map area frames held (\d+), reserved pages (\d+) before and (\d+) after \((ok|WRONG)\); frames in use (\d+) before, (\d+) after", s)
+if not m or m.group(4) != "ok" or m.group(5) != m.group(6):
     fail.append("the frames check: %s" % (m.group(0) if m else "missing"))
 if fail:
     print("ARM VMO TEST FAILED: " + "; ".join(fail))

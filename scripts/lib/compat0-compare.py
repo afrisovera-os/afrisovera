@@ -23,6 +23,8 @@ NUMBERS = {
     "execve": 59, "getpriority": 140,
 }
 NO_OUTPUT_COMPARE = {"bench0"}  # its stdout is a cycle count
+# the programs whose bundles ask for the per-call lines (daraja/trace): only their call order is compared with strace
+TRACED = {"hello0", "fault0", "bench0"}
 
 
 def section(log, name):
@@ -82,6 +84,14 @@ def judge(log, ref, name):
                 msgs.append(f"{name}: {k} differs: AfriSovera {got!r}, Linux {want!r}")
     names = ref_calls(ref[f"{name}.calls"].decode())
     unknown = [n for n in names if n not in NUMBERS]
+    if name not in TRACED:
+        # untraced (L1.1 on): no per-call lines to compare; output and exit carry the proof
+        if calls:
+            ok = False
+            msgs.append(f"{name}: per-call lines in an untraced run ({len(calls)})")
+        elif ok:
+            msgs.append(f"{name}: equal to Linux: exit {ex}, stdout {len(o1)} bytes, stderr {len(o2)} bytes (untraced)")
+        return ok, msgs
     if unknown:
         ok = False
         msgs.append(f"{name}: strace names this judge has no number for: {unknown}")

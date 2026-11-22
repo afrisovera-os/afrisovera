@@ -12,3 +12,5 @@ fwtest.bin 70000 738d796683b53552914356087ff339feb1be5d8b796cff59925bbaf9e7320fa
 ibt-hw-37.8.10-fw-1.1.1.2c.13.bseq 120 3e0d0db38c76db7491137442176a40d53e66184bdf4a73430a6f025fa0a3bc3d LICENCE.fwtest AfriSovera 1 gen:btpatch1
 ibt-hw-37.8.10-fw-1.1.2.2c.13.bseq 120 14f39d19030c5be4630030e300997db261a6ddd56dfc0a73f39e2f9ef1929fab LICENCE.fwtest AfriSovera 1 gen:btpatch2
 ibt-hw-37.8.10-fw-1.1.4.2c.13.bseq 120 d6b5018633ca5a188f5db1e54d13db103900c2a4bd870632dc53cb024d22f143 LICENCE.fwtest AfriSovera 1 gen:btpatch4
+iwlwifi-7265D-29.ucode 1036312 c52bcaa0595f64d5fb32b7db3dd4b832ea7bf78f1037bcafc19d9c0f5c5c617e LICENCE.iwlwifi_firmware Intel 29.9ef079ed.0 https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/intel/iwlwifi/iwlwifi-7265D-29.ucode?id=f8817f9324dcb9d22b95f8b0c902b2a7b548fc5d
+iwlwifi-7265-17.ucode 1180412 91f699308f102a9ed90217d813bfdb355464ece958a4f8ac96bba5e9d77fe870 LICENCE.iwlwifi_firmware Intel 17.bfb58538.0 https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/intel/iwlwifi/iwlwifi-7265-17.ucode?id=f8817f9324dcb9d22b95f8b0c902b2a7b548fc5d

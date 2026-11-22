@@ -21,6 +21,56 @@ pub static CALLS: AtomicU64 = AtomicU64::new(0);
 /// `int 0x80` refused from foreign processes since boot.
 pub static INT80_REFUSED: AtomicU64 = AtomicU64::new(0);
 
+/// The trace flag (AFR-0001 7.7 as amended for L1.1): while set, each forwarded call prints one kernel line. Off by
+/// default, because per-call lines at 115200 baud dominate a real program's run time. Set for one pair at a time:
+/// `linux <name>` when the bundle holds the file `daraja/trace`, and step 2 of the selftest (pc-daraja grades its line).
+static TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Does a cpio "newc" archive hold an entry named exactly `name`? It walks the entries by their headers ("070701" and
+/// thirteen 8-digit hex fields, 110 bytes; the name and then the data each padded to 4 bytes), so a name counts only
+/// where an entry's name is, never inside a file's data (the architect's note on L1.1). It stops at TRAILER!!!, at the
+/// end, or at anything malformed (a bad magic, a bad digit, a name or size past the end): then the answer is no.
+fn bundle_has(archive: &[u8], name: &[u8]) -> bool {
+    fn hex(b: &[u8]) -> Option<usize> {
+        b.iter().try_fold(0usize, |v, &c| Some(v * 16 + (c as char).to_digit(16)? as usize))
+    }
+    let mut at = 0usize;
+    while let Some(h) = archive.get(at..at + 110) {
+        if &h[..6] != b"070701" {
+            return false;
+        }
+        let (Some(size), Some(nsize)) = (hex(&h[54..62]), hex(&h[94..102])) else { return false };
+        let Some(entry) = nsize.checked_sub(1).and_then(|l| archive.get(at + 110..at + 110 + l)) else { return false };
+        if entry == b"TRAILER!!!" {
+            return false;
+        }
+        if entry == name {
+            return true;
+        }
+        let data = (at + 110 + nsize + 3) & !3;
+        at = data.saturating_add(size).saturating_add(3) & !3; // a huge size runs past the end: the loop stops
+    }
+    false
+}
+
+/// Two small newc archives for the selftest's check of `bundle_has`: one with an entry named daraja/trace, one whose
+/// only file holds those same bytes as its data.
+const CPIO_TRACE_NAMED: &[u8] = concat!(
+    "070701", "00000001", "000081a4", "00000000", "00000000", "00000001", "00000000", "00000000",
+    "00000000", "00000000", "00000000", "00000000", "0000000d", "00000000", "daraja/trace\0", "\0",
+    "070701", "00000002", "00000000", "00000000", "00000000", "00000001", "00000000", "00000000",
+    "00000000", "00000000", "00000000", "00000000", "0000000b", "00000000", "TRAILER!!!\0", "\0\0\0",
+)
+.as_bytes();
+const CPIO_TRACE_IN_DATA: &[u8] = concat!(
+    "070701", "00000001", "000081a4", "00000000", "00000000", "00000001", "00000000", "0000000d",
+    "00000000", "00000000", "00000000", "00000000", "00000007", "00000000", "data/x\0", "\0\0\0",
+    "daraja/trace\0", "\0\0\0",
+    "070701", "00000002", "00000000", "00000000", "00000000", "00000001", "00000000", "00000000",
+    "00000000", "00000000", "00000000", "00000000", "0000000b", "00000000", "TRAILER!!!\0", "\0\0\0",
+)
+.as_bytes();
+
 /// The last forwarded call: (slot, nr, the six arguments), for the selftest.
 static mut LAST: (usize, u64, [u64; 6]) = (0, 0, [0; 6]);
 
@@ -37,6 +87,16 @@ static BUNDLE_HELLO0: &[u8] = include_bytes!(concat!(env!("DARAJA_BUNDLE_DIR"), 
 static BUNDLE_FAULT0: &[u8] = include_bytes!(concat!(env!("DARAJA_BUNDLE_DIR"), "/fault0.cpio"));
 #[cfg(feature = "compat0")]
 static BUNDLE_BENCH0: &[u8] = include_bytes!(concat!(env!("DARAJA_BUNDLE_DIR"), "/bench0.cpio"));
+// stage L1.1's programs (COMPAT_L1_PLAN 6 step 1): untraced bundles
+#[cfg(feature = "compat0")]
+static BUNDLE_MPROT0: &[u8] = include_bytes!(concat!(env!("DARAJA_BUNDLE_DIR"), "/mprot0.cpio"));
+#[cfg(feature = "compat0")]
+static BUNDLE_MPROT1: &[u8] = include_bytes!(concat!(env!("DARAJA_BUNDLE_DIR"), "/mprot1.cpio"));
+#[cfg(feature = "compat0")]
+static BUNDLE_LUA: &[u8] = include_bytes!(concat!(env!("DARAJA_BUNDLE_DIR"), "/lua.cpio"));
+// call 79 (CLOCK_PLAN 4): the clocks, checked by the program itself
+#[cfg(feature = "compat0")]
+static BUNDLE_CLOCK1: &[u8] = include_bytes!(concat!(env!("DARAJA_BUNDLE_DIR"), "/clock1.cpio"));
 
 /// The shell's `linux <name>` (PC only, shell_pc.rs): run one of the test programs through the Linux bridge.
 pub fn linux_command(name: &str) {
@@ -46,17 +106,24 @@ pub fn linux_command(name: &str) {
             "hello0" => BUNDLE_HELLO0,
             "fault0" => BUNDLE_FAULT0,
             "bench0" => BUNDLE_BENCH0,
+            "mprot0" => BUNDLE_MPROT0,
+            "mprot1" => BUNDLE_MPROT1,
+            "lua" => BUNDLE_LUA,
+            "clock1" => BUNDLE_CLOCK1,
             _ => {
-                crate::kprintln!("linux: type linux hello0, linux fault0 or linux bench0 (the stage 0 test programs)");
+                crate::kprintln!("linux: type linux hello0, fault0, bench0, mprot0, mprot1, lua or clock1 (the test programs)");
                 return;
             }
         };
         crate::kprintln!("[daraja] linux {}: begin (bridge {} bytes, bundle {} bytes)", name, BRIDGE.len(), bundle.len());
+        TRACE.store(bundle_has(bundle, b"daraja/trace"), Ordering::Relaxed);
         if proc::spawn_pair(BRIDGE, proc::PERS_LINUX_X86_64, bundle).is_none() {
+            TRACE.store(false, Ordering::Relaxed);
             crate::kprintln!("[daraja] linux {}: the pair was not spawned (reason above)", name);
             return;
         }
         proc::run_all();
+        TRACE.store(false, Ordering::Relaxed);
         crate::kprintln!("[daraja] linux {}: end", name);
     }
     #[cfg(not(feature = "compat0"))]
@@ -238,6 +305,14 @@ pub fn selftest() {
         "IST: stacks set for NMI, #DB, #MC {}, boot core's gates on IST 2, 3, 4 {}, core 1's gates on none {}",
         tss, bsp, ap
     ));
+    // the bundle-name rule (the architect's note on L1.1): daraja/trace counts only as an entry's name
+    let named = bundle_has(CPIO_TRACE_NAMED, b"daraja/trace");
+    let in_data = bundle_has(CPIO_TRACE_IN_DATA, b"daraja/trace");
+    let cut = bundle_has(&CPIO_TRACE_NAMED[..120], b"daraja/trace");
+    t.check(named && !in_data && !cut, format_args!(
+        "bundle names: an entry named daraja/trace found {}, the same bytes as a file's data found {}, a cut archive found {}",
+        named, in_data, cut
+    ));
 
     // 2. a forwarded call carries rax and rdi rsi rdx r10 r8 r9 (not rcx), and never runs a Mansa call
     let c0 = CALLS.load(Ordering::Relaxed);
@@ -350,6 +425,9 @@ pub fn selftest() {
     // 9. step 2: the pair, the memory vectors, the call channel, the ends
     step2(&mut t);
 
+    // 9b. L1.1: ranges that grow, split and only lose rights (7.7 as amended, 21 Nov 2026)
+    l11_ranges(&mut t);
+
     // 10. nothing left behind
     let frames1 = crate::frame::used_frames();
     t.check(frames1 == frames0, format_args!("frames in use before {} and after {}", frames0, frames1));
@@ -439,8 +517,9 @@ pub fn partner(pid: usize) -> Option<usize> {
     }
 }
 
-/// Mappings per foreign process (a static program has three or four segments, a stack, a heap).
-const RANGES_PER: usize = 16;
+/// Ranges per foreign process: runs of pages with one set of rights. 128 (7.7 as amended for L1.1): brk grows one
+/// range in place, and munmap and mprotect split ranges. Only bookkeeping; the pair's 32 MiB cap bounds the memory.
+const RANGES_PER: usize = 128;
 const P_R: u8 = 1;
 const P_W: u8 = 2;
 const P_X: u8 = 4;
@@ -477,9 +556,51 @@ fn range_at(slot: usize, va: u64) -> Option<usize> {
     ranges(slot).iter().position(|r| r.is_some_and(|r| va >= r.va && va < r.va + r.pages as u64 * 4096))
 }
 
-/// The range that is exactly [addr, addr+len), as 7.7's "a whole mapping".
-fn whole(slot: usize, addr: u64, len: u64) -> Option<usize> {
-    ranges(slot).iter().position(|r| r.is_some_and(|r| r.va == addr && r.pages as u64 * 4096 == len))
+/// The end of range `r` (one past its last byte).
+fn range_end(r: &Range) -> u64 {
+    r.va + r.pages as u64 * 4096
+}
+
+/// The run fproc_unmap and fproc_protect act on: page-aligned, not empty, no overflow. Its end, or E_INVAL.
+fn run_ok(addr: u64, len: u64) -> Result<u64, i64> {
+    if addr % 4096 != 0 || len == 0 || len % 4096 != 0 {
+        return Err(proc::E_INVAL);
+    }
+    addr.checked_add(len).ok_or(proc::E_INVAL)
+}
+
+/// Every page of [addr, end) lies in one of `slot`'s ranges. Ranges never overlap, so their overlaps with the run add
+/// up to the run's length exactly when nothing is missing.
+fn covered(slot: usize, addr: u64, end: u64) -> bool {
+    let mut n = 0u64;
+    for r in ranges(slot).iter().flatten() {
+        let (s, e) = (r.va.max(addr), range_end(r).min(end));
+        if s < e {
+            n += e - s;
+        }
+    }
+    n == end - addr
+}
+
+/// How many free entries splitting at `addr` and at `end` takes: one for each of the two that falls strictly inside a
+/// range (two when both fall inside the same one).
+fn cuts(slot: usize, addr: u64, end: u64) -> usize {
+    [addr, end].iter().filter(|&&at| ranges(slot).iter().flatten().any(|r| r.va < at && at < range_end(r))).count()
+}
+
+fn free_entries(slot: usize) -> usize {
+    ranges(slot).iter().filter(|r| r.is_none()).count()
+}
+
+/// Split the range that `at` falls strictly inside into two with the same rights. The caller has checked room first
+/// (`cuts` against `free_entries`), so a full table never leaves a half-done change.
+fn split_at(slot: usize, at: u64) {
+    let t = ranges(slot);
+    let Some(i) = t.iter().position(|r| r.is_some_and(|r| r.va < at && at < range_end(&r))) else { return };
+    let (Some(r), Some(free)) = (t[i], t.iter().position(|r| r.is_none())) else { return };
+    let left = ((at - r.va) / 4096) as u32;
+    t[i] = Some(Range { pages: left, ..r });
+    t[free] = Some(Range { va: at, pages: r.pages - left, prot: r.prot });
 }
 
 /// The foreign process's ranges are forgotten when its memory is given back early (proc::reap); the pair stays, so
@@ -528,7 +649,14 @@ pub fn fproc_map(pid: usize, h: u64, addr: u64, len: u64, prot: u64) -> Result<u
     if ranges(fs).iter().flatten().any(|r| addr < r.va + r.pages as u64 * 4096 && r.va < end) {
         return Err(proc::E_INVAL);
     }
-    let Some(free) = ranges(fs).iter().position(|r| r.is_none()) else { return Err(proc::E_NOMEM) };
+    // a run that starts where a range with the same rights ends grows that range (brk's steps cost one entry)
+    let grow = ranges(fs)
+        .iter()
+        .position(|r| r.is_some_and(|r| r.prot == p && range_end(&r) == addr && r.pages.checked_add(pages).is_some()));
+    let free = ranges(fs).iter().position(|r| r.is_none());
+    if grow.is_none() && free.is_none() {
+        return Err(proc::E_NOMEM);
+    }
     proc::charge_foreign(fs, pid, pages)?;
     let root = proc::root_of(fs);
     for i in 0..pages as u64 {
@@ -553,52 +681,119 @@ pub fn fproc_map(pid: usize, h: u64, addr: u64, len: u64, prot: u64) -> Result<u
             return Err(proc::E_NOMEM); // nothing half made
         }
     }
-    ranges(fs)[free] = Some(Range { va: addr, pages, prot: p });
+    match (grow, free) {
+        (Some(i), _) => {
+            if let Some(r) = ranges(fs)[i].as_mut() {
+                r.pages += pages;
+            }
+        }
+        (None, Some(f)) => ranges(fs)[f] = Some(Range { va: addr, pages, prot: p }),
+        (None, None) => {} // refused above, before anything was charged
+    }
     Ok(0)
 }
 
-/// 50 `fproc_unmap(fproc h, addr, len)`: a whole mapping; its frames go back to the pool.
-pub fn fproc_unmap(pid: usize, h: u64, addr: u64, len: u64) -> Result<u64, i64> {
-    let fs = proc::fproc_of(pid, h, proc::R_MAP)?;
-    let i = whole(fs, addr, len).ok_or(proc::E_INVAL)?;
-    let Some(r) = ranges(fs)[i] else { return Err(proc::E_INVAL) };
+/// Give back the frames of range `r` in `fs` (a range of rights 0 has none left) and its count.
+fn release(fs: usize, r: &Range) {
     let root = proc::root_of(fs);
     for k in 0..r.pages as u64 {
+        // unmap_user_in drops the TLB entry when the foreign space is the loaded one (7.7, stale TLB entries)
         if let Some(fr) = crate::mmu::unmap_user_in(root, r.va + k * 4096) {
             crate::frame::free(fr as usize);
         }
     }
-    ranges(fs)[i] = None;
-    proc::uncharge(fs, r.pages);
+    if r.prot != 0 {
+        proc::uncharge(fs, r.pages);
+    }
+}
+
+/// 50 `fproc_unmap(fproc h, addr, len)`: any page-aligned run of mapped pages (7.7 as amended for L1.1); the ranges
+/// are split at its ends, room checked first, and its frames go back to the pool.
+pub fn fproc_unmap(pid: usize, h: u64, addr: u64, len: u64) -> Result<u64, i64> {
+    let fs = proc::fproc_of(pid, h, proc::R_MAP)?;
+    let end = run_ok(addr, len)?;
+    if !covered(fs, addr, end) {
+        return Err(proc::E_INVAL);
+    }
+    if cuts(fs, addr, end) > free_entries(fs) {
+        return Err(proc::E_NOMEM); // nothing changed
+    }
+    split_at(fs, addr);
+    split_at(fs, end);
+    for e in ranges(fs).iter_mut() {
+        if let Some(r) = *e {
+            if r.va >= addr && range_end(&r) <= end {
+                release(fs, &r);
+                *e = None;
+            }
+        }
+    }
     Ok(0)
 }
 
-/// 56 `fproc_protect(fproc h, addr, len, prot)`: RW to R, or RW to RX before the start. One way: nothing gains WRITE,
-/// and EXECUTE comes only straight from RW (7.7 rules 1 and 2).
+/// 56 `fproc_protect(fproc h, addr, len, prot)`, prot 0 (none), R or RX, never WRITE (7.7 as amended for L1.1):
+/// - EXECUTE: only before the start, and only straight from RW;
+/// - R or none: only removes rights, before or after the start; a right a page lacks now is never added (E_PERM), so
+///   nothing comes back from none and nothing gains WRITE;
+/// - none gives the frames back at once; the range stays, with rights 0.
+/// Ranges are split at the run's ends, room checked first.
 pub fn fproc_protect(pid: usize, h: u64, addr: u64, len: u64, prot: u64) -> Result<u64, i64> {
     let p = prot as u8;
-    if prot > 7 || p & P_W != 0 || (p != P_R && p != P_R | P_X) {
+    if prot > 7 || p & P_W != 0 || (p != 0 && p != P_R && p != P_R | P_X) {
         return Err(proc::E_INVAL);
     }
     let need = if p & P_X != 0 { proc::R_MAP | proc::R_EXECUTE } else { proc::R_MAP };
     let fs = proc::fproc_of(pid, h, need)?;
     if p & P_X != 0 && started(fs) {
-        return Err(proc::E_PERM);
+        return Err(proc::E_PERM); // EXECUTE only before the start (RW to RX after it included)
     }
-    let i = whole(fs, addr, len).ok_or(proc::E_INVAL)?;
-    let Some(mut r) = ranges(fs)[i] else { return Err(proc::E_INVAL) };
-    if r.prot != P_R | P_W {
-        return Err(proc::E_INVAL); // only a writable range is sealed; R and RX never change again
+    let end = run_ok(addr, len)?;
+    if !covered(fs, addr, end) {
+        return Err(proc::E_INVAL);
     }
+    for r in ranges(fs).iter().flatten() {
+        if r.va >= end || range_end(r) <= addr {
+            continue;
+        }
+        if p & P_X != 0 {
+            if r.prot != P_R | P_W {
+                return Err(proc::E_INVAL); // EXECUTE comes only straight from RW
+            }
+        } else if p & !r.prot != 0 {
+            return Err(proc::E_PERM); // a right the page does not have now: never added
+        }
+    }
+    if cuts(fs, addr, end) > free_entries(fs) {
+        return Err(proc::E_NOMEM); // nothing changed
+    }
+    split_at(fs, addr);
+    split_at(fs, end);
     let root = proc::root_of(fs);
-    for k in 0..r.pages as u64 {
-        let va = r.va + k * 4096;
-        let Some(fr) = crate::mmu::user_frame_in(root, va) else { return Err(proc::E_INVAL) };
-        crate::mmu::map_user_prot_in(root, va, fr, false, p & P_X != 0);
+    for e in ranges(fs).iter_mut() {
+        let Some(mut r) = *e else { continue };
+        if r.va < addr || range_end(&r) > end {
+            continue;
+        }
+        if p == 0 {
+            release(fs, &r); // none: the frames go back now and never return (7.7, rule 1 of the L1.1 verdict)
+        } else {
+            for k in 0..r.pages as u64 {
+                let va = r.va + k * 4096;
+                if let Some(fr) = crate::mmu::user_frame_in(root, va) {
+                    // replaces the entry and drops its TLB entry when the foreign space is loaded
+                    crate::mmu::map_user_prot_in(root, va, fr, false, p & P_X != 0);
+                }
+            }
+        }
+        r.prot = p;
+        *e = Some(r);
     }
-    r.prot = p;
-    ranges(fs)[i] = Some(r);
     Ok(0)
+}
+
+/// The number of ranges `slot` holds now (pc-daraja's L1.1 cases check growing in place and splits with it).
+pub(crate) fn range_count(slot: usize) -> usize {
+    ranges(slot).iter().flatten().count()
 }
 
 /// Every page of [faddr, faddr+len) in `fs` lies in a range with all of `need`; and the bridge's own buffer is its own.
@@ -751,7 +946,7 @@ pub fn call(slot: usize, personality: u8, f: &mut TrapFrame) -> Outcome {
     record(slot, args[0], args[1]);
     match pair() {
         Some((b, fs)) if fs == slot => {
-            if !QUIET.load(Ordering::Relaxed) {
+            if TRACE.load(Ordering::Relaxed) {
                 crate::kprintln!("[daraja] P{} call {:#x} ({:#x}) to its bridge P{}", slot, f.rax, args[0], b);
             }
             let seq = push(KIND_CALL, personality, f.rax, args, f.rip, f.rsp);
@@ -776,6 +971,8 @@ pub fn ended_by_fault(slot: usize, personality: u8, vector: u64, error: u64, add
         return None;
     }
     push(KIND_FAULT, personality, vector, [error, addr, 0, 0, 0, 0], rip, rsp);
+    // SAFETY: single core, the trap path; read by the selftest after run() has finished.
+    unsafe { *core::ptr::addr_of_mut!(FAULT_SEEN) = (vector, addr) };
     let c = chan();
     c.waiting = None;
     c.gone = true;
@@ -1189,6 +1386,174 @@ const E_FAULT_U: u64 = -4i64 as u64;
 const E_PERM_U: u64 = -1i64 as u64;
 const E_NOSYS_U: u64 = -3i64 as u64;
 
+/// The last FAULT message's (vector, address), for the L1.1 selftest.
+static mut FAULT_SEEN: (u64, u64) = (0, 0);
+
+// A bridge that only drains its channel: it reads every message until PEER_CLOSED, then exits. The L1.1 selftest
+// makes its calls from the kernel as this bridge (handle 0), so the bridge itself has nothing else to do.
+global_asm!(
+    r#"
+.global daraja_drain
+.global daraja_drain_end
+daraja_drain:
+    movabs r12, {data}
+2:
+    mov eax, 24                 // wait_one(1, READABLE | PEER_CLOSED, no limit)
+    mov edi, 1
+    mov esi, 5
+    mov rdx, -1
+    int 0x80
+    test eax, 1
+    jz 4f
+    mov eax, 18                 // channel_read(1, data + 64, 96)
+    mov edi, 1
+    lea rsi, [r12 + 64]
+    mov edx, 96
+    xor ecx, ecx
+    xor r8d, r8d
+    int 0x80
+    jmp 2b
+4:
+    xor eax, eax                // exit(0)
+    xor edi, edi
+    int 0x80
+daraja_drain_end:
+"#,
+    data = const proc::DATA_VA,
+);
+
+extern "C" {
+    static daraja_drain: u8;
+    static daraja_drain_end: u8;
+}
+
+/// L1.1's checks (AFR-0001 7.7 as amended; one per test vector). The kernel calls fproc_map, fproc_unmap and
+/// fproc_protect as the draining bridge, with handle 0, then starts a tiny foreign program that writes to a page
+/// protected to R after it was RW: the write must fault (no stale TLB entry kept WRITE). Skipped quietly when the pair
+/// cannot be spawned (the default-CPU boot, where the bundle's secret bytes are refused): step 2 reports that.
+fn l11_ranges(t: &mut Tally) {
+    const PG: u64 = 4096;
+    let frames0 = crate::frame::used_frames();
+    let (res0, _, _) = proc::vmo_stats();
+    // SAFETY: label addresses only.
+    let code = prog(unsafe { &daraja_drain }, unsafe { &daraja_drain_end });
+    let Some((b, fs)) = proc::spawn_pair(code, proc::PERS_LINUX_X86_64, b"l11: no bundle is read") else {
+        crate::kprintln!("  (L1.1 range checks skipped: no pair on this machine)");
+        return;
+    };
+    let a = crate::mmu::USER_BASE + 0x40_0000; // A: grows, then its middle page goes
+    let c = a + 0x1_0000; // C: the program's code
+    let s = a + 0x2_0000; // S: its stack
+    let p = a + 0x3_0000; // P: two pages, RW, then R part by part
+    let tt = a + 0x4_0000; // T: three pages, for the full-table splits
+    let (rw, r, rx) = (3u64, 1u64, 5u64);
+    let root = proc::root_of(fs);
+    let frames = || crate::frame::used_frames();
+
+    // 1. growing in place
+    let m1 = fproc_map(b, 0, a, PG, rw);
+    let n1 = range_count(fs);
+    let m2 = fproc_map(b, 0, a + PG, 2 * PG, rw);
+    let n2 = range_count(fs);
+    t.check(m1 == Ok(0) && m2 == Ok(0) && n1 == 1 && n2 == 1, format_args!(
+        "L1.1: a map where a range with the same rights ends grew it ({:?} {:?}, ranges {} then {})",
+        m1, m2, n1, n2
+    ));
+
+    // 2. a middle unmap splits; both halves stay mapped and the middle frame goes back
+    let f0 = frames();
+    let u = fproc_unmap(b, 0, a + PG, PG);
+    let halves = crate::mmu::user_frame_in(root, a).is_some()
+        && crate::mmu::user_frame_in(root, a + 2 * PG).is_some()
+        && crate::mmu::user_frame_in(root, a + PG).is_none();
+    t.check(u == Ok(0) && range_count(fs) == 2 && halves && frames() + 1 == f0, format_args!(
+        "L1.1: unmapping the middle page split the range in two ({:?}, ranges {}, both halves mapped {}, frames {} then {})",
+        u, range_count(fs), halves, f0, frames()
+    ));
+
+    // 3. the program (C, RX), its stack (S), and P sealed to R part by part before the start
+    // movabs rax, P; mov byte ptr [rax], 1; ud2: a write to P, which is R by then
+    let mut fp = [0u8; 15];
+    fp[0] = 0x48;
+    fp[1] = 0xB8;
+    fp[2..10].copy_from_slice(&p.to_le_bytes());
+    fp[10..13].copy_from_slice(&[0xC6, 0x00, 0x01]);
+    fp[13..15].copy_from_slice(&[0x0F, 0x0B]);
+    let mc = fproc_map(b, 0, c, PG, rw);
+    if let Some(fr) = crate::mmu::user_frame_in(root, c) {
+        // SAFETY: the frame of C, just mapped for the foreign process, which has not run; 1:1 mapped in the kernel.
+        unsafe { core::ptr::copy_nonoverlapping(fp.as_ptr(), fr as *mut u8, fp.len()) }; // uaccess: a fresh frame by its 1:1 address, before the process runs
+    }
+    let pc = fproc_protect(b, 0, c, PG, rx);
+    let ms = fproc_map(b, 0, s, PG, rw);
+    let mp = fproc_map(b, 0, p, 2 * PG, rw);
+    let before = range_count(fs);
+    let p1 = fproc_protect(b, 0, p, PG, r);
+    let split = range_count(fs) == before + 1;
+    let p2 = fproc_protect(b, 0, p, 2 * PG, r);
+    t.check(
+        mc == Ok(0) && pc == Ok(0) && ms == Ok(0) && mp == Ok(0) && p1 == Ok(0) && split && p2 == Ok(0),
+        format_args!("L1.1: P protected to R on its first page (a split {}), then whole ({:?} {:?})", split, p1, p2),
+    );
+
+    // 4. after the start, nothing gains a right
+    let started_ok = match fproc_start(b, 0, c, s + PG) {
+        Ok((slot, rip, rsp)) => {
+            proc::start_frame(slot, rip, rsp);
+            true
+        }
+        Err(_) => false,
+    };
+    let e1 = fproc_protect(b, 0, s, PG, rx); // RW to RX: adds EXECUTE
+    let e2 = fproc_protect(b, 0, p, PG, rx); // R to RX
+    let e3 = fproc_protect(b, 0, p, PG, rw); // WRITE is never asked
+    t.check(
+        started_ok && e1 == Err(proc::E_PERM) && e2 == Err(proc::E_PERM) && e3 == Err(proc::E_INVAL),
+        format_args!("L1.1: after the start RW to RX {:?}, R to RX {:?}, WRITE asked {:?}", e1, e2, e3),
+    );
+
+    // 5. none gives the frame back; no way back; unmapping it works
+    let f1 = frames();
+    let n0 = fproc_protect(b, 0, a, PG, 0);
+    let f2 = frames();
+    let back = fproc_protect(b, 0, a, PG, r);
+    let un = fproc_unmap(b, 0, a, PG);
+    let f3 = frames();
+    t.check(
+        n0 == Ok(0) && f2 + 1 == f1 && back == Err(proc::E_PERM) && un == Ok(0) && f3 == f2,
+        format_args!("L1.1: none gave the frame back (frames {} then {}), R after none {:?}, unmap {:?}", f1, f2, back, un),
+    );
+
+    // 6. a full table: a split is E_NOMEM and nothing changes
+    let mt = fproc_map(b, 0, tt, 3 * PG, rw);
+    let mut i = 0;
+    while fproc_map(b, 0, a + 0x10_0000 + i * 2 * PG, PG, if i % 2 == 0 { rw } else { r }) == Ok(0) && i < 200 {
+        i += 1;
+    }
+    let (n_full, f_full) = (range_count(fs), frames());
+    let s1 = fproc_unmap(b, 0, tt + PG, PG);
+    let s2 = fproc_protect(b, 0, tt + PG, PG, r);
+    t.check(
+        mt == Ok(0) && n_full == RANGES_PER && s1 == Err(proc::E_NOMEM) && s2 == Err(proc::E_NOMEM)
+            && range_count(fs) == n_full && frames() == f_full,
+        format_args!("L1.1: a full table ({} ranges) refused both splits ({:?} {:?}), nothing changed", n_full, s1, s2),
+    );
+
+    // 7. the started program's write to P (R since before the start) faults: #PF, vector 14, at P
+    // SAFETY: single core; nothing runs until run().
+    unsafe { *core::ptr::addr_of_mut!(FAULT_SEEN) = (0, 0) };
+    run();
+    // SAFETY: as above; the run has finished.
+    let (v, at) = unsafe { *core::ptr::addr_of!(FAULT_SEEN) };
+    t.check(v == 14 && at == p, format_args!(
+        "L1.1: the program's write to the page sealed R faulted (vector {} at {:#x}; want 14 at {:#x})", v, at, p
+    ));
+    let (res1, _, _) = proc::vmo_stats();
+    t.check(frames() == frames0 && res1 == res0, format_args!(
+        "L1.1: frames in use {} before and {} after, reserved pages {} before and {} after", frames0, frames(), res0, res1
+    ));
+}
+
 /// Step 2's checks in `daraja selftest`: the pair, its run, and what came back.
 fn step2(t: &mut Tally) {
     let frames0 = crate::frame::used_frames();
@@ -1201,7 +1566,9 @@ fn step2(t: &mut Tally) {
     if pair.is_none() {
         return;
     }
+    TRACE.store(true, Ordering::Relaxed); // pc-daraja grades fp0's first call line (the mark in fs:[0])
     proc::run_all();
+    TRACE.store(false, Ordering::Relaxed);
     let calls = CALLS.load(Ordering::Relaxed) - c0;
     let (_, nr, a) = last();
     t.check(calls == 3 && nr == 0x30 && a[0] == 0x21, format_args!(
@@ -1222,7 +1589,7 @@ fn step2(t: &mut Tally) {
 //   (b) native-ipc: a native round trip, SEND to a server process and RECV of its answer (the fair comparison: the
 //       bridge is a server);
 //   (c) forwarded: a foreign `syscall` through a minimal bridge (daraja_b_bridge: read the CALL, answer RESULT
-//       -EBADF), with no per-call console lines (QUIET).
+//       -EBADF), with no per-call console lines (the trace flag is off).
 // Each is timed over N calls and over 0 calls in the same boot, so start-up and teardown cancel: the line gives the
 // time of the N calls alone, in microseconds of the kernel's clock (under the perf rig's -icount, 1 instruction is
 // 1 ns). (b) and (c) both take two process switches per call (to the server or bridge and back), so (c) minus (b)
@@ -1230,8 +1597,7 @@ fn step2(t: &mut Tally) {
 // Every build has it (no cloud-built bridge needed), so pc-perf and pc-perf-release can run it.
 //   [daraja] bench: 10000 calls: native-null N us, native-ipc N us, forwarded N us
 
-/// While set, a pair's calls print no per-call line (the bench; the strace comparison needs them otherwise).
-static QUIET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 const BENCH_N: u32 = 10_000;
 
 global_asm!(
@@ -1452,16 +1818,20 @@ pub fn bench() {
         let c = proc::spawn(client, &[(0, proc::RIGHT_SEND), (1, proc::RIGHT_RECV)], false)?;
         Some([Some(s), Some(c)])
     });
-    QUIET.store(true, Ordering::Relaxed);
     let c = net(&|| {
         let (br, _) = proc::spawn_pair(bridge, proc::PERS_LINUX_X86_64, b"bench: no bundle is read")?;
         Some([Some(br), None])
     });
-    QUIET.store(false, Ordering::Relaxed);
     match (a, b, c) {
         (Some(a), Some(b), Some(c)) => crate::kprintln!(
             "[daraja] bench: {} calls: native-null {} us, native-ipc {} us, forwarded {} us",
             BENCH_N, a, b, c
+        ),
+        // the bridge pair refused (no secret random bytes on this CPU, e.g. QEMU's default one, as on the perf rig):
+        // the two native floors still ran, and are what C2's A/B needs (the performance engineer, 22 Nov)
+        (Some(a), Some(b), None) => crate::kprintln!(
+            "[daraja] bench: {} calls: native-null {} us, native-ipc {} us, forwarded refused",
+            BENCH_N, a, b
         ),
         _ => crate::kprintln!("[daraja] bench: a program could not be spawned (null {:?}, ipc {:?}, forwarded {:?})", a, b, c),
     }

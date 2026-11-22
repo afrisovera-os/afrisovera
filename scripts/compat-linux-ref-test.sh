@@ -30,6 +30,15 @@ SECOND_SOURCES=(
     "https://gitlab.alpinelinux.org/alpine/aports/-/raw/3.22-stable/main/musl/APKBUILD"
 )
 LINK_AT=0x10000400000
+# Daraja L1.1 (COMPAT_L1_PLAN 6 step 1): lua 5.4.7 from lua.org, pinned; Alpine's lua5.4 recipe on its 3.21 and 3.22
+# stable branches publishes the sha512 of the same upstream file
+LUA_VER=5.4.7
+LUA_URL="https://www.lua.org/ftp/lua-$LUA_VER.tar.gz"
+LUA_SHA256="9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30"
+LUA_SECOND=(
+    "https://raw.githubusercontent.com/alpinelinux/aports/3.21-stable/main/lua5.4/APKBUILD"
+    "https://raw.githubusercontent.com/alpinelinux/aports/3.22-stable/main/lua5.4/APKBUILD"
+)
 
 fail() { echo "  FAIL: $*"; echo "COMPAT-LINUX-REF TEST FAILED"; exit 1; }
 W="$(mktemp -d "${TMPDIR:-/tmp}/compat-ref.XXXXXX")"
@@ -72,7 +81,7 @@ CC="$W/musl/bin/musl-gcc"
 [ -x "$CC" ] || fail "no musl-gcc"
 
 echo "  --- our test programs ---"
-for p in hello0 fault0 bench0; do
+for p in hello0 fault0 bench0 mprot0 mprot1 clock1; do
     # musl-gcc's own start file is Scrt1.o (position-independent), whose reference to the undefined weak _DYNAMIC
     # (address 0) cannot reach from 0x10000400000 with a 32-bit relative relocation. A static, not
     # position-independent program takes musl's crt1.o instead, given here by hand around the program.
@@ -95,6 +104,46 @@ for p in hello0 fault0 bench0; do
     echo "  $p: $(stat -c %s "$OUT/$p") bytes, sha256 $(cat "$OUT/$p.sha256"), lowest segment $low"
 done
 
+echo "  --- lua $LUA_VER (Daraja L1.1): fetch, check, build ---"
+# lua.org's release tarball, pinned by sha256 and checked against a second source (Alpine's sha512 for the same file)
+curl -fsSL --retry 3 -o "$W/lua.tgz" "$LUA_URL" || fail "could not fetch $LUA_URL"
+lua256="$(sha256sum "$W/lua.tgz" | cut -d' ' -f1)"; lua512="$(sha512sum "$W/lua.tgz" | cut -d' ' -f1)"
+echo "  lua-$LUA_VER.tar.gz sha256 $lua256"
+lsecond=""; lfrom=""
+for u in "${LUA_SECOND[@]}"; do
+    curl -fsSL --retry 2 -A "afrisovera-ci" -o "$W/lsecond" "$u" 2> /dev/null || { echo "  second source unreachable: $u"; continue; }
+    lsecond="$(grep -E "^[0-9a-f]{128}  lua-$LUA_VER\.tar\.gz$" "$W/lsecond" | cut -d' ' -f1 | head -1)"
+    if [ -n "$lsecond" ]; then lfrom="$u"; break; fi
+    echo "  second source does not list lua-$LUA_VER.tar.gz: $u"
+done
+if [ -n "$lsecond" ]; then
+    [ "$lsecond" = "$lua512" ] || fail "lua tarball sha512 differs from the one published at $lfrom"
+    echo "  second source ($lfrom): sha512 matches"
+fi
+if [ "$lua256" != "$LUA_SHA256" ]; then
+    [ -n "$lsecond" ] && echo "  TO PIN: LUA_SHA256=\"$lua256\" (confirmed by the second source)"
+    fail "lua tarball sha256 $lua256, pinned $LUA_SHA256"
+fi
+echo "  pinned sha256: matches"
+tar -xzf "$W/lua.tgz" -C "$W" || fail "could not unpack lua"
+mkdir -p "$W/luao"
+for c in "$W/lua-$LUA_VER"/src/*.c; do
+    case "$(basename "$c")" in luac.c) continue ;; esac   # the interpreter only (lua.c), not the compiler
+    "$CC" -std=gnu99 -O2 -DLUA_USE_POSIX -c "$c" -o "$W/luao/$(basename "${c%.c}").o" 2> "$W/lua-cc.log" \
+        || { cat "$W/lua-cc.log"; fail "lua: $(basename "$c") did not compile"; }
+done
+L="$W/musl/lib"
+"$CC" -static -no-pie -nostartfiles -Wl,-Ttext-segment=$LINK_AT -Wl,--no-relax -Wl,--defsym=_DYNAMIC=$LINK_AT \
+    -o "$OUT/lua" "$L/crt1.o" "$L/crti.o" "$W"/luao/*.o -lm "$L/crtn.o" 2> "$W/lua-ld.log" \
+    || { cat "$W/lua-ld.log"; fail "lua did not link"; }
+sha256sum "$OUT/lua" | cut -d' ' -f1 > "$OUT/lua.sha256"
+hdr="$(readelf -h "$OUT/lua")"
+grep -q 'Type: *EXEC' <<< "$hdr" || fail "lua is not ET_EXEC"
+grep -qE 'INTERP|DYNAMIC' <<< "$(readelf -l "$OUT/lua")" && fail "lua is not static"
+low="$(readelf -lW "$OUT/lua" | awk '$1=="LOAD"{print $3}' | sort | head -1)"
+[ $(( low )) -ge $(( 0x10000000000 )) ] || fail "lua loads at $low, below the foreign area"
+echo "  lua: $(stat -c %s "$OUT/lua") bytes, sha256 $(cat "$OUT/lua.sha256"), lowest segment $low"
+
 echo "  --- run on Linux, as the bridge will ---"
 command -v strace > /dev/null || (DEBIAN_FRONTEND=noninteractive apt-get install -y -qq strace > /dev/null 2>&1)
 # The program is started exactly as the bridge starts it: argv[0] is its bare name (as in the bundle's daraja/argv), no
@@ -115,7 +164,11 @@ run() { # run <name> <args...>: in a copy of the bundle, empty environment, stdi
 run hello0 one two
 run fault0
 run bench0
-for p in hello0 fault0 bench0; do
+run mprot0
+run mprot1
+run lua data/lua1.lua
+run clock1
+for p in hello0 fault0 bench0 mprot0 mprot1 lua clock1; do
     echo "  $p: exit $(cat "$OUT/$p.exit"), stdout $(wc -c < "$OUT/$p.out1") bytes, stderr $(wc -c < "$OUT/$p.out2") bytes, calls: $(tr '\n' ' ' < "$OUT/$p.calls" 2> /dev/null)"
 done
 
@@ -129,6 +182,14 @@ grep -qx 'this line is on stderr' "$OUT/hello0.out2" || fail "hello0's stderr li
 [ "$(cat "$OUT/fault0.exit")" = 139 ] || fail "fault0 exit $(cat "$OUT/fault0.exit"), want 139"
 [ "$(cat "$OUT/bench0.exit")" = 0 ] || fail "bench0 exit $(cat "$OUT/bench0.exit"), want 0"
 [ -s "$OUT/hello0.calls" ] || fail "no strace call list for hello0"
+# L1.1: mprot0 removes rights (0 on both systems); mprot1 adds them, which Linux allows (exit 1: all three allowed)
+[ "$(cat "$OUT/mprot0.exit")" = 0 ] || fail "mprot0 exit $(cat "$OUT/mprot0.exit"), want 0"
+[ "$(cat "$OUT/mprot1.exit")" = 1 ] || fail "mprot1 exit $(cat "$OUT/mprot1.exit"), want 1 (Linux allows adding rights)"
+[ "$(cat "$OUT/lua.exit")" = 3 ] || fail "lua exit $(cat "$OUT/lua.exit"), want 3 (lua1.lua's os.exit(3))"
+grep -qxF "$(printf 'sum of squares 1..1000\t333833500')" "$OUT/lua.out1" || fail "lua1.lua's first line is not as expected"
+# call 79: clock1 checks its own clocks and prints only verdicts; on Linux all seven hold (exit 0)
+[ "$(cat "$OUT/clock1.exit")" = 0 ] || { cat "$OUT/clock1.out1"; fail "clock1 exit $(cat "$OUT/clock1.exit"), want 0"; }
+grep -q WRONG "$OUT/clock1.out1" && fail "clock1 printed WRONG on Linux"
 sed 's/^/  | /' "$OUT/hello0.out1"
 rm -rf "$W"
 echo "COMPAT-LINUX-REF TEST PASSED"

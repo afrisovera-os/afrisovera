@@ -4,12 +4,12 @@
 
 static R_EN_ONE_0_0: [(u32, u32); 1] = [(1, 1)];
 static G_EN_ONE_0: [Cond; 1] = [Cond { m: 0, ne: false, r: &R_EN_ONE_0_0 }];
-// en (CLDR en-001): one, other; numbers group ',' decimal '.' min 1; region 001 prefers H; am 'am' pm 'pm'
+// en (CLDR en-001): one, other; numbers group ',' decimal '.' min 1 then 3; digits latn; region 001 prefers H; am 'am' pm 'pm'
 static P_EN: [Rule; 1] = [Rule { form: Form::One, any: &[&G_EN_ONE_0] }];
 
 static R_TW_ONE_0_0: [(u32, u32); 1] = [(0, 1)];
 static G_TW_ONE_0: [Cond; 1] = [Cond { m: 0, ne: false, r: &R_TW_ONE_0_0 }];
-// tw (CLDR ak): one, other; numbers group ',' decimal '.' min 1; region GH prefers h; am 'AN' pm 'EW'
+// tw (CLDR ak): one, other; numbers group ',' decimal '.' min 1 then 3; digits latn; region GH prefers h; am 'AN' pm 'EW'
 static P_TW: [Rule; 1] = [Rule { form: Form::One, any: &[&G_TW_ONE_0] }];
 
 static R_ES_ONE_0_0: [(u32, u32); 1] = [(1, 1)];
@@ -17,7 +17,7 @@ static G_ES_ONE_0: [Cond; 1] = [Cond { m: 0, ne: false, r: &R_ES_ONE_0_0 }];
 static R_ES_MANY_0_0: [(u32, u32); 1] = [(0, 0)];
 static R_ES_MANY_0_1: [(u32, u32); 1] = [(0, 0)];
 static G_ES_MANY_0: [Cond; 2] = [Cond { m: 0, ne: true, r: &R_ES_MANY_0_0 }, Cond { m: 1000000, ne: false, r: &R_ES_MANY_0_1 }];
-// es (CLDR es): one, many, other; numbers group '.' decimal ',' min 2; region ES prefers H; am 'a.\xa0m.' pm 'p.\xa0m.'
+// es (CLDR es): one, many, other; numbers group '.' decimal ',' min 2 then 3; digits latn; region ES prefers H; am 'a.\xa0m.' pm 'p.\xa0m.'
 static P_ES: [Rule; 2] = [Rule { form: Form::One, any: &[&G_ES_ONE_0] }, Rule { form: Form::Many, any: &[&G_ES_MANY_0] }];
 
 static R_FR_ONE_0_0: [(u32, u32); 2] = [(0, 0), (1, 1)];
@@ -25,7 +25,7 @@ static G_FR_ONE_0: [Cond; 1] = [Cond { m: 0, ne: false, r: &R_FR_ONE_0_0 }];
 static R_FR_MANY_0_0: [(u32, u32); 1] = [(0, 0)];
 static R_FR_MANY_0_1: [(u32, u32); 1] = [(0, 0)];
 static G_FR_MANY_0: [Cond; 2] = [Cond { m: 0, ne: true, r: &R_FR_MANY_0_0 }, Cond { m: 1000000, ne: false, r: &R_FR_MANY_0_1 }];
-// fr (CLDR fr): one, many, other; numbers group '\xa0' decimal ',' min 1; region FR prefers H; am 'AM' pm 'PM'
+// fr (CLDR fr): one, many, other; numbers group '\xa0' decimal ',' min 1 then 3; digits latn; region FR prefers H; am 'AM' pm 'PM'
 static P_FR: [Rule; 2] = [Rule { form: Form::One, any: &[&G_FR_ONE_0] }, Rule { form: Form::Many, any: &[&G_FR_MANY_0] }];
 
 static R_PT_ONE_0_0: [(u32, u32); 1] = [(0, 1)];
@@ -33,37 +33,57 @@ static G_PT_ONE_0: [Cond; 1] = [Cond { m: 0, ne: false, r: &R_PT_ONE_0_0 }];
 static R_PT_MANY_0_0: [(u32, u32); 1] = [(0, 0)];
 static R_PT_MANY_0_1: [(u32, u32); 1] = [(0, 0)];
 static G_PT_MANY_0: [Cond; 2] = [Cond { m: 0, ne: true, r: &R_PT_MANY_0_0 }, Cond { m: 1000000, ne: false, r: &R_PT_MANY_0_1 }];
-// pt (CLDR pt): one, many, other; numbers group '.' decimal ',' min 1; region BR prefers H; am 'AM' pm 'PM'
+// pt (CLDR pt): one, many, other; numbers group '.' decimal ',' min 1 then 3; digits latn; region BR prefers H; am 'AM' pm 'PM'
 static P_PT: [Rule; 2] = [Rule { form: Form::One, any: &[&G_PT_ONE_0] }, Rule { form: Form::Many, any: &[&G_PT_MANY_0] }];
 
-// id (CLDR id): other; numbers group '.' decimal ',' min 1; region ID prefers H; am 'AM' pm 'PM'
+// id (CLDR id): other; numbers group '.' decimal ',' min 1 then 3; digits latn; region ID prefers H; am 'AM' pm 'PM'
 static P_ID: [Rule; 0] = [];
 
 static R_DE_ONE_0_0: [(u32, u32); 1] = [(1, 1)];
 static G_DE_ONE_0: [Cond; 1] = [Cond { m: 0, ne: false, r: &R_DE_ONE_0_0 }];
-// de (CLDR de): one, other; numbers group '.' decimal ',' min 1; region DE prefers H; am 'AM' pm 'PM'
+// de (CLDR de): one, other; numbers group '.' decimal ',' min 1 then 3; digits latn; region DE prefers H; am 'AM' pm 'PM'
 static P_DE: [Rule; 1] = [Rule { form: Form::One, any: &[&G_DE_ONE_0] }];
 
 static R_TR_ONE_0_0: [(u32, u32); 1] = [(1, 1)];
 static G_TR_ONE_0: [Cond; 1] = [Cond { m: 0, ne: false, r: &R_TR_ONE_0_0 }];
-// tr (CLDR tr): one, other; numbers group '.' decimal ',' min 1; region TR prefers H; am 'ÖÖ' pm 'ÖS'
+// tr (CLDR tr): one, other; numbers group '.' decimal ',' min 1 then 3; digits latn; region TR prefers H; am 'ÖÖ' pm 'ÖS'
 static P_TR: [Rule; 1] = [Rule { form: Form::One, any: &[&G_TR_ONE_0] }];
 
+static R_HI_ONE_0_0: [(u32, u32); 1] = [(0, 0)];
+static G_HI_ONE_0: [Cond; 1] = [Cond { m: 0, ne: false, r: &R_HI_ONE_0_0 }];
+static R_HI_ONE_1_0: [(u32, u32); 1] = [(1, 1)];
+static G_HI_ONE_1: [Cond; 1] = [Cond { m: 0, ne: false, r: &R_HI_ONE_1_0 }];
+// hi (CLDR hi): one, other; numbers group ',' decimal '.' min 1 then 2; digits latn; region IN prefers h; am 'am' pm 'pm'
+static P_HI: [Rule; 1] = [Rule { form: Form::One, any: &[&G_HI_ONE_0, &G_HI_ONE_1] }];
+
+static R_MR_ONE_0_0: [(u32, u32); 1] = [(1, 1)];
+static G_MR_ONE_0: [Cond; 1] = [Cond { m: 0, ne: false, r: &R_MR_ONE_0_0 }];
+// mr (CLDR mr): one, other; numbers group ',' decimal '.' min 1 then 2; digits native; region IN prefers h; am 'AM' pm 'PM'
+static P_MR: [Rule; 1] = [Rule { form: Form::One, any: &[&G_MR_ONE_0] }];
+
+static R_NE_ONE_0_0: [(u32, u32); 1] = [(1, 1)];
+static G_NE_ONE_0: [Cond; 1] = [Cond { m: 0, ne: false, r: &R_NE_ONE_0_0 }];
+// ne (CLDR ne): one, other; numbers group ',' decimal '.' min 1 then 2; digits native; region NP prefers H; am 'पूर्वाह्न' pm 'अपराह्न'
+static P_NE: [Rule; 1] = [Rule { form: Form::One, any: &[&G_NE_ONE_0] }];
+
 /// The locale data of each language, in the order of lang::LANGS.
-pub static LOCS: [Loc; 8] = [
-    Loc { code: "en", group: ",", decimal: ".", min_group: 1, h24: true, am: "am", pm: "pm", plural: &P_EN },
-    Loc { code: "tw", group: ",", decimal: ".", min_group: 1, h24: false, am: "AN", pm: "EW", plural: &P_TW },
-    Loc { code: "es", group: ".", decimal: ",", min_group: 2, h24: true, am: "a.\u{a0}m.", pm: "p.\u{a0}m.", plural: &P_ES },
-    Loc { code: "fr", group: "\u{a0}", decimal: ",", min_group: 1, h24: true, am: "AM", pm: "PM", plural: &P_FR },
-    Loc { code: "pt", group: ".", decimal: ",", min_group: 1, h24: true, am: "AM", pm: "PM", plural: &P_PT },
-    Loc { code: "id", group: ".", decimal: ",", min_group: 1, h24: true, am: "AM", pm: "PM", plural: &P_ID },
-    Loc { code: "de", group: ".", decimal: ",", min_group: 1, h24: true, am: "AM", pm: "PM", plural: &P_DE },
-    Loc { code: "tr", group: ".", decimal: ",", min_group: 1, h24: true, am: "\u{d6}\u{d6}", pm: "\u{d6}S", plural: &P_TR },
+pub static LOCS: [Loc; 11] = [
+    Loc { code: "en", group: ",", decimal: ".", min_group: 1, group2: 3, digits: &[], h24: true, am: "am", pm: "pm", plural: &P_EN },
+    Loc { code: "tw", group: ",", decimal: ".", min_group: 1, group2: 3, digits: &[], h24: false, am: "AN", pm: "EW", plural: &P_TW },
+    Loc { code: "es", group: ".", decimal: ",", min_group: 2, group2: 3, digits: &[], h24: true, am: "a.\u{a0}m.", pm: "p.\u{a0}m.", plural: &P_ES },
+    Loc { code: "fr", group: "\u{a0}", decimal: ",", min_group: 1, group2: 3, digits: &[], h24: true, am: "AM", pm: "PM", plural: &P_FR },
+    Loc { code: "pt", group: ".", decimal: ",", min_group: 1, group2: 3, digits: &[], h24: true, am: "AM", pm: "PM", plural: &P_PT },
+    Loc { code: "id", group: ".", decimal: ",", min_group: 1, group2: 3, digits: &[], h24: true, am: "AM", pm: "PM", plural: &P_ID },
+    Loc { code: "de", group: ".", decimal: ",", min_group: 1, group2: 3, digits: &[], h24: true, am: "AM", pm: "PM", plural: &P_DE },
+    Loc { code: "tr", group: ".", decimal: ",", min_group: 1, group2: 3, digits: &[], h24: true, am: "\u{d6}\u{d6}", pm: "\u{d6}S", plural: &P_TR },
+    Loc { code: "hi", group: ",", decimal: ".", min_group: 1, group2: 2, digits: &[], h24: false, am: "am", pm: "pm", plural: &P_HI },
+    Loc { code: "mr", group: ",", decimal: ".", min_group: 1, group2: 2, digits: &["\u{966}", "\u{967}", "\u{968}", "\u{969}", "\u{96a}", "\u{96b}", "\u{96c}", "\u{96d}", "\u{96e}", "\u{96f}"], h24: false, am: "AM", pm: "PM", plural: &P_MR },
+    Loc { code: "ne", group: ",", decimal: ".", min_group: 1, group2: 2, digits: &["\u{966}", "\u{967}", "\u{968}", "\u{969}", "\u{96a}", "\u{96b}", "\u{96c}", "\u{96d}", "\u{96e}", "\u{96f}"], h24: true, am: "\u{92a}\u{942}\u{930}\u{94d}\u{935}\u{93e}\u{939}\u{94d}\u{928}", pm: "\u{905}\u{92a}\u{930}\u{93e}\u{939}\u{94d}\u{928}", plural: &P_NE },
 ];
 
 /// CLDR's own @integer samples: (language index, n, the form CLDR gives it). The kernel's evaluator must agree
 /// on every one (`desk locale probe`, suite desk-locale).
-pub static SAMPLES: [(u8, u32, Form); 178] = [
+pub static SAMPLES: [(u8, u32, Form); 245] = [
     (0, 1, Form::One), (0, 0, Form::Other), (0, 2, Form::Other), (0, 3, Form::Other), (0, 4, Form::Other), (0, 5, Form::Other),
     (0, 6, Form::Other), (0, 7, Form::Other), (0, 8, Form::Other), (0, 9, Form::Other), (0, 10, Form::Other), (0, 11, Form::Other),
     (0, 12, Form::Other), (0, 13, Form::Other), (0, 14, Form::Other), (0, 15, Form::Other), (0, 16, Form::Other), (0, 100, Form::Other),
@@ -93,5 +113,16 @@ pub static SAMPLES: [(u8, u32, Form); 178] = [
     (7, 1, Form::One), (7, 0, Form::Other), (7, 2, Form::Other), (7, 3, Form::Other), (7, 4, Form::Other), (7, 5, Form::Other),
     (7, 6, Form::Other), (7, 7, Form::Other), (7, 8, Form::Other), (7, 9, Form::Other), (7, 10, Form::Other), (7, 11, Form::Other),
     (7, 12, Form::Other), (7, 13, Form::Other), (7, 14, Form::Other), (7, 15, Form::Other), (7, 16, Form::Other), (7, 100, Form::Other),
-    (7, 1000, Form::Other), (7, 10000, Form::Other), (7, 100000, Form::Other), (7, 1000000, Form::Other),
+    (7, 1000, Form::Other), (7, 10000, Form::Other), (7, 100000, Form::Other), (7, 1000000, Form::Other), (8, 0, Form::One), (8, 1, Form::One),
+    (8, 2, Form::Other), (8, 3, Form::Other), (8, 4, Form::Other), (8, 5, Form::Other), (8, 6, Form::Other), (8, 7, Form::Other),
+    (8, 8, Form::Other), (8, 9, Form::Other), (8, 10, Form::Other), (8, 11, Form::Other), (8, 12, Form::Other), (8, 13, Form::Other),
+    (8, 14, Form::Other), (8, 15, Form::Other), (8, 16, Form::Other), (8, 17, Form::Other), (8, 100, Form::Other), (8, 1000, Form::Other),
+    (8, 10000, Form::Other), (8, 100000, Form::Other), (8, 1000000, Form::Other), (9, 1, Form::One), (9, 0, Form::Other), (9, 2, Form::Other),
+    (9, 3, Form::Other), (9, 4, Form::Other), (9, 5, Form::Other), (9, 6, Form::Other), (9, 7, Form::Other), (9, 8, Form::Other),
+    (9, 9, Form::Other), (9, 10, Form::Other), (9, 11, Form::Other), (9, 12, Form::Other), (9, 13, Form::Other), (9, 14, Form::Other),
+    (9, 15, Form::Other), (9, 16, Form::Other), (9, 100, Form::Other), (9, 1000, Form::Other), (9, 10000, Form::Other), (9, 100000, Form::Other),
+    (9, 1000000, Form::Other), (10, 1, Form::One), (10, 0, Form::Other), (10, 2, Form::Other), (10, 3, Form::Other), (10, 4, Form::Other),
+    (10, 5, Form::Other), (10, 6, Form::Other), (10, 7, Form::Other), (10, 8, Form::Other), (10, 9, Form::Other), (10, 10, Form::Other),
+    (10, 11, Form::Other), (10, 12, Form::Other), (10, 13, Form::Other), (10, 14, Form::Other), (10, 15, Form::Other), (10, 16, Form::Other),
+    (10, 100, Form::Other), (10, 1000, Form::Other), (10, 10000, Form::Other), (10, 100000, Form::Other), (10, 1000000, Form::Other),
 ];

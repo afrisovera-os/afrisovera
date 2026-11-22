@@ -1,9 +1,13 @@
 //! The TPM's random number generator as a counted strong source (F3 step 3, ADR 0008 Decision 1a; plan
 //! PLAN_OS_MESH_F3_STEP3_TPM.md, architect's OK with conditions in ARCHITECT_REVIEWS 13 Nov evening).
 //!
-//! A TIS (FIFO) driver, locality 0 at 0xFED40000, for TPM 1.2 (ACPI TCPA) and TPM 2.0 (ACPI TPM2, start method 6).
-//! - No TPM table: no MMIO access at all. CRB (start methods 7 and 8, firmware TPMs) is reported, not driven.
-//! - Before anything is written: TPM_ACCESS must show tpmRegValidSts and DID_VID must be neither 0 nor all ones.
+//! Locality 0 at 0xFED40000: TIS (FIFO) for TPM 1.2 (ACPI TCPA) and TPM 2.0 (ACPI TPM2, start method 6), and CRB for
+//! TPM 2.0 (start method 7, firmware TPMs such as Intel PTT; tpm_crb.rs, architect's OK 14 Nov 2026).
+//! - No TPM table: no MMIO access at all. When a TPM2 table is listed, a TCPA table is never used as a fallback to
+//!   TIS, so TPM 1.2 commands never go to a TPM 2.0. Start methods 2 and 8 need ACPI's _DSM (AML): off, with the
+//!   number.
+//! - Before anything is written: TIS needs TPM_ACCESS with tpmRegValidSts and DID_VID neither 0 nor all ones; CRB
+//!   needs every check in `tpm_crb::check` (control area and buffers inside the page, INTF_ID says CRB).
 //! - One command at a time; every wait has a clock ceiling (the TSC), never a fixed sleep or an unbounded spin.
 //! - Command bytes and response parsing only through `tpm_wire` (the closed command list, bounded reads).
 //! - Startup only when the TPM answers "not started", once. Any other error leaves the TPM alone and off.
@@ -14,7 +18,9 @@
 //! path on the shell's core.
 #![allow(dead_code)]
 
-use crate::tpm_tis::{self as tis, Budget, Bus, Session, Slow};
+use crate::tpm_crb::{self as crb, CrbLink, CrbOff, Layout};
+use crate::tpm_rules::{self as rules, Budget, Bus, Session, Slow};
+use crate::tpm_tis::{self as tis, TisLink};
 use crate::tpm_wire::Ver;
 
 const BASE: u64 = 0xFED4_0000;
@@ -24,7 +30,8 @@ struct Mmio;
 
 impl Bus for Mmio {
     fn r8(&mut self, off: u64) -> u8 {
-        // SAFETY: only called after a TPM table said a TIS is here; the page is mapped 1:1 uncached (mmu.rs).
+        // SAFETY: only called after a TPM table said a TPM is here, with an offset inside the page (TIS: fixed
+        // registers; CRB: `tpm_crb::check` kept every offset inside it); the page is mapped 1:1 uncached (mmu.rs).
         unsafe { core::ptr::read_volatile((BASE + off) as *const u8) }
     }
     fn r32(&mut self, off: u64) -> u32 {
@@ -55,14 +62,30 @@ enum State {
     None,
     /// Counted: answering GetRandom.
     On,
-    /// Present but not used; the reason is in `OFF` (and `SLOW` when it missed the start-up ceiling).
+    /// Present but not used; the reason is in `OFF`.
     Off,
 }
 
+/// Which interface drives the TPM.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Iface {
+    Tis,
+    Crb(Layout),
+}
+
+/// Why the TPM is off, with the numbers a field report needs.
+#[derive(Clone, Copy)]
+enum Why {
+    Text(&'static str),
+    Slow(Slow),
+    Crb(CrbOff),
+    StartMethod(u32),
+}
+
 static mut STATE: State = State::Unprobed;
+static mut IFACE: Iface = Iface::Tis;
 static mut SESSION: Session = Session { ver: Ver::V20, started_by_us: false };
-static mut OFF: &str = "";
-static mut SLOW: Option<Slow> = None;
+static mut OFF: Why = Why::Text("");
 static mut DIDVID: u32 = 0;
 static mut CALL_US: u64 = 0;
 /// The start-up budget: bytes, TSC ticks and calls spent in GetRandom until STARTUP_SAMPLES have gone out.
@@ -73,7 +96,7 @@ fn st() -> State {
     unsafe { STATE }
 }
 
-fn off(why: &'static str) {
+fn off_why(why: Why) {
     // SAFETY: as above.
     unsafe {
         STATE = State::Off;
@@ -81,47 +104,126 @@ fn off(why: &'static str) {
     }
 }
 
-/// Boot: decide whether there is a TPM to count, and print one `[tpm]` line saying what was found.
-pub fn init() {
-    let t = crate::acpi::tpm_tables();
-    // SAFETY: single accessor, before any rng use of the TPM (STATE was Unprobed, so `fill` returned 0).
-    unsafe {
-        if t.tpm2.0 != 0 {
-            SESSION.ver = Ver::V20;
-            match t.tpm2_start {
-                6 => {}
-                7 | 8 => {
-                    off("CRB, not supported yet: only the TIS interface is driven");
-                    return line();
-                }
-                _ => {
-                    off("TPM2 table names a start method other than TIS");
-                    return line();
-                }
-            }
-        } else if t.tcpa.0 != 0 {
-            SESSION.ver = Ver::V12;
-        } else {
-            STATE = State::None;
-            return line();
-        }
+fn off(why: &'static str) {
+    off_why(Why::Text(why));
+}
+
+/// hwdb's hook for MSFT0101 (AcpiV::Asks; the architect's Q2 on the CRB plan, 14 Nov 2026: hwdb asks the owning
+/// driver, it holds no fixed answer). Driven when the TPM answers and is counted; off when this driver found it and
+/// left it off (`rng sources` gives the reason and the values); missing before the probe or with no TPM table.
+pub fn claim() -> crate::hwdb::Claim {
+    use crate::hwdb::Claim;
+    match st() {
+        State::On => Claim::Driven(match iface() {
+            Iface::Crb(_) => "tpm, CRB (its random numbers are a counted source)",
+            Iface::Tis => "tpm, TIS (its random numbers are a counted source)",
+        }),
+        State::Off => Claim::Off("tpm found it and left it off; rng sources gives the reason and the values"),
+        State::Unprobed | State::None => Claim::Missing,
     }
-    let mut b = Mmio;
-    // Condition 4: absent before anything is written.
+}
+
+fn iface() -> Iface {
+    // SAFETY: single accessor.
+    unsafe { IFACE }
+}
+
+fn session() -> &'static mut Session {
+    // SAFETY: single accessor (the rng path on the shell's core); no other reference to SESSION is live.
+    unsafe { &mut *core::ptr::addr_of_mut!(SESSION) }
+}
+
+fn request_locality(b: &mut Mmio) -> bool {
+    match iface() {
+        Iface::Tis => tis::request_locality(b),
+        Iface::Crb(_) => crb::request_locality(b),
+    }
+}
+
+fn release_locality(b: &mut Mmio) {
+    match iface() {
+        Iface::Tis => tis::release_locality(b),
+        Iface::Crb(_) => crb::release_locality(b),
+    }
+}
+
+/// The boot probe, through the interface's link (locality held by the caller).
+fn probe(b: &mut Mmio) -> Result<u64, &'static str> {
+    match iface() {
+        Iface::Tis => rules::probe(&mut TisLink(b), session()),
+        Iface::Crb(layout) => rules::probe(&mut CrbLink { bus: b, layout }, session()),
+    }
+}
+
+/// One batch, through the interface's link (locality held by the caller).
+fn fill_batch(b: &mut Mmio, buf: &mut [u8]) -> (usize, u64, bool) {
+    match iface() {
+        Iface::Tis => rules::fill_batch(&mut TisLink(b), session(), buf),
+        Iface::Crb(layout) => rules::fill_batch(&mut CrbLink { bus: b, layout }, session(), buf),
+    }
+}
+
+/// TIS, condition 4: absent before anything is written. True when the registers answer.
+fn tis_present(b: &mut Mmio) -> bool {
     let (acc, did) = (b.r8(tis::ACCESS), b.r32(tis::DID_VID));
     if acc & tis::ACCESS_VALID == 0 || did == 0 || did == u32::MAX {
         off("table but no TIS answer");
-        return line();
+        return false;
     }
     // SAFETY: single accessor.
     unsafe { DIDVID = did };
-    if !tis::request_locality(&mut b) {
+    true
+}
+
+/// Boot: decide whether there is a TPM to count, and print one `[tpm]` line saying what was found.
+pub fn init() {
+    let t = crate::acpi::tpm_tables();
+    let mut b = Mmio;
+    // A TPM2 table decides alone: TCPA is not a fallback when TPM2 is listed (the HP lists both for one PTT).
+    if t.tpm2.0 != 0 {
+        session().ver = Ver::V20;
+        match t.tpm2_start {
+            6 => {
+                if !tis_present(&mut b) {
+                    return line();
+                }
+            }
+            7 => match crb::check(&mut b, BASE, t.tpm2_ctrl) {
+                // SAFETY: single accessor.
+                Ok(layout) => unsafe {
+                    IFACE = Iface::Crb(layout);
+                    DIDVID = layout.vid_did;
+                },
+                Err(e) => {
+                    off_why(Why::Crb(e));
+                    return line();
+                }
+            },
+            2 | 8 => {
+                off_why(Why::StartMethod(t.tpm2_start));
+                return line();
+            }
+            _ => {
+                off("TPM2 table names a start method other than TIS");
+                return line();
+            }
+        }
+    } else if t.tcpa.0 != 0 {
+        session().ver = Ver::V12;
+        if !tis_present(&mut b) {
+            return line();
+        }
+    } else {
+        // SAFETY: single accessor.
+        unsafe { STATE = State::None };
+        return line();
+    }
+    if !request_locality(&mut b) {
         off("locality 0 was not granted");
         return line();
     }
-    // SAFETY: single accessor.
-    let r = tis::probe(&mut b, unsafe { &mut *core::ptr::addr_of_mut!(SESSION) });
-    tis::release_locality(&mut b);
+    let r = probe(&mut b);
+    release_locality(&mut b);
     match r {
         // SAFETY: single accessor.
         Ok(us) => unsafe {
@@ -140,24 +242,21 @@ pub fn fill(buf: &mut [u8]) -> usize {
         return 0;
     }
     let mut b = Mmio;
-    if !tis::request_locality(&mut b) {
+    if !request_locality(&mut b) {
         off("locality 0 was not granted");
         return 0;
     }
     let t0 = b.now();
-    // SAFETY: single accessor.
-    let (n, calls, stopped) = tis::fill_batch(&mut b, unsafe { &mut *core::ptr::addr_of_mut!(SESSION) }, buf);
+    let (n, calls, stopped) = fill_batch(&mut b, buf);
     if stopped {
         off("stopped answering GetRandom");
     }
-    tis::release_locality(&mut b);
+    release_locality(&mut b);
     let dt = b.now().wrapping_sub(t0);
     // SAFETY: single accessor.
     let budget = unsafe { &mut *core::ptr::addr_of_mut!(BUDGET) };
-    if let Err(slow) = budget.charge(n, dt, calls, b.hz(), crate::drbg::STARTUP_SAMPLES, tis::STARTUP_CEILING_MS) {
-        off("too slow");
-        // SAFETY: single accessor.
-        unsafe { SLOW = Some(slow) };
+    if let Err(slow) = budget.charge(n, dt, calls, b.hz(), crate::drbg::STARTUP_SAMPLES, rules::STARTUP_CEILING_MS) {
+        off_why(Why::Slow(slow));
         buf[..n].fill(0);
         return 0;
     }
@@ -178,22 +277,31 @@ fn ver_name() -> &'static str {
 
 fn summary(prefix: &str) {
     // SAFETY: single accessor; read-only here.
-    let (state, did, us, why, slow, started) = unsafe { (STATE, DIDVID, CALL_US, OFF, SLOW, SESSION.started_by_us) };
+    let (state, did, us, why, started) = unsafe { (STATE, DIDVID, CALL_US, OFF, SESSION.started_by_us) };
+    let via = match iface() {
+        Iface::Tis => "TIS",
+        Iface::Crb(_) => "CRB",
+    };
     match state {
         State::Unprobed => crate::kprintln!("{}not probed", prefix),
         State::None => crate::kprintln!("{}none (no TCPA or TPM2 table)", prefix),
         State::On => crate::kprintln!(
-            "{}TPM {} over TIS at 0x{:x}: vendor 0x{:04x} device 0x{:04x}, GetRandom ok (32 bytes in {} us){}",
-            prefix, ver_name(), BASE, did & 0xFFFF, did >> 16, us,
+            "{}TPM {} over {} at 0x{:x}: vendor 0x{:04x} device 0x{:04x}, GetRandom ok (32 bytes in {} us){}",
+            prefix, ver_name(), via, BASE, did & 0xFFFF, did >> 16, us,
             if started { ", started by us" } else { "" }
         ),
-        State::Off => match slow {
+        State::Off => match why {
             // Follow-up 4: the measured time, so a slow TPM on a real machine says how slow.
-            Some(s) => crate::kprintln!(
+            Why::Slow(s) => crate::kprintln!(
                 "{}off (too slow: the 1024-byte start-up test took {} ms over {} GetRandom calls, {} us per call; {}",
                 prefix, s.total_ms, s.calls, s.us_per_call, "the ceiling is 2000 ms, so it is not counted this boot)"
             ),
-            None => crate::kprintln!("{}off ({})", prefix, why),
+            Why::Crb(e) => crate::kprintln!("{}off ({})", prefix, e),
+            Why::StartMethod(m) => crate::kprintln!(
+                "{}off (TPM2 start method {} needs the ACPI start method (AML), not supported)",
+                prefix, m
+            ),
+            Why::Text(t) => crate::kprintln!("{}off ({})", prefix, t),
         },
     }
 }

@@ -16,6 +16,7 @@ Imports (module afri): putc (0), pollkey (1), sleep_ms (2), print (3), time (4),
 """
 import os
 import sys
+from permlist import permlist  # C2: a list for the apps that call more than print and putc
 
 
 def uleb(n):
@@ -104,5 +105,6 @@ if __name__ == '__main__':
     d = sys.argv[1]
     os.makedirs(d, exist_ok=True)
     for n, body in APPS.items():
-        open(os.path.join(d, n + '.wasm'), 'wb').write(module(body))
+        perms = {'pu1': ['putc', 'input', 'time'], 'pu7': ['putc', 'time', 'random', 'input']}.get(n, [])
+        open(os.path.join(d, n + '.wasm'), 'wb').write(module(body) + permlist(perms))
         print(n)

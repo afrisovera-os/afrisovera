@@ -59,6 +59,50 @@ pub mod frame {
         None
     }
 
+    /// `n` frames in a row whose first address is a multiple of `align` bytes (a power of two), zeroed: DMA
+    /// memory for a device that needs one contiguous buffer (the Wi-Fi driver's rings and upload buffer, W5).
+    /// None when no such run is free; the caller then fails cleanly. Given back with `free_run`.
+    #[allow(dead_code)] // the first caller is the Wi-Fi driver (pc/iwm.rs)
+    pub fn alloc_run(n: usize, align: usize) -> Option<usize> {
+        let (total, base) = (TOTAL.load(Ordering::Relaxed), BASE.load(Ordering::Relaxed));
+        if n == 0 || n > total || !align.is_power_of_two() {
+            return None;
+        }
+        // SAFETY: single core; the heap's own GROW_LOCK serialises its callers, and the Wi-Fi driver runs from the
+        // shell only.
+        unsafe {
+            let bm = &mut *core::ptr::addr_of_mut!(BITMAP);
+            let mut i = LOW.load(Ordering::Relaxed) * 64;
+            while i + n <= total {
+                let pa = base + i * FRAME_SIZE;
+                if pa % align != 0 {
+                    i += 1;
+                    continue;
+                }
+                match (i..i + n).find(|&j| bm[j / 64] & (1 << (j % 64)) != 0) {
+                    Some(j) => i = j + 1,
+                    None => {
+                        for j in i..i + n {
+                            bm[j / 64] |= 1 << (j % 64);
+                        }
+                        USED.fetch_add(n, Ordering::Relaxed);
+                        core::ptr::write_bytes(pa as *mut u8, 0, n * FRAME_SIZE);
+                        return Some(pa);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Give back a run from `alloc_run`.
+    #[allow(dead_code)]
+    pub fn free_run(pa: usize, n: usize) {
+        for k in 0..n {
+            free(pa + k * FRAME_SIZE);
+        }
+    }
+
     pub fn free(pa: usize) {
         let base = BASE.load(Ordering::Relaxed);
         if pa < base || pa >= end() || (pa - base) % FRAME_SIZE != 0 {

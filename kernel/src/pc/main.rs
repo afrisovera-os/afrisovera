@@ -171,9 +171,13 @@ mod conback;
 mod helpview;
 mod font_lower;
 mod acpi;
-mod tpm; // F3 step 3: the TPM's RNG as a counted source (TIS only)
+mod tpm; // F3 step 3: the TPM's RNG as a counted source (TIS, and CRB for start method 7)
 mod tpm_wire;
-mod tpm_tis; // the TIS protocol and its rules, generic over the bus (host-tested: drbg-host/tests/tpm_tis.rs)
+// G13: which CPU side channels this CPU is open to (pure; fuzz-host tests the parse)
+mod cpu_sidech;
+mod tpm_tis; // the TIS protocol, generic over the bus (host-tested: drbg-host/tests/tpm_tis.rs)
+mod tpm_rules; // the TPM rules over a Link (Startup once, the 1.2 flags, the start-up ceiling)
+mod tpm_crb; // TPM 2.0 over CRB (start method 7, firmware TPMs)
 mod gpt;
 mod bootent;
 mod update;
@@ -181,11 +185,19 @@ mod trial;
 mod esp;
 mod fwinfo;
 mod wifi;
+mod backlight; // the laptop screen's backlight PWM on Intel graphics, read only (14 Nov 2026)
+mod nmea; // sensors S1: NMEA 0183 sentences from a GPS receiver (pure; fuzz target nmea)
+mod gps; // sensors S1: a GPS on a USB serial cable, and the shell's `sensors` (the position on the screen only)
 // Our own Wi-Fi stack (WIFI_PLAN.md, architect 14 Nov 2026); PC only, so the ARM image does not change.
 #[path = "../wlan/mod.rs"]
 mod wlan;
 // Wi-Fi as the network card, and the `wifi scan|connect|status|disconnect` commands (W4b)
 mod wifinet;
+// the Intel Wireless 7265 / 3165: its firmware file, its words, its registers, and the driver to ALIVE (W5)
+mod iwm_fw;
+mod iwm_rx;
+mod iwm_reg;
+mod iwm;
 // the radio under it: the real one (W5: the Intel 7265), or the test image's pretend radio and access point. The one
 // place feature `wifi-sim` is named; suite pc-wifi-sim checks the normal image holds none of the test radio.
 #[cfg(not(feature = "wifi-sim"))]
@@ -595,6 +607,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     // The TSC's frequency, measured against the PIT now that the firmware no longer uses it;
     // the shell's clock (`uptime`, `sleep`, `bench`) counts from here.
     timer::init();
+    timer::report(); // the rate's source and the invariant-TSC line (call 79, CLOCK_PLAN 2)
     // SAFETY: boot mainline, one core (boot_step).
     unsafe { STEP_AT = timer::cycles() };
     // The frame pool lives inside the image (see mansa_pc_frame_pool), not in RAM the firmware
@@ -652,7 +665,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
     // F8: the firmware region under the stack is ours to scribble on only now (its page tables are retired).
     stackinfo::paint();
     if let (Some((b, len)), Some(s)) = (early_fb, &scr) {
-        if mmu::map_mmio(b, len) {
+        if mmu::map_mmio(b, len, "screen") {
             early_resume(s);
         }
     }
@@ -662,6 +675,7 @@ extern "efiapi" fn efi_main(image: uefi::Handle, st: *mut uefi::SystemTable) -> 
         kprintln!("[pc] no-execute: this CPU does not offer it (CPUID 8000_0001h EDX bit 20), ring-3 pages stay executable");
     }
     uaccess::init();
+    cpu::side_channel_line("[pc] ");
     // Proof the tables are the kernel's: touch pages nobody mapped. Each touch faults, the
     // #PF handler maps a fresh frame, the write runs again; then read every page back both
     // through its virtual address and through the frame's own 1:1 address.

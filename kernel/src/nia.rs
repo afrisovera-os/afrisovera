@@ -16,6 +16,10 @@ use core::cell::Cell;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+// The load-time validator (Nia speed step 2a). A submodule, so the kernels and fuzz-host all compile the one file.
+#[path = "nia_check.rs"]
+pub mod check;
+
 // Types and defined functions per module (16 each until claude/nia-a1a3, OS_REQUESTS item 10 A1). Module keeps
 // them in narrow element types (u8 type index, u32 code offset and length, u16 counts), each stored through a
 // checked conversion, so the Module frame grows by about 640 bytes, not 2.9 KB.
@@ -49,6 +53,19 @@ const CAP_AUDIO: u32 = 1 << 10; // host sound stream (N-A1a): bundled and manife
 /// What an app outside the integrity manifest gets (appget's sideloaded apps, architect's change B,
 /// claude/appget): no file, net, AI or voice. Manifest apps keep CAP_ALL.
 pub const CAP_SIDELOAD: u32 = CAP_PRINT | CAP_PUTC | CAP_DRAW | CAP_TIME | CAP_INPUT | CAP_RANDOM;
+/// What an unverified app with NO afri.permissions list gets (item 8, C2): print and putc only. An unverified
+/// app with a list still gets what it lists, within CAP_SIDELOAD.
+pub const CAP_V0: u32 = CAP_PRINT | CAP_PUTC;
+
+/// An app's kind, passed from the place that decided it (run_verified's integrity verdict) down to the grant, never
+/// guessed from its caps (the architect's C2 follow-up). Only an Unverified app with no list gets CAP_V0.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    /// the kernel's own bytes, or bytes matching the integrity manifest
+    Bundled,
+    /// a disk file or an appget install not in the manifest
+    Unverified,
+}
 const CAP_ALL: u32 = CAP_PRINT
     | CAP_PUTC
     | CAP_DRAW
@@ -94,6 +111,12 @@ const HOST_AUDIO_LEVEL: u8 = 25; // audio_level(id) -> frames still queued, -1 w
 const HOST_AUDIO_CLOSE: u8 = 26; // audio_close(id) -> 0 after the queue played out, -1 wrong id
 // file_list(buf, cap) -> bytes written, or -(bytes all names need) (A5, Andika's Open dialog): permission file.
 const HOST_FILE_LIST: u8 = 27;
+// A6, streamed files (permission file): read a file in pieces, and write one through a stream committed once.
+const HOST_FILE_SIZE: u8 = 28; // file_size(name, nlen) -> size, -1 no such file, -5 damaged
+const HOST_FILE_READ_AT: u8 = 29; // file_read_at(name, nlen, off, buf, cap) -> bytes copied
+const HOST_FILE_OPEN_WRITE: u8 = 30; // file_open_write(name, nlen) -> 1, the stream
+const HOST_FILE_APPEND: u8 = 31; // file_append(stream, ptr, len) -> the stream's total so far
+const HOST_FILE_COMMIT: u8 = 32; // file_commit(stream) -> bytes saved, or file_write's codes
 /// The most characters win_text_run draws: one row of the widest window (CW / 8); a longer run is cut, not refused.
 const TEXT_RUN_MAX: usize = 30;
 const HOST_UNKNOWN: u8 = 255;
@@ -1172,24 +1195,195 @@ fn host_file_write(nptr: i32, nlen: i32, dptr: i32, dlen: i32) -> Result<i32, &'
     }
     // SAFETY: single-threaded interpreter; d + want is inside WASM_MEM (mem_range).
     let bytes = unsafe { &(&*core::ptr::addr_of!(WASM_MEM))[d..d + want] };
+    Ok(save_file("file_write", name, bytes))
+}
+
+/// The one way an app's bytes become a file (file_write and A6's file_commit): write_full, then sync_file. The
+/// codes are file_write's: the bytes saved, -1 the VFS could not take it, -2 kept in memory but the disk save failed.
+fn save_file(call: &str, name: &str, bytes: &[u8]) -> i32 {
+    let want = bytes.len();
     if !crate::vfs::write_full(name, bytes) {
-        crate::kprintln!("    [wasm app] file_write('{}') -> failed", name);
-        return Ok(-1);
+        crate::kprintln!("    [wasm app] {}('{}') -> failed", call, name);
+        return -1;
     }
     if !crate::virtio::blk_present() {
-        crate::kprintln!("    [wasm app] file_write('{}', {} bytes) -> ok (no disk: kept in memory)", name, want);
-        return Ok(want as i32);
+        crate::kprintln!("    [wasm app] {}('{}', {} bytes) -> ok (no disk: kept in memory)", call, name, want);
+        return want as i32;
     }
     let hz = crate::timer::hz().max(1);
     let t0 = crate::timer::cycles();
     let saved = crate::vfs::sync_file(name);
     let us = crate::timer::cycles().wrapping_sub(t0) * 1_000_000 / hz;
     if saved {
-        crate::kprintln!("    [wasm app] file_write('{}', {} bytes) -> ok, on disk in {} us", name, want, us);
-        Ok(want as i32)
+        crate::kprintln!("    [wasm app] {}('{}', {} bytes) -> ok, on disk in {} us", call, name, want, us);
+        want as i32
     } else {
-        crate::kprintln!("    [wasm app] file_write('{}', {} bytes) -> in memory, the save to disk FAILED", name, want);
-        Ok(-2)
+        crate::kprintln!("    [wasm app] {}('{}', {} bytes) -> in memory, the save to disk FAILED", call, name, want);
+        -2
+    }
+}
+
+/// A6's one write stream: one Nia app runs at a time, so one stream system-wide (the architect, Q1). Its bytes wait
+/// in STAGE, never in the file, until the commit.
+struct Stream {
+    open: bool,
+    spoiled: bool,
+    name: [u8; 24],
+    nlen: usize,
+    len: usize,
+}
+static mut STREAM: Stream = Stream { open: false, spoiled: false, name: [0; 24], nlen: 0, len: 0 };
+/// The staging buffer (A6 Q1: .bss, 16 KiB, not a VFS slot).
+static mut STAGE: [u8; FILE_IO_MAX] = [0; FILE_IO_MAX];
+/// The stream's id: there is only one.
+const STREAM_ID: i32 = 1;
+
+fn stream_name() -> &'static str {
+    // SAFETY: single-threaded; the name was copied from a valid &str at open.
+    unsafe {
+        let st = &*core::ptr::addr_of!(STREAM);
+        core::str::from_utf8(&st.name[..st.nlen]).unwrap_or("?")
+    }
+}
+
+/// The run's end (a return, a TRAP, Ctrl+C or Close anyway alike): an open stream is dropped, with one line. Its bytes
+/// were never the file, so the old file stays as it was, in memory and on the disk.
+fn stream_app_ended() {
+    // SAFETY: single-threaded interpreter.
+    unsafe {
+        if (*core::ptr::addr_of_mut!(STREAM)).open {
+            crate::kprintln!("[nia] file stream for '{}' dropped: not committed; the old file is kept", stream_name());
+            (*core::ptr::addr_of_mut!(STREAM)).open = false;
+        }
+    }
+}
+
+/// file_size(name, nlen) (A6): the file's size, so an app can refuse a file before reading any of it. -1 no such
+/// file, -5 a damaged one (file_read's code).
+fn host_file_size(nptr: i32, nlen: i32) -> Result<i32, &'static str> {
+    let mut nb = [0u8; 32];
+    let name = read_name(nptr, nlen, &mut nb)?;
+    if crate::vfs::is_damaged(name) {
+        crate::kprintln!("    [wasm app] file_size('{}') -> damaged by a cut during a save", name);
+        return Ok(-5);
+    }
+    let r = crate::vfs::read_full(name).map_or(-1, |b| b.len() as i32);
+    crate::kprintln!("    [wasm app] file_size('{}') -> {}", name, r);
+    Ok(r)
+}
+
+/// file_read_at(name, nlen, off, buf, cap) (A6): the file's bytes from `off`, at most `cap`, as they are now. An
+/// offset at or past the end gives 0 bytes; a negative offset or cap is -3; -1 no such file; -5 damaged. The buffer
+/// goes through mem_range, so past the app's memory is a TRAP.
+fn host_file_read_at(nptr: i32, nlen: i32, off: i32, bptr: i32, cap: i32) -> Result<i32, &'static str> {
+    let mut nb = [0u8; 32];
+    let name = read_name(nptr, nlen, &mut nb)?;
+    if off < 0 || cap < 0 {
+        crate::kprintln!("    [wasm app] file_read_at('{}', {}, {}) -> refused: a negative offset or length", name, off, cap);
+        return Ok(-3);
+    }
+    if crate::vfs::is_damaged(name) {
+        crate::kprintln!("    [wasm app] file_read_at('{}') -> damaged by a cut during a save", name);
+        return Ok(-5);
+    }
+    let Some(bytes) = crate::vfs::read_full(name) else {
+        crate::kprintln!("    [wasm app] file_read_at('{}') -> not found", name);
+        return Ok(-1);
+    };
+    let off = off as usize;
+    let n = if off >= bytes.len() { 0 } else { (bytes.len() - off).min(cap as usize).min(FILE_IO_MAX) };
+    let b = mem_range(bptr, n)?;
+    for i in 0..n {
+        mem_write8(b + i, bytes[off + i]);
+    }
+    crate::kprintln!("    [wasm app] file_read_at('{}', {}) -> {} bytes", name, off, n);
+    Ok(n as i32)
+}
+
+/// file_open_write(name, nlen) (A6): start the stream. The name is fixed for the whole stream. -4 the system's file
+/// (the same rule as file_write); -1 a bad name, or no slot it could ever use. A second open drops the first stream,
+/// with a line (the architect's Q1).
+fn host_file_open_write(nptr: i32, nlen: i32) -> Result<i32, &'static str> {
+    let mut nb = [0u8; 32];
+    let name = read_name(nptr, nlen, &mut nb)?;
+    if is_system_file(name) {
+        crate::kprintln!("    [wasm app] file_open_write('{}') -> refused: the system's file", name);
+        return Ok(-4);
+    }
+    let exists = crate::vfs::read_full(name).is_some() || crate::vfs::is_damaged(name);
+    let free = (0..crate::vfs::MAX_FILES).any(|i| !crate::vfs::is_used(i));
+    if name.is_empty() || name.len() > 24 || !(exists || free) {
+        crate::kprintln!("    [wasm app] file_open_write('{}') -> refused: a bad name or no free file slot", name);
+        return Ok(-1);
+    }
+    // SAFETY: single-threaded interpreter.
+    unsafe {
+        if (*core::ptr::addr_of_mut!(STREAM)).open {
+            crate::kprintln!("[nia] file stream for '{}' dropped: a second file_open_write; the old file is kept", stream_name());
+        }
+        (&mut *core::ptr::addr_of_mut!(STREAM)).name[..name.len()].copy_from_slice(name.as_bytes());
+        (*core::ptr::addr_of_mut!(STREAM)).nlen = name.len();
+        (*core::ptr::addr_of_mut!(STREAM)).len = 0;
+        (*core::ptr::addr_of_mut!(STREAM)).spoiled = false;
+        (*core::ptr::addr_of_mut!(STREAM)).open = true;
+    }
+    crate::kprintln!("    [wasm app] file_open_write('{}') -> stream {}", name, STREAM_ID);
+    Ok(STREAM_ID)
+}
+
+/// file_append(stream, ptr, len) (A6): copy the bytes straight from the app's memory into STAGE. Past 16 KiB in all
+/// takes nothing and spoils the stream (-3 now, and from every later append and the commit); a negative len is -3;
+/// -1 a wrong or closed stream. Past the app's memory is a TRAP (mem_range).
+fn host_file_append(id: i32, ptr: i32, len: i32) -> Result<i32, &'static str> {
+    // SAFETY: single-threaded interpreter; STAGE writes stay below FILE_IO_MAX (checked first).
+    unsafe {
+        if id != STREAM_ID || !(*core::ptr::addr_of_mut!(STREAM)).open {
+            crate::kprintln!("    [wasm app] file_append({}) -> no such stream", id);
+            return Ok(-1);
+        }
+        if len < 0 || (*core::ptr::addr_of_mut!(STREAM)).spoiled {
+            crate::kprintln!("    [wasm app] file_append('{}') -> refused (the stream is spoiled or the length negative)", stream_name());
+            return Ok(-3);
+        }
+        let want = len as usize;
+        if (*core::ptr::addr_of_mut!(STREAM)).len + want > FILE_IO_MAX {
+            (*core::ptr::addr_of_mut!(STREAM)).spoiled = true;
+            crate::kprintln!(
+                "    [wasm app] file_append('{}', {} bytes) -> refused: past {} bytes; the stream is spoiled, nothing will be written",
+                stream_name(), want, FILE_IO_MAX
+            );
+            return Ok(-3);
+        }
+        let d = mem_range(ptr, want)?;
+        let src = &(&*core::ptr::addr_of!(WASM_MEM))[d..d + want];
+        (&mut *core::ptr::addr_of_mut!(STAGE))[(*core::ptr::addr_of_mut!(STREAM)).len..(*core::ptr::addr_of_mut!(STREAM)).len + want].copy_from_slice(src);
+        (*core::ptr::addr_of_mut!(STREAM)).len += want;
+        Ok((*core::ptr::addr_of_mut!(STREAM)).len as i32)
+    }
+}
+
+/// file_commit(stream) (A6): the only moment the file changes. It closes the stream, checks the name again (an install
+/// meanwhile may have made it the system's), then saves exactly as file_write does. -3 a spoiled stream (nothing
+/// written, the old file stays); -1 a wrong or closed stream.
+fn host_file_commit(id: i32) -> i32 {
+    // SAFETY: single-threaded interpreter; STAGE[..len] was filled by file_append.
+    unsafe {
+        if id != STREAM_ID || !(*core::ptr::addr_of_mut!(STREAM)).open {
+            crate::kprintln!("    [wasm app] file_commit({}) -> no such stream", id);
+            return -1;
+        }
+        (*core::ptr::addr_of_mut!(STREAM)).open = false;
+        let name = stream_name();
+        if (*core::ptr::addr_of_mut!(STREAM)).spoiled {
+            crate::kprintln!("    [wasm app] file_commit('{}') -> refused: the stream passed {} bytes; nothing written", name, FILE_IO_MAX);
+            return -3;
+        }
+        if is_system_file(name) {
+            crate::kprintln!("    [wasm app] file_commit('{}') -> refused: the system's file", name);
+            return -4;
+        }
+        let bytes = &(&*core::ptr::addr_of!(STAGE))[..(*core::ptr::addr_of_mut!(STREAM)).len];
+        save_file("file_commit", name, bytes)
     }
 }
 
@@ -2604,6 +2798,8 @@ struct Module<'a> {
     // The app's `afri.permissions` section (claude/nia-perms, OS_REQUESTS item 8 step B): whether it has one,
     // and the permissions it names. With a section, `caps` is narrowed to `caps & asked` after the parse.
     listed: bool,
+    /// the app's kind (C2's rule for an unlisted app)
+    kind: Kind,
     asked: u32,
     // WASM functions active now (Nia guard). A fresh Module per run_app, so it
     // starts at 0 for every app; `invoke` brings it back down on every way out.
@@ -2711,6 +2907,17 @@ pub fn hati_wasm() -> &'static [u8] {
     WASM_HATI
 }
 
+/// Hesabu, the spreadsheet (native apps engineer, nia-apps office step O4, H1, H1b and H2): a grid with formulas,
+/// CSV files of up to 8 KiB until A6, cut, copy, paste with references that move, sort, undo, column formats kept in
+/// `<name>.fmt` beside the sheet, and an HTML export (F10). Built by nia-apps tools/build.sh at main dd8c49b on
+/// nightly-2026-11-10 (-Cpanic=immediate-abort), on A2's files and A4's key codes; 39,426 bytes (under the architect's
+/// 48 KiB per bundled app), SHA-256 80bcc2db122d632fe9cb9a177cc78e3ccc6efc4cefd993489330641da655b110. Permissions
+/// draw and file.
+static WASM_HESABU: &[u8] = include_bytes!("hesabu.wasm");
+pub fn hesabu_wasm() -> &'static [u8] {
+    WASM_HESABU
+}
+
 /// filetest.wasm, A2's test app (scripts/lib/file-wasm.py): files up to 16 KiB, saves on the disk, a cut save.
 /// In test images only (feature test-apps); it writes only big.txt and cut.txt.
 // scripts/lib/file-wasm.py --rust (890 bytes)
@@ -2803,6 +3010,80 @@ static WASM_KEYTEST: [u8; 268] = [
 #[cfg(feature = "test-apps")]
 pub fn keytest_wasm() -> &'static [u8] {
     &WASM_KEYTEST
+}
+
+/// streamtest.wasm, A6's test app (scripts/lib/stream-wasm.py): files read in pieces and written through one stream
+/// committed once; the first key picks the mode (read the generator). Test images only.
+// scripts/lib/stream-wasm.py --rust (1006 bytes)
+#[cfg(feature = "test-apps")]
+static WASM_STREAMTEST: [u8; 1006] = [
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x35, 0x09, 0x60, 0x01, 0x7F, 0x00, 0x60,
+    0x00, 0x01, 0x7F, 0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, 0x60, 0x00, 0x00, 0x60, 0x03,
+    0x7F, 0x7F, 0x7F, 0x00, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, 0x60, 0x01, 0x7F, 0x01, 0x7F, 0x60,
+    0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, 0x60, 0x05, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, 0x02,
+    0x8F, 0x01, 0x08, 0x04, 0x61, 0x66, 0x72, 0x69, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x00, 0x00,
+    0x04, 0x61, 0x66, 0x72, 0x69, 0x06, 0x67, 0x65, 0x74, 0x6B, 0x65, 0x79, 0x00, 0x01, 0x04, 0x61,
+    0x66, 0x72, 0x69, 0x09, 0x66, 0x69, 0x6C, 0x65, 0x5F, 0x72, 0x65, 0x61, 0x64, 0x00, 0x02, 0x04,
+    0x61, 0x66, 0x72, 0x69, 0x09, 0x66, 0x69, 0x6C, 0x65, 0x5F, 0x73, 0x69, 0x7A, 0x65, 0x00, 0x05,
+    0x04, 0x61, 0x66, 0x72, 0x69, 0x0C, 0x66, 0x69, 0x6C, 0x65, 0x5F, 0x72, 0x65, 0x61, 0x64, 0x5F,
+    0x61, 0x74, 0x00, 0x08, 0x04, 0x61, 0x66, 0x72, 0x69, 0x0F, 0x66, 0x69, 0x6C, 0x65, 0x5F, 0x6F,
+    0x70, 0x65, 0x6E, 0x5F, 0x77, 0x72, 0x69, 0x74, 0x65, 0x00, 0x05, 0x04, 0x61, 0x66, 0x72, 0x69,
+    0x0B, 0x66, 0x69, 0x6C, 0x65, 0x5F, 0x61, 0x70, 0x70, 0x65, 0x6E, 0x64, 0x00, 0x07, 0x04, 0x61,
+    0x66, 0x72, 0x69, 0x0B, 0x66, 0x69, 0x6C, 0x65, 0x5F, 0x63, 0x6F, 0x6D, 0x6D, 0x69, 0x74, 0x00,
+    0x06, 0x03, 0x06, 0x05, 0x03, 0x04, 0x05, 0x06, 0x06, 0x05, 0x03, 0x01, 0x00, 0x01, 0x07, 0x07,
+    0x01, 0x03, 0x72, 0x75, 0x6E, 0x00, 0x08, 0x0A, 0xF2, 0x04, 0x05, 0x92, 0x03, 0x01, 0x01, 0x7F,
+    0x10, 0x01, 0x21, 0x00, 0x20, 0x00, 0x41, 0xF7, 0x00, 0x46, 0x04, 0x40, 0x41, 0x80, 0x20, 0x41,
+    0x80, 0x80, 0x01, 0x41, 0x01, 0x10, 0x09, 0x41, 0x00, 0x41, 0x05, 0x10, 0x05, 0x10, 0x00, 0x41,
+    0x80, 0x20, 0x10, 0x0B, 0x10, 0x00, 0x41, 0x01, 0x10, 0x07, 0x10, 0x00, 0x41, 0x00, 0x41, 0x05,
+    0x10, 0x03, 0x10, 0x00, 0x41, 0x80, 0xC0, 0x01, 0x10, 0x0C, 0x10, 0x00, 0x41, 0x80, 0xC0, 0x01,
+    0x41, 0x80, 0x80, 0x01, 0x10, 0x0A, 0x10, 0x00, 0x41, 0x00, 0x41, 0x05, 0x41, 0x80, 0x80, 0x01,
+    0x41, 0x80, 0xC0, 0x01, 0x41, 0xE4, 0x00, 0x10, 0x04, 0x10, 0x00, 0x41, 0x00, 0x41, 0x05, 0x41,
+    0x7F, 0x41, 0x80, 0xC0, 0x01, 0x41, 0x0A, 0x10, 0x04, 0x10, 0x00, 0x0F, 0x0B, 0x20, 0x00, 0x41,
+    0xF8, 0x00, 0x46, 0x04, 0x40, 0x41, 0x80, 0x20, 0x41, 0x80, 0x80, 0x01, 0x41, 0x02, 0x10, 0x09,
+    0x41, 0x00, 0x41, 0x05, 0x10, 0x05, 0x10, 0x00, 0x41, 0x80, 0x20, 0x10, 0x0B, 0x10, 0x00, 0x41,
+    0x01, 0x41, 0x80, 0x20, 0x41, 0x01, 0x10, 0x06, 0x10, 0x00, 0x41, 0x01, 0x10, 0x07, 0x10, 0x00,
+    0x41, 0x00, 0x41, 0x05, 0x41, 0x80, 0xC0, 0x01, 0x41, 0x80, 0x80, 0x01, 0x10, 0x02, 0x10, 0x00,
+    0x41, 0x80, 0xC0, 0x01, 0x41, 0x80, 0x80, 0x01, 0x10, 0x0A, 0x10, 0x00, 0x0F, 0x0B, 0x20, 0x00,
+    0x41, 0xE3, 0x00, 0x46, 0x04, 0x40, 0x41, 0x80, 0x20, 0x41, 0x80, 0x08, 0x41, 0x02, 0x10, 0x09,
+    0x41, 0x00, 0x41, 0x05, 0x10, 0x05, 0x10, 0x00, 0x41, 0x01, 0x41, 0x80, 0x20, 0x41, 0x80, 0x08,
+    0x10, 0x06, 0x10, 0x00, 0x03, 0x40, 0x10, 0x01, 0x1A, 0x0C, 0x00, 0x0B, 0x0F, 0x0B, 0x20, 0x00,
+    0x41, 0xF2, 0x00, 0x46, 0x04, 0x40, 0x41, 0x00, 0x41, 0x05, 0x10, 0x03, 0x10, 0x00, 0x41, 0x00,
+    0x41, 0x05, 0x41, 0x80, 0xC0, 0x01, 0x41, 0x80, 0x80, 0x01, 0x10, 0x02, 0x10, 0x00, 0x41, 0x80,
+    0xC0, 0x01, 0x41, 0x80, 0x80, 0x01, 0x10, 0x0A, 0x10, 0x00, 0x0F, 0x0B, 0x20, 0x00, 0x41, 0xE4,
+    0x00, 0x46, 0x04, 0x40, 0x41, 0x10, 0x41, 0x05, 0x10, 0x05, 0x10, 0x00, 0x41, 0x01, 0x41, 0x80,
+    0x20, 0x41, 0x0A, 0x10, 0x06, 0x10, 0x00, 0x41, 0x20, 0x41, 0x05, 0x10, 0x05, 0x10, 0x00, 0x41,
+    0x01, 0x41, 0x80, 0x20, 0x41, 0x05, 0x10, 0x06, 0x10, 0x00, 0x41, 0x01, 0x10, 0x07, 0x10, 0x00,
+    0x41, 0x10, 0x41, 0x05, 0x10, 0x03, 0x10, 0x00, 0x41, 0x20, 0x41, 0x05, 0x10, 0x03, 0x10, 0x00,
+    0x0F, 0x0B, 0x20, 0x00, 0x41, 0xF3, 0x00, 0x46, 0x04, 0x40, 0x41, 0x30, 0x41, 0x0F, 0x10, 0x05,
+    0x10, 0x00, 0x41, 0xD0, 0x00, 0x41, 0x0A, 0x10, 0x05, 0x10, 0x00, 0x41, 0x01, 0x41, 0x80, 0x20,
+    0x41, 0x01, 0x10, 0x06, 0x10, 0x00, 0x41, 0x01, 0x10, 0x07, 0x10, 0x00, 0x0F, 0x0B, 0x0B, 0x32,
+    0x01, 0x01, 0x7F, 0x41, 0x00, 0x21, 0x03, 0x02, 0x40, 0x03, 0x40, 0x20, 0x03, 0x20, 0x01, 0x4F,
+    0x0D, 0x01, 0x20, 0x00, 0x20, 0x03, 0x6A, 0x20, 0x03, 0x41, 0x07, 0x6C, 0x20, 0x02, 0x6A, 0x41,
+    0xFF, 0x01, 0x71, 0x3A, 0x00, 0x00, 0x20, 0x03, 0x41, 0x01, 0x6A, 0x21, 0x03, 0x0C, 0x00, 0x0B,
+    0x0B, 0x0B, 0x34, 0x01, 0x02, 0x7F, 0x41, 0x00, 0x21, 0x02, 0x41, 0x00, 0x21, 0x03, 0x02, 0x40,
+    0x03, 0x40, 0x20, 0x02, 0x20, 0x01, 0x4F, 0x0D, 0x01, 0x20, 0x03, 0x41, 0x1F, 0x6C, 0x20, 0x00,
+    0x20, 0x02, 0x6A, 0x2D, 0x00, 0x00, 0x6A, 0x21, 0x03, 0x20, 0x02, 0x41, 0x01, 0x6A, 0x21, 0x02,
+    0x0C, 0x00, 0x0B, 0x0B, 0x20, 0x03, 0x0B, 0x32, 0x01, 0x02, 0x7F, 0x41, 0x00, 0x21, 0x01, 0x02,
+    0x40, 0x03, 0x40, 0x20, 0x01, 0x41, 0x10, 0x4F, 0x0D, 0x01, 0x41, 0x01, 0x20, 0x00, 0x20, 0x01,
+    0x41, 0x80, 0x08, 0x6C, 0x6A, 0x41, 0x80, 0x08, 0x10, 0x06, 0x21, 0x02, 0x20, 0x01, 0x41, 0x01,
+    0x6A, 0x21, 0x01, 0x0C, 0x00, 0x0B, 0x0B, 0x20, 0x02, 0x0B, 0x41, 0x01, 0x02, 0x7F, 0x41, 0x00,
+    0x21, 0x01, 0x41, 0x00, 0x21, 0x02, 0x02, 0x40, 0x03, 0x40, 0x20, 0x01, 0x41, 0x10, 0x4F, 0x0D,
+    0x01, 0x20, 0x02, 0x41, 0x00, 0x41, 0x05, 0x20, 0x01, 0x41, 0x80, 0x08, 0x6C, 0x20, 0x00, 0x20,
+    0x01, 0x41, 0x80, 0x08, 0x6C, 0x6A, 0x41, 0x80, 0x08, 0x10, 0x04, 0x6A, 0x21, 0x02, 0x20, 0x01,
+    0x41, 0x01, 0x6A, 0x21, 0x01, 0x0C, 0x00, 0x0B, 0x0B, 0x20, 0x02, 0x0B, 0x0B, 0x66, 0x01, 0x00,
+    0x41, 0x00, 0x0B, 0x60, 0x73, 0x2E, 0x74, 0x78, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x61, 0x2E, 0x74, 0x78, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x62, 0x2E, 0x74, 0x78, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x61, 0x66, 0x72, 0x69, 0x73, 0x6F, 0x76, 0x65, 0x72, 0x61, 0x2E, 0x63,
+    0x6F, 0x6E, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x68, 0x65, 0x6C, 0x6C, 0x6F, 0x2E, 0x77, 0x61, 0x73, 0x6D, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x10, 0x61, 0x66, 0x72, 0x69, 0x2E, 0x70, 0x65, 0x72, 0x6D,
+    0x69, 0x73, 0x73, 0x69, 0x6F, 0x6E, 0x73, 0x04, 0x05, 0x70, 0x72, 0x69, 0x6E, 0x74, 0x04, 0x70,
+    0x75, 0x74, 0x63, 0x05, 0x69, 0x6E, 0x70, 0x75, 0x74, 0x04, 0x66, 0x69, 0x6C, 0x65,
+];
+#[cfg(feature = "test-apps")]
+pub fn streamtest_wasm() -> &'static [u8] {
+    &WASM_STREAMTEST
 }
 
 /// tone.wasm, the sound demo and N-A1a's test app (scripts/lib/audio-wasm.py): square waves through the sound
@@ -2978,13 +3259,33 @@ static WASM_BENCH_B2: [u8; 123] = [
 // a kernel-side decoder (ARCHITECT_REVIEWS 14 Nov, "Ngoma media player plan", Q3).
 static NGOMA_BENCH_QOA: &[u8] = include_bytes!("bench/ngoma-bench-qoa.wasm");
 static NGOMA_BENCH_DRUMS: &[u8] = include_bytes!("bench/ngoma-bench-drums.wasm");
+// Hesabu, the spreadsheet (nia-apps branch hesabu-speed at 80bc20a, built by the core apps engineer; the
+// architect's OK of 21 Nov). Two sheets, four apps each, that stop at a different point of the same run, so the
+// edit's cost splits into parts. chain: a 1,024-cell sheet where each cell is the next one plus 1 (1,023
+// formulas), the last cell set. fanout: A1 with 100 dependents among 900 numbers, A1 set. loadonly builds and
+// loads; part1 also walks the edit, finding and compiling each formula; part2 also checks each formula's
+// references; full also evaluates. Prints: chain -1947082752, -1947071729 (part1 and part2), -1947072752; fanout
+// -1826739384, 1567011484 (part1 and part2), -710521864. Bars (ARCHITECT_REVIEWS 14 Nov, Hesabu H0): the edit
+// (full minus load only) 100 ms for chain and 16 ms for fanout; the load 1 s. Each imports only afri.print.
+static HESABU_CHAIN: [&[u8]; 4] = [
+    include_bytes!("bench/hesabu-bench-chain-loadonly.wasm"),
+    include_bytes!("bench/hesabu-bench-chain-part1.wasm"),
+    include_bytes!("bench/hesabu-bench-chain-part2.wasm"),
+    include_bytes!("bench/hesabu-bench-chain.wasm"),
+];
+static HESABU_FANOUT: [&[u8]; 4] = [
+    include_bytes!("bench/hesabu-bench-fanout-loadonly.wasm"),
+    include_bytes!("bench/hesabu-bench-fanout-part1.wasm"),
+    include_bytes!("bench/hesabu-bench-fanout-part2.wasm"),
+    include_bytes!("bench/hesabu-bench-fanout.wasm"),
+];
 
 /// One timed run of `run` in `bytes`, nothing printed by the runtime itself (only the app's own print).
 /// Returns the time in microseconds, or the TRAP or parse error.
 fn bench_once(bytes: &[u8]) -> Result<u64, &'static str> {
     putc_reset();
     keyq_reset();
-    let m = parse(bytes, CAP_PRINT)?;
+    let m = parse(bytes, CAP_PRINT, Kind::Bundled)?;
     let mut st = Stack::new();
     let f = crate::timer::hz();
     let t0 = crate::timer::cycles();
@@ -3045,6 +3346,63 @@ pub fn bench() {
                 name, us, us / 10_000, if us < 1_000_000 { "keeps up" } else { "too slow" }
             ),
             Err(e) => crate::kprintln!("[bench] {}: TRAP: {}", name, e),
+        }
+    }
+    // Hesabu: each app once, the new way (eight apps best of three ran past the registry's 300 s suite limit on the
+    // debug kernel; fuzz-host's host-CPU test keeps best of three). The parts are differences of the stopping points:
+    // find and compile = part1 - load, check = part2 - part1, evaluate = full - part2; edit = full - load.
+    let hesabu: [(&str, &[&[u8]; 4], u64, u64); 2] = [
+        ("hesabu chain 1,024 cells", &HESABU_CHAIN, 1023, 100_000),
+        ("hesabu fanout A1 with 100 dependents", &HESABU_FANOUT, 100, 16_000),
+    ];
+    for (name, apps, formulas, bar) in hesabu {
+        let mut t = [0u64; 4];
+        let mut trap = None;
+        for (k, bytes) in apps.iter().enumerate() {
+            match bench_once(bytes) {
+                Ok(us) => t[k] = us,
+                Err(e) => {
+                    trap = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = trap {
+            crate::kprintln!("[bench] {}: TRAP: {}", name, e);
+            continue;
+        }
+        let [load, p1, p2, full] = t;
+        let (find, check, eval, edit) =
+            (p1.saturating_sub(load), p2.saturating_sub(p1), full.saturating_sub(p2), full.saturating_sub(load));
+        crate::kprintln!(
+            "[bench] {}: load only {} us, part1 {} us, part2 {} us, full {} us",
+            name, load, p1, p2, full
+        );
+        crate::kprintln!(
+            "[bench] {}: find and compile {} us, check {} us, evaluate {} us; per formula {}, {}, {} us",
+            name, find, check, eval, find / formulas, check / formulas, eval / formulas
+        );
+        crate::kprintln!(
+            "[bench] {}: edit {} us, bar {} us, {}; load bar 1000000 us, {}",
+            name, edit, bar,
+            if edit < bar { "under the bar" } else { "over the bar" },
+            if load < 1_000_000 { "under" } else { "over" }
+        );
+    }
+    // The validator's cost and verdict on the two big bundled apps (step 2a records Andika's load time).
+    let big: [(&str, &[u8]); 2] = [("andika", WASM_ANDIKA), ("ngoma", WASM_NGOMA)];
+    for (name, bytes) in big {
+        let f = crate::timer::hz();
+        let t0 = crate::timer::cycles();
+        let v = check::validate(bytes);
+        let t1 = crate::timer::cycles();
+        let us = if f > 0 { t1.wrapping_sub(t0).saturating_mul(1_000_000) / f } else { 0 };
+        match v {
+            Ok(r) => crate::kprintln!(
+                "[bench] check {} ({} bytes): {} us, ok: {} functions, {} side entries (most in one {}), largest height {}, most locals {}, largest frame {}",
+                name, bytes.len(), us, r.funcs, r.side_entries, r.side_entries_max_fn, r.max_height, r.max_locals, r.max_frame
+            ),
+            Err(e) => crate::kprintln!("[bench] check {} ({} bytes): {} us, refused: {}", name, bytes.len(), us, e),
         }
     }
     crate::kprintln!("[bench] done");
@@ -3703,17 +4061,22 @@ macro_rules! bundled_list {
             ("rand.wasm", rand_wasm),
             ("andika.wasm", andika_wasm),
             ("ngoma.wasm", ngoma_wasm),
-            ("hati.wasm", hati_wasm)
+            ("hati.wasm", hati_wasm),
+            ("hesabu.wasm", hesabu_wasm)
             $(, $extra)*
         ]
     };
 }
 #[cfg(not(feature = "test-apps"))]
-pub const BUNDLED: [(&str, fn() -> &'static [u8]); 15] = bundled_list!();
-/// Test images (feature test-apps) add tone.wasm (N-A1a), filetest.wasm (A2) and keytest.wasm (A4).
+pub const BUNDLED: [(&str, fn() -> &'static [u8]); 16] = bundled_list!();
+/// Test images (feature test-apps) add tone.wasm (N-A1a), filetest.wasm (A2), keytest.wasm (A4) and streamtest.wasm (A6).
 #[cfg(feature = "test-apps")]
-pub const BUNDLED: [(&str, fn() -> &'static [u8]); 18] =
-    bundled_list!(("tone.wasm", tone_wasm), ("filetest.wasm", filetest_wasm), ("keytest.wasm", keytest_wasm));
+pub const BUNDLED: [(&str, fn() -> &'static [u8]); 20] = bundled_list!(
+    ("tone.wasm", tone_wasm),
+    ("filetest.wasm", filetest_wasm),
+    ("keytest.wasm", keytest_wasm),
+    ("streamtest.wasm", streamtest_wasm)
+);
 
 /// A bundled app's compiled-in bytes (A7): what `nia NAME` runs for a bundled name.
 pub fn bundled(name: &str) -> Option<&'static [u8]> {
@@ -3940,6 +4303,7 @@ fn host_cap(host: u8) -> (u32, &'static str) {
         HOST_WIN_CREATE | HOST_WIN_FILL | HOST_WIN_PRESENT | HOST_WIN_TEXT | HOST_WIN_TEXT_RUN => (CAP_DRAW, "draw"),
         HOST_CELL_OPEN | HOST_CELL_PUT | HOST_CELL_CURSOR | HOST_CELL_SIZE | HOST_CELL_EVENT => (CAP_DRAW, "draw"),
         HOST_FILE_WRITE | HOST_FILE_READ | HOST_FILE_LIST => (CAP_FILE, "file"),
+        HOST_FILE_SIZE | HOST_FILE_READ_AT | HOST_FILE_OPEN_WRITE | HOST_FILE_APPEND | HOST_FILE_COMMIT => (CAP_FILE, "file"),
         HOST_TIME | HOST_SLEEP => (CAP_TIME, "time"),
         HOST_GETKEY | HOST_POLLKEY => (CAP_INPUT, "input"),
         HOST_AI => (CAP_AI, "AI"),
@@ -3985,7 +4349,7 @@ pub fn check_module(bytes: &[u8]) -> Result<(u32, Option<u32>), &'static str> {
     if bytes.len() < 8 {
         return Err("too small to be a WASM module");
     }
-    let m = parse(bytes, CAP_ALL)?;
+    let m = parse(bytes, CAP_ALL, Kind::Bundled)?;
     let mut need = 0u32;
     for i in 0..m.import_count.min(MAX_IMPORTS) {
         need |= host_cap(m.import_host[i]).0;
@@ -4009,23 +4373,25 @@ fn run_app_in(label: &str, bytes: &[u8], caps: u32, from_file: bool, signed: boo
     APP_RUNNING.store(true, Ordering::Relaxed);
     set_app_name(label);
     set_app_signed(signed);
-    run_app_body(label, bytes, caps, from_file);
+    run_app_body(label, bytes, caps, from_file, if signed { Kind::Bundled } else { Kind::Unverified });
     set_app_signed(false);
     APP_RUNNING.store(false, Ordering::Relaxed);
 }
 
-fn run_app_body(label: &str, bytes: &[u8], caps: u32, from_file: bool) {
+fn run_app_body(label: &str, bytes: &[u8], caps: u32, from_file: bool, kind: Kind) {
     crate::kprintln!();
     crate::kprintln!("[nia] === {} ===", label);
     crate::kprintln!("[nia] loading module ({} bytes), granted caps = {:#04x}", bytes.len(), caps);
     putc_reset();
     keyq_reset(); // N1: one app's keys never reach the next
-    match parse(bytes, caps) {
+    match parse(bytes, caps, kind) {
         Ok(m) => {
             if m.listed {
                 print_caps("[nia] permissions asked: ", m.asked, "none");
                 print_caps("[nia] permissions granted: ", m.caps, "none");
                 print_caps("[nia] permissions withheld: ", m.asked & !m.caps, "nothing");
+            } else if from_file && kind == Kind::Unverified {
+                crate::kprintln!("[nia] permissions: none listed; print and putc only (v0)");
             } else if from_file {
                 crate::kprintln!("[nia] permissions: none listed; granted by kind (v0)");
             }
@@ -4035,6 +4401,7 @@ fn run_app_body(label: &str, bytes: &[u8], caps: u32, from_file: bool) {
             // The sound stream closes on every way out (N-A1a): a clean return plays out what is queued, anything
             // else drops it at once.
             audio_app_ended(if r.is_ok() { "the app returned" } else { "the app stopped" }, r.is_ok());
+            stream_app_ended(); // A6: an uncommitted write stream is dropped; the old file stays
             crate::desk::cell_app_ended(); // its cell window closes, on the clean return and on the TRAP alike
             finish_putc(); // the app's last putc line ends before the run's own line, whichever way it ended
             match r {
@@ -4046,7 +4413,7 @@ fn run_app_body(label: &str, bytes: &[u8], caps: u32, from_file: bool) {
     }
 }
 
-fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
+fn parse(m: &[u8], caps: u32, app_kind: Kind) -> Result<Module<'_>, &'static str> {
     if m.len() < 8 || &m[0..4] != b"\0asm" || &m[4..8] != &[1, 0, 0, 0] {
         return Err("not a WASM v1 module");
     }
@@ -4061,6 +4428,11 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
         }
     }
     memo_reset(); // no block-end memo from an earlier app (claude/nia-fast)
+    // Nia speed step 2a, report only: the validator's verdict is printed and nothing is refused yet. It refuses
+    // once it has been fuzzed against wasmparser, in the same round as nia.py's check (NIA_STEP2_PLAN.md).
+    if let Err(f) = check::validate(m) {
+        crate::kprintln!("[nia] check (report only): {}", f);
+    }
     let mut md = Module {
         bytes: m,
         types: [(0, 0); MAX_TYPES],
@@ -4075,6 +4447,7 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
         run_index: usize::MAX,
         caps,
         listed: false,
+        kind: app_kind,
         asked: 0,
         depth: Cell::new(0),
     };
@@ -4207,6 +4580,11 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
                                 b"audio_level" => HOST_AUDIO_LEVEL,
                                 b"audio_close" => HOST_AUDIO_CLOSE,
                                 b"file_list" => HOST_FILE_LIST,
+                                b"file_size" => HOST_FILE_SIZE,
+                                b"file_read_at" => HOST_FILE_READ_AT,
+                                b"file_open_write" => HOST_FILE_OPEN_WRITE,
+                                b"file_append" => HOST_FILE_APPEND,
+                                b"file_commit" => HOST_FILE_COMMIT,
                                 _ => HOST_UNKNOWN,
                             };
                             md.import_type[md.import_count] = desc; // type index
@@ -4364,6 +4742,10 @@ fn parse(m: &[u8], caps: u32) -> Result<Module<'_>, &'static str> {
     // never widen: what an app gets is always within what its kind allows (`caps`).
     if md.listed {
         md.caps = caps & md.asked;
+    } else if app_kind == Kind::Unverified {
+        // C2: an unverified app with no list of its own gets print and putc only (within its kind's caps).
+        // NIA_APP_ABI.md has the dated line.
+        md.caps = caps & CAP_V0;
     }
     Ok(md)
 }
@@ -4432,11 +4814,19 @@ impl<'a> Module<'a> {
             HOST_AUDIO_LEVEL => (CAP_AUDIO, "audio_level"),
             HOST_AUDIO_CLOSE => (CAP_AUDIO, "audio_close"),
             HOST_FILE_LIST => (CAP_FILE, "file_list"),
+            HOST_FILE_SIZE => (CAP_FILE, "file_size"),
+            HOST_FILE_READ_AT => (CAP_FILE, "file_read_at"),
+            HOST_FILE_OPEN_WRITE => (CAP_FILE, "file_open_write"),
+            HOST_FILE_APPEND => (CAP_FILE, "file_append"),
+            HOST_FILE_COMMIT => (CAP_FILE, "file_commit"),
             _ => (0xFFFF_FFFF, "unknown"),
         };
         if host == HOST_UNKNOWN || (self.caps & req) == 0 {
             putc_break();
             crate::kprintln!("    [nia] DENIED: app called host '{}' without the capability", name);
+            if !self.listed && self.kind == Kind::Unverified {
+                crate::kprintln!("    [nia] permissions: an app with no list gets print and putc only (see NIA_APP_ABI.md)");
+            }
             return Err("capability denied");
         }
 
@@ -4454,6 +4844,11 @@ impl<'a> Module<'a> {
                 result = Some(host_file_write(a[0], a[1], a[2], a[3])?);
             }
             HOST_FILE_LIST => result = Some(host_file_list(a[0], a[1])?),
+            HOST_FILE_SIZE => result = Some(host_file_size(a[0], a[1])?),
+            HOST_FILE_READ_AT => result = Some(host_file_read_at(a[0], a[1], a[2], a[3], a[4])?),
+            HOST_FILE_OPEN_WRITE => result = Some(host_file_open_write(a[0], a[1])?),
+            HOST_FILE_APPEND => result = Some(host_file_append(a[0], a[1], a[2])?),
+            HOST_FILE_COMMIT => result = Some(host_file_commit(a[0])),
             HOST_FILE_READ => {
                 result = Some(host_file_read(a[0], a[1], a[2], a[3])?);
             }

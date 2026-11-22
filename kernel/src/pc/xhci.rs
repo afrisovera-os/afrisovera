@@ -1198,7 +1198,7 @@ fn pci_find(parts: &'static [crate::hwdb::Part]) -> ([(u8, u8, u8, u32); 4], usi
 /// BAR0 of the controller at b:d.f, mapped, with memory decoding on; None if it has none.
 fn bar0(b: u8, d: u8, f: u8) -> Option<u64> {
     let bar = pci::bar_mem(b, d, f, 0);
-    if bar == 0 || !mmu::map_mmio(bar, 0x10000) {
+    if bar == 0 || !mmu::map_mmio(bar, 0x10000, "usb-host (xhci)") {
         return None;
     }
     pci::enable(b, d, f, 0x406); // memory decoding + bus mastering, INTx off (polled)
@@ -5091,6 +5091,7 @@ unsafe fn serial_setup(d: usize, port: u32, speed: u32, vid: u16, pid: u16) -> b
     SER_MPSI = mpsi.clamp(8, 512);
     (SER_TX, SER_RX, SER_DROP, SER_ERR, SER_INFLIGHT) = (0, 0, 0, 0, false);
     SER_QH.store(SER_QT.load(Ordering::Acquire), Ordering::Release); // nothing older than the cable
+    crate::gps::reset(); // a console until its bytes show it is a GPS (gps.rs)
     ser_queue_rx();
     SER_SLOT = slot; // from here on every console line is copied to it (this one too)
     READY = true;
@@ -5137,7 +5138,7 @@ unsafe fn ser_event(d: usize, ev: &Trb, cc: u32) {
         let r = &(*addr_of!(REPORT[d])).0;
         for pkt in r[..got].chunks(SER_MPSI as usize) {
             for &b in pkt.iter().skip(2) {
-                crate::uart::inject(b);
+                crate::gps::rx(b); // to the shell, unless the cable is a GPS (gps.rs, nmea.rs)
                 SER_RX += 1;
             }
         }
@@ -5175,8 +5176,8 @@ pub fn serial_write(s: &str) {
     // SAFETY: SER_SLOT is a scalar read; the queue has one producer (under the print lock) and
     // one consumer (the poll), each moving only its own index.
     unsafe {
-        if SER_SLOT == 0 {
-            return;
+        if SER_SLOT == 0 || crate::gps::active() {
+            return; // no cable, or a GPS: the console is not mirrored to a GPS receiver
         }
         let q = &mut *addr_of_mut!(SER_QBUF);
         let mut t = SER_QT.load(Ordering::Relaxed);

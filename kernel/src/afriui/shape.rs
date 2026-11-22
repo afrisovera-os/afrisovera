@@ -637,6 +637,36 @@ fn layout_inner(s: &[u8], cap: i32, rtl: Option<bool>, kind: Text, f: &mut dyn F
     pen
 }
 
+/// The desk's coverage of one string, for the languages engineer's `desk lang check` (the architect's ruling, stage
+/// 7: "the shaper exposes one small query; lang check owns the rule"). Returns (characters drawn as the box or the
+/// face's .notdef, dotted circles the shaper put in front of a broken cluster). It takes the same path the desk draws
+/// with: `layout_as` as prose when `needed`, else the outline faces' cmap chain. A Devanagari dotted circle is
+/// counted only when the shaper inserted it, not when the text itself holds U+25CC. No heap.
+pub fn coverage(s: &[u8]) -> (usize, usize) {
+    let (mut notdef, mut circles) = (0usize, 0usize);
+    if needed(s) {
+        let dotted = vector::lookup_deva(0x25CC);
+        // any cap: coverage does not depend on it (the small-size table only holds alternates of covered characters)
+        layout_as(s, 18, None, Text::Prose, &mut |g, _, _| {
+            if g.boxed || (g.face != vector::LATIN && g.g == 0) {
+                notdef += 1;
+            }
+            if g.face == vector::DEVA && Some(g.g) == dotted && g.cp != 0x25CC {
+                circles += 1;
+            }
+        });
+    } else {
+        let mut i = 0;
+        while i < s.len() {
+            let cp = vector::next_char(s, &mut i);
+            if vector::lookup(cp).is_none() {
+                notdef += 1;
+            }
+        }
+    }
+    (notdef, circles)
+}
+
 /// The oracle hash of a line (tools/face/shape_expected.txt): FNV-1a 64 over (glyph u16, x i32, y i32) in font
 /// units of every glyph in visual order, x where it is drawn. A face 0 glyph or a box counts as glyph 0xFFFF, so a
 /// line that should have been all Arabic cannot match by accident.

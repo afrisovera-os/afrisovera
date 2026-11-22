@@ -60,6 +60,11 @@ pub struct Loc {
     pub decimal: &'static str,
     /// Group only numbers of at least 3 + min_group digits (Spanish: 2, so 1000 stays whole, 10.000 is grouped).
     pub min_group: u8,
+    /// The size of the groups before the last three digits: 3, or 2 in Indian grouping (12,34,567).
+    pub group2: u8,
+    /// The language's own digits 0 to 9 (Marathi, Nepali: Devanagari), or empty for Latin digits. Used only in text the
+    /// desk formats for people (counts, sizes, the clock), never in anything parsed or copied (the architect, 15 Nov).
+    pub digits: &'static [&'static str],
     pub h24: bool,
     pub am: &'static str,
     pub pm: &'static str,
@@ -96,7 +101,26 @@ pub fn uses(l: Lang, f: Form) -> bool {
     f == Form::Other || loc(l).plural.iter().any(|r| r.form == f)
 }
 
-/// Write `n` with the language's grouping separator every three digits (when it has enough digits).
+/// Write ASCII text with its digits in the language's own digits (the clock, a size): other bytes as they are.
+pub fn native(l: Lang, s: &[u8], put: &mut dyn FnMut(&[u8])) {
+    let digits = loc(l).digits;
+    if digits.len() != 10 {
+        put(s);
+        return;
+    }
+    let mut from = 0;
+    for (i, &b) in s.iter().enumerate() {
+        if b.is_ascii_digit() {
+            put(&s[from..i]);
+            put(digits[(b - b'0') as usize].as_bytes());
+            from = i + 1;
+        }
+    }
+    put(&s[from..]);
+}
+
+/// Write `n` with the language's grouping: the last three digits, and before them groups of `group2` (3, or 2 in
+/// Indian grouping), when it has enough digits; in the language's own digits.
 pub fn group(l: Lang, n: u64, put: &mut dyn FnMut(&[u8])) {
     let lc = loc(l);
     let mut d = [0u8; 20];
@@ -112,21 +136,25 @@ pub fn group(l: Lang, n: u64, put: &mut dyn FnMut(&[u8])) {
     }
     let digits = &d[k..];
     let len = digits.len();
-    if len < 3 + lc.min_group as usize {
-        put(digits);
+    if len < 3 + lc.min_group as usize || len <= 3 {
+        native(l, digits, put);
         return;
     }
-    let first = match len % 3 {
-        0 => 3,
+    let g2 = (lc.group2 as usize).max(1);
+    let head = len - 3;
+    let first = match head % g2 {
+        0 => g2,
         r => r,
     };
-    put(&digits[..first]);
+    native(l, &digits[..first], put);
     let mut i = first;
-    while i < len {
+    while i < head {
         put(lc.group.as_bytes());
-        put(&digits[i..i + 3]);
-        i += 3;
+        native(l, &digits[i..i + g2], put);
+        i += g2;
     }
+    put(lc.group.as_bytes());
+    native(l, &digits[head..], put);
 }
 
 /// A memory size given in MiB: "512 MiB" below 1 GiB, else GiB with one decimal ("3,8 GiB" in French), the decimal
@@ -141,7 +169,7 @@ pub fn memory(l: Lang, mib: u64, put: &mut dyn FnMut(&[u8])) {
     group(l, tenths / 10, put);
     if tenths % 10 != 0 {
         put(loc(l).decimal.as_bytes());
-        put(&[b'0' + (tenths % 10) as u8]);
+        native(l, &[b'0' + (tenths % 10) as u8], put);
     }
     put(b" GiB");
 }

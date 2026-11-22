@@ -10,7 +10,7 @@
 use crate::sys;
 use core::arch::global_asm;
 use core::ops::Range;
-use daraja_linux::{bundle, calls, cpio, limit, stack};
+use daraja_linux::{bundle, calls, cpio, limit, mem, stack};
 
 const USER_BASE: u64 = 0x0000_0100_0000_0000;
 /// Where the kernel maps the bundle (proc.rs MAP_LO: USER_BASE + 1 GiB).
@@ -68,7 +68,19 @@ fn fail(why: &[u8]) -> ! {
 // ----------------------------------------------------------------------------------------------------- host --
 /// The kernel as `calls::Host`: the program's memory through fproc_read and fproc_write, its output as console
 /// lines `[daraja] out1 <hex bytes>` (exact bytes for the cloud job), its FS base through fproc_set_tls.
-struct Kernel;
+/// `real0_ns` and `mono0_ns`: the CMOS clock (SYS_TIME, seconds) and call 79, both read once at the start; realtime is
+/// `real0_ns` plus the monotonic time since, so it moves smoothly and never steps back within a run (CLOCK_PLAN 3).
+/// When the Dira runtime's time_now (78) is on master, its seconds take SYS_TIME's place here.
+struct Kernel {
+    real0_ns: u64,
+    mono0_ns: u64,
+}
+impl Kernel {
+    fn new() -> Kernel {
+        let mono0_ns = sys::clock_monotonic();
+        Kernel { real0_ns: sys::time().saturating_mul(1_000_000_000), mono0_ns }
+    }
+}
 impl calls::Host for Kernel {
     fn read_mem(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), ()> {
         if buf.is_empty() {
@@ -93,6 +105,32 @@ impl calls::Host for Kernel {
     }
     fn set_fs(&mut self, value: u64) -> Result<(), ()> {
         sys::fproc_set_tls(0, value).map(|_| ()).map_err(|_| ())
+    }
+    fn mono_ns(&mut self) -> u64 {
+        sys::clock_monotonic()
+    }
+    fn real_ns(&mut self) -> u64 {
+        self.real0_ns.saturating_add(sys::clock_monotonic().saturating_sub(self.mono0_ns))
+    }
+    fn sleep_ms(&mut self, ms: u64) {
+        sys::sleep_ms(ms)
+    }
+    fn note(&mut self, line: &[u8]) {
+        puts(line);
+        sys::putc(b'\n');
+    }
+}
+
+/// The program's pages through the kernel (AFR-0001 7.7 as amended for L1.1): fresh RW pages, then protect.
+impl mem::Mapper for Kernel {
+    fn map(&mut self, addr: u64, len: u64) -> Result<(), ()> {
+        sys::fproc_map(addr, len, sys::PROT_RW).map(|_| ()).map_err(|_| ())
+    }
+    fn unmap(&mut self, addr: u64, len: u64) -> Result<(), ()> {
+        sys::fproc_unmap(addr, len).map(|_| ()).map_err(|_| ())
+    }
+    fn protect(&mut self, addr: u64, len: u64, prot: u64) -> Result<(), ()> {
+        sys::fproc_protect(addr, len, prot).map(|_| ()).map_err(|_| ())
     }
 }
 
@@ -230,8 +268,28 @@ pub extern "C" fn rust_main() -> ! {
     }
 
     // the calls, until the end
+    // the per-call lines only when the bundle asks for them (AFR-0001 7.7 as amended for L1.1): stage 0's programs,
+    // where the call order is compared with strace, do; a real program's thousands of calls would crawl at 115200 baud
+    let trace = cpio::find(ar, b"daraja/trace").is_some();
+    // the program's memory (L1.1): brk from the end of its image, mmap regions below the stack's guard page
+    let image_end = img.segments().iter().map(|s| s.vaddr + s.memsz).max().unwrap_or(AREA.start);
+    let mut memory = mem::Memory::new(AREA.start, image_end, STACK_TOP - STACK_LEN - PAGE);
+    // the pages mapped before the start, with the rights load() gave them, so mprotect and munmap on them follow the
+    // same rules (adding a right is EACCES there too)
+    for s in img.segments() {
+        let p = s.pages();
+        let prot = if s.flags & afri_elf::PF_X != 0 {
+            mem::PROT_READ | mem::PROT_EXEC
+        } else if s.flags & afri_elf::PF_W != 0 {
+            mem::PROT_READ | mem::PROT_WRITE
+        } else {
+            mem::PROT_READ
+        };
+        memory.known(p.start, p.end - p.start, prot);
+    }
+    memory.known(STACK_TOP - STACK_LEN, STACK_LEN, mem::PROT_READ | mem::PROT_WRITE);
     let mut files = calls::Files::new(ar);
-    let mut host = Kernel;
+    let mut host = Kernel::new();
     let mut msg = [0u8; 96];
     // `[daraja] unknown call <n>`: the first few per number, then one summary line per number at the end
     let mut unknown = limit::Limit::new();
@@ -253,10 +311,12 @@ pub extern "C" fn rust_main() -> ! {
         match kind {
             1 => {
                 let a = [word(24), word(32), word(40), word(48), word(56), word(64)];
-                puts(b"[daraja] call ");
-                dec(nr);
-                sys::putc(b'\n');
-                let (rk, value) = match calls::handle(&mut host, &mut files, nr, a) {
+                if trace {
+                    puts(b"[daraja] call ");
+                    dec(nr);
+                    sys::putc(b'\n');
+                }
+                let (rk, value) = match calls::handle(&mut host, &mut files, &mut memory, nr, a) {
                     calls::Action::Ret(v) => {
                         if v == -calls::ENOSYS && unknown.note(nr) == limit::Say::Show {
                             puts(b"[daraja] unknown call ");

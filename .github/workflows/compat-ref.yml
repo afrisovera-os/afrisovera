@@ -1,0 +1,142 @@
+# compat-ref: the golden references for Daraja's Windows and macOS stages (WINDOWS_PLAN 7, MAC_PLAN 7).
+# The owner's decision (21 Nov 2026): run on the public repo's free runners. Drafted by the compatibility engineer,
+# fitted to the public overlay by the release engineer (R5).
+#
+# Rules (release engineer, lead's yes of 22 Nov 2026):
+#   (a) this file lives only in the private release/public-overlay/ and reaches the public repo through
+#       export-public.sh, scan-public.sh and the architect's review;
+#   (b) it reads only this public checkout: no secrets, no org tokens, `contents: read`, the checkout keeps no
+#       credential (persist-credentials: false), and nothing here fetches a private repo or a mirror;
+#   (c) every `uses:` is GitHub's own action, pinned to a full commit sha (the tag is in the comment);
+#   (d) what it records stays as artifacts. Nothing is pushed back from here.
+#
+# Inputs: only our own test programs (tests/compat/win/*.c, tests/compat/mac/*.c) and the bundle data
+# (tests/compat/bundle/); the export publishes all of tests/compat/.
+#
+# What it records, per program: its sha256, stdout (.out1), stderr (.out2) and exit code (.exit), on real Windows
+# and real macOS. AfriSovera's cloud job later runs the SAME binary (same sha256) through daraja-win / daraja-mac and
+# compares.
+# - Windows: the .exe is cross-built on ubuntu-24.04 with the image's mingw-w64 (the version goes into toolchain.txt,
+#   so our own cloud job can check it builds the same hash), then run on windows-latest.
+# - macOS: Apple's SDK licence ties building to Apple hardware, so it is built on macos-latest with the runner's
+#   clang, and the binary is kept as an artifact (mac-bin) beside its reference.
+#
+# How the references come back to the private repo (rule d), by hand and reviewed:
+#   1. the release engineer downloads win-ref, mac-ref and mac-bin from one named run
+#      (gh run download <id> --repo afrisovera-os/afrisovera);
+#   2. checks every .sha256 against the binary it names, and that every program in tests/compat/{win,mac} has
+#      .out1, .out2 and .exit (or, on macOS without Rosetta, a .not-run file: no reference that time);
+#      the compare side trims a trailing CRLF on .exit files only (Windows writes CRLF); .out1 and .out2 are
+#      compared byte for byte;
+#   3. commits them on a branch under tests/compat/ref/win/ and tests/compat/ref/mac/ (mac-bin's binaries beside
+#      their references), with the run id and its commit in the message;
+#   4. the compatibility engineer reviews that branch and the architect gives OK TO MERGE as for any branch.
+name: compat-ref
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["tests/compat/win/**", "tests/compat/mac/**", "tests/compat/bundle/**", ".github/workflows/compat-ref.yml"]
+permissions:
+  contents: read
+concurrency:
+  group: compat-ref-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  win-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
+      - name: mingw-w64 (the image's package; its version is recorded)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-mingw-w64-x86-64-posix
+          x86_64-w64-mingw32-gcc --version > gcc-version.txt
+          sed -n 1p gcc-version.txt > toolchain.txt
+          dpkg-query -W gcc-mingw-w64-x86-64-posix >> toolchain.txt
+          cat toolchain.txt
+      - name: build
+        run: |
+          mkdir -p out/win
+          shopt -s nullglob
+          for c in tests/compat/win/*.c; do
+            n=$(basename "${c%.c}")
+            # reproducible: no timestamp in the PE header, no build id, fixed paths
+            x86_64-w64-mingw32-gcc -O2 -static -s -Wl,--no-insert-timestamp -ffile-prefix-map="$PWD"=. \
+              -o "out/win/$n.exe" "$c"
+            sha256sum "out/win/$n.exe" | cut -d' ' -f1 > "out/win/$n.sha256"
+          done
+          cp toolchain.txt out/win/
+          ls -la out/win
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: win-bin, path: out/win }
+
+  win-run:
+    needs: win-build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      # the bundle's text files must reach the programs byte for byte, as on AfriSovera: no CRLF conversion
+      - name: keep line endings as committed
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { name: win-bin, path: bin }
+      - name: run each program as the bridge will (no extra environment, stdin empty, in a copy of the bundle)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ref | Out-Null
+          $empty = Join-Path $env:RUNNER_TEMP "empty-stdin.txt"; New-Item -ItemType File -Force $empty | Out-Null
+          (Get-CimInstance Win32_OperatingSystem).Version | Out-File ref/windows-version.txt -Encoding ascii
+          Copy-Item bin/toolchain.txt ref/toolchain.txt
+          foreach ($exe in Get-ChildItem bin -Filter *.exe) {
+            $n = $exe.BaseName
+            $run = Join-Path $env:RUNNER_TEMP "run-$n"
+            Copy-Item -Recurse tests/compat/bundle $run
+            $p = Start-Process -FilePath $exe.FullName -WorkingDirectory $run -NoNewWindow -Wait -PassThru `
+              -RedirectStandardInput $empty -RedirectStandardOutput "ref/$n.out1" -RedirectStandardError "ref/$n.out2"
+            "$($p.ExitCode)" | Out-File "ref/$n.exit" -Encoding ascii
+            Copy-Item "bin/$n.sha256" "ref/$n.sha256"
+          }
+          Get-ChildItem ref
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: win-ref, path: ref }
+
+  mac-ref:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
+      - name: build (x86_64 slice, the PC's) and run each program on real macOS
+        run: |
+          mkdir -p out/mac ref
+          sw_vers > ref/macos-version.txt
+          clang --version > clang-version.txt
+          sed -n 1p clang-version.txt > ref/toolchain.txt
+          # macos-latest is Apple silicon: the x86_64 slice runs under Rosetta 2. Without it the binaries are still
+          # built and kept, and each program gets a .not-run file instead of a reference (architect, 22 Nov 2026;
+          # no Intel image is a fallback, macos-13 is being retired)
+          rosetta=yes
+          arch -x86_64 /usr/bin/true 2> /dev/null || { rosetta=no; echo "x86 not run on this image" > ref/x86-not-run.txt; }
+          shopt -s nullglob
+          for c in tests/compat/mac/*.c; do
+            n=$(basename "${c%.c}")
+            clang -O2 -arch x86_64 -o "out/mac/$n" "$c"
+            shasum -a 256 "out/mac/$n" | cut -d' ' -f1 > "ref/$n.sha256"
+            if [ "$rosetta" = no ]; then echo "x86 not run on this image" > "ref/$n.not-run"; continue; fi
+            run="$RUNNER_TEMP/run-$n"; cp -R tests/compat/bundle "$run"
+            # the step runs under bash -e: a program's own non-zero exit is a result to record, not a failure
+            rc=0
+            ( cd "$run" && env -i "$GITHUB_WORKSPACE/out/mac/$n" < /dev/null > "$GITHUB_WORKSPACE/ref/$n.out1" \
+                2> "$GITHUB_WORKSPACE/ref/$n.out2" ) || rc=$?
+            echo "$rc" > "ref/$n.exit"
+          done
+          ls -la out/mac ref
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: mac-bin, path: out/mac }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: mac-ref, path: ref }

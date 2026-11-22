@@ -38,12 +38,18 @@ pub enum Lang {
     Id = 5,
     De = 6,
     Tr = 7,
+    /// Hindi, Marathi and Nepali (stage 7): Devanagari, shaped by the desk since C3 and C3b.
+    Hi = 8,
+    Mr = 9,
+    Ne = 10,
     /// The test language (stage 6): pseudo-English that shows what skipped the catalogue. Never in LANGS, so never
     /// in Settings' list or `desk lang`'s codes; reached only by `desk lang qps`, and never saved.
-    Qps = 8,
+    Qps = 255,
 }
 
-pub const LANGS: [Lang; 8] = [Lang::En, Lang::Tw, Lang::Es, Lang::Fr, Lang::Pt, Lang::Id, Lang::De, Lang::Tr];
+pub const LANGS: [Lang; 11] = [
+    Lang::En, Lang::Tw, Lang::Es, Lang::Fr, Lang::Pt, Lang::Id, Lang::De, Lang::Tr, Lang::Hi, Lang::Mr, Lang::Ne,
+];
 
 /// Which way a language's text and the desk run (for the scripts engineer's mirrored desk, SHAPING_PLAN.md C2).
 #[allow(dead_code)]
@@ -66,6 +72,9 @@ impl Lang {
             Lang::Id => "id",
             Lang::De => "de",
             Lang::Tr => "tr",
+            Lang::Hi => "hi",
+            Lang::Mr => "mr",
+            Lang::Ne => "ne",
             Lang::Qps => "qps",
         }
     }
@@ -81,13 +90,17 @@ impl Lang {
             Lang::Id => "Bahasa Indonesia",
             Lang::De => "Deutsch",
             Lang::Tr => "Türkçe",
+            Lang::Hi => "\u{0939}\u{093F}\u{0928}\u{094D}\u{0926}\u{0940}",
+            Lang::Mr => "\u{092E}\u{0930}\u{093E}\u{0920}\u{0940}",
+            Lang::Ne => "\u{0928}\u{0947}\u{092A}\u{093E}\u{0932}\u{0940}",
             Lang::Qps => "qps (test)",
         }
     }
     /// Left to right for every language so far; Arabic, Urdu and Persian will say Rtl when they join the catalogue.
     pub fn dir(self) -> Dir {
         match self {
-            Lang::En | Lang::Tw | Lang::Es | Lang::Fr | Lang::Pt | Lang::Id | Lang::De | Lang::Tr | Lang::Qps => Dir::Ltr,
+            Lang::En | Lang::Tw | Lang::Es | Lang::Fr | Lang::Pt | Lang::Id | Lang::De | Lang::Tr | Lang::Hi | Lang::Mr | Lang::Ne
+            | Lang::Qps => Dir::Ltr,
         }
     }
     pub fn from_code(c: &str) -> Option<Lang> {
@@ -253,6 +266,9 @@ fn entry(l: Lang, m: Msg) -> (&'static str, Status) {
         Lang::Id => ID[m as usize],
         Lang::De => DE[m as usize],
         Lang::Tr => TR[m as usize],
+        Lang::Hi => HI[m as usize],
+        Lang::Mr => MR[m as usize],
+        Lang::Ne => NE[m as usize],
         Lang::Qps => QPS[m as usize],
     }
 }
@@ -648,6 +664,151 @@ static TR: [(&str, Status); COUNT] = table(&[
     (Msg::TermBack, "{0} satır geri, herhangi bir anahtar döner", Draft),
 ]);
 
+/// Hindi, Marathi and Nepali (stage 7): machine drafts, every one Draft until a fluent speaker checks it; the safety
+/// words draw in English until then. Filled from the cloud drafts (tools/lang/draft.py).
+static HI: [(&str, Status); COUNT] = table(&[
+    // hi, machine drafts by google/madlad400-3b-mt at fa184c675da0 and, where its draft failed the checks, Helsinki-NLP/opus-mt-en-hi
+    // at 75d7f7c9232b (apache-2.0). Picked by the stage 7 checks: no stray Latin words or marks,
+    // plural markers kept, names kept as written, and fit (desk lang fit). Every one Draft until a fluent speaker
+    // checks it; the ids left out, and why, are on the speakers' sheet.
+    (Msg::AppFiles, "फ़ाइलें", Draft),
+    (Msg::AppSettings, "विन्यास", Draft),
+    (Msg::AppAbout, "के बारे में", Draft),
+    (Msg::SetDisplay, "प्रदर्शक", Draft),
+    (Msg::SetPixels, "{0} x {1} लॉजिकल पिक्सेल", Draft),
+    (Msg::SetInput, "इनपुट", Draft),
+    (Msg::SetPointer, "संकेतक", Draft),
+    (Msg::SetTouch, "टच", Draft),
+    (Msg::SetDesktop, "डेस्कटॉप", Draft),
+    (Msg::SetWallpaper, "स्मारक वालपेपर", Draft),
+    (Msg::SetClock24, "24- घंटे की घड़ी", Draft),
+    (Msg::SetMotion, "गति", Draft),
+    (Msg::SetNetwork, "नेटवर्क", Draft),
+    (Msg::SetNoDevice, "कोई नेटवर्क उपकरण नहीं", Draft),
+    (Msg::SetNoAddress, "लिंक अप, अभी कोई पता नहीं", Draft),
+    (Msg::SetConnected, "   कनेक्टेड {0}", Draft),
+    (Msg::SetSystem, "तंत्र", Draft),
+    (Msg::AboutMotto, "अपने उपकरण का स्वामित्व - अपने भविष्य का स्वामित्व", Draft),
+    (Msg::AboutDesktop, "डेस्कटॉप", Draft),
+    (Msg::AboutDevice, "उपकरण", Draft),
+    (Msg::AboutMemory, "मेमोरी", Draft),
+    (Msg::AboutMemoryIs, "{0}, ऊपर {1} सेकंड", Draft),
+    (Msg::FilesName, "नाम", Draft),
+    (Msg::FilesSize, "आकार", Draft),
+    (Msg::FilesNone, "अभी कोई फ़ाइलें नहीं", Draft),
+    (Msg::FilesBytes, "one:{0#} बाइट|other:{0#} बाइट", Draft),
+    (Msg::FilesRunIt, "इसे टर्मिनल से चलाएँ:", Draft),
+    (Msg::FilesBinary, "बाइनरी डाटा", Draft),
+    (Msg::FilesSelect, "फ़ाइल चुनें", Draft),
+    (Msg::CircleNoNet, "कोई नेटवर्क नहीं", Draft),
+    (Msg::CircleNoAddress, "लिंक अप, कोई पता नहीं", Draft),
+    (Msg::CircleDevice, "यह उपकरण", Draft),
+    (Msg::CircleUp, "{0} s.  सुपर या ESC वृत्त को बंद कर देता है।", Draft),
+    (Msg::NotesTitle, "अधिसूचना", Draft),
+    (Msg::NotesNone, "कुछ नया नहीं", Draft),
+    (Msg::TitleUnsigned, "हस्ताक्षरित नहीं", Draft),
+    (Msg::TitleAnyway, "जैसे भी हो बंद करें", Draft),
+    (Msg::SetLanguage, "भाषा", Draft),
+    (Msg::SetDraft, "ड्राफ्ट", Draft),
+    (Msg::TermBack, "one:{0#} लाइन बैक, कोई कुंजी लौटाता है|other:{0#} लाइन बैक, कोई कुंजी लौटाता है", Draft),
+    (Msg::PowerTitle, "पावर", Draft),
+    (Msg::PowerOff, "बंद करें", Draft),
+    (Msg::PowerRestart, "फिर से प्रारंभ करें", Draft),
+    (Msg::PowerOffAsk, "अब बंद कर दिया?", Draft),
+    (Msg::PowerRestartAsk, "अब फिर से प्रारंभ करें?", Draft),
+    (Msg::PowerUnsaved, "सहेजे बगैर अनुप्रयोग बंद करें.", Draft),
+    (Msg::CircleBusy, "टर्मिनल व्यस्त है; जल्द ही फिर से कोशिश करें.", Draft),
+    (Msg::PowerCancel, "रद्द करें", Draft),
+]);
+static MR: [(&str, Status); COUNT] = table(&[
+    // mr, machine drafts by google/madlad400-3b-mt at fa184c675da0 (opus-mt-en-mr returned KDE leftovers
+    // and is not used) (apache-2.0). Picked by the stage 7 checks: no stray Latin words or marks,
+    // plural markers kept, names kept as written, and fit (desk lang fit). Every one Draft until a fluent speaker
+    // checks it; the ids left out, and why, are on the speakers' sheet.
+    (Msg::AppFiles, "फाइल", Draft),
+    (Msg::AppSettings, "संयोजना", Draft),
+    (Msg::AppAbout, "विषयी", Draft),
+    (Msg::SetPixels, "{0} x {1} लॉजिकल पिक्सेल", Draft),
+    (Msg::SetInput, "इनपुट", Draft),
+    (Msg::SetPointer, "पॉइंटर", Draft),
+    (Msg::SetTouch, "टच", Draft),
+    (Msg::SetDesktop, "डेस्कटॉप", Draft),
+    (Msg::SetWallpaper, "स्मारक वॉलपेपर", Draft),
+    (Msg::SetClock24, "२४- तासाची घड्याळ", Draft),
+    (Msg::SetMotion, "हालचाली", Draft),
+    (Msg::SetNoDevice, "संजाळ साधन आढळले नाही", Draft),
+    (Msg::SetNoAddress, "लिंक अप, अद्याप पत्ता नाही", Draft),
+    (Msg::SetSystem, "प्रणाली", Draft),
+    (Msg::AboutDesktop, "डेस्कटॉप", Draft),
+    (Msg::AboutDevice, "साधन", Draft),
+    (Msg::AboutMemory, "स्मृती", Draft),
+    (Msg::FilesNone, "अद्याप फाइल आढळले नाही", Draft),
+    (Msg::FilesRunIt, "टर्मिनल पासून चालवा:", Draft),
+    (Msg::FilesBinary, "द्विचर माहिती", Draft),
+    (Msg::FilesSelect, "फाइल निवडा", Draft),
+    (Msg::CircleNoNet, "संजाळ नाही", Draft),
+    (Msg::CircleNoAddress, "लिंक अप, पत्ता नाही", Draft),
+    (Msg::CircleDevice, "हे साधन", Draft),
+    (Msg::NotesNone, "नविन काही नाही", Draft),
+    (Msg::TitleUnsigned, "स्वाक्षरी न केलेले", Draft),
+    (Msg::TitleAnyway, "तरीही बंद करा", Draft),
+    (Msg::SetDraft, "ड्राफ्ट", Draft),
+    (Msg::PowerOff, "बंद करा", Draft),
+    (Msg::PowerRestart, "पुन्हप्रारंभ करा", Draft),
+    (Msg::PowerOffAsk, "आता बंद करा?", Draft),
+    (Msg::PowerRestartAsk, "आता पुन्हप्रारंभ करा?", Draft),
+    (Msg::PowerUnsaved, "संचयीत न करता अनुप्रयोग बंद करा.", Draft),
+    (Msg::CircleBusy, "टर्मिनल व्यस्त आहे; लवकरच पुन्हा प्रयत्न करा.", Draft),
+    (Msg::PowerCancel, "रद्द करा", Draft),
+]);
+static NE: [(&str, Status); COUNT] = table(&[
+    // ne, machine drafts by google/madlad400-3b-mt at fa184c675da0 (apache-2.0). Picked by the stage 7 checks: no stray Latin words or marks,
+    // plural markers kept, names kept as written, and fit (desk lang fit). Every one Draft until a fluent speaker
+    // checks it; the ids left out, and why, are on the speakers' sheet.
+    (Msg::AppFiles, "फाइलहरू", Draft),
+    (Msg::AppSettings, "सेटिङ", Draft),
+    (Msg::AppAbout, "यसका बारेमा", Draft),
+    (Msg::SetDisplay, "प्रदर्शन गर्नुहोस्", Draft),
+    (Msg::SetInput, "आगत", Draft),
+    (Msg::SetPointer, "सङ्केतक", Draft),
+    (Msg::SetDesktop, "डेस्कटप", Draft),
+    (Msg::SetWallpaper, "स्मारक वालपेपर", Draft),
+    (Msg::SetClock24, "२४-घण्टा घडी", Draft),
+    (Msg::SetMotion, "चाल", Draft),
+    (Msg::SetNetwork, "सञ्जाल", Draft),
+    (Msg::SetNoDevice, "सञ्जाल यन्त्र छैन", Draft),
+    (Msg::SetNoAddress, "लिङ्क माथि, अझै ठेगाना छैन", Draft),
+    (Msg::SetConnected, "   जडान गरिएको {0}", Draft),
+    (Msg::SetSystem, "प्रणाली", Draft),
+    (Msg::AboutDesktop, "डेस्कटप", Draft),
+    (Msg::AboutDevice, "यन्त्र", Draft),
+    (Msg::AboutMemory, "स्मृति", Draft),
+    (Msg::FilesNone, "अझै फाइल छैन", Draft),
+    (Msg::FilesWasm, "वेब एसेम्बली कार्यक्रम", Draft),
+    (Msg::FilesRunIt, "टर्मिनलबाट चलाउनुहोस्:", Draft),
+    (Msg::FilesBinary, "बाइनरी डेटा", Draft),
+    (Msg::FilesSelect, "फाइल चयन गर्नुहोस्", Draft),
+    (Msg::CircleNoNet, "सञ्जाल छैन", Draft),
+    (Msg::CircleNoAddress, "लिङ्क माथि, ठेगाना छैन", Draft),
+    (Msg::CircleDevice, "यो यन्त्र", Draft),
+    (Msg::NotesTitle, "सूचना", Draft),
+    (Msg::NotesNone, "नयाँ केही छैन", Draft),
+    (Msg::NoteWelcome, "AfriSovera मा स्वागत छ", Draft),
+    (Msg::TitleUnsigned, "हस्ताक्षर नगरिएको", Draft),
+    (Msg::TitleAnyway, "जसरी पनि बन्द गर्नुहोस्", Draft),
+    (Msg::SetLanguage, "भाषा", Draft),
+    (Msg::SetDraft, "ड्राफ्ट", Draft),
+    (Msg::TermBack, "one:{0#} रेखा पछाडि, कुनै कुञ्जी फर्काउँछ|other:{0#} रेखा पछाडि, कुनै कुञ्जी फर्काउँछ", Draft),
+    (Msg::PowerTitle, "शक्ति", Draft),
+    (Msg::PowerOff, "बन्द गर्नुहोस्", Draft),
+    (Msg::PowerRestart, "पुन: सुरु गर्नुहोस्", Draft),
+    (Msg::PowerOffAsk, "अहिले बन्द गर्नुहुन्छ?", Draft),
+    (Msg::PowerRestartAsk, "अहिले पुन: सुरु गर्नुहुन्छ?", Draft),
+    (Msg::PowerUnsaved, "बचत नगरी अनुप्रयोग बन्द गर्नुहोस् ।", Draft),
+    (Msg::CircleBusy, "टर्मिनल व्यस्त छ; चाँडै फेरि प्रयास गर्नुहोस् ।", Draft),
+    (Msg::PowerCancel, "रद्द गर्नुहोस्", Draft),
+]);
+
 // BEGIN qps: generated by tools/lang/pseudo.py from the English; do not edit by hand
 /// The test language qps: never listed, never saved; its safety words draw in pseudo form (the architect,
 /// 15 Nov). Made from the English by tools/lang/pseudo.py.
@@ -891,7 +1052,7 @@ pub fn fill_text_in(l: Lang, s: &[u8], args: &[Arg], put: &mut dyn FnMut(&[u8]))
 
 /// The language codes, for the `desk lang` usage line.
 pub fn codes() -> &'static str {
-    "en tw es fr pt id de tr"
+    "en tw es fr pt id de tr hi mr ne"
 }
 
 /// For a language: (ids, drafts, checked, shown in English because there is no text yet). English counts its own
@@ -906,6 +1067,9 @@ pub fn counts(l: Lang) -> (usize, usize, usize, usize) {
         Lang::Id => &ID,
         Lang::De => &DE,
         Lang::Tr => &TR,
+        Lang::Hi => &HI,
+        Lang::Mr => &MR,
+        Lang::Ne => &NE,
         Lang::Qps => &QPS,
     };
     let (mut draft, mut checked, mut english) = (0, 0, 0);
@@ -960,6 +1124,15 @@ pub fn check(bad: &mut dyn FnMut(&str, &str, &str)) {
                 bad(l.code(), IDS[k], "gaps differ from the English");
             } else if marks(s) != 0 {
                 bad(l.code(), IDS[k], "a counted gap {d#} without plural forms");
+            }
+            // stage 7 (the architect's ruling, 15 Nov): the string shaped through the desk's own face chain, as it is
+            // drawn; no box or .notdef, and no dotted circle the shaper put before a broken cluster
+            let (notdef, circles) = super::paint::shape::coverage(s);
+            if notdef > 0 {
+                bad(l.code(), IDS[k], "a character the desk's faces cannot draw");
+            }
+            if circles > 0 {
+                bad(l.code(), IDS[k], "a broken cluster (the shaper put a dotted circle before it)");
             }
             let st = core::str::from_utf8(s).unwrap_or("");
             if st.is_empty() && !s.is_empty() {

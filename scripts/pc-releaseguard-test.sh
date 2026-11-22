@@ -18,6 +18,7 @@ UPD='release build refused: it trusts the DEMO update key \(AFR-0010 section 7\)
 APP='release build refused: it trusts the DEMO app publisher key \(AFR-0010 section 7\)'
 BYTES="release build refused: a key table row holds the DEMO update key's bytes \(AFR-0010 section 7\)"
 SW="release build refused: a test switch \(AFRI_TEST_FAIL or AFRI_RELEASE\) is set \(AFR-0010 section 7\)"
+TA="release build refused: the test images' feature test-apps is set \\(AFR-0010 section 7\\)"
 PLANT="release build refused: the planted row \(demo: false\) holds the DEMO update key's bytes \(AFR-0010 section 7\)"
 
 
@@ -29,6 +30,13 @@ grade_sw() { # grade_sw <rc> <log>: a release build with a test switch set (safe
     local fail=0
     [ "$1" -ne 0 ] || { echo "  FAIL: a release build with AFRI_TEST_FAIL set COMPILED"; fail=1; }
     grep -aqE "$SW" "$2" || { echo "  FAIL: the release build with AFRI_TEST_FAIL set does not name the test switch"; fail=1; }
+    return $fail
+}
+
+grade_ta() { # grade_ta <rc> <log>: a release build of a test image (test-apps) does not compile (item 9)
+    local fail=0
+    [ "$1" -ne 0 ] || { echo "  FAIL: a release build with test-apps COMPILED"; fail=1; }
+    grep -aqE "$TA" "$2" || { echo "  FAIL: the release build with test-apps does not name the feature"; fail=1; }
     return $fail
 }
 
@@ -86,9 +94,12 @@ selftest() {
     if grade_sw 101 "$W/sw.log" > /dev/null 2>&1; then pass=$((pass+1)); echo "    arm switch-refused: green (expected green) OK"; else bad=$((bad+1)); echo "    arm switch-refused: red  <-- GRADER BUG"; fi
     if grade_sw 0 "$W/ok.log" > /dev/null 2>&1; then bad=$((bad+1)); echo "    arm switch-built: green  <-- GRADER BUG"; else pass=$((pass+1)); echo "    arm switch-built: red (expected red) OK"; fi
     if grade_sw 101 "$W/rel.log" > /dev/null 2>&1; then bad=$((bad+1)); echo "    arm switch-unnamed: green  <-- GRADER BUG"; else pass=$((pass+1)); echo "    arm switch-unnamed: red (expected red) OK"; fi
+    { cat "$W/rel.log"; echo "error[E0080]: evaluation panicked: release build refused: the test images' feature test-apps is set (AFR-0010 section 7)"; } > "$W/ta.log"
+    if grade_ta 101 "$W/ta.log" > /dev/null 2>&1; then pass=$((pass+1)); echo "    arm testapps-refused: green (expected green) OK"; else bad=$((bad+1)); echo "    arm testapps-refused: red  <-- GRADER BUG"; fi
+    if grade_ta 101 "$W/rel.log" > /dev/null 2>&1; then bad=$((bad+1)); echo "    arm testapps-unnamed: green  <-- GRADER BUG"; else pass=$((pass+1)); echo "    arm testapps-unnamed: red (expected red) OK"; fi
     rm -rf "$W"
     echo "  grader selftest: $pass ok / $bad FAIL"
-    [ "$bad" -eq 0 ] && [ "$pass" -eq 14 ]
+    [ "$bad" -eq 0 ] && [ "$pass" -eq 16 ]
 }
 
 echo "== PC safe updates: release guard against demo keys (AFR-0010 section 7) =="
@@ -103,11 +114,13 @@ chk pc control; crc=$?
 chk pc,release release; rrc=$?
 chk pc,releaseguard-plant plant; prc=$?
 AFRI_TEST_FAIL=selftest chk pc,release testsw; src=$?
+chk pc,release,test-apps testapps; trc=$?
+grep -aE "test images' feature" "$W/testapps.log" | sed "s/^/  testapps | /"
 grep -aE "test switch" "$W/testsw.log" | sed "s/^/  testsw | /"
 echo "  control (pc): exit $crc; release (pc,release): exit $rrc; planted row (pc,releaseguard-plant): exit $prc"
 grep -aE '^error' "$W/release.log" | sed 's/^/  release | /'
 grep -aE 'planted row' "$W/plant.log" | sed 's/^/  plant | /'
-if grade "$crc" "$W/control.log" "$rrc" "$W/release.log" "$prc" "$W/plant.log" && grade_sw "$src" "$W/testsw.log"; then
+if grade "$crc" "$W/control.log" "$rrc" "$W/release.log" "$prc" "$W/plant.log" && grade_sw "$src" "$W/testsw.log" && grade_ta "$trc" "$W/testapps.log"; then
     rm -rf "$W"
     echo "PC RELEASEGUARD TEST PASSED"
     exit 0

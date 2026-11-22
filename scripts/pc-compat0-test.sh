@@ -27,7 +27,7 @@ echo "  --- the judge's selftest ---"
 
 echo "  --- 1. the Linux reference ---"
 bash scripts/compat-linux-ref-test.sh > "$T/compat0-ref.log" 2>&1 || { tail -30 "$T/compat0-ref.log"; fail "compat-linux-ref"; }
-grep -aE '^  (hello0|fault0|bench0): ' "$T/compat0-ref.log" | sed 's/^/  | /'
+grep -aE '^  (hello0|fault0|bench0|mprot0|mprot1|lua|clock1): ' "$T/compat0-ref.log" | sed 's/^/  | /'
 REF="$ROOT/build/compat-ref"
 
 echo "  --- 2. the bundles ---"
@@ -36,7 +36,9 @@ rm -rf "$B"; mkdir -p "$B/bundles"
 "$PY" - "$REF" "$ROOT/tests/compat/bundle" "$B/bundles" <<'EOF' || fail "could not pack the bundles"
 import os, sys
 ref, files, out = sys.argv[1], sys.argv[2], sys.argv[3]
-ARGS = {"hello0": ["hello0", "one", "two"], "fault0": ["fault0"], "bench0": ["bench0"]}
+ARGS = {"hello0": ["hello0", "one", "two"], "fault0": ["fault0"], "bench0": ["bench0"],
+        "mprot0": ["mprot0"], "mprot1": ["mprot1"], "lua": ["lua", "data/lua1.lua"], "clock1": ["clock1"]}
+TRACED = {"hello0", "fault0", "bench0"}  # stage 0's programs: the call order is compared with strace
 
 def entry(buf, name, mode, data):
     n = name.encode() + b"\0"
@@ -53,6 +55,10 @@ for prog, argv in ARGS.items():
         entry(buf, "data/" + f, 0o100644, open(os.path.join(files, "data", f), "rb").read())
     entry(buf, "daraja", 0o040755, b"")
     entry(buf, "daraja/argv", 0o100644, b"\0".join(a.encode() for a in argv) + b"\0")
+    # traced: stage 0's three programs are where the call order is compared with strace, so their bundles ask for the
+    # per-call lines (AFR-0001 7.7 as amended for L1.1: off unless a bundle holds daraja/trace)
+    if prog in TRACED:
+        entry(buf, "daraja/trace", 0o100644, b"")
     entry(buf, prog, 0o100755, open(os.path.join(ref, prog), "rb").read())
     entry(buf, "TRAILER!!!", 0, b"")
     open(os.path.join(out, prog + ".cpio"), "wb").write(buf)
@@ -106,7 +112,7 @@ export AFRISH_CMD_QUIET="${AFRISH_CMD_QUIET:-120}" AFRISH_CMD_CEILING="${AFRISH_
     -serial "tcp:127.0.0.1:5478,server,nowait" -qmp "tcp:127.0.0.1:5479,server,nowait" &
 Q=$!
 AFRISH_BOOT_GRACE="${AFRISH_BOOT_GRACE:-10}" "$PY" scripts/shell-demo.py 5478 5479 "$W/shot.png" \
-    "linux hello0" "linux fault0" "linux bench0" > "$W/boot.log" 2>&1
+    "linux hello0" "linux fault0" "linux bench0" "linux mprot0" "linux mprot1" "linux lua" "linux clock1" > "$W/boot.log" 2>&1
 kill "$Q" 2> /dev/null
 wait "$Q" 2> /dev/null
 tr -d '\r' < "$W/boot.log" | grep -aE '^\[daraja\] (linux|exit|unknown|bridge stopped)|^\[daraja\] P[0-9] (personality|ended|memory)|NOT (given|spawned)' | sed 's/^/  | /'
@@ -127,7 +133,21 @@ if [ "$f0_lines" != 3 ] || [ -z "$f0_sum" ] || [ -z "$f0_exit" ] || [ "$f0_sum" 
     echo "PC COMPAT0 TEST FAILED"
     exit 1
 fi
-if "$PY" scripts/lib/compat0-compare.py "$W/boot.log" "$REF" hello0 fault0 bench0; then
+# L1.1: mprot1 adds rights after the start; AfriSovera refuses all three with EACCES (exit 0) where Linux allows
+# them (exit 1, checked by compat-linux-ref), so it is graded on its own, not compared
+M1="$(tr -d '\r' < "$W/boot.log" | sed -n '/linux mprot1: begin/,/linux mprot1: end/p')"
+m1_out="$(sed -nE 's/^\[daraja\] out1 ([0-9a-f]+)$/\1/p' <<< "$M1" | tr -d '\n')"
+m1_text="$("$PY" -c "import sys; print(bytes.fromhex(sys.argv[1]).decode(), end='')" "$m1_out" 2> /dev/null)"
+m1_want="$(printf 'add WRITE to a read-only page: EACCES\nadd EXEC to a read-write page: EACCES\nadd WRITE to the code page: EACCES')"
+echo "  mprot1 through the bridge: $(grep -c EACCES <<< "$m1_text") of 3 refused, $(grep -aoE '^\[daraja\] exit [0-9]+' <<< "$M1" | head -1)"
+if [ "$m1_text" != "$m1_want" ] || ! grep -qE '^\[daraja\] exit 0$' <<< "$M1"; then
+    echo "  FAIL: mprot1 was not refused all three times with EACCES and exit 0"
+    printf '%s\n' "$m1_text" | sed 's/^/  | /'
+    echo "  logs kept in $W"
+    echo "PC COMPAT0 TEST FAILED"
+    exit 1
+fi
+if "$PY" scripts/lib/compat0-compare.py "$W/boot.log" "$REF" hello0 fault0 bench0 mprot0 lua clock1; then
     # the serial log's lines end in CR: strip it first, or the end-of-line match below finds nothing (first runs)
     cyc="$(tr -d '\r' < "$W/boot.log" | sed -n '/linux bench0: begin/,/linux bench0: end/p' | sed -nE 's/^\[daraja\] out1 ([0-9a-f]+)$/\1/p' | head -1)"
     [ -n "$cyc" ] && echo "  bench0 through the bridge: $("$PY" -c "import sys; print(bytes.fromhex(sys.argv[1]).decode().strip())" "$cyc")" \

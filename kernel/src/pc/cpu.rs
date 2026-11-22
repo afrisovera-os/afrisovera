@@ -19,6 +19,53 @@ pub unsafe fn inb(port: u16) -> u8 {
     asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack, preserves_flags));
     v
 }
+/// G13 (pc/cpu_sidech.rs): this CPU's side-channel state, from CPUID, and from IA32_ARCH_CAPABILITIES only when
+/// CPUID.7.0:EDX[29] says the MSR exists (reading it otherwise is a #GP).
+pub fn side_channels() -> crate::cpu_sidech::Report {
+    use crate::cpu_sidech::{assess, Vendor, EDX7_ARCH_CAPABILITIES, MSR_ARCH_CAPABILITIES};
+    // SAFETY: CPUID exists on every x86-64 CPU; leaf 7 is read only when leaf 0 says it exists.
+    let l0 = unsafe { core::arch::x86_64::__cpuid_count(0, 0) };
+    let mut v = [0u8; 12];
+    v[0..4].copy_from_slice(&l0.ebx.to_le_bytes());
+    v[4..8].copy_from_slice(&l0.edx.to_le_bytes());
+    v[8..12].copy_from_slice(&l0.ecx.to_le_bytes());
+    let vendor = match &v {
+        b"GenuineIntel" => Vendor::Intel,
+        b"AuthenticAMD" => Vendor::Amd,
+        _ => Vendor::Other,
+    };
+    let (edx7, ebx7) = if l0.eax >= 7 {
+        // SAFETY: as above.
+        let r = unsafe { core::arch::x86_64::__cpuid_count(7, 0) };
+        (r.edx, r.ebx)
+    } else {
+        (0, 0)
+    };
+    // SAFETY: the MSR exists (CPUID.7.0:EDX[29]); reading it has no side effects.
+    let caps = if edx7 & EDX7_ARCH_CAPABILITIES != 0 { Some(unsafe { rdmsr(MSR_ARCH_CAPABILITIES) }) } else { None };
+    assess(vendor, edx7, ebx7, caps)
+}
+
+/// The one G13 line, for the boot log (so `report` carries it), `cpuinfo` and `hwscan`.
+pub fn side_channel_line(prefix: &str) {
+    let r = side_channels();
+    // CPUID.1:ECX[31]: running under a hypervisor, whose CPUID answer is its own, not the hardware's (QEMU's TCG CPU
+    // says AuthenticAMD, so a cloud boot reads "no"; that is not a fact about any real machine)
+    // SAFETY: CPUID leaf 1 exists on every x86-64 CPU.
+    let hv = unsafe { core::arch::x86_64::__cpuid_count(1, 0) }.ecx & (1 << 31) != 0;
+    crate::kprintln!(
+        "{}cpu side channels: {}; {}{}",
+        prefix,
+        r,
+        if r.meltdown_affected() {
+            "no KPTI yet, so downloaded foreign programs are refused (G13)"
+        } else {
+            "Meltdown ruled out by the CPU"
+        },
+        if hv { " (under a hypervisor: its answer)" } else { "" }
+    );
+}
+
 pub unsafe fn rdmsr(msr: u32) -> u64 {
     let (lo, hi): (u32, u32);
     asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nomem, nostack));
